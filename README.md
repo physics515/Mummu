@@ -19,7 +19,7 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
 ## Design principles
 
 - **Local-first, offline, private** — a single consumer GPU (or CPU) is the whole story; the cloud is never a dependency.
-- **From scratch, in Rust, on Burn** — one backend-agnostic codebase (CPU / CUDA / Metal / Vulkan / WebGPU) instead of per-backend feature flags; first-class on-device **training / fine-tuning** later.
+- **Burn at the core** — [Burn](https://burn.dev) is the one inference *and* training engine. Every model, every backend, and the (future) on-device fine-tune loop is built **from scratch on Burn** (via CubeCL) as a single backend-agnostic codebase (CPU / CUDA / Metal / Vulkan / WebGPU). No second runtime, no per-backend forks, no C/CUDA toolchain — Burn is the foundation the whole runner stands on.
 - **Parity or it didn't happen** — a reimplementation ships only when it is numerically byte-identical to a reference.
 - **Performance is a gate** — a change lands only when the parity + perf budgets (TTFT, decode tok/s, VRAM ceiling) hold; README perf claims link a benchmark artifact.
 - **README + ROADMAP are the only docs** — shipped capability is described here; everything planned or next lives as a `[ ]` in [ROADMAP.md](ROADMAP.md); git history + PRs are the record.

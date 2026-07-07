@@ -13,8 +13,9 @@
 
 One binary that runs small open models — LLM, embeddings, and (later) vision — **natively in Rust on a
 single consumer GPU**, from-scratch and parity-verified, fast enough to run a real agent loop offline.
-Two apps (laurelane, Nanna) build on it; Mummu is the runner, they keep the domain glue. Every run moves
-one phase toward that end state — depth over breadth.
+**Burn is the core** — the one inference *and* training engine; every model and backend is built from
+scratch on Burn (via CubeCL), never a second runtime. Two apps (laurelane, Nanna) build on it; Mummu is
+the runner, they keep the domain glue. Every run moves one phase toward that end state — depth over breadth.
 
 ## Provenance
 
