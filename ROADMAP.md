@@ -57,11 +57,32 @@ holds and a benchmark holds/improves its budget; README perf claims link an arti
       masked-mean-pool + L2-normalize).
 - [ ] A `Model` trait so new architectures (Hermes-class function-callers, Gemma, Qwen3, …) slot in.
 
-### P3 — Weight loading *(ex-laurelane)*
-- [ ] `burn-store` `SafetensorsStore` + `PyTorchToBurnAdapter` + a `CastFloatAdapter` (bf16→f32/f16);
-      checked load (fail on missing/unused keys).
-- [ ] HF streaming download → per-user model cache (resume `.part`, resources-dir first); shard-merge for
-      multi-file (3B+) checkpoints.
+### P3 — Model import suite (any source / any format → a running model)
+The subsystem that turns "a model on HuggingFace or on disk" into a loaded, parity-checked Mummu model.
+**Data-driven** — adding a model is a manifest entry, not new code. All import is Burn-native (`burn-store` /
+`burn-import`).
+- [ ] **Sources** — HuggingFace Hub (repo id + revision), local paths, and a bundled resources dir (checked
+      first). Streaming download into a per-user cache: resumable (`.part`), integrity-checked, and
+      **sharded-checkpoint aware** (read `*.index.json`, fetch + merge shards).
+- [ ] **safetensors** *(ex-laurelane)* — `burn-store` `SafetensorsStore` + `PyTorchToBurnAdapter`; the primary path.
+- [ ] **PyTorch state dicts** (`.pth` / `pytorch_model*.bin`) — for models not shipped as safetensors.
+- [ ] **GGUF** (llama.cpp) — parse the GGUF container (metadata KV + tensor table), map tensors to modules,
+      and **dequantize** Q4/Q5/Q8/K-quant blocks into Burn tensors (or hand keep-quantized to P9). GGUF is how
+      most small models are distributed — this makes the whole ecosystem importable.
+- [ ] **ONNX** (optional) — `burn-import` ONNX→Burn for models distributed as ONNX graphs.
+- [ ] **Dtype handling** — a `CastFloatAdapter` (bf16→f32/f16); quantized→dequant on import; keep-quantized
+      handed to P9.
+- [ ] **Weight-name remapping + checked load** — per-architecture key-remap tables (checkpoint naming →
+      Mummu module names); **fail loudly** on missing/unexpected keys with a readable diff, never silently zero-init.
+- [ ] **Config import** — parse `config.json` → model hyperparameters (layers, hidden, heads, kv-heads,
+      rope-theta, vocab, tie-word-embeddings, …) so a model is **config-driven**, not hardcoded per checkpoint.
+- [ ] **Tokenizer + chat-template import** — HF `tokenizer.json` (fast), SentencePiece `tokenizer.model`, BPE
+      merges/vocab; special-tokens map + the chat template from `tokenizer_config.json`.
+- [ ] **Model registry / manifest** — a declarative `ModelSpec` (repo, architecture, weight format, dtype,
+      tokenizer, chat template, size tier) + a small built-in catalog of known-good models (Qwen2.5, LFM2.5,
+      MiniLM, …); adding a model = a manifest entry.
+- [ ] **Import validation** — checked load + a first-token parity smoke against a reference before a model is
+      marked trusted; a clear error taxonomy (missing file, bad shard, key mismatch, unsupported dtype).
 
 ### P4 — Tokenizer & chat templates *(ex-laurelane)*
 - [ ] HF `tokenizers` (pinned); explicit chat templates (ChatML + per-model), correct special/EOS tokens.
