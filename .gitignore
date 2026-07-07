@@ -1,0 +1,13 @@
+# Rust
+/target
+**/*.rs.bk
+*.pdb
+
+# model weights / caches (fetched on demand, never committed)
+/models
+*.safetensors
+*.gguf
+
+# OS / editor
+.DS_Store
+Thumbs.db
