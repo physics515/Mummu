@@ -84,7 +84,9 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       (verified via `ollama show` 2026-07-09) — not the same weights, so no valid local reference exists;
       see the P7 reference item.*
 - [ ] **all-MiniLM** BERT sentence-embedder (6-layer post-LN bidirectional attention + GeLU FFN,
-      masked-mean-pool + L2-normalize).
+      masked-mean-pool + L2-normalize). *(2026-07-09) Ported (`models::minilm`, ids+mask in → L2-normalized
+      embedding out; tokenization stays caller-side); unit tests incl. padding-invisibility; real-weights
+      semantic test (`tests/real_minilm.rs`). Stays `[ ]` until the P7 cosine-vs-Candle parity re-runs here.*
 - [ ] A `Model` trait so new architectures (Hermes-class function-callers, Gemma, Qwen3, …) slot in.
 
 ### P3 — Model import suite (any source / any format → a running model)

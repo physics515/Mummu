@@ -3,4 +3,5 @@
 //! checkpoint's `config.json`, never hardcoded).
 
 pub mod lfm2;
+pub mod minilm;
 pub mod qwen2;
