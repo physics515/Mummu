@@ -10,4 +10,8 @@
 #![recursion_limit = "512"]
 
 pub mod backend;
+pub mod decode;
+pub mod import;
+pub mod manage;
+pub mod models;
 pub mod nn;

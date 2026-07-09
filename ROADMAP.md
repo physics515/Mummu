@@ -35,7 +35,11 @@ TTFT while fitting the *target device set's* VRAM/RAM (one GPU, several, or CPU)
 that fits, run as fast as the hardware allows, every device busy. A change ships only when parity holds and
 a benchmark holds/improves its budget; README perf claims link an artifact.
 - [ ] `mummu-bench` (criterion) — TTFT, decode tok/s, VRAM per model × device-set (1 GPU / N GPUs / CPU / hybrid).
+      *(2026-07-09) Crate + harness wired (smoke bench); real model benches land with P5.*
 - [ ] `bench/BASELINE.md` budgets (VRAM ceiling, min decode tok/s, max TTFT) + a `cargo test` gate that fails a regression.
+- [ ] Evaluate Burn 0.21's `burn.toml` project config — per-subsystem tuning + a CubeCL kernel-validation
+      layer without recompiling; useful as a debug switch for kernel-level parity hunts —
+      https://burn.dev/blog/release-0.21.0/
 
 ## Phases
 
@@ -56,6 +60,10 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       f16=true on Vulkan, false on DX12, + an integrated AMD GPU (a real second adapter for multi-GPU).*
 - [x] `fusion` + `autotune` on (`Wgpu` becomes `Fusion<Wgpu>`; needs `recursion_limit = 512`).
       *(2026-07-09) Workspace features + crate-level `recursion_limit`.*
+- [ ] Evaluate **burn-flex** (Burn 0.21's new pure-Rust CPU backend; `burn-ndarray` is now on a
+      deprecation path) as the `Cpu` alias replacement — SIMD + gemm, no_std, and built-in per-tensor/
+      per-block quantization (~40 quantized ops) that P9 could ride on. Gate on parity + a CPU decode
+      bench — https://github.com/antimora/burn-flex · https://burn.dev/blog/release-0.21.0/
 
 ### P2 — Model zoo (from scratch, generic over `B`) *(ex-laurelane)*
 - [x] Shared blocks: RmsNorm, GQA attention, RoPE (manual rotate-half), SwiGLU MLP, tied lm-head,
@@ -63,9 +71,18 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       (optional per-head q/k RMSNorm covers Qwen2 AND LFM2), `SwiGluMlp`, `ShortConv` (LIV) with rolling
       state, RoPE + causal mask; 18 unit tests incl. the prefill+decode ≡ full-forward equivalence for
       both the KV cache and the conv state. RmsNorm/tied-head come from burn::nn / the model files.*
-- [ ] **Qwen2 / Qwen2.5** decoder (1.5B / 0.5B tiers).
+- [ ] **Qwen2 / Qwen2.5** decoder (1.5B / 0.5B tiers). *(2026-07-09) Ported (`models::qwen2`,
+      config-driven, checked safetensors load); REAL GPU inference verified — Qwen2.5-1.5B on the 4070 Ti
+      SUPER greedy-decoded "2+2 equals 4.", top-5 probe led by id 9707 "Hello"; toy-model cache-equivalence
+      unit test. Stays `[ ]` until the P7 parity harness passes it against a logits reference.*
 - [ ] **LFM2.5-1.2B** hybrid (6 GQA-attention w/ per-head q/k RMSNorm + 10 double-gated short-conv "LIV"
-      blocks, SwiGLU, tied head, conv-state cache; ChatML, EOS `<|im_end|>`).
+      blocks, SwiGLU, tied head, conv-state cache; ChatML, EOS `<|im_end|>`). *(2026-07-09) Ported
+      (`models::lfm2`, hybrid cache, LFM2→shared-block key remap); toy hybrid cache-equivalence test;
+      greedy-vs-Ollama parity test written (`tests/parity_lfm2.rs`). REAL GPU inference verified — the
+      1.2B greedy-decoded a correct, coherent primes list on the 4070 Ti SUPER. Stays `[ ]` until the
+      gate passes: the local `ollama lfm2.5:latest` tag now resolves to the 8.5B **MoE** Q4 w/ thinking
+      (verified via `ollama show` 2026-07-09) — not the same weights, so no valid local reference exists;
+      see the P7 reference item.*
 - [ ] **all-MiniLM** BERT sentence-embedder (6-layer post-LN bidirectional attention + GeLU FFN,
       masked-mean-pool + L2-normalize).
 - [ ] A `Model` trait so new architectures (Hermes-class function-callers, Gemma, Qwen3, …) slot in.
@@ -77,7 +94,9 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
 - [ ] **Sources** — HuggingFace Hub (repo id + revision), local paths, and a bundled resources dir (checked
       first). Streaming download into a per-user cache: resumable (`.part`), integrity-checked, and
       **sharded-checkpoint aware** (read `*.index.json`, fetch + merge shards).
-- [ ] **safetensors** *(ex-laurelane)* — `burn-store` `SafetensorsStore` + `PyTorchToBurnAdapter`; the primary path.
+- [x] **safetensors** *(ex-laurelane)* — `burn-store` `SafetensorsStore` + `PyTorchToBurnAdapter`; the primary path.
+      *(2026-07-09) `import::{CastFloatAdapter, load_checked}`: bf16→backend-float cast + fail-loud load;
+      proven by loading the real 3.1 GB Qwen2.5-1.5B and 2.3 GB LFM2.5 checkpoints with zero missing keys.*
 - [ ] **PyTorch state dicts** (`.pth` / `pytorch_model*.bin`) — for models not shipped as safetensors.
 - [ ] **GGUF** (llama.cpp) — parse the GGUF container (metadata KV + tensor table), map tensors to modules,
       and **dequantize** Q4/Q5/Q8/K-quant blocks into Burn tensors (or hand keep-quantized to P9). GGUF is how
@@ -87,10 +106,15 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
 - [ ] **ONNX** (optional) — `burn-import` ONNX→Burn for models distributed as ONNX graphs.
 - [ ] **Dtype handling** — a `CastFloatAdapter` (bf16→f32/f16); quantized→dequant on import; keep-quantized
       handed to P9.
-- [ ] **Weight-name remapping + checked load** — per-architecture key-remap tables (checkpoint naming →
+- [x] **Weight-name remapping + checked load** — per-architecture key-remap tables (checkpoint naming →
       Mummu module names); **fail loudly** on missing/unexpected keys with a readable diff, never silently zero-init.
-- [ ] **Config import** — parse `config.json` → model hyperparameters (layers, hidden, heads, kv-heads,
+      *(2026-07-09) Remap tables live in each model's `load_from_dir` (Qwen2: strip `model.` + RmsNorm→gamma;
+      LFM2: + `out_proj`/`q_layernorm`/`w1-w3` onto the shared blocks); `load_checked` errors carry the
+      store's readable report. A declarative table registry lands with the manifest item below.*
+- [x] **Config import** — parse `config.json` → model hyperparameters (layers, hidden, heads, kv-heads,
       rope-theta, vocab, tie-word-embeddings, …) so a model is **config-driven**, not hardcoded per checkpoint.
+      *(2026-07-09) Per-architecture serde configs with validation (`Qwen2Config`, `Lfm2Config` incl.
+      `layer_types` + auto-adjusted ff_dim); both real checkpoints parse and drive the build.*
 - [ ] **Tokenizer + chat-template import** — HF `tokenizer.json` (fast), SentencePiece `tokenizer.model`, BPE
       merges/vocab; special-tokens map + the chat template from `tokenizer_config.json`.
 - [ ] **Model registry / manifest** — a declarative `ModelSpec` (repo, architecture, weight format, dtype,
@@ -101,10 +125,18 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
 
 ### P4 — Tokenizer & chat templates *(ex-laurelane)*
 - [ ] HF `tokenizers` (pinned); explicit chat templates (ChatML + per-model), correct special/EOS tokens.
+- [ ] Hermes-style tool-use chat template (Qwen3 ships it in `tokenizer_config.json`) + LFM2.5's
+      bracket-notation tool-call output — the two top scorers (0.880 agent score; LFM2.5-1.2B also the
+      fastest at ~1.5 s) on 2026's 21-model local tool-calling benchmark; function calling is why the
+      apps want a local runner — https://mikeveerman.be/blog/github-2026-02-06-tool-calling-benchmark/ ·
+      https://qwen.readthedocs.io/en/latest/framework/function_call.html
 
 ### P5 — Decode engine *(ex-laurelane)*
-- [ ] Per-layer KV cache (+ conv-state cache for hybrids); prompt prefilled once, then one token/step.
-- [ ] On-GPU argmax (sync only the winning index); single-token decode skips the causal mask.
+- [x] Per-layer KV cache (+ conv-state cache for hybrids); prompt prefilled once, then one token/step.
+      *(2026-07-09) `nn::{LayerKv, ConvState}` + per-model `new_cache`/`forward(past)`; prefill+decode ≡
+      full-forward proven by unit tests at block AND whole-model level, then by real GPU decode.*
+- [x] On-GPU argmax (sync only the winning index); single-token decode skips the causal mask.
+      *(2026-07-09) `decode::argmax_id`; `t == 1` builds no mask.*
 - [ ] Sampling beyond greedy (temperature / top-p); **token streaming** via a callback/channel;
       cooperative interrupt/cancellation between tokens.
 - [ ] Process-lifetime model + tokenizer cache (per backend; behind a `Mutex` since Burn `Param` isn't `Sync`).
@@ -132,12 +164,19 @@ that fits the model AND uses every device to the fullest.
 
 ### P7 — Parity & performance harness *(ex-laurelane)*
 - [ ] Parity gate: single-forward top-k logits + a short greedy sequence must match a reference (Candle,
-      or a local Ollama of the same model) — the trust gate every port passes.
+      or a local Ollama of the same model) — the trust gate every port passes. *(2026-07-09) Greedy leg
+      exists (`tests/parity_lfm2.rs`, Ollama raw-mode temperature-0 via curl); blocked on a same-weights
+      reference: `ollama lfm2.5:latest` is now the 8.5B MoE and no 1.2B tag exists.*
+- [ ] Stand up same-weights references: a Candle-based logits probe (dev-dependency or a small side
+      harness, as laurelane's Qwen2 validation did) + pull `qwen2.5:1.5b-instruct-fp16` in Ollama for the
+      Qwen greedy leg.
 - [ ] Wire the perf suite (above) into the parity harness so a correctness *or* budget regression fails CI.
 
 ### P8 — Model management API
 - [ ] Download progress · disk usage · switch/remove models — an app-agnostic API the consumers' settings
       UIs call. *(laurelane has disk-usage + remove; add progress + active-model switch.)*
+      *(2026-07-09) Disk usage + traversal-safe removal validation shipped as `manage` (5 unit tests);
+      download progress + active-model switch still open.*
 
 ### P9 — Quantization (fit any model to the hardware)
 The VRAM lever the P6 planner pulls to make the largest useful model fit the user's actual devices.
@@ -175,3 +214,7 @@ Each app depends on Mummu (path/git dep) and keeps its own glue:
   tensor-parallel), Burn 0.20 — https://www.phoronix.com/news/Burn-0.20-Released
 - Quantization formats 2026 (GGUF K-quants Q2_K–Q8_0, GPTQ, AWQ, int4/int8; GGUF CPU+GPU hybrid) —
   https://www.digitalapplied.com/blog/gguf-vs-awq-vs-gptq-vs-mlx-llm-quantization-formats-2026
+- Burn 0.21 (May 2026): 8× lower framework overhead, differentiable collectives, burn-dispatch, faster
+  GEMV/top-k, per-tensor + per-block int8/int4/int2 quant on some backends — https://burn.dev/blog/release-0.21.0/
+- wgpu f16 IO polyfill on Vulkan (SHADER_F16 without storageInputOutput16), wgpu PR #7884 — confirmed
+  live on the dev box: Vulkan advertises SHADER_F16 on the 4070 Ti SUPER, DX12 does not (2026-07-09 probe).

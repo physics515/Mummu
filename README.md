@@ -16,6 +16,21 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
 - **Quantize to fit, fill the hardware** — a planner probes every GPU + the CPU (VRAM / RAM), then imports or **quantizes on the fly** (GGUF K-quants, GPTQ / AWQ, or Burn's own int8/int4) and chooses precision + **layer placement** so the *largest model that fits* runs and every device is used — sharded across GPUs, spilling cold layers to CPU when needed. Plus a model-management API (download progress, disk usage, remove) apps surface in their settings UI.
 - **Local embeddings** — a from-scratch MiniLM-class sentence embedder (CPU) for fully-offline semantic search.
 
+## Status — what runs today
+
+- **Workspace + backends** — `crates/mummu` (library) + `crates/mummu-bench` (criterion); one binary
+  compiles both `Wgpu` (with `fusion` + `autotune`) and `NdArray`, with a cached runtime GPU probe and a
+  device inventory that records per-adapter/per-API `SHADER_F16`.
+- **Shared blocks, generic over `B: Backend`** — cache-aware GQA attention (optional per-head q/k
+  RMSNorm), manual RoPE, SwiGLU, and LFM2's double-gated causal short-conv with rolling decode state;
+  unit tests prove prefill+decode ≡ full-forward for both cache kinds.
+- **Checked safetensors import** — bf16→backend-float cast adapter, per-architecture key remaps, and a
+  fail-loud load (never silently zero-init); `config.json`-driven hyperparameters.
+- **Two decoders ported and running on real weights** — Qwen2/2.5 and the LFM2/2.5 hybrid; Qwen2.5-1.5B
+  loads and greedy-decodes correctly on the reference GPU (wgpu/Vulkan). The P7 parity harness will gate
+  them "trusted" against a reference before the roadmap ticks them done.
+- **Model-cache disk accounting** — per-model disk usage + traversal-safe removal validation (`manage`).
+
 ## Design principles
 
 - **Local-first, offline, private** — your own hardware is the whole story; the cloud is never a dependency.
