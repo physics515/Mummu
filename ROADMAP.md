@@ -58,8 +58,11 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       *(2026-07-09) Workspace features + crate-level `recursion_limit`.*
 
 ### P2 — Model zoo (from scratch, generic over `B`) *(ex-laurelane)*
-- [ ] Shared blocks: RmsNorm, GQA attention, RoPE (manual rotate-half), SwiGLU MLP, tied lm-head,
-      depthwise causal conv (for hybrids).
+- [x] Shared blocks: RmsNorm, GQA attention, RoPE (manual rotate-half), SwiGLU MLP, tied lm-head,
+      depthwise causal conv (for hybrids). *(2026-07-09) `mummu::nn`: cache-aware `GqaAttention`
+      (optional per-head q/k RMSNorm covers Qwen2 AND LFM2), `SwiGluMlp`, `ShortConv` (LIV) with rolling
+      state, RoPE + causal mask; 18 unit tests incl. the prefill+decode ≡ full-forward equivalence for
+      both the KV cache and the conv state. RmsNorm/tied-head come from burn::nn / the model files.*
 - [ ] **Qwen2 / Qwen2.5** decoder (1.5B / 0.5B tiers).
 - [ ] **LFM2.5-1.2B** hybrid (6 GQA-attention w/ per-head q/k RMSNorm + 10 double-gated short-conv "LIV"
       blocks, SwiGLU, tied head, conv-state cache; ChatML, EOS `<|im_end|>`).
