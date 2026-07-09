@@ -40,9 +40,11 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
 ## Phases
 
 ### P0 — Workspace scaffold
-- [ ] Cargo workspace: `crates/mummu` (the library), model code generic over `B: Backend`. `.gitignore`
-      (Rust); commit `Cargo.lock` for reproducible builds/benchmarks.
-- [ ] `cargo build` / `test` / `clippy --all-targets` green baseline; `mummu-bench` (criterion) crate stub.
+- [x] Cargo workspace: `crates/mummu` (the library), model code generic over `B: Backend`. `.gitignore`
+      (Rust); commit `Cargo.lock` for reproducible builds/benchmarks. *(2026-07-09) Workspace + both
+      crates; pinned combo burn 0.21 / wgpu 29 / tokenizers 0.22 / criterion 0.7; release profile fat-LTO.*
+- [x] `cargo build` / `test` / `clippy --all-targets` green baseline; `mummu-bench` (criterion) crate stub.
+      *(2026-07-09) All green; criterion harness wired via a smoke bench.*
 
 ### P1 — Backends & device *(ex-laurelane)*
 - [ ] Backend abstraction generic over `B: Backend`; one binary compiling BOTH `Wgpu` (Vulkan/DX12/Metal,
