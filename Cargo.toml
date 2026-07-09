@@ -36,9 +36,10 @@ serde_json = "1"
 thiserror = "2"
 once_cell = "1"
 
-criterion = "0.7"
+criterion = "0.8"
 
 [profile.release]
-# Model inference is the hot path; fat LTO buys measurable decode throughput.
-lto = "fat"
-codegen-units = 1
+# Thin LTO: inference is GPU-kernel-bound, so fat LTO's extra minutes per link
+# buy almost nothing here while tripling the verify-loop cost. Revisit against
+# bench/BASELINE.md numbers if a CPU-bound path ever becomes hot.
+lto = "thin"
