@@ -1,0 +1,18 @@
+[package]
+name = "mummu-bench"
+description = "Criterion benchmarks for Mummu: TTFT, decode tok/s, VRAM per model x device-set."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+mummu = { path = "../mummu" }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "runner"
+harness = false

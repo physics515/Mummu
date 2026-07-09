@@ -1,0 +1,45 @@
+[workspace]
+resolver = "3"
+members = ["crates/mummu", "crates/mummu-bench"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/physics515/Mummu"
+
+[workspace.dependencies]
+# Intentional pins (see ROADMAP "Stack"): burn 0.21 + wgpu 29 + tokenizers 0.22 are the
+# parity-validated combination proven in laurelane (byte-identical logits vs Candle).
+# `fusion` + `autotune` are the throughput levers: fusion compiles streams of tensor ops
+# into far fewer GPU kernels and autotune picks the fastest kernel variant; with `fusion`,
+# `Wgpu` transparently becomes `Fusion<Wgpu>`.
+burn = { version = "0.21", default-features = false, features = [
+	"std",
+	"ndarray",
+	"wgpu",
+	"fusion",
+	"autotune",
+	"store",
+] }
+# Direct handle on wgpu (the same version Burn resolves) for the cheap startup
+# adapter probe: enumerate GPUs to decide GPU vs CPU before building a backend.
+wgpu = "29"
+# Block on wgpu 29's async adapter enumeration from the sync startup probe.
+pollster = "0.4"
+# f16 element type for the GPU backend; the same `half` version Burn pulls.
+half = "2"
+tokenizers = "0.22"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+once_cell = "1"
+
+criterion = "0.8"
+
+[profile.release]
+# Thin LTO: inference is GPU-kernel-bound, so fat LTO's extra minutes per link
+# buy almost nothing here while tripling the verify-loop cost. Revisit against
+# bench/BASELINE.md numbers if a CPU-bound path ever becomes hot.
+lto = "thin"
