@@ -47,11 +47,15 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       *(2026-07-09) All green; criterion harness wired via a smoke bench.*
 
 ### P1 — Backends & device *(ex-laurelane)*
-- [ ] Backend abstraction generic over `B: Backend`; one binary compiling BOTH `Wgpu` (Vulkan/DX12/Metal,
-      no CUDA toolchain) and `NdArray` (CPU).
-- [ ] Runtime `use_gpu()` probe (`wgpu` adapter enumerate; `pollster::block_on` for the async probe),
-      cached in a `OnceCell`; pick GPU else CPU. No feature-split builds.
-- [ ] `fusion` + `autotune` on (`Wgpu` becomes `Fusion<Wgpu>`; needs `recursion_limit = 512`).
+- [x] Backend abstraction generic over `B: Backend`; one binary compiling BOTH `Wgpu` (Vulkan/DX12/Metal,
+      no CUDA toolchain) and `NdArray` (CPU). *(2026-07-09) `backend::{Gpu, GpuF16, Cpu}` aliases; no
+      feature splits.*
+- [x] Runtime `use_gpu()` probe (`wgpu` adapter enumerate; `pollster::block_on` for the async probe),
+      cached in a `OnceCell`; pick GPU else CPU. No feature-split builds. *(2026-07-09) `backend::inventory()`
+      also records per-adapter/per-API `SHADER_F16` for the P6 planner; on the dev box: 4070 Ti SUPER
+      f16=true on Vulkan, false on DX12, + an integrated AMD GPU (a real second adapter for multi-GPU).*
+- [x] `fusion` + `autotune` on (`Wgpu` becomes `Fusion<Wgpu>`; needs `recursion_limit = 512`).
+      *(2026-07-09) Workspace features + crate-level `recursion_limit`.*
 
 ### P2 — Model zoo (from scratch, generic over `B`) *(ex-laurelane)*
 - [ ] Shared blocks: RmsNorm, GQA attention, RoPE (manual rotate-half), SwiGLU MLP, tied lm-head,

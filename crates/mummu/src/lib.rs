@@ -8,3 +8,5 @@
 
 // Burn's `fusion` feature wraps backends in deeply nested generic types.
 #![recursion_limit = "512"]
+
+pub mod backend;
