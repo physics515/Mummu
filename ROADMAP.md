@@ -173,7 +173,11 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       an O(vocab) partial select, deterministic in-house PCG32 (no rand dep), `ControlFlow` callback =
       streaming AND cancellation; greedy stays on-GPU argmax and re-passed the Qwen2 parity gate; real-GPU
       proof: seeded sampled stream replays identically and cancels at 8 tokens (10 new unit tests).*
-- [ ] Process-lifetime model + tokenizer cache (per backend; behind a `Mutex` since Burn `Param` isn't `Sync`).
+- [x] Process-lifetime model + tokenizer cache (per backend; behind a `Mutex` since Burn `Param` isn't `Sync`).
+      *(2026-07-10) `cache::ModelSlot<T>` — one static slot per (model, backend); `with(key, load, f)`
+      loads once, reuses on key match, drop-then-swap on a different checkpoint dir (the P8
+      active-model-switch primitive), `clear()` frees VRAM; real-GPU proof: two decodes through a static
+      slot performed exactly one 3.1 GB load (6 unit tests + threaded-static test).*
 
 ### P6 — Hardware planner: precision, placement & full utilization
 The "use all the hardware" phase — inventory the machine, then pick the precision and the device placement

@@ -153,3 +153,38 @@ fn qwen2_sampled_streaming_is_seeded_deterministic_and_cancellable() {
     eprintln!("[real_inference/sampled] 8 tokens @ T=0.7 p=0.9 seed=42: {text:?}");
     assert!(!text.trim().is_empty(), "sampled text should be non-empty");
 }
+
+/// The process-lifetime slot the cached-decode test drives (a static, as
+/// consumers would hold it).
+static QWEN2_SLOT: mummu::cache::ModelSlot<qwen2::LoadedQwen2<Gpu>> =
+    mummu::cache::ModelSlot::new();
+
+#[test]
+#[ignore = "needs multi-GB local weights (MUMMU_QWEN2_DIR)"]
+fn qwen2_model_slot_loads_once_across_calls() {
+    let Some(dir) = qwen2_dir() else {
+        panic!("set MUMMU_QWEN2_DIR to a dir with config.json/tokenizer.json/model.safetensors");
+    };
+    let device = burn::tensor::Device::<Gpu>::default();
+    let prompt = encode(
+        &dir,
+        "<|im_start|>user\nSay hi.<|im_end|>\n<|im_start|>assistant\n",
+    );
+
+    let mut loads = 0;
+    for _ in 0..2 {
+        let ids = QWEN2_SLOT
+            .with(
+                &dir,
+                |d| {
+                    loads += 1;
+                    qwen2::load_from_dir::<Gpu>(d, &device)
+                },
+                |m| m.greedy_generate(&prompt, 4, &device).expect("decode"),
+            )
+            .expect("slot load");
+        assert!(!ids.is_empty(), "cached model must still decode");
+    }
+    assert_eq!(loads, 1, "the multi-GB load must happen exactly once");
+    assert_eq!(QWEN2_SLOT.loaded_key().as_deref(), Some(dir.as_path()));
+}

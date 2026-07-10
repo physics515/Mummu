@@ -10,6 +10,7 @@
 #![recursion_limit = "512"]
 
 pub mod backend;
+pub mod cache;
 pub mod chat;
 pub mod decode;
 pub mod import;
