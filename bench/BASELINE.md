@@ -13,6 +13,10 @@ recorded numbers (and this file's date) only on a legitimate improvement.
 | Decode latency (32 greedy tokens, warm KV cache) | 2.414 s → **75.4 ms/token ≈ 13.3 tok/s** | ≥ 10 tok/s |
 | Peak GPU memory during decode (whole card, ~4.0 GiB desktop ambient → ~7.9 GiB runner) | 11.9 GiB | ≤ 13 GiB whole-card |
 
+Datapoint (not yet a budget): the same model on `GpuF16` peaks at **8.7 GiB whole-card (~4.7 GiB
+runner)** — VRAM roughly halves as expected — but decodes NaN today (see the ROADMAP P6
+mixed-precision-islands item), so no f16 perf row exists yet.
+
 Notes
 - Effective weight-streaming bandwidth at 75 ms/token over ~6.2 GB of f32 weights is ~83 GB/s vs the
   card's ~672 GB/s — the decode path is kernel/dispatch-bound, not bandwidth-bound. The CubeCL SPIR-V

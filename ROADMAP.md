@@ -200,7 +200,15 @@ that fits the model AND uses every device to the fullest.
 - [ ] **Precision selection** — pick a per-device dtype (f32 / **f16** / int8 / int4) that fits: f16 via
       `Wgpu<half::f16, i32>` (needs wgpu ≥ 27 `SHADER_F16` polyfill — *laurelane compiles it + a startup
       `SHADER_F16` diagnostic; finish on-GPU validation here*: no naga crash, ~halved VRAM, coherent output);
-      drop to int8/int4 (P9) when f16 still won't fit.
+      drop to int8/int4 (P9) when f16 still won't fit. *(2026-07-10) On-GPU validation ran
+      (`tests/real_f16.rs`, the standing gate): **2 of 3 claims hold** — shaders compile + run on
+      Vulkan/SHADER_F16, VRAM drops 11.9 → 8.7 GiB whole-card (~7.9 → ~4.7 GiB runner), but logits
+      collapse to NaN (the GPU argmax returns the out-of-vocab sentinel 151936 = vocab_size; now caught
+      loudly by a decode guard). Coherent-output remains open below.*
+- [ ] **f16 mixed-precision islands** — Qwen2.5-1.5B in pure f16 NaNs out (overflow in the
+      softmax/RmsNorm/logit reductions; f16 max is 65 504). Keep weights + matmuls f16 but compute the
+      numerically hot reductions (attention softmax, RmsNorm accumulation, final logits) in f32, then
+      re-run the f16 gate and the parity harness.
 - [ ] Evaluate burn-wgpu's **`spirv` compiler feature** on Vulkan (CubeCL SPIR-V backend instead of
       WGSL/naga): claims significantly faster matmul incl. TensorCores at f16 — could be the cheapest
       decode-tok/s lever on the dev GPU; gate on the parity harness + `bench/BASELINE.md` —

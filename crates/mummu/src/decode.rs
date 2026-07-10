@@ -217,6 +217,7 @@ pub fn generate_loop<B: Backend>(
     let mut logits = step(prompt_ids, 0);
     let mut out: Vec<u32> = Vec::with_capacity(max_tokens);
     for past in (prompt_ids.len()..).take(max_tokens) {
+        let vocab = logits.dims()[1] as u32;
         let next = if greedy {
             argmax_id(logits)?
         } else {
@@ -227,6 +228,14 @@ pub fn generate_loop<B: Backend>(
                 .map_err(|e| format!("logits readback: {e:?}"))?;
             sample_id(&v, opts, &mut rng)
         };
+        // A GPU argmax over NaN logits can return an out-of-range sentinel
+        // (observed: exactly `vocab` on f16 numeric collapse) — fail loudly
+        // instead of emitting garbage ids the tokenizer silently drops.
+        if next >= vocab {
+            return Err(format!(
+                "decode step {past}: id {next} is outside the {vocab}-token vocab — NaN logits / numeric collapse on this backend?"
+            ));
+        }
         if is_eos(next) {
             break;
         }
