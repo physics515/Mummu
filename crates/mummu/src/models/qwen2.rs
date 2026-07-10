@@ -213,7 +213,7 @@ impl<B: Backend> CausalLm<B> for LoadedQwen2<B> {
         );
         let cfg = &self.config;
 
-        // i32 token ids: native for wgpu, upcast for ndarray — portable either way.
+        // i32 token ids: native for wgpu and the flex CPU backend alike.
         let ids32: Vec<i32> = new_ids.iter().map(|&i| i as i32).collect();
         let input =
             Tensor::<B, 1, Int>::from_data(TensorData::new(ids32, [t]), device).reshape([1, t]);

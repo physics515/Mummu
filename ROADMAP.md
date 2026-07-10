@@ -6,7 +6,7 @@
 > README (perf claims link a benchmark artifact); everything not-done / discovered / next is a `[ ]`
 > here; git history + PRs are the record. Edit surgically; never rewrite wholesale.
 
-**Stack:** Rust 2024 · **Burn 0.21** (`wgpu` 29 + `ndarray`, `fusion` + `autotune`, multi-device) ·
+**Stack:** Rust 2024 · **Burn 0.21** (`wgpu` 29 + `burn-flex` CPU, `fusion` + `autotune`, multi-device) ·
 `burn-store` · HF `tokenizers` · runs on **any hardware** — CPU, one GPU, or several (multi-GPU + CPU
 offload). Reference dev machine: Ryzen 9 7950X3D · 128 GB · RTX 4070 Ti SUPER 16 GB.
 
@@ -68,10 +68,18 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       f16=true on Vulkan, false on DX12, + an integrated AMD GPU (a real second adapter for multi-GPU).*
 - [x] `fusion` + `autotune` on (`Wgpu` becomes `Fusion<Wgpu>`; needs `recursion_limit = 512`).
       *(2026-07-09) Workspace features + crate-level `recursion_limit`.*
-- [ ] Evaluate **burn-flex** (Burn 0.21's new pure-Rust CPU backend; `burn-ndarray` is now on a
+- [x] Evaluate **burn-flex** (Burn 0.21's new pure-Rust CPU backend; `burn-ndarray` is now on a
       deprecation path) as the `Cpu` alias replacement — SIMD + gemm, no_std, and built-in per-tensor/
       per-block quantization (~40 quantized ops) that P9 could ride on. Gate on parity + a CPU decode
       bench — https://github.com/antimora/burn-flex · https://burn.dev/blog/release-0.21.0/
+      *(2026-07-10) **Swapped in** (`Cpu = burn_flex::Flex<f32, i32>`, ndarray feature dropped): the
+      MiniLM Candle-parity gate passes on Flex (cosine 0.99999994, max |Δcomponent| 1.3e-7 — equivalent
+      to ndarray's 1.2e-7) and all 80 unit tests are green, incl. the cache-equivalence proofs that run
+      on the CPU backend. A dedicated CPU decode tok/s bench still wants a CPU-tier model (0.5B) — next
+      item.*
+- [ ] CPU decode bench for `bench/BASELINE.md`: pull Qwen2.5-0.5B (catalog entry exists) and record
+      decode tok/s on the Flex backend, so CPU-only machines get a budget row and Flex regressions are
+      caught like GPU ones.
 
 ### P2 — Model zoo (from scratch, generic over `B`) *(ex-laurelane)*
 - [x] Shared blocks: RmsNorm, GQA attention, RoPE (manual rotate-half), SwiGLU MLP, tied lm-head,
@@ -84,7 +92,7 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       SUPER greedy-decoded "2+2 equals 4.", top-5 probe led by id 9707 "Hello"; toy-model cache-equivalence
       unit test.* *(2026-07-10) **Parity gate PASSED** (`tests/parity_qwen2.rs`): top-5 logits match the
       Candle f32 reference exactly by id with max |Δlogit| 2.7e-5 (bound 1e-3), and a 24-token greedy
-      sequence matches `ollama qwen2.5:1.5b-instruct-fp16` byte-for-byte on the 4070 Ti SUPER.**
+      sequence matches `ollama qwen2.5:1.5b-instruct-fp16` byte-for-byte on the 4070 Ti SUPER.*
 - [ ] **LFM2.5-1.2B** hybrid (6 GQA-attention w/ per-head q/k RMSNorm + 10 double-gated short-conv "LIV"
       blocks, SwiGLU, tied head, conv-state cache; ChatML, EOS `<|im_end|>`). *(2026-07-09) Ported
       (`models::lfm2`, hybrid cache, LFM2→shared-block key remap); toy hybrid cache-equivalence test;

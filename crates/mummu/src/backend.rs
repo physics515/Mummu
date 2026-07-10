@@ -4,7 +4,7 @@
 //! choice on a consumer. What this module owns is the *default* policy proven
 //! in laurelane: enumerate GPU adapters once with a cheap `wgpu` probe (no
 //! device creation), run on **wgpu (GPU via Vulkan/DX12/Metal — no CUDA
-//! toolchain)** when a hardware adapter is present, else **ndarray (CPU)**.
+//! toolchain)** when a hardware adapter is present, else **burn-flex (CPU)**.
 //! No feature-split builds.
 //!
 //! The probe also records which adapters advertise `SHADER_F16` — the input
@@ -22,8 +22,8 @@ pub type Gpu = burn::backend::Wgpu;
 /// where `SHADER_F16` is available (check [`DeviceInventory::any_shader_f16`]).
 pub type GpuF16 = burn::backend::Wgpu<half::f16, i32>;
 
-/// CPU backend (pure-Rust ndarray).
-pub type Cpu = burn::backend::NdArray<f32>;
+/// CPU backend (burn-flex: pure-Rust SIMD + gemm; burn-ndarray's successor).
+pub type Cpu = burn_flex::Flex<f32, i32>;
 
 /// One enumerated GPU adapter, as reported by wgpu.
 #[derive(Debug, Clone)]
@@ -118,7 +118,7 @@ pub fn device_label() -> &'static str {
     if use_gpu() {
         "GPU (wgpu)"
     } else {
-        "CPU (ndarray)"
+        "CPU (flex)"
     }
 }
 
@@ -151,7 +151,7 @@ mod tests {
         if use_gpu() {
             assert_eq!(label, "GPU (wgpu)");
         } else {
-            assert_eq!(label, "CPU (ndarray)");
+            assert_eq!(label, "CPU (flex)");
         }
     }
 
