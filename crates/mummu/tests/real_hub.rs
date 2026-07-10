@@ -15,21 +15,29 @@ use tokenizers::Tokenizer;
 /// Small enough to download in seconds, real enough to prove the pipeline.
 const REPO: &str = "sentence-transformers/all-MiniLM-L6-v2";
 
+/// The MiniLM entry from the built-in catalog (also pins the repo above).
+fn minilm_spec() -> mummu::registry::ModelSpec {
+    mummu::registry::catalog()
+        .into_iter()
+        .find(|s| s.repo == REPO)
+        .expect("MiniLM is in the built-in catalog")
+}
+
 #[test]
 #[ignore = "needs network (MUMMU_HUB_DEST names the download dir)"]
 fn hub_download_then_load_then_embed() {
     let Some(dest) = std::env::var_os("MUMMU_HUB_DEST").map(PathBuf::from) else {
         panic!("set MUMMU_HUB_DEST to a scratch dir for the ~90 MB download");
     };
-    let dir = dest.join("all-minilm-l6-v2");
-
     let mut events = 0u64;
     let mut last_total = None;
-    let dir = hub::fetch_model(REPO, "main", &dir, |p| {
-        events += 1;
-        last_total = p.total_bytes;
-    })
-    .expect("hub fetch");
+    // Spec-driven: the catalog entry names the repo/revision/dir.
+    let dir = minilm_spec()
+        .fetch(&dest, |p| {
+            events += 1;
+            last_total = p.total_bytes;
+        })
+        .expect("hub fetch");
     // Either the network streamed (progress fired) or everything was already
     // cached from a prior run (zero events) — both are correct; the load
     // below is the real proof either way.

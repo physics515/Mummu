@@ -18,3 +18,4 @@ pub mod import;
 pub mod manage;
 pub mod models;
 pub mod nn;
+pub mod registry;

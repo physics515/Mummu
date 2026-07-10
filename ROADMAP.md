@@ -149,9 +149,13 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       `layer_types` + auto-adjusted ff_dim); both real checkpoints parse and drive the build.*
 - [ ] **Tokenizer + chat-template import** — HF `tokenizer.json` (fast), SentencePiece `tokenizer.model`, BPE
       merges/vocab; special-tokens map + the chat template from `tokenizer_config.json`.
-- [ ] **Model registry / manifest** — a declarative `ModelSpec` (repo, architecture, weight format, dtype,
+- [x] **Model registry / manifest** — a declarative `ModelSpec` (repo, architecture, weight format, dtype,
       tokenizer, chat template, size tier) + a small built-in catalog of known-good models (Qwen2.5, LFM2.5,
-      MiniLM, …); adding a model = a manifest entry.
+      MiniLM, …); adding a model = a manifest entry. *(2026-07-10) `mummu::registry`: `ModelSpec`
+      (name/repo/revision/architecture/size, validated incl. traversal-safe names, serde round-trip) +
+      `spec.fetch(models_root, progress)` onto the hub downloader; built-in catalog: Qwen2.5-1.5B/0.5B,
+      LFM2.5-1.2B, all-MiniLM (repo ids match laurelane's validated constants); the network proof now
+      fetches spec-driven. Weight-format/dtype/chat-template fields accrete as those import paths land.*
 - [ ] **Import validation** — checked load + a first-token parity smoke against a reference before a model is
       marked trusted; a clear error taxonomy (missing file, bad shard, key mismatch, unsupported dtype).
 
