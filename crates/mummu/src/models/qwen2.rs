@@ -15,8 +15,8 @@ use burn::nn::{Embedding, EmbeddingConfig, RmsNorm, RmsNormConfig};
 use burn::store::{ModuleAdapter, PyTorchToBurnAdapter, SafetensorsStore};
 use burn::tensor::{Int, Tensor, TensorData, backend::Backend};
 
-use crate::decode::{argmax_id, top_k_ids};
 use crate::import::{CastFloatAdapter, ImportError, load_checked, required_file};
+use crate::models::CausalLm;
 use crate::nn::{
     GqaAttention, GqaAttentionConfig, LayerKv, SwiGluMlp, SwiGluMlpConfig, causal_mask, rope_tables,
 };
@@ -185,21 +185,22 @@ pub fn load_from_dir<B: Backend>(
     Ok(LoadedQwen2 { model, config })
 }
 
-impl<B: Backend> LoadedQwen2<B> {
-    /// A fresh (empty) per-layer KV cache.
-    #[must_use]
-    pub fn new_cache(&self) -> Vec<LayerKv<B>> {
+impl<B: Backend> CausalLm<B> for LoadedQwen2<B> {
+    type Cache = Vec<LayerKv<B>>;
+
+    fn new_cache(&self) -> Self::Cache {
         (0..self.config.num_hidden_layers).map(|_| None).collect()
     }
 
-    /// Forward `new_ids` (the whole prompt when `past == 0`, else one decode
-    /// token), updating `cache`; returns logits for the **last** position,
-    /// `[1, vocab]`.
-    pub fn forward(
+    fn is_eos(&self, id: u32) -> bool {
+        self.config.eos_token_id.contains(id)
+    }
+
+    fn forward(
         &self,
         new_ids: &[u32],
         past: usize,
-        cache: &mut [LayerKv<B>],
+        cache: &mut Self::Cache,
         device: &B::Device,
     ) -> Tensor<B, 2> {
         let t = new_ids.len();
@@ -212,7 +213,7 @@ impl<B: Backend> LoadedQwen2<B> {
         );
         let cfg = &self.config;
 
-        // i32 token ids: native for wgpu, upcast for ndarray — portable either way.
+        // i32 token ids: native for wgpu and the flex CPU backend alike.
         let ids32: Vec<i32> = new_ids.iter().map(|&i| i as i32).collect();
         let input =
             Tensor::<B, 1, Int>::from_data(TensorData::new(ids32, [t]), device).reshape([1, t]);
@@ -245,52 +246,6 @@ impl<B: Backend> LoadedQwen2<B> {
         let last = x.narrow(1, t - 1, 1).reshape([1, cfg.hidden_size]);
         let w = self.model.embed_tokens.weight.val(); // [vocab, hidden]
         last.matmul(w.swap_dims(0, 1)) // [1, vocab]
-    }
-
-    /// Greedy decode: prefill `prompt_ids` once, then one token per step
-    /// through the KV cache, stopping at any config EOS id or `max_tokens`.
-    /// The argmax runs on-device; only the winning index is synced back.
-    pub fn greedy_generate(
-        &self,
-        prompt_ids: &[u32],
-        max_tokens: usize,
-        device: &B::Device,
-    ) -> Result<Vec<u32>, String> {
-        assert!(!prompt_ids.is_empty(), "greedy_generate: empty prompt");
-        assert!(max_tokens >= 1, "greedy_generate: max_tokens must be >= 1");
-        let mut cache = self.new_cache();
-        let mut logits = self.forward(prompt_ids, 0, &mut cache, device);
-        let mut out: Vec<u32> = Vec::with_capacity(max_tokens);
-        for past in (prompt_ids.len()..).take(max_tokens) {
-            let next = argmax_id(logits)?;
-            if self.config.eos_token_id.contains(next) {
-                break;
-            }
-            out.push(next);
-            logits = self.forward(&[next], past, &mut cache, device);
-        }
-        debug_assert!(out.len() <= max_tokens);
-        Ok(out)
-    }
-
-    /// Parity probe: greedy next-token id + top-k ids for a single prefill.
-    pub fn first_token(
-        &self,
-        prompt_ids: &[u32],
-        k: usize,
-        device: &B::Device,
-    ) -> Result<Vec<u32>, String> {
-        assert!(!prompt_ids.is_empty(), "first_token: empty prompt");
-        assert!(k >= 1, "first_token: k must be >= 1");
-        let mut cache = self.new_cache();
-        let logits = self.forward(prompt_ids, 0, &mut cache, device);
-        // `convert` so an f16 GPU tensor reads back as f32.
-        let v = logits
-            .into_data()
-            .convert::<f32>()
-            .to_vec::<f32>()
-            .map_err(|e| format!("logits readback: {e:?}"))?;
-        Ok(top_k_ids(&v, k))
     }
 }
 

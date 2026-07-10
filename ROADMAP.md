@@ -6,7 +6,7 @@
 > README (perf claims link a benchmark artifact); everything not-done / discovered / next is a `[ ]`
 > here; git history + PRs are the record. Edit surgically; never rewrite wholesale.
 
-**Stack:** Rust 2024 · **Burn 0.21** (`wgpu` 29 + `ndarray`, `fusion` + `autotune`, multi-device) ·
+**Stack:** Rust 2024 · **Burn 0.21** (`wgpu` 29 + `burn-flex` CPU, `fusion` + `autotune`, multi-device) ·
 `burn-store` · HF `tokenizers` · runs on **any hardware** — CPU, one GPU, or several (multi-GPU + CPU
 offload). Reference dev machine: Ryzen 9 7950X3D · 128 GB · RTX 4070 Ti SUPER 16 GB.
 
@@ -34,9 +34,17 @@ Performance is a **gate**, not a phase. Governing metric: **task throughput @ bu
 TTFT while fitting the *target device set's* VRAM/RAM (one GPU, several, or CPU): the biggest useful model
 that fits, run as fast as the hardware allows, every device busy. A change ships only when parity holds and
 a benchmark holds/improves its budget; README perf claims link an artifact.
-- [ ] `mummu-bench` (criterion) — TTFT, decode tok/s, VRAM per model × device-set (1 GPU / N GPUs / CPU / hybrid).
-      *(2026-07-09) Crate + harness wired (smoke bench); real model benches land with P5.*
-- [ ] `bench/BASELINE.md` budgets (VRAM ceiling, min decode tok/s, max TTFT) + a `cargo test` gate that fails a regression.
+- [x] `mummu-bench` (criterion) — TTFT, decode tok/s, VRAM per model × device-set (1 GPU / N GPUs / CPU / hybrid).
+      *(2026-07-09) Crate + harness wired (smoke bench); real model benches land with P5.* *(2026-07-10)
+      Real Qwen2.5-1.5B GPU benches live: TTFT 100.5 ms, decode 13.3 tok/s (f32, criterion). More
+      model × device-set combos accrete as those paths land (CPU, f16, multi-GPU).*
+- [x] `bench/BASELINE.md` budgets (VRAM ceiling, min decode tok/s, max TTFT) + a `cargo test` gate that fails a regression.
+      *(2026-07-10) Baseline recorded (TTFT ≤ 150 ms, ≥ 10 tok/s, ≤ 13 GiB whole-card; measured 100.5 ms /
+      13.3 tok/s / 11.9 GiB peak incl. ~4 GiB ambient); gate = `mummu-bench/tests/budget.rs` (ignored,
+      weights + GPU) passing at 110.4 ms / 11.8 tok/s.*
+- [ ] Decode is dispatch-bound, not bandwidth-bound: 75 ms/token streams ~6.2 GB of f32 weights at only
+      ~83 GB/s vs the 4070 Ti SUPER's ~672 GB/s — the SPIR-V compiler feature (P6 item) and f16 are the
+      levers to chase; re-baseline after each.
 - [ ] Evaluate Burn 0.21's `burn.toml` project config — per-subsystem tuning + a CubeCL kernel-validation
       layer without recompiling; useful as a debug switch for kernel-level parity hunts —
       https://burn.dev/blog/release-0.21.0/
@@ -60,10 +68,20 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       f16=true on Vulkan, false on DX12, + an integrated AMD GPU (a real second adapter for multi-GPU).*
 - [x] `fusion` + `autotune` on (`Wgpu` becomes `Fusion<Wgpu>`; needs `recursion_limit = 512`).
       *(2026-07-09) Workspace features + crate-level `recursion_limit`.*
-- [ ] Evaluate **burn-flex** (Burn 0.21's new pure-Rust CPU backend; `burn-ndarray` is now on a
+- [x] Evaluate **burn-flex** (Burn 0.21's new pure-Rust CPU backend; `burn-ndarray` is now on a
       deprecation path) as the `Cpu` alias replacement — SIMD + gemm, no_std, and built-in per-tensor/
       per-block quantization (~40 quantized ops) that P9 could ride on. Gate on parity + a CPU decode
       bench — https://github.com/antimora/burn-flex · https://burn.dev/blog/release-0.21.0/
+      *(2026-07-10) **Swapped in** (`Cpu = burn_flex::Flex<f32, i32>`, ndarray feature dropped): the
+      MiniLM Candle-parity gate passes on Flex (cosine 0.99999994, max |Δcomponent| 1.3e-7 — equivalent
+      to ndarray's 1.2e-7) and all 80 unit tests are green, incl. the cache-equivalence proofs that run
+      on the CPU backend. A dedicated CPU decode tok/s bench still wants a CPU-tier model (0.5B) — next
+      item.*
+- [x] CPU decode bench for `bench/BASELINE.md`: pull Qwen2.5-0.5B (catalog entry exists) and record
+      decode tok/s on the Flex backend, so CPU-only machines get a budget row and Flex regressions are
+      caught like GPU ones. *(2026-07-10) 0.5B fetched through the registry/hub path (988 MB in ~13 s),
+      decodes coherently on Flex at **11.7 tok/s** (7950X3D, f32); budget ≥ 6 tok/s gated by
+      `mummu-bench/tests/budget_cpu.rs`.*
 
 ### P2 — Model zoo (from scratch, generic over `B`) *(ex-laurelane)*
 - [x] Shared blocks: RmsNorm, GQA attention, RoPE (manual rotate-half), SwiGLU MLP, tied lm-head,
@@ -71,10 +89,12 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       (optional per-head q/k RMSNorm covers Qwen2 AND LFM2), `SwiGluMlp`, `ShortConv` (LIV) with rolling
       state, RoPE + causal mask; 18 unit tests incl. the prefill+decode ≡ full-forward equivalence for
       both the KV cache and the conv state. RmsNorm/tied-head come from burn::nn / the model files.*
-- [ ] **Qwen2 / Qwen2.5** decoder (1.5B / 0.5B tiers). *(2026-07-09) Ported (`models::qwen2`,
+- [x] **Qwen2 / Qwen2.5** decoder (1.5B / 0.5B tiers). *(2026-07-09) Ported (`models::qwen2`,
       config-driven, checked safetensors load); REAL GPU inference verified — Qwen2.5-1.5B on the 4070 Ti
       SUPER greedy-decoded "2+2 equals 4.", top-5 probe led by id 9707 "Hello"; toy-model cache-equivalence
-      unit test. Stays `[ ]` until the P7 parity harness passes it against a logits reference.*
+      unit test.* *(2026-07-10) **Parity gate PASSED** (`tests/parity_qwen2.rs`): top-5 logits match the
+      Candle f32 reference exactly by id with max |Δlogit| 2.7e-5 (bound 1e-3), and a 24-token greedy
+      sequence matches `ollama qwen2.5:1.5b-instruct-fp16` byte-for-byte on the 4070 Ti SUPER.*
 - [ ] **LFM2.5-1.2B** hybrid (6 GQA-attention w/ per-head q/k RMSNorm + 10 double-gated short-conv "LIV"
       blocks, SwiGLU, tied head, conv-state cache; ChatML, EOS `<|im_end|>`). *(2026-07-09) Ported
       (`models::lfm2`, hybrid cache, LFM2→shared-block key remap); toy hybrid cache-equivalence test;
@@ -83,26 +103,46 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       gate passes: the local `ollama lfm2.5:latest` tag now resolves to the 8.5B **MoE** Q4 w/ thinking
       (verified via `ollama show` 2026-07-09) — not the same weights, so no valid local reference exists;
       see the P7 reference item.*
-- [ ] **all-MiniLM** BERT sentence-embedder (6-layer post-LN bidirectional attention + GeLU FFN,
+- [x] **all-MiniLM** BERT sentence-embedder (6-layer post-LN bidirectional attention + GeLU FFN,
       masked-mean-pool + L2-normalize). *(2026-07-09) Ported (`models::minilm`, ids+mask in → L2-normalized
       embedding out; tokenization stays caller-side); unit tests incl. padding-invisibility; real-weights
-      semantic test (`tests/real_minilm.rs`). Stays `[ ]` until the P7 cosine-vs-Candle parity re-runs here.*
-- [ ] A `Model` trait so new architectures (Hermes-class function-callers, Gemma, Qwen3, …) slot in.
+      semantic test (`tests/real_minilm.rs`).* *(2026-07-10) **Parity PASSED**: embedding matches the
+      Candle f32 reference (`minilm-probe` fixture) at cosine 0.99999994 with max |Δcomponent| 1.2e-7
+      (bound 1e-4); semantic sanity re-verified on real weights (paraphrase 0.556 vs cross-topic ≈ 0).*
+- [x] A `Model` trait so new architectures (Hermes-class function-callers, Gemma, Qwen3, …) slot in.
+      *(2026-07-10) `models::CausalLm<B>` — associated `Cache` type; a port supplies `new_cache` /
+      `forward` / `is_eos` and inherits `generate` / `greedy_generate` / `first_token` from the shared
+      driver (static dispatch, single code path). Both LLMs now implement it; the parity gate re-ran
+      green through the trait, and the real-inference suite shares one `ModelSlot` (4 GPU tests, one
+      3.1 GB load — found and fixed a 2-models-in-VRAM blowup in the old per-test loads).*
 
 ### P3 — Model import suite (any source / any format → a running model)
 The subsystem that turns "a model on HuggingFace or on disk" into a loaded, parity-checked Mummu model.
 **Data-driven** — adding a model is a manifest entry, not new code. All import is Burn-native (`burn-store` /
 `burn-import`).
-- [ ] **Sources** — HuggingFace Hub (repo id + revision), local paths, and a bundled resources dir (checked
+- [x] **Sources** — HuggingFace Hub (repo id + revision), local paths, and a bundled resources dir (checked
       first). Streaming download into a per-user cache: resumable (`.part`), integrity-checked, and
-      **sharded-checkpoint aware** (read `*.index.json`, fetch + merge shards).
+      **sharded-checkpoint aware** (read `*.index.json`, fetch + merge shards). *(2026-07-10) `mummu::hub`
+      (ureq 3, https-only): `fetch_file` streams through `.part` with HTTP-Range resume + Content-Length
+      verification + cache-first; `fetch_model` pulls config/tokenizer/weights with the
+      `model.safetensors.index.json` shard fallback; `Progress` callback per chunk (feeds P8). Real-network
+      proof: all-MiniLM (90.8 MB) downloaded → checked-load → unit-norm embedding; a half-seeded `.part`
+      resumed at byte 249,507/466,247 and finished byte-identical. Local paths are already first-class
+      (`load_from_dir`); bundled-resources-dir precedence is app wiring.*
+- [ ] Stronger download integrity: verify the Hub's LFS sha256 (`X-Linked-ETag`) instead of length-only;
+      re-verify on cache hits behind a flag.
 - [x] **safetensors** *(ex-laurelane)* — `burn-store` `SafetensorsStore` + `PyTorchToBurnAdapter`; the primary path.
       *(2026-07-09) `import::{CastFloatAdapter, load_checked}`: bf16→backend-float cast + fail-loud load;
       proven by loading the real 3.1 GB Qwen2.5-1.5B and 2.3 GB LFM2.5 checkpoints with zero missing keys.*
 - [ ] **PyTorch state dicts** (`.pth` / `pytorch_model*.bin`) — for models not shipped as safetensors.
 - [ ] **GGUF** (llama.cpp) — parse the GGUF container (metadata KV + tensor table), map tensors to modules,
       and **dequantize** Q4/Q5/Q8/K-quant blocks into Burn tensors (or hand keep-quantized to P9). GGUF is how
-      most small models are distributed — this makes the whole ecosystem importable.
+      most small models are distributed — this makes the whole ecosystem importable. *(2026-07-10 research)*
+      K-quant superblocks are 256 values: Q4_K = fp16 d + fp16 dmin + 12 B of 6-bit sub-scales/mins + 128 B
+      of 4-bit q (144 B total), `x = d·scale_i·q − dmin·min_i`; Q6_K = 128 B low-4 + 64 B high-2 + 16×i8
+      sub-scales + fp16 d (210 B). Rust references: llama.cpp ggml-quants + the `rage-quant` crate
+      (Q8_0/Q4_K/Q6_K dequant + SIMD dot) — https://haroldbenoit.com/notes/ml/llms/quantization/llama.cpp/k-quants-implementation ·
+      https://crates.io/crates/rage-quant
 - [ ] **GPTQ / AWQ** (HF safetensors) — import the calibration-quantized int4/int8 layouts most "quantized on
       the Hub" models ship as (a `.safetensors` payload + a quant config), dequant or keep-quant into Burn.
 - [ ] **ONNX** (optional) — `burn-import` ONNX→Burn for models distributed as ONNX graphs.
@@ -119,19 +159,34 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       `layer_types` + auto-adjusted ff_dim); both real checkpoints parse and drive the build.*
 - [ ] **Tokenizer + chat-template import** — HF `tokenizer.json` (fast), SentencePiece `tokenizer.model`, BPE
       merges/vocab; special-tokens map + the chat template from `tokenizer_config.json`.
-- [ ] **Model registry / manifest** — a declarative `ModelSpec` (repo, architecture, weight format, dtype,
+- [x] **Model registry / manifest** — a declarative `ModelSpec` (repo, architecture, weight format, dtype,
       tokenizer, chat template, size tier) + a small built-in catalog of known-good models (Qwen2.5, LFM2.5,
-      MiniLM, …); adding a model = a manifest entry.
+      MiniLM, …); adding a model = a manifest entry. *(2026-07-10) `mummu::registry`: `ModelSpec`
+      (name/repo/revision/architecture/size, validated incl. traversal-safe names, serde round-trip) +
+      `spec.fetch(models_root, progress)` onto the hub downloader; built-in catalog: Qwen2.5-1.5B/0.5B,
+      LFM2.5-1.2B, all-MiniLM (repo ids match laurelane's validated constants); the network proof now
+      fetches spec-driven. Weight-format/dtype/chat-template fields accrete as those import paths land.*
 - [ ] **Import validation** — checked load + a first-token parity smoke against a reference before a model is
       marked trusted; a clear error taxonomy (missing file, bad shard, key mismatch, unsupported dtype).
 
 ### P4 — Tokenizer & chat templates *(ex-laurelane)*
-- [ ] HF `tokenizers` (pinned); explicit chat templates (ChatML + per-model), correct special/EOS tokens.
+- [x] HF `tokenizers` (pinned); explicit chat templates (ChatML + per-model), correct special/EOS tokens.
+      *(2026-07-10) `mummu::chat`: `Turn`/`Role` + a `ChatMl` renderer with per-model constructors
+      (`qwen2` plain, `lfm2` with `<|startoftext|>` BOS); byte-verified — the Qwen2 parity gate now
+      renders its prompt through the template and still matches the Candle fixture and the Ollama fp16
+      greedy leg exactly. EOS stays config-driven (`EosIds`); tool-use templates are the next item.*
 - [ ] Hermes-style tool-use chat template (Qwen3 ships it in `tokenizer_config.json`) + LFM2.5's
       bracket-notation tool-call output — the two top scorers (0.880 agent score; LFM2.5-1.2B also the
       fastest at ~1.5 s) on 2026's 21-model local tool-calling benchmark; function calling is why the
       apps want a local runner — https://mikeveerman.be/blog/github-2026-02-06-tool-calling-benchmark/ ·
       https://qwen.readthedocs.io/en/latest/framework/function_call.html
+      *(2026-07-10 research)* 2026 community numbers back the plan: Qwen3-8B keeps tool-calling score
+      through Q4_K_M (0.919 quantized vs 0.933 full — quant does NOT cost tool reliability, good news for
+      P9); BFCL shows a capability cliff below ~7B (Qwen3.5-9B 66.1% vs 4B 50.3%), so the zoo's
+      function-calling tier should target the 7–9B class once quant lands; Hermes 4 (Qwen3-14B fine-tune)
+      emits `<tool_call>` tags after an explicit reasoning step — easy to parse with the same template
+      machinery — https://www.promptquorum.com/power-local-llm/best-local-models-tool-calling-2026 ·
+      https://localaimaster.com/blog/best-ollama-models-for-agents
 
 ### P5 — Decode engine *(ex-laurelane)*
 - [x] Per-layer KV cache (+ conv-state cache for hybrids); prompt prefilled once, then one token/step.
@@ -139,9 +194,17 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       full-forward proven by unit tests at block AND whole-model level, then by real GPU decode.*
 - [x] On-GPU argmax (sync only the winning index); single-token decode skips the causal mask.
       *(2026-07-09) `decode::argmax_id`; `t == 1` builds no mask.*
-- [ ] Sampling beyond greedy (temperature / top-p); **token streaming** via a callback/channel;
-      cooperative interrupt/cancellation between tokens.
-- [ ] Process-lifetime model + tokenizer cache (per backend; behind a `Mutex` since Burn `Param` isn't `Sync`).
+- [x] Sampling beyond greedy (temperature / top-p); **token streaming** via a callback/channel;
+      cooperative interrupt/cancellation between tokens. *(2026-07-10) `decode::{SamplerOptions,
+      sample_id, Pcg32, generate_loop}` + per-model `generate(…, on_token)`: temperature/top-k/top-p over
+      an O(vocab) partial select, deterministic in-house PCG32 (no rand dep), `ControlFlow` callback =
+      streaming AND cancellation; greedy stays on-GPU argmax and re-passed the Qwen2 parity gate; real-GPU
+      proof: seeded sampled stream replays identically and cancels at 8 tokens (10 new unit tests).*
+- [x] Process-lifetime model + tokenizer cache (per backend; behind a `Mutex` since Burn `Param` isn't `Sync`).
+      *(2026-07-10) `cache::ModelSlot<T>` — one static slot per (model, backend); `with(key, load, f)`
+      loads once, reuses on key match, drop-then-swap on a different checkpoint dir (the P8
+      active-model-switch primitive), `clear()` frees VRAM; real-GPU proof: two decodes through a static
+      slot performed exactly one 3.1 GB load (6 unit tests + threaded-static test).*
 
 ### P6 — Hardware planner: precision, placement & full utilization
 The "use all the hardware" phase — inventory the machine, then pick the precision and the device placement
@@ -151,7 +214,19 @@ that fits the model AND uses every device to the fullest.
 - [ ] **Precision selection** — pick a per-device dtype (f32 / **f16** / int8 / int4) that fits: f16 via
       `Wgpu<half::f16, i32>` (needs wgpu ≥ 27 `SHADER_F16` polyfill — *laurelane compiles it + a startup
       `SHADER_F16` diagnostic; finish on-GPU validation here*: no naga crash, ~halved VRAM, coherent output);
-      drop to int8/int4 (P9) when f16 still won't fit.
+      drop to int8/int4 (P9) when f16 still won't fit. *(2026-07-10) On-GPU validation ran
+      (`tests/real_f16.rs`, the standing gate): **2 of 3 claims hold** — shaders compile + run on
+      Vulkan/SHADER_F16, VRAM drops 11.9 → 8.7 GiB whole-card (~7.9 → ~4.7 GiB runner), but logits
+      collapse to NaN (the GPU argmax returns the out-of-vocab sentinel 151936 = vocab_size; now caught
+      loudly by a decode guard). Coherent-output remains open below.*
+- [ ] **f16 mixed-precision islands** — Qwen2.5-1.5B in pure f16 NaNs out (overflow in the
+      softmax/RmsNorm/logit reductions; f16 max is 65 504). Keep weights + matmuls f16 but compute the
+      numerically hot reductions (attention softmax, RmsNorm accumulation, final logits) in f32, then
+      re-run the f16 gate and the parity harness.
+- [ ] Evaluate burn-wgpu's **`spirv` compiler feature** on Vulkan (CubeCL SPIR-V backend instead of
+      WGSL/naga): claims significantly faster matmul incl. TensorCores at f16 — could be the cheapest
+      decode-tok/s lever on the dev GPU; gate on the parity harness + `bench/BASELINE.md` —
+      https://github.com/tracel-ai/burn/blob/main/crates/burn-wgpu/README.md
 - [ ] **Placement plan** — given model size + KV-cache + display headroom and the device set, choose a
       **fit-and-fill** plan: single GPU when it fits; **shard layers across multiple GPUs** (pipeline/
       layer-parallel over Burn's multi-device tensors — Burn gives the multi-device *primitives*, not automatic
@@ -165,20 +240,32 @@ that fits the model AND uses every device to the fullest.
       counts, precision, CPU-offload cap) for power users.
 
 ### P7 — Parity & performance harness *(ex-laurelane)*
-- [ ] Parity gate: single-forward top-k logits + a short greedy sequence must match a reference (Candle,
+- [x] Parity gate: single-forward top-k logits + a short greedy sequence must match a reference (Candle,
       or a local Ollama of the same model) — the trust gate every port passes. *(2026-07-09) Greedy leg
-      exists (`tests/parity_lfm2.rs`, Ollama raw-mode temperature-0 via curl); blocked on a same-weights
-      reference: `ollama lfm2.5:latest` is now the 8.5B MoE and no 1.2B tag exists.*
-- [ ] Stand up same-weights references: a Candle-based logits probe (dev-dependency or a small side
+      exists (`tests/parity_lfm2.rs`, Ollama raw-mode temperature-0 via curl).* *(2026-07-10) Both legs
+      live and passing for Qwen2.5-1.5B (`tests/parity_qwen2.rs`): logits leg vs a committed
+      `tools/candle-probe` fixture, greedy leg vs Ollama fp16. LFM2.5 still lacks a same-weights
+      reference (see the P2 item); candle-transformers has no LFM2, so its logits leg needs another
+      route (llama.cpp logprobs, or an HF transformers dump).*
+- [x] Stand up same-weights references: a Candle-based logits probe (dev-dependency or a small side
       harness, as laurelane's Qwen2 validation did) + pull `qwen2.5:1.5b-instruct-fp16` in Ollama for the
-      Qwen greedy leg.
+      Qwen greedy leg. *(2026-07-10) `tools/candle-probe` (out-of-workspace bin, Candle =0.9.1 CPU f32)
+      prints top-k (id, logit) JSON for the fixed prompt; fixture committed under
+      `crates/mummu/tests/fixtures/`; fp16 Ollama tag pulled and validated.*
+- [ ] LFM2.5 same-weights reference for the parity gate: no Candle port exists — candidate routes are
+      llama.cpp `logprobs` on the fp16 GGUF, or a one-shot HF `transformers` logits dump matched to the
+      safetensors revision.
 - [ ] Wire the perf suite (above) into the parity harness so a correctness *or* budget regression fails CI.
 
 ### P8 — Model management API
-- [ ] Download progress · disk usage · switch/remove models — an app-agnostic API the consumers' settings
+- [x] Download progress · disk usage · switch/remove models — an app-agnostic API the consumers' settings
       UIs call. *(laurelane has disk-usage + remove; add progress + active-model switch.)*
-      *(2026-07-09) Disk usage + traversal-safe removal validation shipped as `manage` (5 unit tests);
-      download progress + active-model switch still open.*
+      *(2026-07-09) Disk usage + traversal-safe removal validation shipped as `manage` (5 unit tests).*
+      *(2026-07-10) Composed into `manage::ModelManager`: catalog listing, `is_installed`,
+      `install(name, on_progress)` (resumable hub fetch with per-chunk progress), traversal-safe
+      `remove`, `disk_report`; active-model switch = a consumer `ModelSlot` keyed by
+      `manager.model_dir(name)` (drop-then-swap + `clear()` already proven on the real GPU). 4 new
+      unit tests.*
 
 ### P9 — Quantization (fit any model to the hardware)
 The VRAM lever the P6 planner pulls to make the largest useful model fit the user's actual devices.

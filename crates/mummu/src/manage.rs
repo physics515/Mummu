@@ -220,3 +220,153 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 }
+
+/// The settings-UI-facing management surface (P8): one object owning the
+/// models root that composes the catalog ([`crate::registry`]), downloads
+/// ([`crate::hub`], with per-chunk progress), disk accounting, and safe
+/// removal. Active-model *switching* is the consumer's `ModelSlot` keyed by
+/// [`ModelManager::model_dir`].
+pub struct ModelManager {
+    root: PathBuf,
+    catalog: Vec<crate::registry::ModelSpec>,
+}
+
+impl ModelManager {
+    /// Manage `root` with the built-in catalog.
+    #[must_use]
+    pub fn new(root: PathBuf) -> Self {
+        Self::with_catalog(root, crate::registry::catalog())
+    }
+
+    /// Manage `root` with an app-supplied catalog (all specs must validate).
+    #[must_use]
+    pub fn with_catalog(root: PathBuf, catalog: Vec<crate::registry::ModelSpec>) -> Self {
+        assert!(
+            !root.as_os_str().is_empty(),
+            "models root must be non-empty"
+        );
+        assert!(!catalog.is_empty(), "catalog must not be empty");
+        for spec in &catalog {
+            if let Err(e) = spec.validate() {
+                panic!("invalid catalog spec: {e}");
+            }
+        }
+        Self { root, catalog }
+    }
+
+    #[must_use]
+    pub fn catalog(&self) -> &[crate::registry::ModelSpec] {
+        &self.catalog
+    }
+
+    /// The dir a catalog model lives in (whether or not it's installed yet).
+    pub fn model_dir(&self, name: &str) -> Result<PathBuf, String> {
+        self.spec(name).map(|s| s.dir(&self.root))
+    }
+
+    /// Is every required artifact of `name` on disk? (config + tokenizer +
+    /// single-file weights or a shard index.)
+    pub fn is_installed(&self, name: &str) -> Result<bool, String> {
+        let dir = self.model_dir(name)?;
+        let weights = dir.join("model.safetensors").is_file()
+            || dir.join("model.safetensors.index.json").is_file();
+        Ok(weights && dir.join("config.json").is_file() && dir.join("tokenizer.json").is_file())
+    }
+
+    /// Download `name` from its spec (resumable, cache-first), reporting
+    /// progress per chunk. Returns the model dir ready for `load_from_dir`.
+    pub fn install(
+        &self,
+        name: &str,
+        on_progress: impl FnMut(crate::hub::Progress<'_>),
+    ) -> Result<PathBuf, String> {
+        let spec = self.spec(name)?;
+        spec.fetch(&self.root, on_progress)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Remove `name`'s files from disk (traversal-safe). The caller drops any
+    /// live `ModelSlot` first — removal only touches the disk.
+    pub fn remove(&self, name: &str) -> Result<(), String> {
+        let target = resolve_removal(&self.root, name)?;
+        std::fs::remove_dir_all(&target).map_err(|e| format!("remove {name:?}: {e}"))
+    }
+
+    /// Disk usage for everything under the root, largest first.
+    #[must_use]
+    pub fn disk_report(&self) -> DiskReport {
+        report(&self.root)
+    }
+
+    fn spec(&self, name: &str) -> Result<&crate::registry::ModelSpec, String> {
+        self.catalog.iter().find(|s| s.name == name).ok_or_else(|| {
+            let known: Vec<&str> = self.catalog.iter().map(|s| s.name.as_str()).collect();
+            format!("unknown model {name:?}; catalog has {known:?}")
+        })
+    }
+}
+
+#[cfg(test)]
+mod manager_tests {
+    use super::*;
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("mummu-manager-{tag}"));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn fake_install(root: &Path, name: &str) {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in ["config.json", "tokenizer.json", "model.safetensors"] {
+            std::fs::write(dir.join(f), b"{}").unwrap();
+        }
+    }
+
+    #[test]
+    fn install_state_and_report_reflect_disk() {
+        let root = temp_root("state");
+        let mgr = ModelManager::new(root.clone());
+        assert_eq!(mgr.is_installed("all-minilm-l6-v2"), Ok(false));
+
+        fake_install(&root, "all-minilm-l6-v2");
+        assert_eq!(mgr.is_installed("all-minilm-l6-v2"), Ok(true));
+
+        let rep = mgr.disk_report();
+        assert_eq!(rep.models.len(), 1);
+        assert_eq!(rep.models[0].name, "all-minilm-l6-v2");
+        assert!(rep.total_bytes > 0);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn remove_deletes_only_the_named_model() {
+        let root = temp_root("remove");
+        let mgr = ModelManager::new(root.clone());
+        fake_install(&root, "all-minilm-l6-v2");
+        fake_install(&root, "qwen2.5-0.5b-instruct");
+
+        mgr.remove("all-minilm-l6-v2").unwrap();
+        assert_eq!(mgr.is_installed("all-minilm-l6-v2"), Ok(false));
+        assert_eq!(mgr.is_installed("qwen2.5-0.5b-instruct"), Ok(true));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn unknown_names_fail_loudly_with_the_catalog() {
+        let root = temp_root("unknown");
+        let mgr = ModelManager::new(root.clone());
+        let err = mgr.model_dir("nope").unwrap_err();
+        assert!(err.contains("nope") && err.contains("all-minilm-l6-v2"));
+        assert!(mgr.remove("nope").is_err());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    #[should_panic(expected = "catalog must not be empty")]
+    fn empty_catalog_is_rejected() {
+        let _ = ModelManager::with_catalog(PathBuf::from("x"), vec![]);
+    }
+}

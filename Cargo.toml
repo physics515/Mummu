@@ -16,20 +16,29 @@ repository = "https://github.com/physics515/Mummu"
 # `Wgpu` transparently becomes `Fusion<Wgpu>`.
 burn = { version = "0.21", default-features = false, features = [
 	"std",
-	"ndarray",
 	"wgpu",
 	"fusion",
 	"autotune",
 	"store",
 ] }
+# The CPU backend: pure-Rust SIMD + gemm, burn-ndarray's designated successor
+# (0.21 release notes); swapped in 2026-07-10 after the MiniLM Candle-parity
+# gate passed on it bit-for-bit-equivalent (cosine 0.99999994, max component
+# diff 1.3e-7) with all 80 unit tests green.
+burn-flex = "0.21"
+
 # Direct handle on wgpu (the same version Burn resolves) for the cheap startup
 # adapter probe: enumerate GPUs to decide GPU vs CPU before building a backend.
 wgpu = "29"
 # Block on wgpu 29's async adapter enumeration from the sync startup probe.
-pollster = "0.4"
+pollster = "1.0"
 # f16 element type for the GPU backend; the same `half` version Burn pulls.
 half = "2"
 tokenizers = "0.22"
+
+# Blocking HTTP (rustls) for the P3 model downloader; small, sync like the rest
+# of the library surface.
+ureq = "3"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
