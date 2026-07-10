@@ -26,7 +26,7 @@ burn = { version = "0.21", default-features = false, features = [
 # adapter probe: enumerate GPUs to decide GPU vs CPU before building a backend.
 wgpu = "29"
 # Block on wgpu 29's async adapter enumeration from the sync startup probe.
-pollster = "0.4"
+pollster = "1.0"
 # f16 element type for the GPU backend; the same `half` version Burn pulls.
 half = "2"
 tokenizers = "0.22"
