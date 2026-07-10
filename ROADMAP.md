@@ -110,9 +110,17 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
 The subsystem that turns "a model on HuggingFace or on disk" into a loaded, parity-checked Mummu model.
 **Data-driven** — adding a model is a manifest entry, not new code. All import is Burn-native (`burn-store` /
 `burn-import`).
-- [ ] **Sources** — HuggingFace Hub (repo id + revision), local paths, and a bundled resources dir (checked
+- [x] **Sources** — HuggingFace Hub (repo id + revision), local paths, and a bundled resources dir (checked
       first). Streaming download into a per-user cache: resumable (`.part`), integrity-checked, and
-      **sharded-checkpoint aware** (read `*.index.json`, fetch + merge shards).
+      **sharded-checkpoint aware** (read `*.index.json`, fetch + merge shards). *(2026-07-10) `mummu::hub`
+      (ureq 3, https-only): `fetch_file` streams through `.part` with HTTP-Range resume + Content-Length
+      verification + cache-first; `fetch_model` pulls config/tokenizer/weights with the
+      `model.safetensors.index.json` shard fallback; `Progress` callback per chunk (feeds P8). Real-network
+      proof: all-MiniLM (90.8 MB) downloaded → checked-load → unit-norm embedding; a half-seeded `.part`
+      resumed at byte 249,507/466,247 and finished byte-identical. Local paths are already first-class
+      (`load_from_dir`); bundled-resources-dir precedence is app wiring.*
+- [ ] Stronger download integrity: verify the Hub's LFS sha256 (`X-Linked-ETag`) instead of length-only;
+      re-verify on cache hits behind a flag.
 - [x] **safetensors** *(ex-laurelane)* — `burn-store` `SafetensorsStore` + `PyTorchToBurnAdapter`; the primary path.
       *(2026-07-09) `import::{CastFloatAdapter, load_checked}`: bf16→backend-float cast + fail-loud load;
       proven by loading the real 3.1 GB Qwen2.5-1.5B and 2.3 GB LFM2.5 checkpoints with zero missing keys.*
@@ -231,7 +239,9 @@ that fits the model AND uses every device to the fullest.
 - [ ] Download progress · disk usage · switch/remove models — an app-agnostic API the consumers' settings
       UIs call. *(laurelane has disk-usage + remove; add progress + active-model switch.)*
       *(2026-07-09) Disk usage + traversal-safe removal validation shipped as `manage` (5 unit tests);
-      download progress + active-model switch still open.*
+      download progress + active-model switch still open.* *(2026-07-10) Both primitives now exist —
+      `hub::Progress` per-chunk callback and `cache::ModelSlot` key-switch/`clear` — what remains is
+      composing them into one settings-UI-facing surface with `manage`.*
 
 ### P9 — Quantization (fit any model to the hardware)
 The VRAM lever the P6 planner pulls to make the largest useful model fit the user's actual devices.

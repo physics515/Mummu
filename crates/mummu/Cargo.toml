@@ -15,4 +15,5 @@ tokenizers = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+ureq = { workspace = true }
 once_cell = { workspace = true }

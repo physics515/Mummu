@@ -42,6 +42,11 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
   whole-card peak** (~7.9 GiB runner) — recorded with budgets in [bench/BASELINE.md](bench/BASELINE.md),
   enforced by an opt-in regression gate (`mummu-bench/tests/budget.rs`).
 - **Model-cache disk accounting** — per-model disk usage + traversal-safe removal validation (`manage`).
+- **Hub downloads** — streaming HuggingFace fetches into the model cache: resumable (`.part` + HTTP
+  Range, proven byte-identical after an interrupted transfer), length-verified, shard-index aware, with
+  a per-chunk progress callback; verified end-to-end by downloading all-MiniLM and embedding with it.
+- **Process-lifetime model cache** — `ModelSlot` loads a checkpoint once per process, switches models by
+  key, and `clear()`s to free VRAM; Burn's `Param` isn't `Sync`, so access serializes behind its mutex.
 
 ## Design principles
 

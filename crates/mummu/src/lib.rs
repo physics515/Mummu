@@ -13,6 +13,7 @@ pub mod backend;
 pub mod cache;
 pub mod chat;
 pub mod decode;
+pub mod hub;
 pub mod import;
 pub mod manage;
 pub mod models;
