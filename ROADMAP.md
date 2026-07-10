@@ -77,9 +77,11 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       to ndarray's 1.2e-7) and all 80 unit tests are green, incl. the cache-equivalence proofs that run
       on the CPU backend. A dedicated CPU decode tok/s bench still wants a CPU-tier model (0.5B) — next
       item.*
-- [ ] CPU decode bench for `bench/BASELINE.md`: pull Qwen2.5-0.5B (catalog entry exists) and record
+- [x] CPU decode bench for `bench/BASELINE.md`: pull Qwen2.5-0.5B (catalog entry exists) and record
       decode tok/s on the Flex backend, so CPU-only machines get a budget row and Flex regressions are
-      caught like GPU ones.
+      caught like GPU ones. *(2026-07-10) 0.5B fetched through the registry/hub path (988 MB in ~13 s),
+      decodes coherently on Flex at **11.7 tok/s** (7950X3D, f32); budget ≥ 6 tok/s gated by
+      `mummu-bench/tests/budget_cpu.rs`.*
 
 ### P2 — Model zoo (from scratch, generic over `B`) *(ex-laurelane)*
 - [x] Shared blocks: RmsNorm, GQA attention, RoPE (manual rotate-half), SwiGLU MLP, tied lm-head,

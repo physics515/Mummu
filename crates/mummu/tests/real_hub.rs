@@ -113,3 +113,23 @@ fn hub_resume_completes_a_partial_download_byte_identical() {
         resumed.len()
     );
 }
+
+/// One-shot helper the nightly uses to pull the CPU-tier Qwen into a cache
+/// dir (also a second real proof of the sharded/single-file fetch path on a
+/// 1 GB checkpoint).
+#[test]
+#[ignore = "needs network (MUMMU_HUB_DEST names the download dir); ~1 GB"]
+fn hub_fetches_the_cpu_tier_qwen() {
+    let Some(dest) = std::env::var_os("MUMMU_HUB_DEST").map(PathBuf::from) else {
+        panic!("set MUMMU_HUB_DEST to a scratch dir for the ~1 GB download");
+    };
+    let spec = mummu::registry::catalog()
+        .into_iter()
+        .find(|s| s.name == "qwen2.5-0.5b-instruct")
+        .expect("0.5B is in the catalog");
+    let dir = spec.fetch(&dest, |_| {}).expect("hub fetch");
+    for f in ["config.json", "tokenizer.json", "model.safetensors"] {
+        assert!(dir.join(f).is_file(), "{f} must exist after fetch");
+    }
+    eprintln!("[real_hub] 0.5B fetched into {}", dir.display());
+}
