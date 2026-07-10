@@ -41,7 +41,9 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
 - **Benchmarked** — Qwen2.5-1.5B f32 on the reference GPU: **TTFT 100.5 ms, decode 13.3 tok/s, 11.9 GiB
   whole-card peak** (~7.9 GiB runner) — recorded with budgets in [bench/BASELINE.md](bench/BASELINE.md),
   enforced by an opt-in regression gate (`mummu-bench/tests/budget.rs`).
-- **Model-cache disk accounting** — per-model disk usage + traversal-safe removal validation (`manage`).
+- **Model management** — `ModelManager` gives settings UIs the whole lifecycle over a declarative model
+  catalog (`registry::ModelSpec`): install with per-chunk download progress, `is_installed`, per-model
+  disk usage, and traversal-safe removal; model switching rides `ModelSlot`.
 - **Hub downloads** — streaming HuggingFace fetches into the model cache: resumable (`.part` + HTTP
   Range, proven byte-identical after an interrupted transfer), length-verified, shard-index aware, with
   a per-chunk progress callback; verified end-to-end by downloading all-MiniLM and embedding with it.

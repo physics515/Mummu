@@ -248,12 +248,14 @@ that fits the model AND uses every device to the fullest.
 - [ ] Wire the perf suite (above) into the parity harness so a correctness *or* budget regression fails CI.
 
 ### P8 — Model management API
-- [ ] Download progress · disk usage · switch/remove models — an app-agnostic API the consumers' settings
+- [x] Download progress · disk usage · switch/remove models — an app-agnostic API the consumers' settings
       UIs call. *(laurelane has disk-usage + remove; add progress + active-model switch.)*
-      *(2026-07-09) Disk usage + traversal-safe removal validation shipped as `manage` (5 unit tests);
-      download progress + active-model switch still open.* *(2026-07-10) Both primitives now exist —
-      `hub::Progress` per-chunk callback and `cache::ModelSlot` key-switch/`clear` — what remains is
-      composing them into one settings-UI-facing surface with `manage`.*
+      *(2026-07-09) Disk usage + traversal-safe removal validation shipped as `manage` (5 unit tests).*
+      *(2026-07-10) Composed into `manage::ModelManager`: catalog listing, `is_installed`,
+      `install(name, on_progress)` (resumable hub fetch with per-chunk progress), traversal-safe
+      `remove`, `disk_report`; active-model switch = a consumer `ModelSlot` keyed by
+      `manager.model_dir(name)` (drop-then-swap + `clear()` already proven on the real GPU). 4 new
+      unit tests.*
 
 ### P9 — Quantization (fit any model to the hardware)
 The VRAM lever the P6 planner pulls to make the largest useful model fit the user's actual devices.
