@@ -3407,8 +3407,10 @@ dependencies = [
 name = "mummu-bench"
 version = "0.1.0"
 dependencies = [
+ "burn",
  "criterion",
  "mummu",
+ "tokenizers",
 ]
 
 [[package]]

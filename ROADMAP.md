@@ -34,9 +34,17 @@ Performance is a **gate**, not a phase. Governing metric: **task throughput @ bu
 TTFT while fitting the *target device set's* VRAM/RAM (one GPU, several, or CPU): the biggest useful model
 that fits, run as fast as the hardware allows, every device busy. A change ships only when parity holds and
 a benchmark holds/improves its budget; README perf claims link an artifact.
-- [ ] `mummu-bench` (criterion) — TTFT, decode tok/s, VRAM per model × device-set (1 GPU / N GPUs / CPU / hybrid).
-      *(2026-07-09) Crate + harness wired (smoke bench); real model benches land with P5.*
-- [ ] `bench/BASELINE.md` budgets (VRAM ceiling, min decode tok/s, max TTFT) + a `cargo test` gate that fails a regression.
+- [x] `mummu-bench` (criterion) — TTFT, decode tok/s, VRAM per model × device-set (1 GPU / N GPUs / CPU / hybrid).
+      *(2026-07-09) Crate + harness wired (smoke bench); real model benches land with P5.* *(2026-07-10)
+      Real Qwen2.5-1.5B GPU benches live: TTFT 100.5 ms, decode 13.3 tok/s (f32, criterion). More
+      model × device-set combos accrete as those paths land (CPU, f16, multi-GPU).*
+- [x] `bench/BASELINE.md` budgets (VRAM ceiling, min decode tok/s, max TTFT) + a `cargo test` gate that fails a regression.
+      *(2026-07-10) Baseline recorded (TTFT ≤ 150 ms, ≥ 10 tok/s, ≤ 13 GiB whole-card; measured 100.5 ms /
+      13.3 tok/s / 11.9 GiB peak incl. ~4 GiB ambient); gate = `mummu-bench/tests/budget.rs` (ignored,
+      weights + GPU) passing at 110.4 ms / 11.8 tok/s.*
+- [ ] Decode is dispatch-bound, not bandwidth-bound: 75 ms/token streams ~6.2 GB of f32 weights at only
+      ~83 GB/s vs the 4070 Ti SUPER's ~672 GB/s — the SPIR-V compiler feature (P6 item) and f16 are the
+      levers to chase; re-baseline after each.
 - [ ] Evaluate Burn 0.21's `burn.toml` project config — per-subsystem tuning + a CubeCL kernel-validation
       layer without recompiling; useful as a debug switch for kernel-level parity hunts —
       https://burn.dev/blog/release-0.21.0/
@@ -106,7 +114,12 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
 - [ ] **PyTorch state dicts** (`.pth` / `pytorch_model*.bin`) — for models not shipped as safetensors.
 - [ ] **GGUF** (llama.cpp) — parse the GGUF container (metadata KV + tensor table), map tensors to modules,
       and **dequantize** Q4/Q5/Q8/K-quant blocks into Burn tensors (or hand keep-quantized to P9). GGUF is how
-      most small models are distributed — this makes the whole ecosystem importable.
+      most small models are distributed — this makes the whole ecosystem importable. *(2026-07-10 research)*
+      K-quant superblocks are 256 values: Q4_K = fp16 d + fp16 dmin + 12 B of 6-bit sub-scales/mins + 128 B
+      of 4-bit q (144 B total), `x = d·scale_i·q − dmin·min_i`; Q6_K = 128 B low-4 + 64 B high-2 + 16×i8
+      sub-scales + fp16 d (210 B). Rust references: llama.cpp ggml-quants + the `rage-quant` crate
+      (Q8_0/Q4_K/Q6_K dequant + SIMD dot) — https://haroldbenoit.com/notes/ml/llms/quantization/llama.cpp/k-quants-implementation ·
+      https://crates.io/crates/rage-quant
 - [ ] **GPTQ / AWQ** (HF safetensors) — import the calibration-quantized int4/int8 layouts most "quantized on
       the Hub" models ship as (a `.safetensors` payload + a quant config), dequant or keep-quant into Burn.
 - [ ] **ONNX** (optional) — `burn-import` ONNX→Burn for models distributed as ONNX graphs.
@@ -136,6 +149,13 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       fastest at ~1.5 s) on 2026's 21-model local tool-calling benchmark; function calling is why the
       apps want a local runner — https://mikeveerman.be/blog/github-2026-02-06-tool-calling-benchmark/ ·
       https://qwen.readthedocs.io/en/latest/framework/function_call.html
+      *(2026-07-10 research)* 2026 community numbers back the plan: Qwen3-8B keeps tool-calling score
+      through Q4_K_M (0.919 quantized vs 0.933 full — quant does NOT cost tool reliability, good news for
+      P9); BFCL shows a capability cliff below ~7B (Qwen3.5-9B 66.1% vs 4B 50.3%), so the zoo's
+      function-calling tier should target the 7–9B class once quant lands; Hermes 4 (Qwen3-14B fine-tune)
+      emits `<tool_call>` tags after an explicit reasoning step — easy to parse with the same template
+      machinery — https://www.promptquorum.com/power-local-llm/best-local-models-tool-calling-2026 ·
+      https://localaimaster.com/blog/best-ollama-models-for-agents
 
 ### P5 — Decode engine *(ex-laurelane)*
 - [x] Per-layer KV cache (+ conv-state cache for hybrids); prompt prefilled once, then one token/step.
@@ -160,6 +180,10 @@ that fits the model AND uses every device to the fullest.
       `Wgpu<half::f16, i32>` (needs wgpu ≥ 27 `SHADER_F16` polyfill — *laurelane compiles it + a startup
       `SHADER_F16` diagnostic; finish on-GPU validation here*: no naga crash, ~halved VRAM, coherent output);
       drop to int8/int4 (P9) when f16 still won't fit.
+- [ ] Evaluate burn-wgpu's **`spirv` compiler feature** on Vulkan (CubeCL SPIR-V backend instead of
+      WGSL/naga): claims significantly faster matmul incl. TensorCores at f16 — could be the cheapest
+      decode-tok/s lever on the dev GPU; gate on the parity harness + `bench/BASELINE.md` —
+      https://github.com/tracel-ai/burn/blob/main/crates/burn-wgpu/README.md
 - [ ] **Placement plan** — given model size + KV-cache + display headroom and the device set, choose a
       **fit-and-fill** plan: single GPU when it fits; **shard layers across multiple GPUs** (pipeline/
       layer-parallel over Burn's multi-device tensors — Burn gives the multi-device *primitives*, not automatic

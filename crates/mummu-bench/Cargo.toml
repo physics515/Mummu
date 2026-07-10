@@ -9,9 +9,11 @@ publish = false
 
 [dependencies]
 mummu = { path = "../mummu" }
+burn = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+tokenizers = { workspace = true }
 
 [[bench]]
 name = "runner"

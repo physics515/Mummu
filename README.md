@@ -35,6 +35,12 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
   matches `ollama qwen2.5:1.5b-instruct-fp16` byte-for-byte. The MiniLM embedder matches its Candle
   reference at cosine 0.99999994 (max |Δcomponent| 1.2e-7, `tests/real_minilm.rs`). LFM2.5 still awaits
   a same-weights reference (tracked in P7).
+- **Sampling, streaming, cancellation** — temperature / top-k / top-p sampling (deterministic per seed),
+  per-token streaming through a `ControlFlow` callback, and cooperative between-token cancellation;
+  greedy decoding keeps the argmax on-device.
+- **Benchmarked** — Qwen2.5-1.5B f32 on the reference GPU: **TTFT 100.5 ms, decode 13.3 tok/s, 11.9 GiB
+  whole-card peak** (~7.9 GiB runner) — recorded with budgets in [bench/BASELINE.md](bench/BASELINE.md),
+  enforced by an opt-in regression gate (`mummu-bench/tests/budget.rs`).
 - **Model-cache disk accounting** — per-model disk usage + traversal-safe removal validation (`manage`).
 
 ## Design principles
