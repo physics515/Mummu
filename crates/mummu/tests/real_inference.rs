@@ -102,3 +102,54 @@ fn qwen2_first_token_probe_reports_top5() {
         decode(&dir, &top5[..1])
     );
 }
+
+#[test]
+#[ignore = "needs multi-GB local weights (MUMMU_QWEN2_DIR)"]
+fn qwen2_sampled_streaming_is_seeded_deterministic_and_cancellable() {
+    let Some(dir) = qwen2_dir() else {
+        panic!("set MUMMU_QWEN2_DIR to a dir with config.json/tokenizer.json/model.safetensors");
+    };
+    let prompt = encode(
+        &dir,
+        &chatml("You are a poet.", "Write one line about the sea."),
+    );
+    let device = burn::tensor::Device::<Gpu>::default();
+    let loaded = qwen2::load_from_dir::<Gpu>(&dir, &device).expect("weights load checked");
+
+    let opts = mummu::decode::SamplerOptions {
+        temperature: 0.7,
+        top_p: 0.9,
+        seed: 42,
+        ..mummu::decode::SamplerOptions::default()
+    };
+
+    // Leg 1: streaming + cooperative cancellation after 8 tokens.
+    let mut streamed = Vec::new();
+    let cancelled = loaded
+        .generate(&prompt, 64, &opts, &device, |id| {
+            streamed.push(id);
+            if streamed.len() == 8 {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        })
+        .expect("sampled decode");
+    assert_eq!(cancelled.len(), 8, "cancel after 8 streamed tokens");
+    assert_eq!(cancelled, streamed, "returned ids == streamed ids");
+
+    // Leg 2: the same seed replays the same sampled prefix.
+    let replay = loaded
+        .generate(&prompt, 8, &opts, &device, |_| {
+            std::ops::ControlFlow::Continue(())
+        })
+        .expect("replay decode");
+    assert_eq!(
+        replay, cancelled,
+        "same (prompt, options, seed) must resample the same tokens"
+    );
+
+    let text = decode(&dir, &cancelled);
+    eprintln!("[real_inference/sampled] 8 tokens @ T=0.7 p=0.9 seed=42: {text:?}");
+    assert!(!text.trim().is_empty(), "sampled text should be non-empty");
+}

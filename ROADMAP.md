@@ -143,8 +143,12 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       full-forward proven by unit tests at block AND whole-model level, then by real GPU decode.*
 - [x] On-GPU argmax (sync only the winning index); single-token decode skips the causal mask.
       *(2026-07-09) `decode::argmax_id`; `t == 1` builds no mask.*
-- [ ] Sampling beyond greedy (temperature / top-p); **token streaming** via a callback/channel;
-      cooperative interrupt/cancellation between tokens.
+- [x] Sampling beyond greedy (temperature / top-p); **token streaming** via a callback/channel;
+      cooperative interrupt/cancellation between tokens. *(2026-07-10) `decode::{SamplerOptions,
+      sample_id, Pcg32, generate_loop}` + per-model `generate(…, on_token)`: temperature/top-k/top-p over
+      an O(vocab) partial select, deterministic in-house PCG32 (no rand dep), `ControlFlow` callback =
+      streaming AND cancellation; greedy stays on-GPU argmax and re-passed the Qwen2 parity gate; real-GPU
+      proof: seeded sampled stream replays identically and cancels at 8 tokens (10 new unit tests).*
 - [ ] Process-lifetime model + tokenizer cache (per backend; behind a `Mutex` since Burn `Param` isn't `Sync`).
 
 ### P6 — Hardware planner: precision, placement & full utilization
