@@ -99,7 +99,12 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       semantic test (`tests/real_minilm.rs`).* *(2026-07-10) **Parity PASSED**: embedding matches the
       Candle f32 reference (`minilm-probe` fixture) at cosine 0.99999994 with max |Δcomponent| 1.2e-7
       (bound 1e-4); semantic sanity re-verified on real weights (paraphrase 0.556 vs cross-topic ≈ 0).*
-- [ ] A `Model` trait so new architectures (Hermes-class function-callers, Gemma, Qwen3, …) slot in.
+- [x] A `Model` trait so new architectures (Hermes-class function-callers, Gemma, Qwen3, …) slot in.
+      *(2026-07-10) `models::CausalLm<B>` — associated `Cache` type; a port supplies `new_cache` /
+      `forward` / `is_eos` and inherits `generate` / `greedy_generate` / `first_token` from the shared
+      driver (static dispatch, single code path). Both LLMs now implement it; the parity gate re-ran
+      green through the trait, and the real-inference suite shares one `ModelSlot` (4 GPU tests, one
+      3.1 GB load — found and fixed a 2-models-in-VRAM blowup in the old per-test loads).*
 
 ### P3 — Model import suite (any source / any format → a running model)
 The subsystem that turns "a model on HuggingFace or on disk" into a loaded, parity-checked Mummu model.

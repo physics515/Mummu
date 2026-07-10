@@ -16,6 +16,7 @@ use std::time::Instant;
 
 use mummu::backend::Gpu;
 use mummu::decode::argmax_id;
+use mummu::models::CausalLm;
 use mummu::models::qwen2;
 use tokenizers::Tokenizer;
 

@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use mummu::backend::Gpu;
+use mummu::models::CausalLm;
 use mummu::models::qwen2;
 use tokenizers::Tokenizer;
 

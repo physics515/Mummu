@@ -15,8 +15,8 @@ use burn::nn::{Embedding, EmbeddingConfig, RmsNorm, RmsNormConfig};
 use burn::store::{ModuleAdapter, PyTorchToBurnAdapter, SafetensorsStore};
 use burn::tensor::{Int, Tensor, TensorData, backend::Backend};
 
-use crate::decode::{SamplerOptions, generate_loop, top_k_ids};
 use crate::import::{CastFloatAdapter, ImportError, load_checked, required_file};
+use crate::models::CausalLm;
 use crate::models::qwen2::EosIds;
 use crate::nn::{
     ConvState, GqaAttention, GqaAttentionConfig, LayerKv, ShortConv, ShortConvConfig, SwiGluMlp,
@@ -219,10 +219,15 @@ pub fn load_from_dir<B: Backend>(
     Ok(LoadedLfm2 { model, config })
 }
 
-impl<B: Backend> LoadedLfm2<B> {
+impl<B: Backend> CausalLm<B> for LoadedLfm2<B> {
+    type Cache = Vec<HybridKv<B>>;
+
+    fn is_eos(&self, id: u32) -> bool {
+        self.config.eos_token_id.contains(id)
+    }
+
     /// A fresh per-layer cache matching `layer_types`.
-    #[must_use]
-    pub fn new_cache(&self) -> Vec<HybridKv<B>> {
+    fn new_cache(&self) -> Self::Cache {
         (0..self.config.num_hidden_layers)
             .map(|i| {
                 if self.config.is_attention(i) {
@@ -236,11 +241,11 @@ impl<B: Backend> LoadedLfm2<B> {
 
     /// Forward `new_ids` (the whole prompt when `past == 0`, else one decode
     /// token), updating `cache`; returns logits for the last position `[1, vocab]`.
-    pub fn forward(
+    fn forward(
         &self,
         new_ids: &[u32],
         past: usize,
-        cache: &mut [HybridKv<B>],
+        cache: &mut Self::Cache,
         device: &B::Device,
     ) -> Tensor<B, 2> {
         let t = new_ids.len();
@@ -287,64 +292,6 @@ impl<B: Backend> LoadedLfm2<B> {
         let last = x.narrow(1, t - 1, 1).reshape([1, cfg.hidden_size]);
         let w = self.model.embed_tokens.weight.val(); // tied lm-head
         last.matmul(w.swap_dims(0, 1))
-    }
-
-    /// Full decode: prefill once, then one token per step, stopping at any
-    /// config EOS id, `max_tokens`, or a `Break` from `on_token` (streaming +
-    /// cooperative cancellation). Greedy keeps the argmax on-device.
-    pub fn generate(
-        &self,
-        prompt_ids: &[u32],
-        max_tokens: usize,
-        opts: &SamplerOptions,
-        device: &B::Device,
-        on_token: impl FnMut(u32) -> std::ops::ControlFlow<()>,
-    ) -> Result<Vec<u32>, String> {
-        let mut cache = self.new_cache();
-        generate_loop(
-            |ids, past| self.forward(ids, past, &mut cache, device),
-            prompt_ids,
-            max_tokens,
-            opts,
-            |id| self.config.eos_token_id.contains(id),
-            on_token,
-        )
-    }
-
-    /// Greedy decode (the parity-gate path): [`Self::generate`] at
-    /// temperature 0 with no streaming.
-    pub fn greedy_generate(
-        &self,
-        prompt_ids: &[u32],
-        max_tokens: usize,
-        device: &B::Device,
-    ) -> Result<Vec<u32>, String> {
-        self.generate(
-            prompt_ids,
-            max_tokens,
-            &SamplerOptions::greedy(),
-            device,
-            |_| std::ops::ControlFlow::Continue(()),
-        )
-    }
-
-    /// Parity probe: top-k next-token ids for a single prefill.
-    pub fn first_token(
-        &self,
-        prompt_ids: &[u32],
-        k: usize,
-        device: &B::Device,
-    ) -> Result<Vec<u32>, String> {
-        assert!(!prompt_ids.is_empty(), "first_token: empty prompt");
-        assert!(k >= 1, "first_token: k must be >= 1");
-        let mut cache = self.new_cache();
-        let logits = self.forward(prompt_ids, 0, &mut cache, device);
-        let v = logits
-            .into_data()
-            .convert::<f32>()
-            .to_vec::<f32>()
-            .map_err(|e| format!("logits readback: {e:?}"))?;
-        Ok(top_k_ids(&v, k))
     }
 }
 
