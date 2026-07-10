@@ -143,7 +143,11 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       marked trusted; a clear error taxonomy (missing file, bad shard, key mismatch, unsupported dtype).
 
 ### P4 — Tokenizer & chat templates *(ex-laurelane)*
-- [ ] HF `tokenizers` (pinned); explicit chat templates (ChatML + per-model), correct special/EOS tokens.
+- [x] HF `tokenizers` (pinned); explicit chat templates (ChatML + per-model), correct special/EOS tokens.
+      *(2026-07-10) `mummu::chat`: `Turn`/`Role` + a `ChatMl` renderer with per-model constructors
+      (`qwen2` plain, `lfm2` with `<|startoftext|>` BOS); byte-verified — the Qwen2 parity gate now
+      renders its prompt through the template and still matches the Candle fixture and the Ollama fp16
+      greedy leg exactly. EOS stays config-driven (`EosIds`); tool-use templates are the next item.*
 - [ ] Hermes-style tool-use chat template (Qwen3 ships it in `tokenizer_config.json`) + LFM2.5's
       bracket-notation tool-call output — the two top scorers (0.880 agent score; LFM2.5-1.2B also the
       fastest at ~1.5 s) on 2026's 21-model local tool-calling benchmark; function calling is why the

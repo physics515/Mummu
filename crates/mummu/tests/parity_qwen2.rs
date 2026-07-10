@@ -26,11 +26,14 @@ fn qwen2_dir() -> Option<PathBuf> {
     dir.is_dir().then_some(dir)
 }
 
-/// The Qwen2.5-Instruct ChatML wrapping (system + user turn + assistant open).
+/// The Qwen2.5-Instruct ChatML wrapping (system + user turn + assistant open),
+/// rendered by the library's own template — the fixture equality assert below
+/// is what byte-verifies `chat::ChatMl::qwen2` against the Candle reference.
 fn chatml(user: &str) -> String {
-    format!(
-        "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n"
-    )
+    mummu::chat::ChatMl::qwen2().render(&[
+        mummu::chat::Turn::system("You are a helpful assistant."),
+        mummu::chat::Turn::user(user),
+    ])
 }
 
 /// Greedy reference from Ollama in raw mode (identical prompt text,

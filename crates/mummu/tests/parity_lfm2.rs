@@ -27,9 +27,10 @@ fn lfm2_dir() -> Option<PathBuf> {
     dir.is_dir().then_some(dir)
 }
 
-/// The LFM2.5 ChatML wrapping (BOS + user turn + assistant open).
+/// The LFM2.5 ChatML wrapping (BOS + user turn + assistant open), rendered by
+/// the library's own template (the same shape laurelane validated vs Ollama).
 fn chatml(user: &str) -> String {
-    format!("<|startoftext|><|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n")
+    mummu::chat::ChatMl::lfm2().render(&[mummu::chat::Turn::user(user)])
 }
 
 /// Greedy reference from Ollama in raw mode (identical prompt text,
