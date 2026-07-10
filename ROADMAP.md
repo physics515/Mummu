@@ -71,10 +71,12 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       (optional per-head q/k RMSNorm covers Qwen2 AND LFM2), `SwiGluMlp`, `ShortConv` (LIV) with rolling
       state, RoPE + causal mask; 18 unit tests incl. the prefill+decode ≡ full-forward equivalence for
       both the KV cache and the conv state. RmsNorm/tied-head come from burn::nn / the model files.*
-- [ ] **Qwen2 / Qwen2.5** decoder (1.5B / 0.5B tiers). *(2026-07-09) Ported (`models::qwen2`,
+- [x] **Qwen2 / Qwen2.5** decoder (1.5B / 0.5B tiers). *(2026-07-09) Ported (`models::qwen2`,
       config-driven, checked safetensors load); REAL GPU inference verified — Qwen2.5-1.5B on the 4070 Ti
       SUPER greedy-decoded "2+2 equals 4.", top-5 probe led by id 9707 "Hello"; toy-model cache-equivalence
-      unit test. Stays `[ ]` until the P7 parity harness passes it against a logits reference.*
+      unit test.* *(2026-07-10) **Parity gate PASSED** (`tests/parity_qwen2.rs`): top-5 logits match the
+      Candle f32 reference exactly by id with max |Δlogit| 2.7e-5 (bound 1e-3), and a 24-token greedy
+      sequence matches `ollama qwen2.5:1.5b-instruct-fp16` byte-for-byte on the 4070 Ti SUPER.**
 - [ ] **LFM2.5-1.2B** hybrid (6 GQA-attention w/ per-head q/k RMSNorm + 10 double-gated short-conv "LIV"
       blocks, SwiGLU, tied head, conv-state cache; ChatML, EOS `<|im_end|>`). *(2026-07-09) Ported
       (`models::lfm2`, hybrid cache, LFM2→shared-block key remap); toy hybrid cache-equivalence test;
@@ -165,13 +167,21 @@ that fits the model AND uses every device to the fullest.
       counts, precision, CPU-offload cap) for power users.
 
 ### P7 — Parity & performance harness *(ex-laurelane)*
-- [ ] Parity gate: single-forward top-k logits + a short greedy sequence must match a reference (Candle,
+- [x] Parity gate: single-forward top-k logits + a short greedy sequence must match a reference (Candle,
       or a local Ollama of the same model) — the trust gate every port passes. *(2026-07-09) Greedy leg
-      exists (`tests/parity_lfm2.rs`, Ollama raw-mode temperature-0 via curl); blocked on a same-weights
-      reference: `ollama lfm2.5:latest` is now the 8.5B MoE and no 1.2B tag exists.*
-- [ ] Stand up same-weights references: a Candle-based logits probe (dev-dependency or a small side
+      exists (`tests/parity_lfm2.rs`, Ollama raw-mode temperature-0 via curl).* *(2026-07-10) Both legs
+      live and passing for Qwen2.5-1.5B (`tests/parity_qwen2.rs`): logits leg vs a committed
+      `tools/candle-probe` fixture, greedy leg vs Ollama fp16. LFM2.5 still lacks a same-weights
+      reference (see the P2 item); candle-transformers has no LFM2, so its logits leg needs another
+      route (llama.cpp logprobs, or an HF transformers dump).*
+- [x] Stand up same-weights references: a Candle-based logits probe (dev-dependency or a small side
       harness, as laurelane's Qwen2 validation did) + pull `qwen2.5:1.5b-instruct-fp16` in Ollama for the
-      Qwen greedy leg.
+      Qwen greedy leg. *(2026-07-10) `tools/candle-probe` (out-of-workspace bin, Candle =0.9.1 CPU f32)
+      prints top-k (id, logit) JSON for the fixed prompt; fixture committed under
+      `crates/mummu/tests/fixtures/`; fp16 Ollama tag pulled and validated.*
+- [ ] LFM2.5 same-weights reference for the parity gate: no Candle port exists — candidate routes are
+      llama.cpp `logprobs` on the fp16 GGUF, or a one-shot HF `transformers` logits dump matched to the
+      safetensors revision.
 - [ ] Wire the perf suite (above) into the parity harness so a correctness *or* budget regression fails CI.
 
 ### P8 — Model management API

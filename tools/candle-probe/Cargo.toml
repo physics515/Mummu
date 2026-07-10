@@ -1,0 +1,22 @@
+# A standalone same-weights reference for the P7 parity gate: load a Qwen2
+# safetensors checkpoint with Candle (CPU, f32), run one forward over a fixed
+# ChatML prompt, and print the top-k (id, logit) pairs as JSON. The output is
+# committed as a fixture under crates/mummu/tests/fixtures/ so the mummu-side
+# logits test runs without Candle installed. Deliberately OUTSIDE the cargo
+# workspace: Candle must never become a mummu dependency (Burn is the one
+# runtime — see the ROADMAP North Star).
+[package]
+name = "candle-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# =0.9.1: the same Candle laurelane validated byte-identical parity against.
+candle-core = "=0.9.1"
+candle-nn = "=0.9.1"
+candle-transformers = "=0.9.1"
+tokenizers = "0.22"
+serde_json = "1"
+
+[workspace]

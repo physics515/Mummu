@@ -28,8 +28,11 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
   fail-loud load (never silently zero-init); `config.json`-driven hyperparameters.
 - **Three models ported and running on real weights** — Qwen2/2.5, the LFM2/2.5 hybrid, and the
   all-MiniLM sentence embedder; Qwen2.5-1.5B and LFM2.5-1.2B load and greedy-decode correctly on the
-  reference GPU (wgpu/Vulkan). The P7 parity harness will gate them "trusted" against a reference before
-  the roadmap ticks them done.
+  reference GPU (wgpu/Vulkan).
+- **Qwen2.5 is parity-verified** — the two-leg P7 gate passes on the reference GPU: single-forward top-5
+  logits match a Candle f32 reference (max |Δlogit| 2.7e-5, `tests/parity_qwen2.rs` + the committed
+  `tools/candle-probe` fixture) and a 24-token greedy sequence matches `ollama qwen2.5:1.5b-instruct-fp16`
+  byte-for-byte. LFM2.5 and MiniLM await a same-weights reference (tracked in P7).
 - **Model-cache disk accounting** — per-model disk usage + traversal-safe removal validation (`manage`).
 
 ## Design principles

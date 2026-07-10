@@ -1,0 +1,54 @@
+{
+  "prompt_ids": [
+    151644,
+    8948,
+    198,
+    2610,
+    525,
+    264,
+    10950,
+    17847,
+    13,
+    151645,
+    198,
+    151644,
+    872,
+    198,
+    852,
+    279,
+    1156,
+    4236,
+    10250,
+    5109,
+    13,
+    151645,
+    198,
+    151644,
+    77091,
+    198
+  ],
+  "prompt_raw": "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nList the first five prime numbers.<|im_end|>\n<|im_start|>assistant\n",
+  "reference": "candle-0.9.1 cpu f32",
+  "top_k": [
+    {
+      "id": 785,
+      "logit": 24.636566162109375
+    },
+    {
+      "id": 16,
+      "logit": 22.25823211669922
+    },
+    {
+      "id": 32,
+      "logit": 21.57818031311035
+    },
+    {
+      "id": 1249,
+      "logit": 21.026325225830078
+    },
+    {
+      "id": 8420,
+      "logit": 20.907291412353516
+    }
+  ]
+}
