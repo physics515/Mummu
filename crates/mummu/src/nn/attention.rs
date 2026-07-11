@@ -4,7 +4,7 @@
 
 use burn::module::Module;
 use burn::nn::{Linear, LinearConfig, RmsNorm, RmsNormConfig};
-use burn::tensor::{Tensor, TensorData, activation, backend::Backend};
+use burn::tensor::{DType, Tensor, TensorData, activation, backend::Backend};
 
 use super::MAX_CONTEXT_TOKENS;
 use super::rope::apply_rope;
@@ -185,12 +185,22 @@ impl<B: Backend> GqaAttention<B> {
         let k = repeat_kv(k_all, group);
         let v = repeat_kv(v_all, group);
 
+        // f32 island: Qwen-class attention logits overflow f16 (max 65504)
+        // in the q·kᵀ scores, collapsing softmax to NaN — llama.cpp pins this
+        // same matmul to f32 precision for the same reason. Scores + mask +
+        // softmax run in f32, the probabilities (all in [0, 1]) return to the
+        // ambient dtype for the value matmul. Every cast is a no-op on f32
+        // backends.
+        let ambient = q.dtype();
         let scale = 1.0 / (hd as f32).sqrt();
-        let mut scores = q.matmul(k.swap_dims(2, 3)).mul_scalar(scale);
+        let mut scores = q
+            .cast(DType::F32)
+            .matmul(k.cast(DType::F32).swap_dims(2, 3))
+            .mul_scalar(scale);
         if let Some(m) = mask {
-            scores = scores.add(m.clone());
+            scores = scores.add(m.clone().cast(DType::F32));
         }
-        let probs = activation::softmax(scores, 3);
+        let probs = activation::softmax(scores, 3).cast(ambient);
         let ctx = probs.matmul(v).swap_dims(1, 2).reshape([b, t, nh * hd]);
         self.o_proj.forward(ctx)
     }

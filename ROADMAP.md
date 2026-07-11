@@ -44,7 +44,9 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       weights + GPU) passing at 110.4 ms / 11.8 tok/s.*
 - [ ] Decode is dispatch-bound, not bandwidth-bound: 75 ms/token streams ~6.2 GB of f32 weights at only
       ~83 GB/s vs the 4070 Ti SUPER's ~672 GB/s — the SPIR-V compiler feature (P6 item) and f16 are the
-      levers to chase; re-baseline after each.
+      levers to chase; re-baseline after each. *(2026-07-11) Confirmed empirically: f16 (half the weight
+      traffic) decodes at exactly f32's speed — 70.9 vs 70.7 ms/token — so bandwidth isn't the limiter;
+      SPIR-V (TensorCores at f16) is the remaining lever.*
 - [ ] Evaluate Burn 0.21's `burn.toml` project config — per-subsystem tuning + a CubeCL kernel-validation
       layer without recompiling; useful as a debug switch for kernel-level parity hunts —
       https://burn.dev/blog/release-0.21.0/
@@ -149,6 +151,11 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       sub-scales + fp16 d (210 B). Rust references: llama.cpp ggml-quants + the `rage-quant` crate
       (Q8_0/Q4_K/Q6_K dequant + SIMD dot) — https://haroldbenoit.com/notes/ml/llms/quantization/llama.cpp/k-quants-implementation ·
       https://crates.io/crates/rage-quant
+      *(2026-07-11 research)* `pmetal-gguf` 0.5 (May 2026, MIT/Apache-2.0, standalone — no candle/burn
+      deps) is the most complete Rust GGUF implementation yet: read/write + dequant for the K-quants
+      (Q2K–Q8K) AND IQ-quants, SIMD-optimized, importance-matrix support, HF-compatible config
+      generation — evaluate as dependency-or-reference before hand-porting ggml-quants —
+      https://docs.rs/pmetal-gguf/latest/pmetal_gguf/
 - [ ] **GPTQ / AWQ** (HF safetensors) — import the calibration-quantized int4/int8 layouts most "quantized on
       the Hub" models ship as (a `.safetensors` payload + a quant config), dequant or keep-quant into Burn.
 - [ ] **ONNX** (optional) — `burn-import` ONNX→Burn for models distributed as ONNX graphs.
@@ -218,17 +225,21 @@ that fits the model AND uses every device to the fullest.
 - [ ] **Device inventory** — enumerate every GPU (`wgpu` adapters: name, backend, VRAM) and the CPU (cores,
       RAM); a stable device set cached at startup, reported so the apps can show it in settings.
 - [ ] **Precision selection** — pick a per-device dtype (f32 / **f16** / int8 / int4) that fits: f16 via
-      `Wgpu<half::f16, i32>` (needs wgpu ≥ 27 `SHADER_F16` polyfill — *laurelane compiles it + a startup
-      `SHADER_F16` diagnostic; finish on-GPU validation here*: no naga crash, ~halved VRAM, coherent output);
-      drop to int8/int4 (P9) when f16 still won't fit. *(2026-07-10) On-GPU validation ran
-      (`tests/real_f16.rs`, the standing gate): **2 of 3 claims hold** — shaders compile + run on
-      Vulkan/SHADER_F16, VRAM drops 11.9 → 8.7 GiB whole-card (~7.9 → ~4.7 GiB runner), but logits
-      collapse to NaN (the GPU argmax returns the out-of-vocab sentinel 151936 = vocab_size; now caught
-      loudly by a decode guard). Coherent-output remains open below.*
-- [ ] **f16 mixed-precision islands** — Qwen2.5-1.5B in pure f16 NaNs out (overflow in the
+      `Wgpu<half::f16, i32>`; drop to int8/int4 (P9) when f16 still won't fit. *(2026-07-11) The f16
+      backend itself is now **fully validated** (all 3 claims — see the islands item below); what remains
+      here is the *picking* logic, which rides the placement-plan item + P9.*
+- [x] **f16 mixed-precision islands** — Qwen2.5-1.5B in pure f16 NaNs out (overflow in the
       softmax/RmsNorm/logit reductions; f16 max is 65 504). Keep weights + matmuls f16 but compute the
       numerically hot reductions (attention softmax, RmsNorm accumulation, final logits) in f32, then
-      re-run the f16 gate and the parity harness.
+      re-run the f16 gate and the parity harness. *(2026-07-11) **One island sufficed**: the q·kᵀ
+      attention scores overflow f16 — scores + mask + softmax now compute in f32 (per-tensor
+      `cast(DType::F32)`, Burn 0.21 multi-dtype; llama.cpp pins the same matmul to f32), probs return to
+      the ambient dtype; Burn's RmsNorm already reduces in f32 upstream, and the logit path needed
+      nothing. The f16 gate passes all 3 claims: no crash, **6.75 GiB whole-card / ~3.6 GiB runner**
+      (vs ~7.9 GiB f32), coherent greedy output ("2+2 equals 4."). Casts are no-ops on f32: the parity
+      gate re-passed both legs (max |Δlogit| 2.670e-5, unchanged; Ollama greedy byte-identical), and f32
+      perf *improved* (TTFT 100.5 → 88.4 ms, decode 13.3 → 14.1 tok/s). f16 benches recorded in
+      `bench/BASELINE.md`: 88.0 ms TTFT, 14.1 tok/s — speed parity with f32, VRAM halved.*
 - [ ] Evaluate burn-wgpu's **`spirv` compiler feature** on Vulkan (CubeCL SPIR-V backend instead of
       WGSL/naga): claims significantly faster matmul incl. TensorCores at f16 — could be the cheapest
       decode-tok/s lever on the dev GPU; gate on the parity harness + `bench/BASELINE.md` —
@@ -260,7 +271,11 @@ that fits the model AND uses every device to the fullest.
       `crates/mummu/tests/fixtures/`; fp16 Ollama tag pulled and validated.*
 - [ ] LFM2.5 same-weights reference for the parity gate: no Candle port exists — candidate routes are
       llama.cpp `logprobs` on the fp16 GGUF, or a one-shot HF `transformers` logits dump matched to the
-      safetensors revision.
+      safetensors revision. *(2026-07-11 research)* Liquid officially documents running LFM2.5-1.2B
+      GGUFs under `llama-server`; its completion API returns per-token top logprobs via `n_probs`
+      (temperature 0 for the greedy leg) — that plus an fp16 GGUF of the same revision is a workable
+      logits leg without Python — https://docs.liquid.ai/deployment/on-device/llama-cpp ·
+      https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md
 - [ ] Wire the perf suite (above) into the parity harness so a correctness *or* budget regression fails CI.
 
 ### P8 — Model management API

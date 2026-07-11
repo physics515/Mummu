@@ -1,6 +1,6 @@
 //! Real-model benchmarks: TTFT and decode tok/s for Qwen2.5-1.5B on the
-//! machine's default GPU. Budgets and the last recorded numbers live in
-//! `bench/BASELINE.md`. Run with
+//! machine's default GPU, in f32 and (where `SHADER_F16` exists) f16.
+//! Budgets and the last recorded numbers live in `bench/BASELINE.md`. Run with
 //!
 //! ```text
 //! MUMMU_QWEN2_DIR=path/to/qwen2.5-1.5b cargo bench -p mummu-bench
@@ -10,11 +10,12 @@
 //! so `cargo bench` stays green on machines without the multi-GB checkpoint.
 
 use std::hint::black_box;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use burn::tensor::backend::Backend;
 use criterion::{Criterion, criterion_group, criterion_main};
-use mummu::backend::Gpu;
+use mummu::backend::{Gpu, GpuF16, inventory};
 use mummu::decode::argmax_id;
 use mummu::models::CausalLm;
 use mummu::models::qwen2::{self, LoadedQwen2};
@@ -30,7 +31,7 @@ fn qwen2_dir() -> Option<PathBuf> {
 }
 
 /// The benchmark prompt — fixed so numbers are comparable across runs.
-fn prompt_ids(dir: &std::path::Path) -> Vec<u32> {
+fn prompt_ids(dir: &Path) -> Vec<u32> {
     let text = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nExplain, in three sentences, why the sky is blue.<|im_end|>\n<|im_start|>assistant\n";
     let tok = Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer.json loads");
     let ids = tok.encode(text, false).expect("encodes").get_ids().to_vec();
@@ -44,19 +45,19 @@ fn bench_harness_smoke(c: &mut Criterion) {
     });
 }
 
-fn bench_qwen2_real(c: &mut Criterion) {
-    let Some(dir) = qwen2_dir() else {
-        eprintln!("[mummu-bench] MUMMU_QWEN2_DIR not set — skipping real-model benches");
-        return;
-    };
-    let device = burn::tensor::Device::<Gpu>::default();
-    let loaded: LoadedQwen2<Gpu> =
-        qwen2::load_from_dir(&dir, &device).expect("weights load checked");
-    let ids = prompt_ids(&dir);
+/// TTFT + decode for one backend; the model drops (and its VRAM frees) when
+/// this returns, so backends bench sequentially without stacking checkpoints.
+fn bench_qwen2_on<B: Backend>(c: &mut Criterion, dir: &Path, group_name: &str)
+where
+    B::Device: Default,
+{
+    let device = B::Device::default();
+    let loaded: LoadedQwen2<B> = qwen2::load_from_dir(dir, &device).expect("weights load checked");
+    let ids = prompt_ids(dir);
 
     // TTFT: fresh cache, full prefill, first token argmax (the id readback is
     // the GPU sync point, so the measured span covers real work end-to-end).
-    let mut group = c.benchmark_group("qwen2.5-1.5b/gpu");
+    let mut group = c.benchmark_group(group_name);
     group.sample_size(10);
     group.bench_function("ttft_prefill_first_token", |b| {
         b.iter(|| {
@@ -87,6 +88,19 @@ fn bench_qwen2_real(c: &mut Criterion) {
         });
     });
     group.finish();
+}
+
+fn bench_qwen2_real(c: &mut Criterion) {
+    let Some(dir) = qwen2_dir() else {
+        eprintln!("[mummu-bench] MUMMU_QWEN2_DIR not set — skipping real-model benches");
+        return;
+    };
+    bench_qwen2_on::<Gpu>(c, &dir, "qwen2.5-1.5b/gpu");
+    if inventory().any_shader_f16() {
+        bench_qwen2_on::<GpuF16>(c, &dir, "qwen2.5-1.5b/gpu-f16");
+    } else {
+        eprintln!("[mummu-bench] no SHADER_F16 adapter — skipping the f16 benches");
+    }
 }
 
 criterion_group!(benches, bench_harness_smoke, bench_qwen2_real);

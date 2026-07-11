@@ -11,7 +11,7 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
 - **One binary, every device** — compile both `Wgpu` (Vulkan/DX12/Metal, no CUDA toolchain) and `burn-flex` (CPU); a runtime probe enumerates **all** adapters + the CPU and places the model across them — a single GPU, **several GPUs together**, or GPU + CPU hybrid. No feature-split builds, no per-vendor path.
 - **Models from scratch, generic over `B: Backend`** — a growing zoo (Qwen2/2.5, LFM2/2.5 hybrid conv+attention, all-MiniLM embedder) built on shared blocks (RmsNorm · GQA · RoPE · SwiGLU · tied lm-head · depthwise causal conv), with a clean trait to add more.
 - **Trustworthy reimplementations** — every port must pass a **parity gate**: single-forward top-k logits *and* a short greedy sequence match a reference (Candle, or a local Ollama of the same model) exactly.
-- **Fast** — per-layer KV cache (+ conv-state cache for hybrids), on-GPU argmax (sync only the winning index), sampling, **token streaming**, cooperative cancellation; kernel `fusion` + `autotune`; an opt-in **f16** path to roughly halve VRAM.
+- **Fast** — per-layer KV cache (+ conv-state cache for hybrids), on-GPU argmax (sync only the winning index), sampling, **token streaming**, cooperative cancellation; kernel `fusion` + `autotune`; an **f16** path (f32 attention-score island for numeric safety) that halves VRAM at full speed.
 - **A full model-import suite** — pull a model from HuggingFace (by repo id) or from disk and load it: **safetensors**, **PyTorch** state dicts, and **GGUF** (llama.cpp, dequantized) weights; `config.json`-driven hyperparameters; tokenizer + chat-template import (HF `tokenizers` / SentencePiece / BPE); per-architecture weight-name remapping with a **checked load** (fail loudly on a key mismatch, never silently zero-init); resumable, shard-aware downloads into a per-user cache; and a declarative **model registry** so adding a model is a manifest entry, not new code.
 - **Quantize to fit, fill the hardware** — a planner probes every GPU + the CPU (VRAM / RAM), then imports or **quantizes on the fly** (GGUF K-quants, GPTQ / AWQ, or Burn's own int8/int4) and chooses precision + **layer placement** so the *largest model that fits* runs and every device is used — sharded across GPUs, spilling cold layers to CPU when needed. Plus a model-management API (download progress, disk usage, remove) apps surface in their settings UI.
 - **Local embeddings** — a from-scratch MiniLM-class sentence embedder (CPU) for fully-offline semantic search.
@@ -38,9 +38,14 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
 - **Sampling, streaming, cancellation** — temperature / top-k / top-p sampling (deterministic per seed),
   per-token streaming through a `ControlFlow` callback, and cooperative between-token cancellation;
   greedy decoding keeps the argmax on-device.
-- **Benchmarked** — Qwen2.5-1.5B f32 on the reference GPU: **TTFT 100.5 ms, decode 13.3 tok/s, 11.9 GiB
-  whole-card peak** (~7.9 GiB runner) — recorded with budgets in [bench/BASELINE.md](bench/BASELINE.md),
-  enforced by an opt-in regression gate (`mummu-bench/tests/budget.rs`).
+- **f16 inference, validated** — Qwen2.5-1.5B runs coherently on `GpuF16` (weights + KV in f16, the
+  q·kᵀ attention scores + softmax computed in an f32 island to stop f16 overflow): **~3.6 GiB runner
+  VRAM vs ~7.9 GiB f32, at identical speed** (14.1 tok/s / 88 ms TTFT); the parity gate re-passes
+  unchanged on f32, where the island casts are no-ops ([bench/BASELINE.md](bench/BASELINE.md)).
+- **Benchmarked** — Qwen2.5-1.5B on the reference GPU: **TTFT 88.4 ms, decode 14.1 tok/s** (f32, 11.9 GiB
+  whole-card peak ≈ 7.9 GiB runner; f16: 88.0 ms, 14.1 tok/s, 6.75 GiB ≈ 3.6 GiB runner) — recorded with
+  budgets in [bench/BASELINE.md](bench/BASELINE.md), enforced by an opt-in regression gate
+  (`mummu-bench/tests/budget.rs`).
 - **Model management** — `ModelManager` gives settings UIs the whole lifecycle over a declarative model
   catalog (`registry::ModelSpec`): install with per-chunk download progress, `is_installed`, per-model
   disk usage, and traversal-safe removal; model switching rides `ModelSlot`.
