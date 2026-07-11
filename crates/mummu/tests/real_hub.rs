@@ -114,6 +114,70 @@ fn hub_resume_completes_a_partial_download_byte_identical() {
     );
 }
 
+#[test]
+#[ignore = "needs network (MUMMU_HUB_DEST names the download dir)"]
+fn hub_sha256_verification_catches_and_heals_a_corrupt_cache() {
+    let Some(dest) = std::env::var_os("MUMMU_HUB_DEST").map(PathBuf::from) else {
+        panic!("set MUMMU_HUB_DEST to a scratch dir for the ~90 MB download");
+    };
+    let dir = dest.join("verify-proof");
+    let url = hub::hub_file_url(REPO, "main", "model.safetensors");
+    let weights = dir.join("model.safetensors");
+    let verify = hub::FetchOptions {
+        verify_cached: true,
+    };
+
+    // Fresh (or cached) download; the stream itself hash-verifies against the
+    // Hub's X-Linked-ETag, so success here is already an integrity proof.
+    hub::fetch_file(&url, &weights, |_| {}).expect("verified fetch");
+    let healthy_len = weights.metadata().expect("weights exist").len();
+
+    // A clean cache re-verifies without being touched.
+    let modified_before = weights.metadata().unwrap().modified().unwrap();
+    hub::fetch_file_with(&url, &weights, verify, |_| {}).expect("clean cache re-verifies");
+    assert_eq!(
+        weights.metadata().unwrap().modified().unwrap(),
+        modified_before,
+        "a matching cached file must not be rewritten"
+    );
+
+    // Corrupt one byte mid-file (length unchanged — only the hash can see it),
+    // then watch verify_cached self-heal by re-downloading.
+    let mut bytes = std::fs::read(&weights).expect("read weights");
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0xFF;
+    std::fs::write(&weights, &bytes).expect("plant corruption");
+    let mut streamed = 0u64;
+    hub::fetch_file_with(&url, &weights, verify, |p| streamed = p.received_bytes)
+        .expect("corrupt cache heals");
+    assert_eq!(
+        weights.metadata().unwrap().len(),
+        healthy_len,
+        "healed file has the healthy length"
+    );
+    assert_eq!(
+        streamed, healthy_len,
+        "healing must have re-streamed the whole file"
+    );
+    eprintln!(
+        "[real_hub] sha256 gate: clean cache untouched; flipped byte at {mid} was caught and healed ({streamed} bytes re-streamed)"
+    );
+
+    // Resumed LFS download: the .part prefix must fold into the stream hash
+    // (a 206 + hash_part_prefix pass over a real X-Linked-ETag file).
+    let healthy = std::fs::read(&weights).expect("healthy bytes");
+    std::fs::remove_file(&weights).expect("drop completed file");
+    let half = healthy.len() / 2;
+    std::fs::write(dir.join("model.safetensors.part"), &healthy[..half]).expect("seed part");
+    hub::fetch_file(&url, &weights, |_| {}).expect("resumed fetch hash-verifies");
+    assert_eq!(
+        weights.metadata().unwrap().len(),
+        healthy_len,
+        "resumed file has the healthy length"
+    );
+    eprintln!("[real_hub] sha256 gate: resume from {half} bytes re-verified the whole file");
+}
+
 /// One-shot helper the nightly uses to pull the CPU-tier Qwen into a cache
 /// dir (also a second real proof of the sharded/single-file fetch path on a
 /// 1 GB checkpoint).

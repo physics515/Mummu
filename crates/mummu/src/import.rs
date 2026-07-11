@@ -1,15 +1,17 @@
-//! Weight import: safetensors → Burn modules, checked and loud.
+//! Weight import: checkpoint files → Burn modules, checked and loud.
 //!
 //! The pieces every model load shares (P3): a dtype-cast adapter (HF ships
-//! bf16, which wgpu can't ingest directly), and a checked-load wrapper that
-//! **fails on missing or errored params** instead of silently zero-initing —
-//! a partial load is a quietly broken model.
+//! bf16, which wgpu can't ingest directly), a weights-file picker
+//! (**safetensors** preferred, the PyTorch state dict `pytorch_model.bin` as
+//! the fallback for models never re-shipped as safetensors), and a
+//! checked-load wrapper that **fails on missing or errored params** instead
+//! of silently zero-initing — a partial load is a quietly broken model.
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use burn::module::Module;
-use burn::store::{ModuleAdapter, ModuleSnapshot, SafetensorsStore, TensorSnapshot};
+use burn::store::{ModuleAdapter, ModuleSnapshot, ModuleStore, TensorSnapshot};
 use burn::tensor::DType;
 
 /// Everything that can go wrong turning files on disk into a loaded model.
@@ -80,15 +82,21 @@ impl ModuleAdapter for CastFloatAdapter {
     }
 }
 
-/// Load `store` into `module`, refusing partial results: any missing param or
-/// per-tensor error is an [`ImportError::Incomplete`] carrying the store's own
-/// readable report. Unused checkpoint tensors are *allowed* (e.g. BERT's
+/// Load `store` (any format: safetensors, PyTorch state dict, …) into
+/// `module`, refusing partial results: any missing param or per-tensor error
+/// is an [`ImportError::Incomplete`] carrying the store's own readable
+/// report. Unused checkpoint tensors are *allowed* (e.g. BERT's
 /// intentionally-skipped `pooler.*`) — callers that care inspect the report.
-pub fn load_checked<M: Module<B> + ModuleSnapshot<B>, B: burn::tensor::backend::Backend>(
+pub fn load_checked<M, B, S>(
     module: &mut M,
-    store: &mut SafetensorsStore,
+    store: &mut S,
     weights_path: &Path,
-) -> Result<(), ImportError> {
+) -> Result<(), ImportError>
+where
+    M: Module<B> + ModuleSnapshot<B>,
+    B: burn::tensor::backend::Backend,
+    S: ModuleStore,
+{
     let report = module.load_from(store).map_err(|e| ImportError::Load {
         file: weights_path.to_path_buf(),
         reason: e.to_string(),
@@ -120,6 +128,30 @@ pub fn required_file(dir: &Path, file: &str) -> Result<PathBuf, ImportError> {
     }
 }
 
+/// The weights checkpoint found in a model dir.
+#[derive(Debug, Clone)]
+pub enum WeightsFile {
+    /// `model.safetensors` — the primary format.
+    Safetensors(PathBuf),
+    /// `pytorch_model.bin` — the PyTorch state dict older checkpoints ship.
+    PytorchBin(PathBuf),
+}
+
+/// Pick the weights file in `dir`: `model.safetensors` when present, else
+/// `pytorch_model.bin`. Reports the *safetensors* name when neither exists
+/// (it's the file a fresh download would produce).
+pub fn weights_file(dir: &Path) -> Result<WeightsFile, ImportError> {
+    let safetensors = dir.join("model.safetensors");
+    if safetensors.is_file() {
+        return Ok(WeightsFile::Safetensors(safetensors));
+    }
+    let bin = dir.join("pytorch_model.bin");
+    if bin.is_file() {
+        return Ok(WeightsFile::PytorchBin(bin));
+    }
+    Err(ImportError::MissingFile(safetensors))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,5 +171,26 @@ mod tests {
     #[should_panic(expected = "float dtype")]
     fn cast_adapter_rejects_non_float_target() {
         let _ = CastFloatAdapter::new(DType::I32);
+    }
+
+    #[test]
+    fn weights_file_prefers_safetensors_falls_back_to_pytorch() {
+        let dir = std::env::temp_dir().join("mummu_weights_file_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Neither present: missing, reported by the safetensors name.
+        assert!(matches!(
+            weights_file(&dir),
+            Err(ImportError::MissingFile(p)) if p.ends_with("model.safetensors")
+        ));
+        // Only the state dict: the PyTorch path.
+        std::fs::write(dir.join("pytorch_model.bin"), b"pt").unwrap();
+        assert!(matches!(weights_file(&dir), Ok(WeightsFile::PytorchBin(_))));
+        // Both: safetensors wins.
+        std::fs::write(dir.join("model.safetensors"), b"st").unwrap();
+        assert!(matches!(
+            weights_file(&dir),
+            Ok(WeightsFile::Safetensors(_))
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

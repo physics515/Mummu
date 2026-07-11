@@ -16,5 +16,12 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 ureq = { workspace = true }
+sha2 = { workspace = true }
 once_cell = { workspace = true }
 burn-flex = { workspace = true }
+burn-store = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# One syscall (GlobalMemoryStatusEx) for the device inventory's total-RAM
+# figure; the narrow feature keeps the compile cost near zero.
+windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
