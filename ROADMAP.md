@@ -188,11 +188,19 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       (`qwen2` plain, `lfm2` with `<|startoftext|>` BOS); byte-verified — the Qwen2 parity gate now
       renders its prompt through the template and still matches the Candle fixture and the Ollama fp16
       greedy leg exactly. EOS stays config-driven (`EosIds`); tool-use templates are the next item.*
-- [ ] Hermes-style tool-use chat template (Qwen3 ships it in `tokenizer_config.json`) + LFM2.5's
-      bracket-notation tool-call output — the two top scorers (0.880 agent score; LFM2.5-1.2B also the
-      fastest at ~1.5 s) on 2026's 21-model local tool-calling benchmark; function calling is why the
-      apps want a local runner — https://mikeveerman.be/blog/github-2026-02-06-tool-calling-benchmark/ ·
+- [x] Hermes-style tool-use chat template (the format Qwen2.5/Qwen3 ship in `tokenizer_config.json`) —
+      function calling is why the apps want a local runner —
       https://qwen.readthedocs.io/en/latest/framework/function_call.html
+      *(2026-07-11) `chat`: `ToolSpec` → `render_with_tools` (byte-matches the Qwen template's `# Tools`
+      /`<tools>`/`<tool_call>` wording), `Turn::{assistant_tool_calls, tool_response}` (consecutive tool
+      results merge into one user turn, per the template), and a bounded `parse_tool_calls` extractor
+      (calls + prose, loud error taxonomy). REAL-GPU proof (`tests/real_toolcall.rs`): Qwen2.5-1.5B
+      greedy-emitted `<tool_call>{"name": "get_weather", "arguments": {"city": "Paris"}}</tool_call>`
+      from a rendered prompt and the parser round-tripped it. 10 new unit tests.*
+- [ ] LFM2.5 bracket-notation tool-call template + parser (`<|tool_list_start|>` special tokens,
+      Python-ish call syntax) — with Hermes/Qwen2.5 (0.880 agent score) done, LFM2.5-1.2B (same score,
+      fastest at ~1.5 s on 2026's 21-model local tool-calling benchmark) is the other target —
+      https://mikeveerman.be/blog/github-2026-02-06-tool-calling-benchmark/
       *(2026-07-10 research)* 2026 community numbers back the plan: Qwen3-8B keeps tool-calling score
       through Q4_K_M (0.919 quantized vs 0.933 full — quant does NOT cost tool reliability, good news for
       P9); BFCL shows a capability cliff below ~7B (Qwen3.5-9B 66.1% vs 4B 50.3%), so the zoo's

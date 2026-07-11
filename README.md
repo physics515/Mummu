@@ -38,6 +38,11 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
 - **Sampling, streaming, cancellation** — temperature / top-k / top-p sampling (deterministic per seed),
   per-token streaming through a `ControlFlow` callback, and cooperative between-token cancellation;
   greedy decoding keeps the argmax on-device.
+- **Function calling (Hermes-style)** — advertise `ToolSpec`s through `render_with_tools` (the exact
+  `# Tools`/`<tool_call>` template Qwen2.5/Qwen3 are trained on), feed results back as merged
+  `<tool_response>` turns, and extract calls with a bounded `parse_tool_calls`; proven end-to-end on
+  the real GPU (Qwen2.5-1.5B emitted a parseable `get_weather({"city": "Paris"})` call,
+  `tests/real_toolcall.rs`).
 - **f16 inference, validated** — Qwen2.5-1.5B runs coherently on `GpuF16` (weights + KV in f16, the
   q·kᵀ attention scores + softmax computed in an f32 island to stop f16 overflow): **~3.6 GiB runner
   VRAM vs ~7.9 GiB f32, at identical speed** (14.1 tok/s / 88 ms TTFT); the parity gate re-passes
