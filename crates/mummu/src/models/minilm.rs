@@ -15,10 +15,12 @@ use std::path::Path;
 
 use burn::module::Module;
 use burn::nn::{Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear, LinearConfig};
-use burn::store::{ModuleAdapter, PyTorchToBurnAdapter, SafetensorsStore};
+use burn::store::{ModuleAdapter, PyTorchToBurnAdapter, PytorchStore, SafetensorsStore};
 use burn::tensor::{Int, Tensor, TensorData, activation, backend::Backend};
 
-use crate::import::{CastFloatAdapter, ImportError, load_checked, required_file};
+use crate::import::{
+    CastFloatAdapter, ImportError, WeightsFile, load_checked, required_file, weights_file,
+};
 
 /// BERT hyperparameters, read from the checkpoint's `config.json`.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -117,17 +119,49 @@ fn build<B: Backend>(cfg: &BertConfig, device: &B::Device) -> Bert<B> {
     }
 }
 
-/// Build from `dir/config.json` and load `dir/model.safetensors`, checked.
+/// HF BERT checkpoint names → our field paths, shared by every weight format.
+const KEY_REMAPS: &[(&str, &str)] = &[
+    (r"^bert\.", ""), // some checkpoints prefix `bert.`
+    (r"^embeddings\.LayerNorm\.", "embeddings.layer_norm."),
+    (
+        r"^encoder\.layer\.(\d+)\.attention\.self\.(query|key|value)\.",
+        "layers.$1.$2.",
+    ),
+    (
+        r"^encoder\.layer\.(\d+)\.attention\.output\.dense\.",
+        "layers.$1.attn_output.",
+    ),
+    (
+        r"^encoder\.layer\.(\d+)\.attention\.output\.LayerNorm\.",
+        "layers.$1.attn_layer_norm.",
+    ),
+    (
+        r"^encoder\.layer\.(\d+)\.intermediate\.dense\.",
+        "layers.$1.intermediate.",
+    ),
+    (
+        r"^encoder\.layer\.(\d+)\.output\.dense\.",
+        "layers.$1.output.",
+    ),
+    (
+        r"^encoder\.layer\.(\d+)\.output\.LayerNorm\.",
+        "layers.$1.output_layer_norm.",
+    ),
+];
+
+/// Build from `dir/config.json` and load the checkpoint, checked —
+/// `model.safetensors` preferred, `pytorch_model.bin` (the state dict this
+/// model family originally shipped) as the fallback.
 /// NOTE: LayerNorm keys keep their `.weight`/`.bias` suffixes — the
 /// `PyTorchToBurnAdapter` renames those to `gamma`/`beta` itself (unlike
 /// RmsNorm in the decoder models, where the rename is manual — the asymmetry
-/// is intentional). `pooler.*` stays unused (masked-mean pooling instead).
+/// is intentional; `PytorchStore` applies that adapter internally).
+/// `pooler.*` stays unused (masked-mean pooling instead).
 pub fn load_from_dir<B: Backend>(
     dir: &Path,
     device: &B::Device,
 ) -> Result<LoadedMiniLm<B>, ImportError> {
     let cfg_path = required_file(dir, "config.json")?;
-    let weights = required_file(dir, "model.safetensors")?;
     let cfg_bytes = std::fs::read(&cfg_path).map_err(|e| ImportError::Parse {
         file: cfg_path.clone(),
         reason: e.to_string(),
@@ -139,36 +173,27 @@ pub fn load_from_dir<B: Backend>(
 
     let mut model = build::<B>(&config, device);
     let target_float = Tensor::<B, 1>::zeros([1], device).dtype();
-    let mut store = SafetensorsStore::from_file(weights.clone())
-        .with_from_adapter(PyTorchToBurnAdapter.chain(CastFloatAdapter::new(target_float)))
-        .allow_partial(true)
-        .with_key_remapping(r"^bert\.", "") // some checkpoints prefix `bert.`
-        .with_key_remapping(r"^embeddings\.LayerNorm\.", "embeddings.layer_norm.")
-        .with_key_remapping(
-            r"^encoder\.layer\.(\d+)\.attention\.self\.(query|key|value)\.",
-            "layers.$1.$2.",
-        )
-        .with_key_remapping(
-            r"^encoder\.layer\.(\d+)\.attention\.output\.dense\.",
-            "layers.$1.attn_output.",
-        )
-        .with_key_remapping(
-            r"^encoder\.layer\.(\d+)\.attention\.output\.LayerNorm\.",
-            "layers.$1.attn_layer_norm.",
-        )
-        .with_key_remapping(
-            r"^encoder\.layer\.(\d+)\.intermediate\.dense\.",
-            "layers.$1.intermediate.",
-        )
-        .with_key_remapping(
-            r"^encoder\.layer\.(\d+)\.output\.dense\.",
-            "layers.$1.output.",
-        )
-        .with_key_remapping(
-            r"^encoder\.layer\.(\d+)\.output\.LayerNorm\.",
-            "layers.$1.output_layer_norm.",
-        );
-    load_checked(&mut model, &mut store, &weights)?;
+    match weights_file(dir)? {
+        WeightsFile::Safetensors(weights) => {
+            let mut store = SafetensorsStore::from_file(weights.clone())
+                .with_from_adapter(PyTorchToBurnAdapter.chain(CastFloatAdapter::new(target_float)))
+                .allow_partial(true);
+            for (pattern, replacement) in KEY_REMAPS {
+                store = store.with_key_remapping(*pattern, *replacement);
+            }
+            load_checked(&mut model, &mut store, &weights)?;
+        }
+        WeightsFile::PytorchBin(weights) => {
+            // No cast adapter on this path (PytorchStore has no adapter
+            // chaining) — .bin-era checkpoints are f32, which every backend
+            // ingests directly.
+            let mut store = PytorchStore::from_file(weights.clone()).allow_partial(true);
+            for (pattern, replacement) in KEY_REMAPS {
+                store = store.with_key_remapping(*pattern, *replacement);
+            }
+            load_checked(&mut model, &mut store, &weights)?;
+        }
+    }
     Ok(LoadedMiniLm { model, config })
 }
 

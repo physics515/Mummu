@@ -26,6 +26,14 @@ burn = { version = "0.21", default-features = false, features = [
 # gate passed on it bit-for-bit-equivalent (cosine 0.99999994, max component
 # diff 1.3e-7) with all 80 unit tests green.
 burn-flex = "0.21"
+# Direct handle on burn-store (the same crate burn's `store` feature pulls) to
+# turn on its `pytorch` feature: .pth / pytorch_model.bin state-dict loading
+# for models never re-shipped as safetensors (feature-unified, no duplicate).
+burn-store = { version = "0.21", default-features = false, features = [
+	"std",
+	"safetensors",
+	"pytorch",
+] }
 
 # Direct handle on wgpu (the same version Burn resolves) for the cheap startup
 # adapter probe: enumerate GPUs to decide GPU vs CPU before building a backend.

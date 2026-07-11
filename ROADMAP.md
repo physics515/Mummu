@@ -142,7 +142,16 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
 - [x] **safetensors** *(ex-laurelane)* — `burn-store` `SafetensorsStore` + `PyTorchToBurnAdapter`; the primary path.
       *(2026-07-09) `import::{CastFloatAdapter, load_checked}`: bf16→backend-float cast + fail-loud load;
       proven by loading the real 3.1 GB Qwen2.5-1.5B and 2.3 GB LFM2.5 checkpoints with zero missing keys.*
-- [ ] **PyTorch state dicts** (`.pth` / `pytorch_model*.bin`) — for models not shipped as safetensors.
+- [x] **PyTorch state dicts** (`.pth` / `pytorch_model*.bin`) — for models not shipped as safetensors.
+      *(2026-07-11)* `burn-store`'s `PytorchStore` wired through the shared checked-load path:
+      `import::weights_file` picks `model.safetensors` first, falls back to `pytorch_model.bin`;
+      `load_checked` is now generic over any `ModuleStore`; MiniLM loads either format through one
+      remap table. REAL-WEIGHTS proof (`tests/real_pytorch.rs`): the Hub's actual MiniLM
+      `pytorch_model.bin` embeds **byte-identically** (max |Δ| = 0) to the safetensors copy of the same
+      weights. Remaining follow-ups: sharded `.bin` indexes, a bf16-cast on this path (PytorchStore has
+      no adapter chaining; `.bin`-era checkpoints are f32), decoder loaders adopt `weights_file` when a
+      real `.pth` decoder checkpoint exists to verify against, and `hub::fetch_model` learning the
+      `pytorch_model.bin` fallback.
 - [ ] **GGUF** (llama.cpp) — parse the GGUF container (metadata KV + tensor table), map tensors to modules,
       and **dequantize** Q4/Q5/Q8/K-quant blocks into Burn tensors (or hand keep-quantized to P9). GGUF is how
       most small models are distributed — this makes the whole ecosystem importable. *(2026-07-10 research)*

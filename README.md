@@ -24,8 +24,10 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
 - **Shared blocks, generic over `B: Backend`** — cache-aware GQA attention (optional per-head q/k
   RMSNorm), manual RoPE, SwiGLU, and LFM2's double-gated causal short-conv with rolling decode state;
   unit tests prove prefill+decode ≡ full-forward for both cache kinds.
-- **Checked safetensors import** — bf16→backend-float cast adapter, per-architecture key remaps, and a
-  fail-loud load (never silently zero-init); `config.json`-driven hyperparameters.
+- **Checked safetensors + PyTorch import** — bf16→backend-float cast adapter, per-architecture key
+  remaps, and a fail-loud load (never silently zero-init); `config.json`-driven hyperparameters.
+  `pytorch_model.bin` state dicts load through the same checked path (safetensors preferred when both
+  exist) — proven byte-identical on MiniLM's real Hub checkpoint in both formats.
 - **Three models ported and running on real weights** — Qwen2/2.5, the LFM2/2.5 hybrid, and the
   all-MiniLM sentence embedder; Qwen2.5-1.5B and LFM2.5-1.2B load and greedy-decode correctly on the
   reference GPU (wgpu/Vulkan).
