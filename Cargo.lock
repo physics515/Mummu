@@ -3556,6 +3556,7 @@ dependencies = [
  "tokenizers",
  "ureq 3.3.0",
  "wgpu",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

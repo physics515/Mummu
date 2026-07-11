@@ -241,6 +241,12 @@ The "use all the hardware" phase — inventory the machine, then pick the precis
 that fits the model AND uses every device to the fullest.
 - [ ] **Device inventory** — enumerate every GPU (`wgpu` adapters: name, backend, VRAM) and the CPU (cores,
       RAM); a stable device set cached at startup, reported so the apps can show it in settings.
+      *(2026-07-11)* Everything but true VRAM shipped: `DeviceInventory` now carries per-adapter
+      `max_buffer_bytes` (the planner's hard per-tensor bound; dev box: 4 GiB Vulkan / 2 GiB DX12) and
+      `CpuInfo` (logical cores + total RAM — `GlobalMemoryStatusEx` on Windows, `/proc/meminfo` on
+      Linux; dev box: 32 cores / 127 GiB). Remaining: per-adapter VRAM capacity, which wgpu does not
+      expose portably — needs per-API `wgpu-hal` queries (Vulkan memory heaps / DXGI) — and a macOS RAM
+      sysctl.
 - [ ] **Precision selection** — pick a per-device dtype (f32 / **f16** / int8 / int4) that fits: f16 via
       `Wgpu<half::f16, i32>`; drop to int8/int4 (P9) when f16 still won't fit. *(2026-07-11) The f16
       backend itself is now **fully validated** (all 3 claims — see the islands item below); what remains

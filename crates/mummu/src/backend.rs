@@ -37,15 +37,42 @@ pub struct GpuAdapter {
     pub device_type: wgpu::DeviceType,
     /// Does this adapter advertise `SHADER_F16` (native f16 shader arithmetic)?
     pub shader_f16: bool,
+    /// Largest single buffer this adapter permits — a hard bound the placement
+    /// planner respects per tensor/shard. (True VRAM capacity is NOT exposed
+    /// portably by wgpu; querying it per-API via wgpu-hal is a P6 follow-up.)
+    pub max_buffer_bytes: u64,
 }
 
-/// Every hardware GPU visible to wgpu, enumerated once per process.
+/// The host CPU as a compute device (the `burn-flex` target and the P6
+/// offload pool).
+#[derive(Debug, Clone)]
+pub struct CpuInfo {
+    /// Logical cores (SMT threads) available to this process; at least 1.
+    pub logical_cores: usize,
+    /// Total physical RAM; `None` where no query is implemented yet (macOS).
+    pub total_ram_bytes: Option<u64>,
+}
+
+impl Default for CpuInfo {
+    fn default() -> Self {
+        Self {
+            logical_cores: 1,
+            total_ram_bytes: None,
+        }
+    }
+}
+
+/// Every hardware GPU visible to wgpu plus the host CPU, enumerated once per
+/// process — the device set the P6 hardware planner (and app settings UIs)
+/// read.
 #[derive(Debug, Clone, Default)]
 pub struct DeviceInventory {
     /// Hardware adapters across the primary graphics APIs. The same physical
     /// card appears once per API that exposes it (e.g. Vulkan AND DX12) —
     /// deliberate, because features like `SHADER_F16` differ per API.
     pub gpus: Vec<GpuAdapter>,
+    /// The host CPU (cores + RAM).
+    pub cpu: CpuInfo,
 }
 
 impl DeviceInventory {
@@ -78,9 +105,71 @@ fn enumerate(instance: &wgpu::Instance, backends: wgpu::Backends) -> Vec<GpuAdap
                 backend: info.backend,
                 device_type: info.device_type,
                 shader_f16,
+                max_buffer_bytes: adapter.limits().max_buffer_size,
             })
         })
         .collect()
+}
+
+/// Total physical RAM, per platform. Kept syscall-thin — this runs once, at
+/// inventory time.
+#[cfg(windows)]
+fn total_ram_bytes() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut status = MEMORYSTATUSEX {
+        dwLength: core::mem::size_of::<MEMORYSTATUSEX>() as u32,
+        dwMemoryLoad: 0,
+        ullTotalPhys: 0,
+        ullAvailPhys: 0,
+        ullTotalPageFile: 0,
+        ullAvailPageFile: 0,
+        ullTotalVirtual: 0,
+        ullAvailVirtual: 0,
+        ullAvailExtendedVirtual: 0,
+    };
+    // SAFETY: `status` is a live, writable MEMORYSTATUSEX with dwLength set,
+    // exactly what the API contract requires.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+    (ok != 0).then_some(status.ullTotalPhys)
+}
+
+#[cfg(target_os = "linux")]
+fn total_ram_bytes() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kib: u64 = meminfo
+        .lines()
+        .find(|l| l.starts_with("MemTotal:"))?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
+    Some(kib * 1024)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn total_ram_bytes() -> Option<u64> {
+    None // macOS et al.: a sysctl query is a P6 follow-up
+}
+
+/// The host CPU: logical cores + total RAM.
+fn cpu_info() -> CpuInfo {
+    let logical_cores = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+    let total_ram_bytes = total_ram_bytes();
+    assert!(
+        logical_cores >= 1,
+        "a running process has at least one core"
+    );
+    // Negative space: an answer below 64 MiB is a parse/API bug, not a machine.
+    debug_assert!(
+        total_ram_bytes.is_none_or(|b| b >= 64 << 20),
+        "implausible total RAM: {total_ram_bytes:?}"
+    );
+    CpuInfo {
+        logical_cores,
+        total_ram_bytes,
+    }
 }
 
 /// The process-lifetime device inventory. Enumerated once (first call pays
@@ -90,7 +179,10 @@ pub fn inventory() -> &'static DeviceInventory {
     INVENTORY.get_or_init(|| {
         let instance = wgpu::Instance::default();
         let gpus = enumerate(&instance, wgpu::Backends::PRIMARY);
-        let inv = DeviceInventory { gpus };
+        let inv = DeviceInventory {
+            gpus,
+            cpu: cpu_info(),
+        };
         // Positive space: every inventoried adapter is real hardware.
         debug_assert!(
             inv.gpus
@@ -164,15 +256,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cpu_inventory_reports_cores_and_plausible_ram() {
+        let cpu = &inventory().cpu;
+        assert!(cpu.logical_cores >= 1);
+        // Windows and Linux have a RAM query; its answer must be a real
+        // machine's (1 GiB ..= 64 TiB), not a unit slip.
+        if cfg!(any(windows, target_os = "linux")) {
+            let ram = cpu.total_ram_bytes.expect("RAM query exists here");
+            assert!((1 << 30..=1u64 << 46).contains(&ram), "implausible: {ram}");
+        }
+    }
+
+    #[test]
+    fn adapters_report_a_usable_buffer_bound() {
+        // Every real adapter permits at least the WebGPU floor (256 MiB);
+        // a smaller answer means the limits plumbing broke.
+        for gpu in &inventory().gpus {
+            assert!(
+                gpu.max_buffer_bytes >= 256 << 20,
+                "{}: max_buffer_bytes {} below the WebGPU floor",
+                gpu.name,
+                gpu.max_buffer_bytes
+            );
+        }
+    }
+
     /// Print the inventory so the nightly log records what this machine has.
     #[test]
     fn report_inventory() {
         for gpu in &inventory().gpus {
             eprintln!(
-                "[mummu] {:?} / {} ({:?}): SHADER_F16 = {}",
-                gpu.backend, gpu.name, gpu.device_type, gpu.shader_f16
+                "[mummu] {:?} / {} ({:?}): SHADER_F16 = {}, max buffer {:.1} GiB",
+                gpu.backend,
+                gpu.name,
+                gpu.device_type,
+                gpu.shader_f16,
+                gpu.max_buffer_bytes as f64 / f64::from(1u32 << 30),
             );
         }
+        let cpu = &inventory().cpu;
+        eprintln!(
+            "[mummu] CPU: {} logical cores, RAM {:?} GiB",
+            cpu.logical_cores,
+            cpu.total_ram_bytes.map(|b| b >> 30),
+        );
         eprintln!("[mummu] policy: {}", device_label());
     }
 }
