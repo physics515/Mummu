@@ -129,8 +129,14 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       proof: all-MiniLM (90.8 MB) downloaded → checked-load → unit-norm embedding; a half-seeded `.part`
       resumed at byte 249,507/466,247 and finished byte-identical. Local paths are already first-class
       (`load_from_dir`); bundled-resources-dir precedence is app wiring.*
-- [ ] Stronger download integrity: verify the Hub's LFS sha256 (`X-Linked-ETag`) instead of length-only;
-      re-verify on cache hits behind a flag.
+- [x] Stronger download integrity: verify the Hub's LFS sha256 (`X-Linked-ETag`) instead of length-only;
+      re-verify on cache hits behind a flag. *(2026-07-11) Every download stream-hashes (sha2, SHA-NI)
+      against the sha256 a redirect-stopped HEAD reads from `X-Linked-ETag`; resumes fold the `.part`
+      prefix into the hash; a mismatched `.part` is deleted, never resumed. `FetchOptions::verify_cached`
+      re-hashes cache hits and self-heals once (delete + verified refetch). Real-network proof on the
+      90.8 MB MiniLM weights: a flipped byte mid-file (invisible to the length check) was caught and
+      healed; a 45.4 MB-seeded resume re-verified whole. Non-LFS files (no announced sha256) stay
+      length-verified.*
 - [x] **safetensors** *(ex-laurelane)* — `burn-store` `SafetensorsStore` + `PyTorchToBurnAdapter`; the primary path.
       *(2026-07-09) `import::{CastFloatAdapter, load_checked}`: bf16→backend-float cast + fail-loud load;
       proven by loading the real 3.1 GB Qwen2.5-1.5B and 2.3 GB LFM2.5 checkpoints with zero missing keys.*

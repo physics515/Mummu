@@ -3402,6 +3402,7 @@ dependencies = [
  "pollster",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
  "tokenizers",
  "ureq 3.3.0",
