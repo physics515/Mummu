@@ -175,8 +175,15 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       layouts recorded (`block_size`/`bytes_per_block` for Q4_0…Q8_K), fail-loud error taxonomy.
       REAL-FILE proof (`tests/real_gguf.rs`): the local Qwen2.5-1.5B **Q4_K_M** parses — v3, 26 kvs,
       339 tensors, Q4_K `token_embd [1536, 151936]`, 198 K-quant tensors, ~1.04 GiB payload located
-      (3B file cross-checked: 435 tensors). 7 unit tests over a synthetic-bytes builder. NEXT slice:
-      dequant kernels (Q8_0 → Q4_K/Q6_K), then tensor payload → Burn module load.*
+      (3B file cross-checked: 435 tensors). 7 unit tests over a synthetic-bytes builder.*
+      *(2026-07-12, same run) **Dequant shipped** for the Q4_K_M set — F32/F16/BF16, Q8_0, and the
+      K-quant superblocks **Q4_K/Q6_K** (exact ports of ggml-quants' reference dequantizers, incl. the
+      packed 6-bit scale/min encoding) + `GgufFile::read_tensor_f32`. Proof against the model's TRUE
+      weights (`real_gguf.rs` — the same checkpoint exists locally as bf16 safetensors AND Q4_K_M GGUF):
+      the GGUF's F32 `output_norm.weight` is **bit-exact** vs the bf16 originals, and dequantized Q4_K
+      embedding rows hit cosine **0.9975** vs truth (garbage layout ⇒ ≈ 0) — 5 hand-computed-block unit
+      tests (121 total). NEXT slice: remaining dequants (Q4_0/Q5/Q2_K/Q3_K/Q5_K), GGUF→model load
+      (name remap + ggml dim-order transpose), tokenizer-from-GGUF-metadata.*
 - [ ] **GPTQ / AWQ** (HF safetensors) — import the calibration-quantized int4/int8 layouts most "quantized on
       the Hub" models ship as (a `.safetensors` payload + a quant config), dequant or keep-quant into Burn.
 - [ ] **ONNX** (optional) — `burn-import` ONNX→Burn for models distributed as ONNX graphs.

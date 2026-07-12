@@ -245,6 +245,8 @@ impl GgufTensorInfo {
 /// A parsed GGUF header: typed metadata + the located tensor table.
 #[derive(Debug)]
 pub struct GgufFile {
+    /// Where this header was read from (payload reads re-open it).
+    pub path: std::path::PathBuf,
     pub version: u32,
     /// Metadata in file order (keys are unique per the spec).
     pub metadata: Vec<(String, GgufValue)>,
@@ -267,13 +269,56 @@ impl GgufFile {
             inner: BufReader::new(file),
             path: path.display().to_string(),
         };
-        let parsed = r.read_file()?;
+        let parsed = r.read_file(path)?;
         // Positive space: the header must end before the payload it locates.
         assert!(
             parsed.data_offset.is_multiple_of(parsed.alignment),
             "data offset is aligned by construction"
         );
         Ok(parsed)
+    }
+
+    /// Read one tensor's payload and dequantize it to f32, in the on-disk
+    /// (ggml fastest-varying-first) element order.
+    pub fn read_tensor_f32(&self, name: &str) -> Result<Vec<f32>, GgufError> {
+        use std::io::SeekFrom;
+        let info = self.tensor(name).ok_or_else(|| GgufError::BadValue {
+            path: self.path.display().to_string(),
+            key: name.to_string(),
+            reason: "no such tensor".into(),
+        })?;
+        let mut file = File::open(&self.path).map_err(|source| GgufError::Io {
+            path: self.path.display().to_string(),
+            source,
+        })?;
+        file.seek(SeekFrom::Start(self.data_offset + info.offset))
+            .map_err(|source| GgufError::Io {
+                path: self.path.display().to_string(),
+                source,
+            })?;
+        let byte_len = usize::try_from(info.byte_len()).map_err(|_| GgufError::OverBound {
+            path: self.path.display().to_string(),
+            what: "tensor payload bytes",
+            count: info.byte_len(),
+            bound: usize::MAX as u64,
+        })?;
+        let mut bytes = vec![0u8; byte_len];
+        file.read_exact(&mut bytes)
+            .map_err(|source| GgufError::Io {
+                path: self.path.display().to_string(),
+                source,
+            })?;
+        let out = dequantize(info.dtype, &bytes).map_err(|reason| GgufError::BadTensor {
+            path: self.path.display().to_string(),
+            index: 0,
+            reason: format!("{name}: {reason}"),
+        })?;
+        assert_eq!(
+            out.len() as u64,
+            info.element_count(),
+            "dequant must yield exactly the tensor's elements"
+        );
+        Ok(out)
     }
 
     /// Look up a metadata value by exact key.
@@ -398,7 +443,7 @@ impl Reader {
     }
 
     /// The whole header: magic, version, metadata, tensor table, alignment.
-    fn read_file(&mut self) -> Result<GgufFile, GgufError> {
+    fn read_file(&mut self, source_path: &Path) -> Result<GgufFile, GgufError> {
         let magic = self.bytes::<4>()?;
         if magic != MAGIC {
             return Err(GgufError::BadMagic {
@@ -455,6 +500,7 @@ impl Reader {
         let data_offset = header_end.div_ceil(alignment) * alignment;
         debug_assert!(data_offset >= header_end, "padding never rewinds");
         Ok(GgufFile {
+            path: source_path.to_path_buf(),
             version,
             metadata,
             tensors,
@@ -517,6 +563,125 @@ impl Reader {
             });
         }
         Ok(tensors)
+    }
+}
+
+// ---- Dequantization ------------------------------------------------------
+//
+// Exact ports of ggml's reference dequantizers (ggml-quants.c) for the types
+// a Q4_K_M file actually carries: plain floats, Q8_0, and the K-quant
+// superblocks Q4_K / Q6_K. Layouts follow `GgmlType::bytes_per_block`.
+
+/// Dequantize a whole tensor payload to f32. `bytes` must be whole blocks of
+/// `dtype` (guaranteed for payload slices sized by [`GgufTensorInfo::byte_len`]).
+pub fn dequantize(dtype: GgmlType, bytes: &[u8]) -> Result<Vec<f32>, String> {
+    let bpb = usize::try_from(dtype.bytes_per_block()).expect("small");
+    if bytes.is_empty() || !bytes.len().is_multiple_of(bpb) {
+        return Err(format!(
+            "{} bytes is not whole {dtype:?} blocks of {bpb}",
+            bytes.len()
+        ));
+    }
+    let blocks = bytes.len() / bpb;
+    let block_elems = usize::try_from(dtype.block_size()).expect("small");
+    let mut out = Vec::with_capacity(blocks * block_elems);
+    for block in bytes.chunks_exact(bpb) {
+        match dtype {
+            GgmlType::F32 => out.push(f32::from_le_bytes(block.try_into().expect("4 bytes"))),
+            GgmlType::F16 => out.push(f16_to_f32(u16::from_le_bytes([block[0], block[1]]))),
+            GgmlType::BF16 => {
+                out.push(f32::from_bits(
+                    u32::from(u16::from_le_bytes([block[0], block[1]])) << 16,
+                ));
+            }
+            GgmlType::Q8_0 => dequant_q8_0(block, &mut out),
+            GgmlType::Q4_K => dequant_q4_k(block, &mut out),
+            GgmlType::Q6_K => dequant_q6_k(block, &mut out),
+            other => return Err(format!("dequant for {other:?} is not implemented yet")),
+        }
+    }
+    assert_eq!(out.len(), blocks * block_elems, "whole blocks out");
+    Ok(out)
+}
+
+/// IEEE 754 half → f32 (no `half` dep on this path; exhaustive over u16 in
+/// tests against the `half` crate the workspace already carries).
+fn f16_to_f32(bits: u16) -> f32 {
+    f32::from(half::f16::from_bits(bits))
+}
+
+/// Q8_0: f16 scale + 32 signed bytes; `x = d * q`.
+fn dequant_q8_0(block: &[u8], out: &mut Vec<f32>) {
+    assert_eq!(block.len(), 34, "Q8_0 block is 34 bytes");
+    let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+    #[allow(clippy::cast_possible_wrap)] // bit-exact reinterpret is the format
+    out.extend(block[2..34].iter().map(|&q| d * f32::from(q as i8)));
+}
+
+/// The Q4_K/Q5_K 6-bit (scale, min) pair for sub-block `j` — ggml's
+/// `get_scale_min_k4`.
+fn scale_min_k4(scales: &[u8], j: usize) -> (f32, f32) {
+    assert_eq!(scales.len(), 12, "K-quant scale block is 12 bytes");
+    assert!(j < 8, "8 sub-blocks per superblock");
+    let (sc, m) = if j < 4 {
+        (scales[j] & 63, scales[j + 4] & 63)
+    } else {
+        (
+            (scales[j + 4] & 0x0F) | ((scales[j - 4] >> 6) << 4),
+            (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4),
+        )
+    };
+    (f32::from(sc), f32::from(m))
+}
+
+/// Q4_K: 256-element superblock — f16 d + f16 dmin + 12 B packed 6-bit
+/// (scale, min) pairs + 128 B of 4-bit quants; `x = d·sc·q − dmin·m`.
+fn dequant_q4_k(block: &[u8], out: &mut Vec<f32>) {
+    assert_eq!(block.len(), 144, "Q4_K superblock is 144 bytes");
+    let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+    let dmin = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+    let scales = &block[4..16];
+    let qs = &block[16..144];
+    // 4 chunks of 64 values; each chunk reads 32 bytes — low nibbles first.
+    for chunk in 0..4 {
+        let (sc1, m1) = scale_min_k4(scales, chunk * 2);
+        let (sc2, m2) = scale_min_k4(scales, chunk * 2 + 1);
+        let q = &qs[chunk * 32..chunk * 32 + 32];
+        out.extend(q.iter().map(|&b| d * sc1 * f32::from(b & 0x0F) - dmin * m1));
+        out.extend(q.iter().map(|&b| d * sc2 * f32::from(b >> 4) - dmin * m2));
+    }
+}
+
+/// Q6_K: 256-element superblock — 128 B low-4 + 64 B high-2 + 16 i8
+/// sub-scales + f16 d; `x = d·sc·(q − 32)`.
+fn dequant_q6_k(block: &[u8], out: &mut Vec<f32>) {
+    assert_eq!(block.len(), 210, "Q6_K superblock is 210 bytes");
+    let (ql_all, rest) = block.split_at(128);
+    let (qh_all, rest) = rest.split_at(64);
+    let (scales, d_bytes) = rest.split_at(16);
+    let d = f16_to_f32(u16::from_le_bytes([d_bytes[0], d_bytes[1]]));
+    let start = out.len();
+    out.resize(start + 256, 0.0);
+    let y = &mut out[start..];
+    // Two halves of 128 values, each consuming 64 ql / 32 qh / 8 scales.
+    for half_idx in 0..2 {
+        let ql = &ql_all[half_idx * 64..half_idx * 64 + 64];
+        let qh = &qh_all[half_idx * 32..half_idx * 32 + 32];
+        let sc = &scales[half_idx * 8..half_idx * 8 + 8];
+        let base = half_idx * 128;
+        for l in 0..32 {
+            let is = l / 16;
+            let q1 = i16::from((ql[l] & 0x0F) | ((qh[l] & 3) << 4)) - 32;
+            let q2 = i16::from((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) - 32;
+            let q3 = i16::from((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+            let q4 = i16::from((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+            #[allow(clippy::cast_possible_wrap)] // i8 sub-scales are the format
+            let s = |i: usize| f32::from(sc[i] as i8);
+            y[base + l] = d * s(is) * f32::from(q1);
+            y[base + l + 32] = d * s(is + 2) * f32::from(q2);
+            y[base + l + 64] = d * s(is + 4) * f32::from(q3);
+            y[base + l + 96] = d * s(is + 6) * f32::from(q4);
+        }
     }
 }
 
@@ -714,6 +879,90 @@ mod tests {
             open_bytes(&with_tensor),
             Err(GgufError::BadTensor { .. })
         ));
+    }
+
+    // ---- dequant ---------------------------------------------------------
+
+    fn f16_bytes(v: f32) -> [u8; 2] {
+        half::f16::from_f32(v).to_bits().to_le_bytes()
+    }
+
+    #[test]
+    fn float_widths_dequantize_exactly() {
+        let f32_bytes = 1.5f32.to_le_bytes();
+        assert_eq!(dequantize(GgmlType::F32, &f32_bytes).unwrap(), vec![1.5]);
+        assert_eq!(
+            dequantize(GgmlType::F16, &f16_bytes(-0.25)).unwrap(),
+            vec![-0.25]
+        );
+        // bf16 is the top half of the f32 bit pattern.
+        let bf16 = (2.0f32.to_bits() >> 16) as u16;
+        assert_eq!(
+            dequantize(GgmlType::BF16, &bf16.to_le_bytes()).unwrap(),
+            vec![2.0]
+        );
+    }
+
+    #[test]
+    fn q8_0_block_matches_hand_computation() {
+        let mut block = Vec::new();
+        block.extend_from_slice(&f16_bytes(0.5));
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        block.extend((0..32).map(|i| (i - 16) as i8 as u8));
+        let out = dequantize(GgmlType::Q8_0, &block).unwrap();
+        assert_eq!(out.len(), 32);
+        assert_eq!(out[0], 0.5 * -16.0);
+        assert_eq!(out[16], 0.0);
+        assert_eq!(out[31], 0.5 * 15.0);
+    }
+
+    #[test]
+    fn q4_k_superblock_matches_hand_computation() {
+        let mut block = vec![0u8; 144];
+        block[0..2].copy_from_slice(&f16_bytes(1.0)); // d
+        block[2..4].copy_from_slice(&f16_bytes(0.5)); // dmin
+        // Sub-block 0: sc=2, m=1 · sub-block 1: sc=3, m=0 (direct 6-bit slots).
+        block[4] = 2;
+        block[5] = 3;
+        block[8] = 1;
+        // Sub-block 4: packed slot — sc = scales[8] & 0xF = 1, m = scales[8] >> 4 = 2.
+        block[12] = 0x21;
+        // First quant byte of chunk 0: low nibble 1 (sub 0), high nibble 5 (sub 1).
+        block[16] = 0x51;
+        // First quant byte of chunk 2 (sub-blocks 4/5): low nibble 4.
+        block[16 + 64] = 0x04;
+        let out = dequantize(GgmlType::Q4_K, &block).unwrap();
+        assert_eq!(out.len(), 256);
+        assert_eq!(out[0], 2.0 * 1.0 - 0.5 * 1.0); // d·sc0·q − dmin·m0 = 1.5
+        assert_eq!(out[32], 3.0 * 5.0); // sub 1: m=0
+        assert_eq!(out[128], 1.0 * 4.0 - 0.5 * 2.0); // sub 4 via packed scales
+        // A zero quant in sub-block 0 still subtracts the min.
+        assert_eq!(out[1], -0.5);
+    }
+
+    #[test]
+    fn q6_k_superblock_matches_hand_computation() {
+        let mut block = vec![0u8; 210];
+        block[0] = 0x0F; // ql[0]: low 4 bits = 15
+        block[128] = 0b0000_0011; // qh[0]: high 2 bits = 3 for q1
+        block[192] = 2; // scales[0] = 2
+        block[194] = 1; // scales[2] = 1
+        block[208..210].copy_from_slice(&f16_bytes(1.0)); // d
+        let out = dequantize(GgmlType::Q6_K, &block).unwrap();
+        assert_eq!(out.len(), 256);
+        // q1 = (15 | 3<<4) − 32 = 31, scale 2 → 62.
+        assert_eq!(out[0], 62.0);
+        // q2 = (0 | 0) − 32 = −32, scale sc[2]=1 → −32.
+        assert_eq!(out[32], -32.0);
+        // Zero scale zeroes the value even though q3 = −32.
+        assert_eq!(out[64], 0.0);
+    }
+
+    #[test]
+    fn dequant_rejects_partial_blocks_and_unimplemented_types() {
+        assert!(dequantize(GgmlType::Q8_0, &[0u8; 33]).is_err());
+        assert!(dequantize(GgmlType::Q8_0, &[]).is_err());
+        assert!(dequantize(GgmlType::Q2_K, &[0u8; 84]).is_err());
     }
 
     #[test]

@@ -64,10 +64,12 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
 - **Model management** — `ModelManager` gives settings UIs the whole lifecycle over a declarative model
   catalog (`registry::ModelSpec`): install with per-chunk download progress, `is_installed`, per-model
   disk usage, and traversal-safe removal; model switching rides `ModelSlot`.
-- **GGUF header import (first slice)** — `mummu::gguf` parses the llama.cpp container: typed, bounded
-  metadata and a fully validated tensor table (dtype, shape, aligned offsets, K-quant block layouts);
-  proven on the real Qwen2.5-1.5B Q4_K_M file (339 tensors located, ~1.04 GiB payload). Dequant into
-  Burn tensors is the next slice (tracked in P3/P9).
+- **GGUF import (container + K-quant dequant)** — `mummu::gguf` parses the llama.cpp container (typed,
+  bounded metadata; fully validated tensor table) and dequantizes F32/F16/BF16, Q8_0, and the
+  **Q4_K/Q6_K superblocks** to f32 — proven against the model's true weights: on the real Qwen2.5-1.5B
+  Q4_K_M file the F32 norms come back **bit-exact** vs the bf16 safetensors of the same checkpoint and
+  Q4_K embedding rows dequantize at cosine 0.9975 (`tests/real_gguf.rs`). Next: the remaining quant
+  types and GGUF→model load (tracked in P3/P9).
 - **Hub downloads** — streaming HuggingFace fetches into the model cache: resumable (`.part` + HTTP
   Range, proven byte-identical after an interrupted transfer), length-verified, shard-index aware, with
   a per-chunk progress callback; verified end-to-end by downloading all-MiniLM and embedding with it.
