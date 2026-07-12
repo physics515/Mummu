@@ -206,10 +206,21 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       (calls + prose, loud error taxonomy). REAL-GPU proof (`tests/real_toolcall.rs`): Qwen2.5-1.5B
       greedy-emitted `<tool_call>{"name": "get_weather", "arguments": {"city": "Paris"}}</tool_call>`
       from a rendered prompt and the parser round-tripped it. 10 new unit tests.*
-- [ ] LFM2.5 bracket-notation tool-call template + parser (`<|tool_list_start|>` special tokens,
+- [x] LFM2.5 bracket-notation tool-call template + parser (`<|tool_list_start|>` special tokens,
       Python-ish call syntax) — with Hermes/Qwen2.5 (0.880 agent score) done, LFM2.5-1.2B (same score,
       fastest at ~1.5 s on 2026's 21-model local tool-calling benchmark) is the other target —
       https://mikeveerman.be/blog/github-2026-02-06-tool-calling-benchmark/
+      *(2026-07-12) Shipped to LFM**2.5**'s actual wire format (its `chat_template.jinja` + model card —
+      NOT the gen-1 `<|tool_list_start|>` wrapping, which 2.5 dropped): tools as bare JSON on a
+      `List of tools: […]` system line (no default preamble), tool results as real `tool` role turns,
+      `</think>` reasoning stripped from all but the last assistant history turn, calls emitted as a
+      Pythonic list in `<|tool_call_start|>…<|tool_call_end|>`. `chat`: style-split `render_with_tools`,
+      `Turn::assistant_tool_calls_lfm`, and a bounded recursive-descent parser (`parse_tool_calls_lfm`,
+      depth ≤ 8, ≤ 64 calls, Python AND JSON literal spellings, byte-offset error taxonomy). REAL-GPU
+      proof (`tests/real_toolcall_lfm.rs`): LFM2.5-1.2B greedy-emitted exactly
+      `<|tool_call_start|>[get_weather(city="Paris")]<|tool_call_end|>` from our rendered prompt and the
+      parser round-tripped it; the Qwen2 parity gate re-passed both legs after the template refactor
+      (max |Δlogit| 2.670e-5, Ollama greedy byte-identical). 16 new unit tests (109 total).*
       *(2026-07-10 research)* 2026 community numbers back the plan: Qwen3-8B keeps tool-calling score
       through Q4_K_M (0.919 quantized vs 0.933 full — quant does NOT cost tool reliability, good news for
       P9); BFCL shows a capability cliff below ~7B (Qwen3.5-9B 66.1% vs 4B 50.3%), so the zoo's
