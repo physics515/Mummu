@@ -115,6 +115,12 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       semantic test (`tests/real_minilm.rs`).* *(2026-07-10) **Parity PASSED**: embedding matches the
       Candle f32 reference (`minilm-probe` fixture) at cosine 0.99999994 with max |Δcomponent| 1.2e-7
       (bound 1e-4); semantic sanity re-verified on real weights (paraphrase 0.556 vs cross-topic ≈ 0).*
+- [ ] **Qwen3.5 small tier** as the next zoo port: released Feb 2026 in 0.8B / 2B / 4B / 9B, with
+      2026 GGUF re-releases specifically improving tool-calling (chat-template fixes) — the 4B/9B are
+      the function-calling sweet spot BFCL identified (9B 66.1%), and unsloth ships ready GGUFs for the
+      P3 import path to chew on; parity reference = Ollama `qwen3.5:9b` (already pulled locally) —
+      https://unsloth.ai/docs/models/qwen3.5 · https://huggingface.co/unsloth/Qwen3.5-9B-GGUF
+      *(2026-07-12 research)*
 - [x] A `Model` trait so new architectures (Hermes-class function-callers, Gemma, Qwen3, …) slot in.
       *(2026-07-10) `models::CausalLm<B>` — associated `Cache` type; a port supplies `new_cache` /
       `forward` / `is_eos` and inherits `generate` / `greedy_generate` / `first_token` from the shared
@@ -335,6 +341,11 @@ that fits the model AND uses every device to the fullest.
       (temperature 0 for the greedy leg) — that plus an fp16 GGUF of the same revision is a workable
       logits leg without Python — https://docs.liquid.ai/deployment/on-device/llama-cpp ·
       https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md
+      *(2026-07-12 research)* Caution for that route: llama.cpp's own chat/tool layer mishandles
+      LFM2.5 (issue #23838 — its parser rejects the documented `<|tool_call_start|>[…]` format), so
+      drive `llama-server` in RAW completion mode (`/completion`, no chat template) and render prompts
+      with our byte-verified `ChatMl::lfm2()` — never through llama.cpp's template stack —
+      https://github.com/ggml-org/llama.cpp/issues/23838
 - [ ] Wire the perf suite (above) into the parity harness so a correctness *or* budget regression fails CI.
 
 ### P8 — Model management API
