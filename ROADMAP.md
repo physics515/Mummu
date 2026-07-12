@@ -169,6 +169,14 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       (Q2K–Q8K) AND IQ-quants, SIMD-optimized, importance-matrix support, HF-compatible config
       generation — evaluate as dependency-or-reference before hand-porting ggml-quants —
       https://docs.rs/pmetal-gguf/latest/pmetal_gguf/
+      *(2026-07-12) **Container reader shipped** (`mummu::gguf`, no new deps): magic/version (v2/v3 LE),
+      typed+bounded metadata KVs (strings ≤ 1 MiB, arrays ≤ 4M, nesting ≤ 2), tensor table with
+      per-entry validation (known dtype, aligned offset, whole blocks, unique names), K-quant block
+      layouts recorded (`block_size`/`bytes_per_block` for Q4_0…Q8_K), fail-loud error taxonomy.
+      REAL-FILE proof (`tests/real_gguf.rs`): the local Qwen2.5-1.5B **Q4_K_M** parses — v3, 26 kvs,
+      339 tensors, Q4_K `token_embd [1536, 151936]`, 198 K-quant tensors, ~1.04 GiB payload located
+      (3B file cross-checked: 435 tensors). 7 unit tests over a synthetic-bytes builder. NEXT slice:
+      dequant kernels (Q8_0 → Q4_K/Q6_K), then tensor payload → Burn module load.*
 - [ ] **GPTQ / AWQ** (HF safetensors) — import the calibration-quantized int4/int8 layouts most "quantized on
       the Hub" models ship as (a `.safetensors` payload + a quant config), dequant or keep-quant into Burn.
 - [ ] **ONNX** (optional) — `burn-import` ONNX→Burn for models distributed as ONNX graphs.
