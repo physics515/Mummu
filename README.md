@@ -52,10 +52,13 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
   `tests/real_toolcall_lfm.rs`).
 - **f16 inference, validated** — Qwen2.5-1.5B runs coherently on `GpuF16` (weights + KV in f16, the
   q·kᵀ attention scores + softmax computed in an f32 island to stop f16 overflow): **~3.6 GiB runner
-  VRAM vs ~7.9 GiB f32, at identical speed** (14.1 tok/s / 88 ms TTFT); the parity gate re-passes
-  unchanged on f32, where the island casts are no-ops ([bench/BASELINE.md](bench/BASELINE.md)).
-- **Benchmarked** — Qwen2.5-1.5B on the reference GPU: **TTFT 88.4 ms, decode 14.1 tok/s** (f32, 11.9 GiB
-  whole-card peak ≈ 7.9 GiB runner; f16: 88.0 ms, 14.1 tok/s, 6.75 GiB ≈ 3.6 GiB runner) — recorded with
+  VRAM vs ~7.9 GiB f32, at identical speed**; the parity gate re-passes unchanged on f32, where the
+  island casts are no-ops ([bench/BASELINE.md](bench/BASELINE.md)).
+- **SPIR-V kernels on Vulkan** — CubeCL compiles direct SPIR-V (burn's `vulkan` feature) instead of
+  WGSL/naga on Vulkan adapters, worth **+30% decode throughput** on the reference GPU with parity
+  byte-identical; other APIs (DX12/Metal) transparently keep WGSL in the same binary.
+- **Benchmarked** — Qwen2.5-1.5B on the reference GPU: **TTFT 96.7 ms, decode 18.4 tok/s** (f32,
+  11.5 GiB whole-card peak ≈ 8.0 GiB runner; f16: 97.2 ms, 18.4 tok/s, ~3.6 GiB runner) — recorded with
   budgets in [bench/BASELINE.md](bench/BASELINE.md), enforced by an opt-in regression gate
   (`mummu-bench/tests/budget.rs`).
 - **Model management** — `ModelManager` gives settings UIs the whole lifecycle over a declarative model

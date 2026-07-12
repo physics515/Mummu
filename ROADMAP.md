@@ -46,7 +46,11 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       ~83 GB/s vs the 4070 Ti SUPER's ~672 GB/s — the SPIR-V compiler feature (P6 item) and f16 are the
       levers to chase; re-baseline after each. *(2026-07-11) Confirmed empirically: f16 (half the weight
       traffic) decodes at exactly f32's speed — 70.9 vs 70.7 ms/token — so bandwidth isn't the limiter;
-      SPIR-V (TensorCores at f16) is the remaining lever.*
+      SPIR-V (TensorCores at f16) is the remaining lever.* *(2026-07-12) SPIR-V pulled: decode
+      70.7 → 54.3 ms/token (+30% tok/s) on BOTH dtypes — and f16 still exactly matches f32, so the path
+      stays dispatch-bound (~114 GB/s effective vs ~672). Next levers: whatever closes the remaining
+      per-token dispatch gap (fewer kernels per step — deeper fusion of the decode step, or CubeCL
+      graph/megakernel work) rather than bandwidth.*
 - [ ] Evaluate Burn 0.21's `burn.toml` project config — per-subsystem tuning + a CubeCL kernel-validation
       layer without recompiling; useful as a debug switch for kernel-level parity hunts —
       https://burn.dev/blog/release-0.21.0/
@@ -274,10 +278,16 @@ that fits the model AND uses every device to the fullest.
       gate re-passed both legs (max |Δlogit| 2.670e-5, unchanged; Ollama greedy byte-identical), and f32
       perf *improved* (TTFT 100.5 → 88.4 ms, decode 13.3 → 14.1 tok/s). f16 benches recorded in
       `bench/BASELINE.md`: 88.0 ms TTFT, 14.1 tok/s — speed parity with f32, VRAM halved.*
-- [ ] Evaluate burn-wgpu's **`spirv` compiler feature** on Vulkan (CubeCL SPIR-V backend instead of
+- [x] Evaluate burn-wgpu's **`spirv` compiler feature** on Vulkan (CubeCL SPIR-V backend instead of
       WGSL/naga): claims significantly faster matmul incl. TensorCores at f16 — could be the cheapest
       decode-tok/s lever on the dev GPU; gate on the parity harness + `bench/BASELINE.md` —
       https://github.com/tracel-ai/burn/blob/main/crates/burn-wgpu/README.md
+      *(2026-07-12) **Adopted** (burn `vulkan` feature; runtime reports `fusion<cubecl<wgpu<spirv>>>`,
+      auto-selected on Vulkan adapters only — other APIs keep WGSL, no code changes): decode
+      **70.7 → 54.3 ms/token (14.1 → 18.4 tok/s, +30%)** on f32 AND f16; TTFT 88.4 → 96.7 ms (well
+      under the 150 ms ceiling); VRAM peak unchanged (11.5 GiB whole-card). Parity gate byte-identical
+      (max |Δlogit| 2.670e-5, Ollama greedy exact); f16 island + CPU budget gates re-passed
+      (108.4 ms / 11.7 tok/s GPU gate, 13.2 tok/s CPU). `bench/BASELINE.md` re-baselined.*
 - [ ] **Placement plan** — given model size + KV-cache + display headroom and the device set, choose a
       **fit-and-fill** plan: single GPU when it fits; **shard layers across multiple GPUs** (pipeline/
       layer-parallel over Burn's multi-device tensors — Burn gives the multi-device *primitives*, not automatic

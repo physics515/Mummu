@@ -17,6 +17,11 @@ repository = "https://github.com/physics515/Mummu"
 burn = { version = "0.21", default-features = false, features = [
 	"std",
 	"wgpu",
+	# `vulkan` switches CubeCL's kernel compiler on Vulkan adapters from
+	# WGSL/naga to direct SPIR-V; other APIs keep WGSL in the same binary.
+	# Adopted 2026-07-12: decode 70.7 -> 54.3 ms/token with parity
+	# byte-identical (see bench/BASELINE.md).
+	"vulkan",
 	"fusion",
 	"autotune",
 	"store",

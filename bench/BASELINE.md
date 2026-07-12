@@ -1,29 +1,32 @@
 # Benchmark baseline & budgets
 
-Reference machine: Ryzen 9 7950X3D · 128 GB · **RTX 4070 Ti SUPER 16 GB** (wgpu/Vulkan, `Fusion<Wgpu>`).
+Reference machine: Ryzen 9 7950X3D · 128 GB · **RTX 4070 Ti SUPER 16 GB** (wgpu/Vulkan,
+`Fusion<Wgpu>`, **SPIR-V compiler** — `fusion<cubecl<wgpu<spirv>>>` since 2026-07-12).
 Bench: `MUMMU_QWEN2_DIR=<qwen2.5-1.5b> cargo bench -p mummu-bench` (criterion, `benches/runner.rs`;
 fixed ~36-token ChatML prompt). A change that pushes a budget over its ceiling does not ship; update the
 recorded numbers (and this file's date) only on a legitimate improvement.
 
 ## Qwen2.5-1.5B-Instruct · single GPU · f32
 
-| Metric | Recorded (2026-07-11) | Budget |
+| Metric | Recorded (2026-07-12, SPIR-V) | Budget |
 | --- | --- | --- |
-| TTFT (fresh cache: full prefill + first token) | 88.4 ms | ≤ 150 ms |
-| Decode latency (32 greedy tokens, warm KV cache) | 2.263 s → **70.7 ms/token ≈ 14.1 tok/s** | ≥ 10 tok/s |
-| Peak GPU memory during decode (whole card, ~4.0 GiB desktop ambient → ~7.9 GiB runner) | 11.9 GiB | ≤ 13 GiB whole-card |
+| TTFT (fresh cache: full prefill + first token) | 96.7 ms | ≤ 150 ms |
+| Decode latency (32 greedy tokens, warm KV cache) | 1.737 s → **54.3 ms/token ≈ 18.4 tok/s** | ≥ 10 tok/s |
+| Peak GPU memory during the real-inference suite (whole card, ~3.5 GiB desktop ambient → ~8.0 GiB runner) | 11.5 GiB | ≤ 13 GiB whole-card |
 
 ## Qwen2.5-1.5B-Instruct · single GPU · **f16** (weights + KV; f32 attention-score island)
 
-| Metric | Recorded (2026-07-11) | Budget |
+| Metric | Recorded (2026-07-12, SPIR-V) | Budget |
 | --- | --- | --- |
-| TTFT (fresh cache: full prefill + first token) | 88.0 ms | ≤ 150 ms |
-| Decode latency (32 greedy tokens, warm KV cache) | 2.270 s → **70.9 ms/token ≈ 14.1 tok/s** | ≥ 10 tok/s |
-| Peak GPU memory during decode (whole card, 3.1 GiB ambient → **~3.6 GiB runner**) | 6.75 GiB | ≤ 8 GiB whole-card |
+| TTFT (fresh cache: full prefill + first token) | 97.2 ms | ≤ 150 ms |
+| Decode latency (32 greedy tokens, warm KV cache) | 1.744 s → **54.5 ms/token ≈ 18.4 tok/s** | ≥ 10 tok/s |
+| Peak GPU memory during decode (whole card, 3.1 GiB ambient → **~3.6 GiB runner**, 2026-07-11 measure) | 6.75 GiB | ≤ 8 GiB whole-card |
 
-f16 decode speed matches f32 — the WGSL decode path is dispatch-bound, not bandwidth-bound (see Notes),
-so halved weight traffic buys nothing yet; the win is VRAM (**~7.9 → ~3.6 GiB runner**, room for larger
-models/contexts). The SPIR-V compiler feature (ROADMAP P6) is the identified speed lever for both dtypes.
+The SPIR-V compiler (burn `vulkan` feature) cut decode latency **23%** on both dtypes
+(70.7 → 54.3 ms/token) at the cost of ~9 ms TTFT (88.4 → 96.7 ms, still ⅔ under its ceiling); parity
+held byte-identically (max |Δlogit| 2.670e-5, Ollama greedy leg exact). Decode remains
+dispatch-bound — f16 still buys VRAM (~7.9 → ~3.6 GiB runner), not speed; ~54 ms/token streams f32
+weights at only ~114 GB/s vs the card's ~672 GB/s, so kernel/dispatch overhead is still the ceiling.
 
 ## Qwen2.5-0.5B-Instruct · CPU (burn-flex) · f32
 
