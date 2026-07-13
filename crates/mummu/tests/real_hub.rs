@@ -197,3 +197,38 @@ fn hub_fetches_the_cpu_tier_qwen() {
     }
     eprintln!("[real_hub] 0.5B fetched into {}", dir.display());
 }
+
+/// Registry → single-file GGUF install: the catalog's LFM2.5 Q4_K_M spec
+/// downloads through `fetch` (one ~700 MB file, resumable/cache-first like
+/// every hub fetch), lands where `gguf_path` says, parses as a valid GGUF of
+/// the right architecture, and its metadata builds the tokenizer — the whole
+/// app-facing "install a GGUF model" path in one proof.
+#[test]
+#[ignore = "needs network (MUMMU_HUB_DEST names the download dir; ~700 MB)"]
+fn hub_gguf_spec_downloads_and_parses() {
+    use mummu::registry::WeightFormat;
+    let Some(dest) = std::env::var_os("MUMMU_HUB_DEST").map(PathBuf::from) else {
+        panic!("set MUMMU_HUB_DEST to a scratch dir for the ~700 MB download");
+    };
+    let spec = mummu::registry::catalog()
+        .into_iter()
+        .find(|s| matches!(s.format, WeightFormat::Gguf { .. }) && s.name.starts_with("lfm2.5"))
+        .expect("the catalog has the LFM2.5 GGUF entry");
+
+    let mut events = 0u64;
+    let dir = spec.fetch(&dest, |_| events += 1).expect("gguf fetch");
+    let path = spec.gguf_path(&dest).expect("gguf specs have a file path");
+    assert!(path.starts_with(&dir), "file lives in the spec's dir");
+    assert!(path.is_file(), "downloaded file exists at {path:?}");
+
+    let f = mummu::gguf::GgufFile::open(&path).expect("valid GGUF");
+    assert_eq!(f.architecture(), Some("lfm2"));
+    assert!(!f.tensors.is_empty());
+    let tok = mummu::tokenizer::tokenizer_from_gguf(&f).expect("tokenizer from metadata");
+    assert!(tok.token_to_id("<|im_end|>").is_some());
+    eprintln!(
+        "[real_hub/gguf] {} → {} tensors, tokenizer ok ({events} progress events)",
+        spec.name,
+        f.tensors.len()
+    );
+}

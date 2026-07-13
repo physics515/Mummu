@@ -262,6 +262,12 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       `spec.fetch(models_root, progress)` onto the hub downloader; built-in catalog: Qwen2.5-1.5B/0.5B,
       LFM2.5-1.2B, all-MiniLM (repo ids match laurelane's validated constants); the network proof now
       fetches spec-driven. Weight-format/dtype/chat-template fields accrete as those import paths land.*
+      *(2026-07-13) **Weight-format field landed**: `ModelSpec.format` (`WeightFormat::Safetensors` |
+      `Gguf { file }`, serde-defaulted so old manifests still parse); GGUF specs fetch the one file via
+      the resumable hub path, `gguf_path()` names where it lands, validation rejects unsafe file names.
+      Catalog gains single-file Q4_K_M entries for Qwen2.5-1.5B and LFM2.5-1.2B (quarter the download of
+      the safetensors). REAL-NETWORK proof (`real_hub.rs`): the LFM2.5 GGUF spec installed end-to-end —
+      697 MB fetched, header parses as `lfm2` (148 tensors), tokenizer built from its metadata.*
 - [ ] **Import validation** — checked load + a first-token parity smoke against a reference before a model is
       marked trusted; a clear error taxonomy (missing file, bad shard, key mismatch, unsupported dtype).
 
