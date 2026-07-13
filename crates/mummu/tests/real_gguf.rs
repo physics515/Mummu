@@ -8,7 +8,10 @@
 
 use std::path::PathBuf;
 
+use mummu::backend::{Gpu, use_gpu};
 use mummu::gguf::{GgmlType, GgufFile, GgufValue};
+use mummu::models::CausalLm;
+use mummu::models::qwen2;
 
 fn gguf_path() -> Option<PathBuf> {
     let path = PathBuf::from(std::env::var_os("MUMMU_GGUF_PATH")?);
@@ -158,4 +161,96 @@ fn real_qwen2_gguf_dequant_matches_the_true_weights() {
             "row {row}: cosine {cos} — layout decode is wrong"
         );
     }
+}
+
+/// END-TO-END: the Q4_K_M GGUF alone (config + weights from the one file)
+/// becomes a running model on the GPU — greedy-decodes a correct answer, and
+/// its first-token logits agree with the bf16 safetensors build of the same
+/// checkpoint (top-1 identical, high cosine; small drift IS the quantization).
+/// The models load sequentially — the second only after the first is dropped
+/// — so peak VRAM stays one-model-sized.
+#[test]
+#[ignore = "needs the local GGUF (MUMMU_GGUF_PATH) + safetensors dir (MUMMU_QWEN2_DIR) + GPU"]
+fn real_qwen2_gguf_loads_and_decodes_on_gpu() {
+    let Some(path) = gguf_path() else {
+        panic!("set MUMMU_GGUF_PATH to the qwen2.5-1.5b-instruct q4_k_m gguf");
+    };
+    let dir = std::env::var_os("MUMMU_QWEN2_DIR")
+        .map(PathBuf::from)
+        .filter(|d| d.join("tokenizer.json").is_file())
+        .expect("set MUMMU_QWEN2_DIR to the same model's safetensors dir (tokenizer.json)");
+    assert!(use_gpu(), "this proof wants the real GPU");
+    let device = burn::tensor::Device::<Gpu>::default();
+
+    // Tokenizer from the sibling checkpoint — tokenizer-from-GGUF-metadata
+    // is the next P3 slice.
+    let tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer");
+    let chat = mummu::chat::ChatMl::qwen2();
+    let prompt_text = chat.render(&[
+        mummu::chat::Turn::system("You are a concise assistant."),
+        mummu::chat::Turn::user("What is 2+2? Answer in one short sentence."),
+    ]);
+    let prompt = tok
+        .encode(prompt_text, true)
+        .expect("prompt encodes")
+        .get_ids()
+        .to_vec();
+
+    // Leg 1: the GGUF-loaded model decodes a coherent, correct answer.
+    let gguf_model = qwen2::load_from_gguf::<Gpu>(&path, &device).expect("gguf load is checked");
+    assert_eq!(gguf_model.config.vocab_size, 151_936);
+    assert_eq!(gguf_model.config.num_hidden_layers, 28);
+    let ids = gguf_model
+        .greedy_generate(&prompt, 32, &device)
+        .expect("decode");
+    let text = tok.decode(&ids, true).expect("ids decode");
+    eprintln!("[real_gguf] Q4_K_M greedy: {text:?}");
+    assert!(text.contains('4'), "expected the answer 4 in: {text:?}");
+
+    let logits_of = |m: &qwen2::LoadedQwen2<Gpu>| -> Vec<f32> {
+        let mut cache = m.new_cache();
+        m.forward(&prompt, 0, &mut cache, &device)
+            .into_data()
+            .to_vec::<f32>()
+            .expect("logits read back")
+    };
+    let argmax = |v: &[f32]| -> usize {
+        let (mut best, mut best_v) = (0usize, f32::NEG_INFINITY);
+        for (i, &x) in v.iter().enumerate() {
+            if x > best_v {
+                (best, best_v) = (i, x);
+            }
+        }
+        best
+    };
+
+    // Leg 2: first-token logits vs the bf16 safetensors build — sequential
+    // loads (drop first) keep peak VRAM at one model.
+    let gguf_logits = logits_of(&gguf_model);
+    drop(gguf_model);
+    let st_model = qwen2::load_from_dir::<Gpu>(&dir, &device).expect("safetensors load");
+    let st_logits = logits_of(&st_model);
+    drop(st_model);
+
+    let top5 = |v: &[f32]| -> Vec<usize> {
+        let mut idx: Vec<usize> = (0..v.len()).collect();
+        idx.sort_by(|&a, &b| v[b].total_cmp(&v[a]));
+        idx.truncate(5);
+        idx
+    };
+    let cos = cosine(&gguf_logits, &st_logits);
+    let (g_top, s_top) = (argmax(&gguf_logits), argmax(&st_logits));
+    let (g5, s5) = (top5(&gguf_logits), top5(&st_logits));
+    let overlap = g5.iter().filter(|id| s5.contains(id)).count();
+    eprintln!(
+        "[real_gguf] first-token logits: cosine {cos:.5} vs bf16 · top-1 {g_top} vs {s_top} · top-5 overlap {overlap}/5 ({g5:?} vs {s5:?})"
+    );
+    assert_eq!(g_top, s_top, "Q4_K_M must agree with bf16 on the top token");
+    assert!(overlap >= 4, "top-5 sets diverge: {g5:?} vs {s5:?}");
+    // Measured 0.977 on this checkpoint: 28 layers of Q4_K_M drift (plus the
+    // bf16 reference's own rounding). A layout/scale decode bug reads ≈ 0.
+    assert!(
+        cos > 0.95,
+        "logit cosine {cos} — quantization noise should be small, layout bugs are not"
+    );
 }

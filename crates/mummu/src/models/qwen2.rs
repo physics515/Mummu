@@ -11,10 +11,11 @@
 use std::path::Path;
 
 use burn::module::Module;
-use burn::nn::{Embedding, EmbeddingConfig, RmsNorm, RmsNormConfig};
+use burn::nn::{Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig};
 use burn::store::{ModuleAdapter, PyTorchToBurnAdapter, SafetensorsStore};
 use burn::tensor::{Int, Tensor, TensorData, backend::Backend};
 
+use crate::gguf::{GgufFile, GgufValue};
 use crate::import::{CastFloatAdapter, ImportError, load_checked, required_file};
 use crate::models::CausalLm;
 use crate::nn::{
@@ -63,6 +64,21 @@ impl EosIds {
     }
 }
 
+/// A required GGUF metadata integer, as usize.
+fn gguf_usize(f: &GgufFile, key: &str) -> Result<usize, String> {
+    f.get(key)
+        .and_then(GgufValue::as_u64)
+        .and_then(|v| usize::try_from(v).ok())
+        .ok_or_else(|| format!("missing or non-integer GGUF metadata '{key}'"))
+}
+
+/// A required GGUF metadata f32.
+fn gguf_f32(f: &GgufFile, key: &str) -> Result<f32, String> {
+    f.get(key)
+        .and_then(GgufValue::as_f32)
+        .ok_or_else(|| format!("missing or non-f32 GGUF metadata '{key}'"))
+}
+
 impl Qwen2Config {
     /// Parse `config.json` bytes; derives `head_dim` when absent.
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, String> {
@@ -70,6 +86,62 @@ impl Qwen2Config {
         if cfg.head_dim == 0 {
             cfg.head_dim = cfg.hidden_size / cfg.num_attention_heads;
         }
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Hyperparameters from a GGUF header's `qwen2.*` metadata — a GGUF file
+    /// is self-contained, no `config.json` beside it. `vocab_size` comes from
+    /// the embedding tensor (llama.cpp may pad it past the tokenizer vocab).
+    pub fn from_gguf(f: &GgufFile) -> Result<Self, String> {
+        let arch = f.architecture().unwrap_or("<missing>");
+        if arch != "qwen2" {
+            return Err(format!("GGUF architecture '{arch}' is not qwen2"));
+        }
+        let hidden_size = gguf_usize(f, "qwen2.embedding_length")?;
+        let num_attention_heads = gguf_usize(f, "qwen2.attention.head_count")?;
+        let embd = f
+            .tensor("token_embd.weight")
+            .ok_or("GGUF has no token_embd.weight tensor")?;
+        if embd.dims.len() != 2 || embd.dims[0] != hidden_size as u64 {
+            return Err(format!(
+                "token_embd.weight dims {:?} do not match embedding_length {hidden_size}",
+                embd.dims
+            ));
+        }
+        let vocab_size = usize::try_from(embd.dims[1]).map_err(|_| "vocab too large")?;
+        if let Some(tokens) = f.get("tokenizer.ggml.tokens").and_then(GgufValue::as_array)
+            && tokens.len() > vocab_size
+        {
+            return Err(format!(
+                "tokenizer vocab {} exceeds embedding rows {vocab_size}",
+                tokens.len()
+            ));
+        }
+        let eos_token_id = f
+            .get("tokenizer.ggml.eos_token_id")
+            .and_then(GgufValue::as_u64)
+            .and_then(|v| u32::try_from(v).ok())
+            .map_or(EosIds::None, EosIds::One);
+        let head_dim = f
+            .get("qwen2.attention.key_length")
+            .and_then(GgufValue::as_u64)
+            .and_then(|v| usize::try_from(v).ok())
+            .unwrap_or(hidden_size / num_attention_heads);
+        let cfg = Self {
+            vocab_size,
+            hidden_size,
+            intermediate_size: gguf_usize(f, "qwen2.feed_forward_length")?,
+            num_hidden_layers: gguf_usize(f, "qwen2.block_count")?,
+            num_attention_heads,
+            num_key_value_heads: gguf_usize(f, "qwen2.attention.head_count_kv")?,
+            head_dim,
+            rms_norm_eps: f64::from(gguf_f32(f, "qwen2.attention.layer_norm_rms_epsilon")?),
+            rope_theta: gguf_f32(f, "qwen2.rope.freq_base")?,
+            // No separate output.weight tensor means the lm-head is tied.
+            tie_word_embeddings: f.tensor("output.weight").is_none(),
+            eos_token_id,
+        };
         cfg.validate()?;
         Ok(cfg)
     }
@@ -102,12 +174,16 @@ pub struct DecoderLayer<B: Backend> {
     pub post_attention_layernorm: RmsNorm<B>,
 }
 
-/// The Qwen2 decoder stack (HF's `model.*` subtree; the lm-head is tied).
+/// The Qwen2 decoder stack (HF's `model.*` subtree). The lm-head is tied on
+/// the small tiers (0.5B/1.5B safetensors); untied checkpoints — the 7B, and
+/// every llama.cpp GGUF (which materializes the head as `output.weight`, at
+/// higher precision than the embedding) — carry it explicitly.
 #[derive(Module, Debug)]
 pub struct Qwen2<B: Backend> {
     pub embed_tokens: Embedding<B>,
     pub layers: Vec<DecoderLayer<B>>,
     pub norm: RmsNorm<B>,
+    pub lm_head: Option<Linear<B>>,
 }
 
 /// A weight-loaded Qwen2 plus its config — everything a forward needs.
@@ -142,10 +218,16 @@ fn build<B: Backend>(cfg: &Qwen2Config, device: &B::Device) -> Qwen2<B> {
             post_attention_layernorm: norm(device),
         })
         .collect();
+    let lm_head = (!cfg.tie_word_embeddings).then(|| {
+        LinearConfig::new(cfg.hidden_size, cfg.vocab_size)
+            .with_bias(false)
+            .init(device)
+    });
     Qwen2 {
         embed_tokens: EmbeddingConfig::new(cfg.vocab_size, cfg.hidden_size).init(device),
         layers,
         norm: norm(device),
+        lm_head,
     }
 }
 
@@ -182,6 +264,69 @@ pub fn load_from_dir<B: Backend>(
         .with_key_remapping(r"(post_attention_layernorm)\.weight$", "$1.gamma")
         .with_key_remapping(r"^norm\.weight$", "norm.gamma");
     load_checked(&mut model, &mut store, &weights)?;
+    Ok(LoadedQwen2 { model, config })
+}
+
+/// GGUF (llama.cpp) tensor names → the HF checkpoint names the safetensors
+/// remap chain already handles. `None` for anything unrecognized — the blob
+/// writer turns that into a loud error rather than dropping weights.
+fn gguf_tensor_to_hf(name: &str) -> Option<String> {
+    match name {
+        "token_embd.weight" => return Some("model.embed_tokens.weight".into()),
+        "output_norm.weight" => return Some("model.norm.weight".into()),
+        "output.weight" => return Some("lm_head.weight".into()),
+        _ => {}
+    }
+    let rest = name.strip_prefix("blk.")?;
+    let (layer, field) = rest.split_once('.')?;
+    let layer: usize = layer.parse().ok()?;
+    let mapped = match field {
+        "attn_norm.weight" => "input_layernorm.weight",
+        "ffn_norm.weight" => "post_attention_layernorm.weight",
+        "attn_q.weight" => "self_attn.q_proj.weight",
+        "attn_q.bias" => "self_attn.q_proj.bias",
+        "attn_k.weight" => "self_attn.k_proj.weight",
+        "attn_k.bias" => "self_attn.k_proj.bias",
+        "attn_v.weight" => "self_attn.v_proj.weight",
+        "attn_v.bias" => "self_attn.v_proj.bias",
+        "attn_output.weight" => "self_attn.o_proj.weight",
+        "ffn_gate.weight" => "mlp.gate_proj.weight",
+        "ffn_up.weight" => "mlp.up_proj.weight",
+        "ffn_down.weight" => "mlp.down_proj.weight",
+        _ => return None,
+    };
+    Some(format!("model.layers.{layer}.{mapped}"))
+}
+
+/// Load a Qwen2 model straight from a **GGUF** file (any dtype the dequant
+/// suite covers — Q4_K_M, Q8_0, F16, …): hyperparameters from the GGUF
+/// metadata, weights dequantized to f32 and driven through the exact store
+/// pipeline (adapters + remaps + checked load) the safetensors path uses.
+pub fn load_from_gguf<B: Backend>(
+    path: &Path,
+    device: &B::Device,
+) -> Result<LoadedQwen2<B>, ImportError> {
+    let parse = |reason: String| ImportError::Parse {
+        file: path.to_path_buf(),
+        reason,
+    };
+    let f = GgufFile::open(path).map_err(|e| parse(e.to_string()))?;
+    let config = Qwen2Config::from_gguf(&f).map_err(parse)?;
+    let blob = f
+        .dequant_to_safetensors(&gguf_tensor_to_hf)
+        .map_err(|e| parse(e.to_string()))?;
+    assert!(blob.len() > 8, "a parsed GGUF yields a non-empty blob");
+
+    let mut model = build::<B>(&config, device);
+    let target_float = Tensor::<B, 1>::zeros([1], device).dtype();
+    let mut store = SafetensorsStore::from_bytes(Some(blob))
+        .with_from_adapter(PyTorchToBurnAdapter.chain(CastFloatAdapter::new(target_float)))
+        .allow_partial(true)
+        .with_key_remapping(r"^model\.", "")
+        .with_key_remapping(r"(input_layernorm)\.weight$", "$1.gamma")
+        .with_key_remapping(r"(post_attention_layernorm)\.weight$", "$1.gamma")
+        .with_key_remapping(r"^norm\.weight$", "norm.gamma");
+    load_checked(&mut model, &mut store, path)?;
     Ok(LoadedQwen2 { model, config })
 }
 
@@ -242,10 +387,20 @@ impl<B: Backend> CausalLm<B> for LoadedQwen2<B> {
         }
         let x = self.model.norm.forward(x);
 
-        // Tied lm-head: logits = last_hidden @ embed_weight^T.
         let last = x.narrow(1, t - 1, 1).reshape([1, cfg.hidden_size]);
-        let w = self.model.embed_tokens.weight.val(); // [vocab, hidden]
-        last.matmul(w.swap_dims(0, 1)) // [1, vocab]
+        debug_assert!(
+            self.model.lm_head.is_some() != cfg.tie_word_embeddings,
+            "lm_head presence must match the config's tie flag"
+        );
+        match &self.model.lm_head {
+            // Untied: the checkpoint's own head projection.
+            Some(head) => head.forward(last), // [1, vocab]
+            // Tied lm-head: logits = last_hidden @ embed_weight^T.
+            None => {
+                let w = self.model.embed_tokens.weight.val(); // [vocab, hidden]
+                last.matmul(w.swap_dims(0, 1)) // [1, vocab]
+            }
+        }
     }
 }
 
@@ -340,6 +495,119 @@ mod tests {
         for (i, (c, f)) in step.iter().zip(&full).enumerate() {
             assert!((c - f).abs() < 1e-4, "logit {i}: cached {c} vs full {f}");
         }
+    }
+
+    /// A synthetic in-memory GGUF header shaped like the Qwen2.5-1.5B file.
+    fn toy_gguf() -> GgufFile {
+        use crate::gguf::{GgmlType, GgufTensorInfo};
+        let meta = |k: &str, v: GgufValue| (k.to_string(), v);
+        GgufFile {
+            path: std::path::PathBuf::new(),
+            version: 3,
+            metadata: vec![
+                meta("general.architecture", GgufValue::Str("qwen2".into())),
+                meta("qwen2.embedding_length", GgufValue::U32(16)),
+                meta("qwen2.block_count", GgufValue::U32(2)),
+                meta("qwen2.feed_forward_length", GgufValue::U32(32)),
+                meta("qwen2.attention.head_count", GgufValue::U32(4)),
+                meta("qwen2.attention.head_count_kv", GgufValue::U32(2)),
+                meta(
+                    "qwen2.attention.layer_norm_rms_epsilon",
+                    GgufValue::F32(1e-6),
+                ),
+                meta("qwen2.rope.freq_base", GgufValue::F32(1e4)),
+                meta("tokenizer.ggml.eos_token_id", GgufValue::U32(2)),
+            ],
+            tensors: vec![GgufTensorInfo {
+                name: "token_embd.weight".into(),
+                dims: vec![16, 64], // ggml order: [hidden, vocab]
+                dtype: GgmlType::F32,
+                offset: 0,
+            }],
+            alignment: 32,
+            data_offset: 0,
+        }
+    }
+
+    #[test]
+    fn config_from_gguf_reads_metadata_and_embedding_dims() {
+        let cfg = Qwen2Config::from_gguf(&toy_gguf()).expect("parses");
+        assert_eq!(cfg.vocab_size, 64); // from token_embd dims[1]
+        assert_eq!(cfg.hidden_size, 16);
+        assert_eq!(cfg.num_hidden_layers, 2);
+        assert_eq!(cfg.head_dim, 4); // derived: hidden / heads
+        assert!(cfg.eos_token_id.contains(2));
+        assert!(cfg.tie_word_embeddings); // no output.weight tensor
+    }
+
+    #[test]
+    fn config_from_gguf_fails_loudly_on_missing_keys_and_wrong_arch() {
+        let mut f = toy_gguf();
+        f.metadata.retain(|(k, _)| k != "qwen2.block_count");
+        let err = Qwen2Config::from_gguf(&f).unwrap_err();
+        assert!(err.contains("qwen2.block_count"), "{err}");
+
+        let mut f = toy_gguf();
+        f.metadata[0].1 = GgufValue::Str("llama".into());
+        assert!(Qwen2Config::from_gguf(&f).is_err());
+
+        // Embedding dims that contradict the metadata are rejected.
+        let mut f = toy_gguf();
+        f.tensors[0].dims = vec![8, 64];
+        assert!(Qwen2Config::from_gguf(&f).is_err());
+    }
+
+    #[test]
+    fn untied_toy_config_builds_and_uses_an_lm_head() {
+        let device = Dev::default();
+        let mut cfg = toy_config();
+        cfg.tie_word_embeddings = false;
+        let vocab = cfg.vocab_size;
+        let loaded = LoadedQwen2::<Cpu> {
+            model: build(&cfg, &device),
+            config: cfg,
+        };
+        assert!(loaded.model.lm_head.is_some());
+        let mut cache = loaded.new_cache();
+        let logits = loaded.forward(&[1, 2], 0, &mut cache, &device);
+        assert_eq!(logits.dims(), [1, vocab]);
+    }
+
+    #[test]
+    fn config_from_gguf_detects_an_untied_head() {
+        use crate::gguf::{GgmlType, GgufTensorInfo};
+        let mut f = toy_gguf();
+        f.tensors.push(GgufTensorInfo {
+            name: "output.weight".into(),
+            dims: vec![16, 64],
+            dtype: GgmlType::F32,
+            offset: 4096,
+        });
+        let cfg = Qwen2Config::from_gguf(&f).expect("parses");
+        assert!(!cfg.tie_word_embeddings);
+    }
+
+    #[test]
+    fn gguf_names_map_onto_hf_checkpoint_names() {
+        assert_eq!(
+            gguf_tensor_to_hf("token_embd.weight").as_deref(),
+            Some("model.embed_tokens.weight")
+        );
+        assert_eq!(
+            gguf_tensor_to_hf("blk.27.attn_q.bias").as_deref(),
+            Some("model.layers.27.self_attn.q_proj.bias")
+        );
+        assert_eq!(
+            gguf_tensor_to_hf("blk.0.ffn_down.weight").as_deref(),
+            Some("model.layers.0.mlp.down_proj.weight")
+        );
+        assert_eq!(
+            gguf_tensor_to_hf("output_norm.weight").as_deref(),
+            Some("model.norm.weight")
+        );
+        // Unknown names must map to None (the writer errors loudly).
+        assert_eq!(gguf_tensor_to_hf("rope_freqs.weight"), None);
+        assert_eq!(gguf_tensor_to_hf("blk.x.attn_q.weight"), None);
     }
 
     #[test]

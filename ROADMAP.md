@@ -162,7 +162,7 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       no adapter chaining; `.bin`-era checkpoints are f32), decoder loaders adopt `weights_file` when a
       real `.pth` decoder checkpoint exists to verify against, and `hub::fetch_model` learning the
       `pytorch_model.bin` fallback.
-- [ ] **GGUF** (llama.cpp) — parse the GGUF container (metadata KV + tensor table), map tensors to modules,
+- [x] **GGUF** (llama.cpp) — parse the GGUF container (metadata KV + tensor table), map tensors to modules,
       and **dequantize** Q4/Q5/Q8/K-quant blocks into Burn tensors (or hand keep-quantized to P9). GGUF is how
       most small models are distributed — this makes the whole ecosystem importable. *(2026-07-10 research)*
       K-quant superblocks are 256 values: Q4_K = fp16 d + fp16 dmin + 12 B of 6-bit sub-scales/mins + 128 B
@@ -190,6 +190,28 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       embedding rows hit cosine **0.9975** vs truth (garbage layout ⇒ ≈ 0) — 5 hand-computed-block unit
       tests (121 total). NEXT slice: remaining dequants (Q4_0/Q5/Q2_K/Q3_K/Q5_K), GGUF→model load
       (name remap + ggml dim-order transpose), tokenizer-from-GGUF-metadata.*
+      *(2026-07-13) **GGUF→running model shipped.** Every storage dtype now dequantizes (added
+      Q4_0/Q4_1/Q5_0/Q5_1 + K-quants Q2_K/Q3_K/Q5_K, exact ggml ports, hand-computed block tests —
+      133 unit tests total); `GgufFile::dequant_to_safetensors` bridges a GGUF onto the SAME checked-load
+      pipeline as safetensors (dims reversed = row-major HF layout, unmapped tensor names are loud
+      errors); `Qwen2Config::from_gguf` reads hyperparameters from `qwen2.*` metadata (vocab from the
+      embedding tensor, EOS from tokenizer metadata); `qwen2::load_from_gguf` = one file → running model.
+      The Qwen2 module gained an optional **untied lm_head** (llama.cpp GGUFs materialize the tied head
+      as a separate higher-precision `output.weight` — the real Q4_K_M carries it as Q6_K; also unlocks
+      untied safetensors like Qwen2-7B). REAL-GPU proof (`real_gguf.rs`): the Q4_K_M file alone
+      greedy-decodes "2+2 equals 4.", first-token top-1 identical to the bf16 build, top-5 overlap 4/5,
+      logit cosine 0.977 (28 layers of Q4_K drift; a layout bug reads ≈ 0). Parity gate re-passed
+      byte-identically after the lm_head change (max |Δlogit| 2.670e-5, Ollama greedy exact); f16 +
+      budget gates green (GPU 107.4 ms / 13.6 tok/s, CPU 14.8 tok/s).*
+- [ ] **Tokenizer-from-GGUF metadata** — build the HF `tokenizers` pipeline from `tokenizer.ggml.*`
+      (tokens, merges, token types, BPE pre-tokenizer regex) so a GGUF needs no sibling
+      `tokenizer.json`; byte-verify token ids against the HF tokenizer of the same checkpoint.
+- [ ] **LFM2 GGUF name map** — extend `load_from_gguf` to the LFM2/LFM2.5 hybrid (llama.cpp `lfm2`
+      arch: `shortconv.*` tensor names, `lfm2.*` metadata keys) once a same-weights GGUF is validated.
+- [ ] **Quantized-reference parity leg for GGUF loads** — the end-to-end test compares against the bf16
+      build (quantization drift bounded, not exact); a strict leg needs llama.cpp itself running the
+      SAME quantized file (`llama-server` raw `/completion`, `n_probs` logprobs — see the P7 LFM2.5
+      reference item's caveats) to assert our dequant matches ggml's compute path token-for-token.
 - [ ] **GPTQ / AWQ** (HF safetensors) — import the calibration-quantized int4/int8 layouts most "quantized on
       the Hub" models ship as (a `.safetensors` payload + a quant config), dequant or keep-quant into Burn.
 - [ ] **ONNX** (optional) — `burn-import` ONNX→Burn for models distributed as ONNX graphs.
