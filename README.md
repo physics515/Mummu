@@ -64,12 +64,20 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
 - **Model management** — `ModelManager` gives settings UIs the whole lifecycle over a declarative model
   catalog (`registry::ModelSpec`): install with per-chunk download progress, `is_installed`, per-model
   disk usage, and traversal-safe removal; model switching rides `ModelSlot`.
-- **GGUF import (container + K-quant dequant)** — `mummu::gguf` parses the llama.cpp container (typed,
-  bounded metadata; fully validated tensor table) and dequantizes F32/F16/BF16, Q8_0, and the
-  **Q4_K/Q6_K superblocks** to f32 — proven against the model's true weights: on the real Qwen2.5-1.5B
-  Q4_K_M file the F32 norms come back **bit-exact** vs the bf16 safetensors of the same checkpoint and
-  Q4_K embedding rows dequantize at cosine 0.9975 (`tests/real_gguf.rs`). Next: the remaining quant
-  types and GGUF→model load (tracked in P3/P9).
+- **GGUF import, end to end** — `mummu::gguf` parses the llama.cpp container (typed, bounded metadata;
+  fully validated tensor table) and dequantizes **every storage dtype** (F32/F16/BF16, the legacy
+  Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 blocks, and the Q2_K–Q6_K superblocks) to f32; `qwen2::load_from_gguf`
+  turns the one file into a running model — hyperparameters from the GGUF metadata, weights bridged
+  through the same checked-load pipeline as safetensors (tied *and* untied lm-heads). Proven against
+  the model's true weights (`tests/real_gguf.rs`): F32 norms **bit-exact** vs the bf16 safetensors of
+  the same checkpoint, Q4_K rows at cosine 0.9975, and the real Qwen2.5-1.5B **Q4_K_M file greedy-decodes
+  "2+2 equals 4." on the GPU** with first-token top-1 identical to the bf16 build (logit cosine 0.977).
+  The tokenizer comes from the GGUF too (`tokenizer_from_gguf`: per-family pre-regex → ByteLevel → BPE,
+  byte-identical ids vs the checkpoint's `tokenizer.json`) — **one .gguf file is the whole model**.
+  Works for the **LFM2.5 hybrid** as well (`lfm2::load_from_gguf`: layer kinds from the per-layer
+  kv-head array, conv kernels un-squeezed bit-exactly): the official LiquidAI Q4_K_M greedy-decodes
+  "2 + 2 equals 4." with top-1 identical to bf16 (logit cosine 0.991). Next: keep-quantized VRAM
+  (tracked in P9).
 - **Hub downloads** — streaming HuggingFace fetches into the model cache: resumable (`.part` + HTTP
   Range, proven byte-identical after an interrupted transfer), length-verified, shard-index aware, with
   a per-chunk progress callback; verified end-to-end by downloading all-MiniLM and embedding with it.

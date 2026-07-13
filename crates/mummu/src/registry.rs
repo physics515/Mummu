@@ -19,6 +19,23 @@ pub enum Architecture {
     MiniLm,
 }
 
+/// How the checkpoint's weights are stored — which fetch + load path a spec
+/// takes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum WeightFormat {
+    /// `config.json` + `tokenizer.json` + `model.safetensors` (or a shard
+    /// index); fetched by [`hub::fetch_model`], loaded by `load_from_dir`.
+    #[default]
+    Safetensors,
+    /// One self-contained `.gguf` file in the repo (config + tokenizer +
+    /// weights in the metadata); loaded by the architecture's
+    /// `load_from_gguf` + [`crate::tokenizer::tokenizer_from_gguf`].
+    Gguf {
+        /// The file name inside the repo, e.g. `qwen2.5-1.5b-instruct-q4_k_m.gguf`.
+        file: String,
+    },
+}
+
 /// A declarative model manifest entry.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ModelSpec {
@@ -29,6 +46,9 @@ pub struct ModelSpec {
     /// Git revision (tag, branch, or commit) — pin for reproducibility.
     pub revision: String,
     pub architecture: Architecture,
+    /// Weight storage (absent in older manifests = safetensors).
+    #[serde(default)]
+    pub format: WeightFormat,
     /// Rough on-disk size, for settings UIs and fit checks (0 = unknown).
     pub disk_bytes_estimate: u64,
 }
@@ -50,6 +70,15 @@ impl ModelSpec {
         if self.revision.is_empty() {
             return Err("revision must be non-empty (pin something)".into());
         }
+        if let WeightFormat::Gguf { file } = &self.format {
+            let safe = !file.is_empty()
+                && !file.contains("..")
+                && !file.starts_with('/')
+                && file.ends_with(".gguf");
+            if !safe {
+                return Err(format!("bad gguf file name {file:?}"));
+            }
+        }
         Ok(())
     }
 
@@ -59,21 +88,39 @@ impl ModelSpec {
         models_root.join(&self.name)
     }
 
+    /// For a GGUF spec: the local path of the model file after [`Self::fetch`].
+    #[must_use]
+    pub fn gguf_path(&self, models_root: &Path) -> Option<PathBuf> {
+        match &self.format {
+            WeightFormat::Gguf { file } => Some(self.dir(models_root).join(file)),
+            WeightFormat::Safetensors => None,
+        }
+    }
+
     /// Download this model into `models_root` (resumable, cache-first; see
-    /// [`hub::fetch_model`]) and return its directory, ready for the
-    /// architecture's `load_from_dir`.
+    /// [`hub::fetch_model`] / [`hub::fetch_file`]) and return its directory,
+    /// ready for the architecture's `load_from_dir` / `load_from_gguf`.
     pub fn fetch(
         &self,
         models_root: &Path,
         on_progress: impl FnMut(Progress<'_>),
     ) -> Result<PathBuf, HubError> {
         assert!(self.validate().is_ok(), "fetch of an invalid spec");
-        hub::fetch_model(
-            &self.repo,
-            &self.revision,
-            &self.dir(models_root),
-            on_progress,
-        )
+        let dir = self.dir(models_root);
+        match &self.format {
+            WeightFormat::Safetensors => {
+                hub::fetch_model(&self.repo, &self.revision, &dir, on_progress)
+            }
+            WeightFormat::Gguf { file } => {
+                let url = hub::hub_file_url(&self.repo, &self.revision, file);
+                std::fs::create_dir_all(&dir).map_err(|e| HubError::Io {
+                    path: dir.clone(),
+                    reason: e.to_string(),
+                })?;
+                hub::fetch_file(&url, &dir.join(file), on_progress)?;
+                Ok(dir)
+            }
+        }
     }
 }
 
@@ -87,6 +134,7 @@ pub fn catalog() -> Vec<ModelSpec> {
             repo: "Qwen/Qwen2.5-1.5B-Instruct".into(),
             revision: "main".into(),
             architecture: Architecture::Qwen2,
+            format: WeightFormat::Safetensors,
             disk_bytes_estimate: 3_100_000_000,
         },
         ModelSpec {
@@ -94,6 +142,7 @@ pub fn catalog() -> Vec<ModelSpec> {
             repo: "Qwen/Qwen2.5-0.5B-Instruct".into(),
             revision: "main".into(),
             architecture: Architecture::Qwen2,
+            format: WeightFormat::Safetensors,
             disk_bytes_estimate: 1_000_000_000,
         },
         ModelSpec {
@@ -101,6 +150,7 @@ pub fn catalog() -> Vec<ModelSpec> {
             repo: "LiquidAI/LFM2.5-1.2B-Instruct".into(),
             revision: "main".into(),
             architecture: Architecture::Lfm2,
+            format: WeightFormat::Safetensors,
             disk_bytes_estimate: 2_400_000_000,
         },
         ModelSpec {
@@ -108,7 +158,30 @@ pub fn catalog() -> Vec<ModelSpec> {
             repo: "sentence-transformers/all-MiniLM-L6-v2".into(),
             revision: "main".into(),
             architecture: Architecture::MiniLm,
+            format: WeightFormat::Safetensors,
             disk_bytes_estimate: 91_000_000,
+        },
+        // Single-file GGUF variants — quarter the download, same model
+        // (proven vs the bf16 safetensors builds in tests/real_gguf.rs).
+        ModelSpec {
+            name: "qwen2.5-1.5b-instruct-q4km".into(),
+            repo: "Qwen/Qwen2.5-1.5B-Instruct-GGUF".into(),
+            revision: "main".into(),
+            architecture: Architecture::Qwen2,
+            format: WeightFormat::Gguf {
+                file: "qwen2.5-1.5b-instruct-q4_k_m.gguf".into(),
+            },
+            disk_bytes_estimate: 1_120_000_000,
+        },
+        ModelSpec {
+            name: "lfm2.5-1.2b-q4km".into(),
+            repo: "LiquidAI/LFM2.5-1.2B-Instruct-GGUF".into(),
+            revision: "main".into(),
+            architecture: Architecture::Lfm2,
+            format: WeightFormat::Gguf {
+                file: "LFM2.5-1.2B-Instruct-Q4_K_M.gguf".into(),
+            },
+            disk_bytes_estimate: 731_000_000,
         },
     ];
     debug_assert!(
@@ -163,5 +236,44 @@ mod tests {
         let back: ModelSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(back.name, spec.name);
         assert_eq!(back.architecture, spec.architecture);
+    }
+
+    #[test]
+    fn gguf_specs_round_trip_and_old_manifests_default_to_safetensors() {
+        let gguf = catalog()
+            .into_iter()
+            .find(|s| matches!(s.format, WeightFormat::Gguf { .. }))
+            .expect("catalog has a gguf entry");
+        let json = serde_json::to_string(&gguf).unwrap();
+        let back: ModelSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.format, gguf.format);
+        let file = match &gguf.format {
+            WeightFormat::Gguf { file } => file.clone(),
+            WeightFormat::Safetensors => unreachable!(),
+        };
+        assert_eq!(
+            gguf.gguf_path(Path::new("root")),
+            Some(Path::new("root").join(&gguf.name).join(file))
+        );
+
+        // A manifest written before `format` existed still deserializes.
+        let old = r#"{"name":"m","repo":"a/b","revision":"main",
+                      "architecture":"Qwen2","disk_bytes_estimate":1}"#;
+        let back: ModelSpec = serde_json::from_str(old).unwrap();
+        assert_eq!(back.format, WeightFormat::Safetensors);
+        assert_eq!(back.gguf_path(Path::new("root")), None);
+    }
+
+    #[test]
+    fn bad_gguf_file_names_are_rejected() {
+        let mut spec = catalog()[0].clone();
+        for bad in ["", "../up.gguf", "/abs.gguf", "weights.bin"] {
+            spec.format = WeightFormat::Gguf { file: bad.into() };
+            assert!(spec.validate().is_err(), "{bad:?} must not validate");
+        }
+        spec.format = WeightFormat::Gguf {
+            file: "ok-model.q4_k_m.gguf".into(),
+        };
+        assert!(spec.validate().is_ok());
     }
 }

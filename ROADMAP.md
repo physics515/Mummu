@@ -162,7 +162,7 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       no adapter chaining; `.bin`-era checkpoints are f32), decoder loaders adopt `weights_file` when a
       real `.pth` decoder checkpoint exists to verify against, and `hub::fetch_model` learning the
       `pytorch_model.bin` fallback.
-- [ ] **GGUF** (llama.cpp) — parse the GGUF container (metadata KV + tensor table), map tensors to modules,
+- [x] **GGUF** (llama.cpp) — parse the GGUF container (metadata KV + tensor table), map tensors to modules,
       and **dequantize** Q4/Q5/Q8/K-quant blocks into Burn tensors (or hand keep-quantized to P9). GGUF is how
       most small models are distributed — this makes the whole ecosystem importable. *(2026-07-10 research)*
       K-quant superblocks are 256 values: Q4_K = fp16 d + fp16 dmin + 12 B of 6-bit sub-scales/mins + 128 B
@@ -190,8 +190,57 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       embedding rows hit cosine **0.9975** vs truth (garbage layout ⇒ ≈ 0) — 5 hand-computed-block unit
       tests (121 total). NEXT slice: remaining dequants (Q4_0/Q5/Q2_K/Q3_K/Q5_K), GGUF→model load
       (name remap + ggml dim-order transpose), tokenizer-from-GGUF-metadata.*
+      *(2026-07-13) **GGUF→running model shipped.** Every storage dtype now dequantizes (added
+      Q4_0/Q4_1/Q5_0/Q5_1 + K-quants Q2_K/Q3_K/Q5_K, exact ggml ports, hand-computed block tests —
+      133 unit tests total); `GgufFile::dequant_to_safetensors` bridges a GGUF onto the SAME checked-load
+      pipeline as safetensors (dims reversed = row-major HF layout, unmapped tensor names are loud
+      errors); `Qwen2Config::from_gguf` reads hyperparameters from `qwen2.*` metadata (vocab from the
+      embedding tensor, EOS from tokenizer metadata); `qwen2::load_from_gguf` = one file → running model.
+      The Qwen2 module gained an optional **untied lm_head** (llama.cpp GGUFs materialize the tied head
+      as a separate higher-precision `output.weight` — the real Q4_K_M carries it as Q6_K; also unlocks
+      untied safetensors like Qwen2-7B). REAL-GPU proof (`real_gguf.rs`): the Q4_K_M file alone
+      greedy-decodes "2+2 equals 4.", first-token top-1 identical to the bf16 build, top-5 overlap 4/5,
+      logit cosine 0.977 (28 layers of Q4_K drift; a layout bug reads ≈ 0). Parity gate re-passed
+      byte-identically after the lm_head change (max |Δlogit| 2.670e-5, Ollama greedy exact); f16 +
+      budget gates green (GPU 107.4 ms / 13.6 tok/s, CPU 14.8 tok/s).*
+- [x] **Tokenizer-from-GGUF metadata** — build the HF `tokenizers` pipeline from `tokenizer.ggml.*`
+      (tokens, merges, token types, BPE pre-tokenizer regex) so a GGUF needs no sibling
+      `tokenizer.json`; byte-verify token ids against the HF tokenizer of the same checkpoint.
+      *(2026-07-13, same run) Shipped (`mummu::tokenizer::tokenizer_from_gguf`): NFC → Split(the
+      per-family `tokenizer.ggml.pre` regex, llama.cpp-style registry — unknown ids are loud errors) →
+      ByteLevel → BPE; token id = array index; CONTROL(3)/USER_DEFINED(4) types become special/plain
+      added tokens with post-build id verification, UNUSED(5) `[PADn]` entries skipped. REAL-FILE
+      proof: **byte-identical ids vs the checkpoint's `tokenizer.json` on an 8-prompt battery**
+      (ChatML + specials, unicode/CJK/emoji, whitespace runs, contractions, empty) and identical
+      decodes; the end-to-end GPU test now runs tokenizer + config + weights from the ONE .gguf file.
+      Only `gpt2`-model/`qwen2`-pre is registered so far — new families add a regex entry.*
+- [x] **LFM2 GGUF name map** — extend `load_from_gguf` to the LFM2/LFM2.5 hybrid (llama.cpp `lfm2`
+      arch: `shortconv.*` tensor names, `lfm2.*` metadata keys) once a same-weights GGUF is validated.
+      *(2026-07-13, same run) Shipped (`lfm2::load_from_gguf`): `Lfm2Config::from_gguf` derives
+      `layer_types` from llama.cpp's per-layer `head_count_kv` array (0 = conv, nonzero = attention;
+      i32 in real files), `feed_forward_length` arrives pre-adjusted; the name map covers the hybrid's
+      per-head q/k norms + `shortconv.{conv,in_proj,out_proj}`, with the depthwise conv kernel as the
+      one shape special-case (`GgufMap::Reshape` — llama.cpp squeezes `[C,1,K]` to ggml `[K,C]`, same
+      bytes). Tokenizer registry gained the `lfm2` pre (digits-≤3 regex, no NFC, BOS post-processor
+      from `add_bos_token`; low-id added tokens ride BPE-vocab id reuse). REAL-FILE proof against the
+      official LiquidAI Q4_K_M (697 MB, downloaded this run) vs the local bf16 safetensors of the same
+      checkpoint: 5 F32 tensors incl. both conv kernels **bit-exact**; tokenizer byte-identical on a
+      6-prompt × 2-mode battery; REAL-GPU end-to-end — the one file greedy-decodes "2 + 2 equals 4.",
+      first-token top-1 identical to the bf16 build, logit cosine **0.9914**. (Still not the P2/P7
+      strict parity gate — that needs the llama.cpp same-quant reference leg.) 138 unit tests; parity
+      (2.670e-5, byte-identical) + budget gates re-passed.*
+- [ ] **Quantized-reference parity leg for GGUF loads** — the end-to-end test compares against the bf16
+      build (quantization drift bounded, not exact); a strict leg needs llama.cpp itself running the
+      SAME quantized file (`llama-server` raw `/completion`, `n_probs` logprobs — see the P7 LFM2.5
+      reference item's caveats) to assert our dequant matches ggml's compute path token-for-token.
 - [ ] **GPTQ / AWQ** (HF safetensors) — import the calibration-quantized int4/int8 layouts most "quantized on
       the Hub" models ship as (a `.safetensors` payload + a quant config), dequant or keep-quant into Burn.
+      *(2026-07-13 research)* Both are quantization *algorithms*, not formats — the artifact is ordinary
+      safetensors shards (packed int4 `qweight`/`qzeros`/`scales`, group size 128 is the de-facto
+      standard) plus `quantization_config` in `config.json`; vLLM's **compressed-tensors** is the
+      emerging unified on-disk convention to target (one reader covers GPTQ/AWQ/INT8/FP8 exports) —
+      https://github.com/vllm-project/compressed-tensors ·
+      https://www.digitalapplied.com/blog/gguf-vs-awq-vs-gptq-vs-mlx-llm-quantization-formats-2026
 - [ ] **ONNX** (optional) — `burn-import` ONNX→Burn for models distributed as ONNX graphs.
 - [ ] **Dtype handling** — a `CastFloatAdapter` (bf16→f32/f16); quantized→dequant on import; keep-quantized
       handed to P9.
@@ -213,6 +262,12 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       `spec.fetch(models_root, progress)` onto the hub downloader; built-in catalog: Qwen2.5-1.5B/0.5B,
       LFM2.5-1.2B, all-MiniLM (repo ids match laurelane's validated constants); the network proof now
       fetches spec-driven. Weight-format/dtype/chat-template fields accrete as those import paths land.*
+      *(2026-07-13) **Weight-format field landed**: `ModelSpec.format` (`WeightFormat::Safetensors` |
+      `Gguf { file }`, serde-defaulted so old manifests still parse); GGUF specs fetch the one file via
+      the resumable hub path, `gguf_path()` names where it lands, validation rejects unsafe file names.
+      Catalog gains single-file Q4_K_M entries for Qwen2.5-1.5B and LFM2.5-1.2B (quarter the download of
+      the safetensors). REAL-NETWORK proof (`real_hub.rs`): the LFM2.5 GGUF spec installed end-to-end —
+      697 MB fetched, header parses as `lfm2` (148 tensors), tokenizer built from its metadata.*
 - [ ] **Import validation** — checked load + a first-token parity smoke against a reference before a model is
       marked trusted; a clear error taxonomy (missing file, bad shard, key mismatch, unsupported dtype).
 
@@ -346,6 +401,11 @@ that fits the model AND uses every device to the fullest.
       drive `llama-server` in RAW completion mode (`/completion`, no chat template) and render prompts
       with our byte-verified `ChatMl::lfm2()` — never through llama.cpp's template stack —
       https://github.com/ggml-org/llama.cpp/issues/23838
+      *(2026-07-13 research)* That parser bug is now FIXED upstream (PR #24178 merged ~June 2026 —
+      `is_lfm2_template()` detected only the gen-1 `<|tool_list_start|>` tags); raw completion mode
+      remains the right choice for the logits leg regardless (no template stack in the loop). Also:
+      LiquidAI officially publishes LFM2.5-1.2B GGUFs (incl. F16) — the same-weights reference artifact
+      this leg needs — https://github.com/ggml-org/llama.cpp/issues/23838
 - [ ] Wire the perf suite (above) into the parity harness so a correctness *or* budget regression fails CI.
 
 ### P8 — Model management API
@@ -364,7 +424,14 @@ The VRAM lever the P6 planner pulls to make the largest useful model fit the use
       + CPU paths; quantize on import or on the fly, keyed to the fit target from P6.
 - [ ] **Import pre-quantized** — run **GGUF K-quants** (Q2_K–Q8_0, per-layer precision) and **GPTQ / AWQ** int4
       layouts directly (dequant to the compute dtype, or a keep-quantized matmul where the kernel exists), so a
-      model already quantized on the Hub loads as-is.
+      model already quantized on the Hub loads as-is. *(2026-07-13) The dequant-to-f32 leg of the GGUF
+      path shipped in P3 (`load_from_gguf` — every storage dtype); what remains here is **keep-quantized
+      in VRAM**, which is the actual fit lever (Q4_K_M currently dequants to the same f32 footprint).*
+- [ ] Evaluate **CubeCL's quantization primitives** for the keep-quantized matmul: recent CubeCL ships
+      block-scaled MMA, global quantization for matmul, quantized tensor views, and FP4/FP2 formats —
+      the kernel substrate a Q4-weights × f16-activations decode path would ride (vs hand-writing a
+      dequant-fused kernel); gate any adoption on the parity harness + `bench/BASELINE.md` —
+      https://github.com/tracel-ai/cubecl/releases · https://burn.dev/blog/release-0.21.0/
 - [ ] **Auto-quantize-to-fit** — the planner picks the *highest* precision that fits the detected VRAM
       (f16 → int8 → int4), reports the quality/size trade, and never silently ships a worse tier than asked.
 

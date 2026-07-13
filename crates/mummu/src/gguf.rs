@@ -37,6 +37,10 @@ const MAX_ARRAY_LEN: u64 = 1 << 22;
 /// GGML allows at most 4 tensor dimensions.
 const MAX_DIMS: u32 = 4;
 
+/// Largest dequantized-to-f32 payload [`GgufFile::dequant_to_safetensors`]
+/// will build in RAM (a ~12B-param model; the reference machine has 128 GB).
+const MAX_DEQUANT_BYTES: u64 = 48 << 30;
+
 /// What went wrong reading a GGUF header.
 #[derive(Debug, thiserror::Error)]
 pub enum GgufError {
@@ -108,6 +112,19 @@ impl GgufValue {
             Self::U32(v) => Some(u64::from(v)),
             Self::U64(v) => Some(v),
             _ => None,
+        }
+    }
+
+    /// The value widened to i64, if it is any integer (signed or unsigned)
+    /// that fits.
+    #[must_use]
+    pub fn as_i64(&self) -> Option<i64> {
+        match *self {
+            Self::I8(v) => Some(i64::from(v)),
+            Self::I16(v) => Some(i64::from(v)),
+            Self::I32(v) => Some(i64::from(v)),
+            Self::I64(v) => Some(v),
+            _ => self.as_u64().and_then(|v| i64::try_from(v).ok()),
         }
     }
 
@@ -242,6 +259,19 @@ impl GgufTensorInfo {
     }
 }
 
+/// How one GGUF tensor lands in the safetensors blob
+/// ([`GgufFile::dequant_to_safetensors`]).
+#[derive(Debug, Clone)]
+pub enum GgufMap {
+    /// Target name; shape = the GGUF dims reversed (the row-major twin of
+    /// the ggml layout — right for everything but squeezed kernels).
+    Rename(String),
+    /// Target name + explicit row-major shape (same element count, same
+    /// bytes — e.g. un-squeezing a depthwise conv kernel back to
+    /// `[channels, 1, k]`).
+    Reshape(String, Vec<u64>),
+}
+
 /// A parsed GGUF header: typed metadata + the located tensor table.
 #[derive(Debug)]
 pub struct GgufFile {
@@ -319,6 +349,90 @@ impl GgufFile {
             "dequant must yield exactly the tensor's elements"
         );
         Ok(out)
+    }
+
+    /// Dequantize every tensor to f32 and serialize the result as an
+    /// in-memory **safetensors** file — the bridge onto the exact store
+    /// pipeline (adapters, key remaps, checked load) the safetensors path
+    /// already trusts. `map` maps each GGUF tensor to the name (and
+    /// optionally an explicit shape) the blob should carry (HF-checkpoint
+    /// naming, so per-model remap tables apply unchanged); an unmapped
+    /// tensor is a loud error, never a skip — a name this crate doesn't
+    /// recognize means weights would silently vanish from the model.
+    ///
+    /// Default shapes are the GGUF dims **reversed**: ggml orders dims
+    /// fastest-varying-first, so the raw payload bytes are exactly the
+    /// row-major layout of the reversed shape — same bytes, HF convention.
+    /// [`GgufMap::Reshape`] overrides that for tensors whose checkpoint
+    /// shape differs by more than dim order (e.g. llama.cpp squeezes the
+    /// middle 1 out of depthwise-conv kernels).
+    pub fn dequant_to_safetensors(
+        &self,
+        map: &dyn Fn(&GgufTensorInfo) -> Option<GgufMap>,
+    ) -> Result<Vec<u8>, GgufError> {
+        let total_f32_bytes: u64 = self.tensors.iter().map(|t| t.element_count() * 4).sum();
+        if total_f32_bytes > MAX_DEQUANT_BYTES {
+            return Err(GgufError::OverBound {
+                path: self.path.display().to_string(),
+                what: "dequantized f32 payload bytes",
+                count: total_f32_bytes,
+                bound: MAX_DEQUANT_BYTES,
+            });
+        }
+        let bad = |index: usize, reason: String| GgufError::BadTensor {
+            path: self.path.display().to_string(),
+            index,
+            reason,
+        };
+
+        let mut header = String::from("{");
+        let mut names = std::collections::HashSet::with_capacity(self.tensors.len());
+        let mut data: Vec<u8> =
+            Vec::with_capacity(usize::try_from(total_f32_bytes).expect("bounded above"));
+        for (index, info) in self.tensors.iter().enumerate() {
+            let (name, shape) = match map(info) {
+                Some(GgufMap::Rename(name)) => {
+                    (name, info.dims.iter().rev().copied().collect::<Vec<u64>>())
+                }
+                Some(GgufMap::Reshape(name, shape)) => {
+                    if shape.iter().product::<u64>() != info.element_count() {
+                        return Err(bad(
+                            index,
+                            format!(
+                                "reshape of '{}' to {shape:?} changes the element count",
+                                info.name
+                            ),
+                        ));
+                    }
+                    (name, shape)
+                }
+                None => {
+                    return Err(bad(index, format!("unmapped tensor name '{}'", info.name)));
+                }
+            };
+            if !names.insert(name.clone()) {
+                return Err(bad(index, format!("rename collision on '{name}'")));
+            }
+            let start = data.len();
+            let values = self.read_tensor_f32(&info.name)?;
+            data.extend(values.iter().flat_map(|v| v.to_le_bytes()));
+            let json_name = serde_json::to_string(&name).expect("string serializes");
+            if index > 0 {
+                header.push(',');
+            }
+            header.push_str(&format!(
+                "{json_name}:{{\"dtype\":\"F32\",\"shape\":{shape:?},\"data_offsets\":[{start},{end}]}}",
+                end = data.len(),
+            ));
+        }
+        header.push('}');
+
+        assert_eq!(data.len() as u64, total_f32_bytes, "every element written");
+        let mut blob = Vec::with_capacity(8 + header.len() + data.len());
+        blob.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        blob.extend_from_slice(header.as_bytes());
+        blob.extend_from_slice(&data);
+        Ok(blob)
     }
 
     /// Look up a metadata value by exact key.
@@ -568,9 +682,12 @@ impl Reader {
 
 // ---- Dequantization ------------------------------------------------------
 //
-// Exact ports of ggml's reference dequantizers (ggml-quants.c) for the types
-// a Q4_K_M file actually carries: plain floats, Q8_0, and the K-quant
-// superblocks Q4_K / Q6_K. Layouts follow `GgmlType::bytes_per_block`.
+// Exact ports of ggml's reference dequantizers (ggml-quants.c) for every
+// dtype llama.cpp stores model weights in: plain floats, the 32-element
+// legacy blocks Q4_0/Q4_1/Q5_0/Q5_1/Q8_0, and the 256-element K-quant
+// superblocks Q2_K–Q6_K. Layouts follow `GgmlType::bytes_per_block`.
+// Q8_1/Q8_K are activation formats (dot-product scratch), never tensor
+// storage — they stay loud errors.
 
 /// Dequantize a whole tensor payload to f32. `bytes` must be whole blocks of
 /// `dtype` (guaranteed for payload slices sized by [`GgufTensorInfo::byte_len`]).
@@ -594,8 +711,15 @@ pub fn dequantize(dtype: GgmlType, bytes: &[u8]) -> Result<Vec<f32>, String> {
                     u32::from(u16::from_le_bytes([block[0], block[1]])) << 16,
                 ));
             }
+            GgmlType::Q4_0 => dequant_q4_0(block, &mut out),
+            GgmlType::Q4_1 => dequant_q4_1(block, &mut out),
+            GgmlType::Q5_0 => dequant_q5_0(block, &mut out),
+            GgmlType::Q5_1 => dequant_q5_1(block, &mut out),
             GgmlType::Q8_0 => dequant_q8_0(block, &mut out),
+            GgmlType::Q2_K => dequant_q2_k(block, &mut out),
+            GgmlType::Q3_K => dequant_q3_k(block, &mut out),
             GgmlType::Q4_K => dequant_q4_k(block, &mut out),
+            GgmlType::Q5_K => dequant_q5_k(block, &mut out),
             GgmlType::Q6_K => dequant_q6_k(block, &mut out),
             other => return Err(format!("dequant for {other:?} is not implemented yet")),
         }
@@ -616,6 +740,132 @@ fn dequant_q8_0(block: &[u8], out: &mut Vec<f32>) {
     let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
     #[allow(clippy::cast_possible_wrap)] // bit-exact reinterpret is the format
     out.extend(block[2..34].iter().map(|&q| d * f32::from(q as i8)));
+}
+
+/// Q4_0: f16 scale + 16 bytes of 4-bit quants; `x = d·(q − 8)` — all 16 low
+/// nibbles are elements 0..16, the high nibbles elements 16..32.
+fn dequant_q4_0(block: &[u8], out: &mut Vec<f32>) {
+    assert_eq!(block.len(), 18, "Q4_0 block is 18 bytes");
+    let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+    let qs = &block[2..18];
+    out.extend(qs.iter().map(|&b| d * (f32::from(b & 0x0F) - 8.0)));
+    out.extend(qs.iter().map(|&b| d * (f32::from(b >> 4) - 8.0)));
+}
+
+/// Q4_1: f16 scale + f16 min + 16 bytes of 4-bit quants; `x = d·q + m`.
+fn dequant_q4_1(block: &[u8], out: &mut Vec<f32>) {
+    assert_eq!(block.len(), 20, "Q4_1 block is 20 bytes");
+    let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+    let m = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+    let qs = &block[4..20];
+    out.extend(qs.iter().map(|&b| d * f32::from(b & 0x0F) + m));
+    out.extend(qs.iter().map(|&b| d * f32::from(b >> 4) + m));
+}
+
+/// Q5_0: f16 scale + 4 B of packed 5th bits + 16 B of 4-bit quants;
+/// `x = d·(q − 16)` with bit `j` of `qh` topping up element `j`.
+fn dequant_q5_0(block: &[u8], out: &mut Vec<f32>) {
+    assert_eq!(block.len(), 22, "Q5_0 block is 22 bytes");
+    let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+    let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
+    let qs = &block[6..22];
+    #[allow(clippy::cast_possible_truncation)] // masked to one nibble bit
+    out.extend(qs.iter().enumerate().map(|(j, &b)| {
+        let hi = ((qh >> j) << 4) as u8 & 0x10;
+        d * (f32::from((b & 0x0F) | hi) - 16.0)
+    }));
+    #[allow(clippy::cast_possible_truncation)] // masked to one nibble bit
+    out.extend(qs.iter().enumerate().map(|(j, &b)| {
+        let hi = (qh >> (j + 12)) as u8 & 0x10;
+        d * (f32::from((b >> 4) | hi) - 16.0)
+    }));
+}
+
+/// Q5_1: f16 scale + f16 min + 4 B packed 5th bits + 16 B quants; `x = d·q + m`.
+fn dequant_q5_1(block: &[u8], out: &mut Vec<f32>) {
+    assert_eq!(block.len(), 24, "Q5_1 block is 24 bytes");
+    let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+    let m = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+    let qh = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+    let qs = &block[8..24];
+    #[allow(clippy::cast_possible_truncation)] // masked to one nibble bit
+    out.extend(qs.iter().enumerate().map(|(j, &b)| {
+        let hi = ((qh >> j) << 4) as u8 & 0x10;
+        d * f32::from((b & 0x0F) | hi) + m
+    }));
+    #[allow(clippy::cast_possible_truncation)] // masked to one nibble bit
+    out.extend(qs.iter().enumerate().map(|(j, &b)| {
+        let hi = (qh >> (j + 12)) as u8 & 0x10;
+        d * f32::from((b >> 4) | hi) + m
+    }));
+}
+
+/// Q2_K: 256-element superblock — 16 packed (scale, min) nibbles + 64 B of
+/// 2-bit quants + f16 d + f16 dmin; `x = d·sc·q − dmin·m` over 16 sub-blocks
+/// of 16.
+fn dequant_q2_k(block: &[u8], out: &mut Vec<f32>) {
+    assert_eq!(block.len(), 84, "Q2_K superblock is 84 bytes");
+    let scales = &block[0..16];
+    let qs = &block[16..80];
+    let d = f16_to_f32(u16::from_le_bytes([block[80], block[81]]));
+    let dmin = f16_to_f32(u16::from_le_bytes([block[82], block[83]]));
+    let mut is = 0;
+    // Two halves of 128 values; each half reads 32 quant bytes at 4 shifts.
+    for q in [&qs[0..32], &qs[32..64]] {
+        for shift in [0u8, 2, 4, 6] {
+            for part in [&q[0..16], &q[16..32]] {
+                let sc = scales[is];
+                is += 1;
+                let dl = d * f32::from(sc & 0x0F);
+                let ml = dmin * f32::from(sc >> 4);
+                out.extend(part.iter().map(|&b| dl * f32::from((b >> shift) & 3) - ml));
+            }
+        }
+    }
+    assert_eq!(is, 16, "16 sub-block scales consumed");
+}
+
+/// Unpack Q3_K's 12 packed scale bytes into 16 signed 6-bit sub-scales
+/// (ggml's kmask bit dance, done bytewise).
+fn q3_k_scales(packed: &[u8]) -> [i8; 16] {
+    assert_eq!(packed.len(), 12, "Q3_K scale block is 12 bytes");
+    let mut sc = [0i8; 16];
+    #[allow(clippy::cast_possible_wrap)] // 6-bit values reinterpret exactly
+    for j in 0..4 {
+        let hi = packed[8 + j]; // 2-bit tops for slots j, j+4, j+8, j+12
+        sc[j] = ((packed[j] & 0x0F) | ((hi & 3) << 4)) as i8;
+        sc[j + 4] = ((packed[j + 4] & 0x0F) | (((hi >> 2) & 3) << 4)) as i8;
+        sc[j + 8] = ((packed[j] >> 4) | (((hi >> 4) & 3) << 4)) as i8;
+        sc[j + 12] = ((packed[j + 4] >> 4) | ((hi >> 6) << 4)) as i8;
+    }
+    sc
+}
+
+/// Q3_K: 256-element superblock — 32 B high-bit mask + 64 B of 2-bit quants
+/// + 12 B packed 6-bit sub-scales + f16 d; `x = d·(sc − 32)·(q − hm·4)`.
+fn dequant_q3_k(block: &[u8], out: &mut Vec<f32>) {
+    assert_eq!(block.len(), 110, "Q3_K superblock is 110 bytes");
+    let hmask = &block[0..32];
+    let qs = &block[32..96];
+    let scales = q3_k_scales(&block[96..108]);
+    let d = f16_to_f32(u16::from_le_bytes([block[108], block[109]]));
+    let mut is = 0;
+    let mut m: u8 = 1;
+    for q in [&qs[0..32], &qs[32..64]] {
+        for shift in [0u8, 2, 4, 6] {
+            for base in [0usize, 16] {
+                let dl = d * f32::from(i16::from(scales[is]) - 32);
+                is += 1;
+                for l in base..base + 16 {
+                    let low = i16::from((q[l] >> shift) & 3);
+                    let sub = if hmask[l] & m == 0 { 4 } else { 0 };
+                    out.push(dl * f32::from(low - sub));
+                }
+            }
+            m <<= 1; // the hmask bit advances per (half, shift) pair
+        }
+    }
+    assert_eq!(is, 16, "16 sub-block scales consumed");
 }
 
 /// The Q4_K/Q5_K 6-bit (scale, min) pair for sub-block `j` — ggml's
@@ -650,6 +900,38 @@ fn dequant_q4_k(block: &[u8], out: &mut Vec<f32>) {
         out.extend(q.iter().map(|&b| d * sc1 * f32::from(b & 0x0F) - dmin * m1));
         out.extend(q.iter().map(|&b| d * sc2 * f32::from(b >> 4) - dmin * m2));
     }
+}
+
+/// Q5_K: 256-element superblock — f16 d + f16 dmin + 12 B packed 6-bit
+/// (scale, min) pairs + 32 B of 5th bits + 128 B of 4-bit quants;
+/// `x = d·sc·q − dmin·m` with two `qh` bits per byte per chunk.
+fn dequant_q5_k(block: &[u8], out: &mut Vec<f32>) {
+    assert_eq!(block.len(), 176, "Q5_K superblock is 176 bytes");
+    let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+    let dmin = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+    let scales = &block[4..16];
+    let qh = &block[16..48];
+    let qs = &block[48..176];
+    let mut u1: u8 = 1;
+    let mut u2: u8 = 2;
+    // 4 chunks of 64 values; each chunk reads 32 quant bytes — low nibbles
+    // first — and one bit-plane pair of the shared 32-byte qh.
+    for chunk in 0..4 {
+        let (sc1, m1) = scale_min_k4(scales, chunk * 2);
+        let (sc2, m2) = scale_min_k4(scales, chunk * 2 + 1);
+        let q = &qs[chunk * 32..chunk * 32 + 32];
+        out.extend(q.iter().zip(qh).map(|(&b, &h)| {
+            let top = if h & u1 == 0 { 0 } else { 16 };
+            d * sc1 * f32::from((b & 0x0F) + top) - dmin * m1
+        }));
+        out.extend(q.iter().zip(qh).map(|(&b, &h)| {
+            let top = if h & u2 == 0 { 0 } else { 16 };
+            d * sc2 * f32::from((b >> 4) + top) - dmin * m2
+        }));
+        u1 <<= 2;
+        u2 <<= 2;
+    }
+    assert_eq!(u1, 0, "four bit-plane pairs consumed"); // 1<<8 wraps to 0
 }
 
 /// Q6_K: 256-element superblock — 128 B low-4 + 64 B high-2 + 16 i8
@@ -766,9 +1048,21 @@ mod tests {
             self.buf.extend_from_slice(&self.tensors);
             self.buf
         }
+
+        /// Header + alignment padding + tensor payload bytes (offsets in the
+        /// tensor table are relative to the padded data start).
+        fn build_with_payload(self, payload: &[u8]) -> Vec<u8> {
+            let mut buf = self.build();
+            let data_offset = (buf.len() as u64).div_ceil(DEFAULT_ALIGNMENT) * DEFAULT_ALIGNMENT;
+            buf.resize(usize::try_from(data_offset).expect("small test file"), 0);
+            buf.extend_from_slice(payload);
+            buf
+        }
     }
 
-    fn open_bytes(bytes: &[u8]) -> Result<GgufFile, GgufError> {
+    /// Write `bytes` to a fresh temp file and run `f` on the parse result
+    /// while the file still exists (payload reads re-open the path).
+    fn with_gguf_bytes<R>(bytes: &[u8], f: impl FnOnce(Result<GgufFile, GgufError>) -> R) -> R {
         use std::sync::atomic::{AtomicU64, Ordering};
         // Parallel tests in one process must never share a temp file.
         static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -779,12 +1073,16 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        let mut f = File::create(&path).expect("temp file");
-        f.write_all(bytes).expect("write");
-        drop(f);
-        let result = GgufFile::open(&path);
+        let mut file = File::create(&path).expect("temp file");
+        file.write_all(bytes).expect("write");
+        drop(file);
+        let result = f(GgufFile::open(&path));
         let _ = std::fs::remove_file(&path);
         result
+    }
+
+    fn open_bytes(bytes: &[u8]) -> Result<GgufFile, GgufError> {
+        with_gguf_bytes(bytes, |r| r)
     }
 
     #[test]
@@ -959,10 +1257,168 @@ mod tests {
     }
 
     #[test]
+    fn q4_0_and_q4_1_blocks_match_hand_computation() {
+        // Q4_0: symmetric around 8 — low nibbles are elements 0..16.
+        let mut b = vec![0u8; 18];
+        b[0..2].copy_from_slice(&f16_bytes(2.0));
+        b[2] = 0x31; // low nibble 1 → elem 0, high nibble 3 → elem 16
+        let out = dequantize(GgmlType::Q4_0, &b).unwrap();
+        assert_eq!(out.len(), 32);
+        assert_eq!(out[0], (1.0 - 8.0) * 2.0);
+        assert_eq!(out[16], (3.0 - 8.0) * 2.0);
+        assert_eq!(out[1], -16.0); // zero nibble is −8·d, not 0
+
+        // Q4_1: affine — the min shifts every element.
+        let mut b = vec![0u8; 20];
+        b[0..2].copy_from_slice(&f16_bytes(2.0));
+        b[2..4].copy_from_slice(&f16_bytes(1.0));
+        b[4] = 0x31;
+        let out = dequantize(GgmlType::Q4_1, &b).unwrap();
+        assert_eq!(out[0], 1.0 * 2.0 + 1.0);
+        assert_eq!(out[16], 3.0 * 2.0 + 1.0);
+        assert_eq!(out[1], 1.0);
+    }
+
+    #[test]
+    fn q5_0_and_q5_1_high_bits_land_on_the_right_elements() {
+        // Q5_0: qh bit 0 tops element 0, bit 16 tops element 16.
+        let mut b = vec![0u8; 22];
+        b[0..2].copy_from_slice(&f16_bytes(1.0));
+        b[2..6].copy_from_slice(&(1u32 | (1 << 16)).to_le_bytes());
+        b[6] = 0x21; // low nibble 1 → elem 0, high nibble 2 → elem 16
+        let out = dequantize(GgmlType::Q5_0, &b).unwrap();
+        assert_eq!(out.len(), 32);
+        assert_eq!(out[0], (1.0 + 16.0) - 16.0);
+        assert_eq!(out[16], (2.0 + 16.0) - 16.0);
+        assert_eq!(out[1], -16.0); // no high bit, zero nibble
+
+        // Q5_1: same bit packing, affine.
+        let mut b = vec![0u8; 24];
+        b[0..2].copy_from_slice(&f16_bytes(1.0));
+        b[2..4].copy_from_slice(&f16_bytes(1.0));
+        b[4..8].copy_from_slice(&1u32.to_le_bytes());
+        b[8] = 0x01;
+        let out = dequantize(GgmlType::Q5_1, &b).unwrap();
+        assert_eq!(out[0], (1.0 + 16.0) * 1.0 + 1.0);
+        assert_eq!(out[16], 1.0); // high nibble 0, qh bit 16 unset → just m
+    }
+
+    #[test]
+    fn q2_k_superblock_matches_hand_computation() {
+        let mut b = vec![0u8; 84];
+        b[80..82].copy_from_slice(&f16_bytes(1.0)); // d
+        b[82..84].copy_from_slice(&f16_bytes(0.5)); // dmin
+        b[0] = 0x12; // sub 0: sc=2, min=1
+        b[1] = 0x01; // sub 1: sc=1, min=0
+        b[8] = 0x0F; // sub 8 (second half, shift 0): sc=15, min=0
+        b[16] = 3; // qs[0] bits 0–1 → elem 0
+        b[32] = 1; // qs[16] → elem 16 (sub 1)
+        b[48] = 2; // qs[32] → elem 128 (second half)
+        let out = dequantize(GgmlType::Q2_K, &b).unwrap();
+        assert_eq!(out.len(), 256);
+        assert_eq!(out[0], 2.0 * 3.0 - 0.5); // d·sc·q − dmin·m
+        assert_eq!(out[1], -0.5); // zero quant still subtracts the min
+        assert_eq!(out[16], 1.0);
+        assert_eq!(out[128], 15.0 * 2.0); // second half reads qs[32..]
+    }
+
+    #[test]
+    fn q3_k_superblock_matches_hand_computation() {
+        let mut b = vec![0u8; 110];
+        b[108..110].copy_from_slice(&f16_bytes(1.0)); // d
+        // scales: slot 0 = 2|32 = 34 → dl 2; slot 1 = 1|32 = 33 → dl 1;
+        // slot 8 = (0x32>>4)|0 = 3 → dl 3−32 = −29 (tests the >>4 packing).
+        b[96] = 0x32;
+        b[97] = 0x01;
+        b[104] = 0b10; // top bits of slot 0
+        b[105] = 0b10; // top bits of slot 1
+        b[0] = 1; // hmask[0] bit 0 → element 0 keeps its high bit (no −4)
+        b[16] = 1; // hmask[16] bit 0 → element 16 too
+        b[32] = 3; // qs[0] → elem 0
+        b[48] = 2; // qs[16] → elem 16
+        let out = dequantize(GgmlType::Q3_K, &b).unwrap();
+        assert_eq!(out.len(), 256);
+        assert_eq!(out[0], 2.0 * 3.0); // high bit set → q unshifted
+        assert_eq!(out[1], 2.0 * -4.0); // high bit clear → q − 4
+        assert_eq!(out[16], 1.0 * 2.0);
+        // Second half, shift 0 (is=8): hmask[0] bit 4 clear → (0−4)·(3−32).
+        assert_eq!(out[128], -4.0 * (3.0 - 32.0));
+    }
+
+    #[test]
+    fn q5_k_superblock_matches_hand_computation() {
+        let mut b = vec![0u8; 176];
+        b[0..2].copy_from_slice(&f16_bytes(1.0)); // d
+        b[2..4].copy_from_slice(&f16_bytes(1.0)); // dmin
+        b[4] = 2; // sub 0 scale
+        b[5] = 3; // sub 1 scale
+        b[8] = 1; // sub 0 min
+        b[16] = 1; // qh[0] bit 0 → elem 0 gets +16 (u1 = 1)
+        b[48] = 0x21; // ql[0]: low 1 → elem 0, high 2 → elem 32
+        let out = dequantize(GgmlType::Q5_K, &b).unwrap();
+        assert_eq!(out.len(), 256);
+        assert_eq!(out[0], 2.0 * (1.0 + 16.0) - 1.0);
+        assert_eq!(out[1], -1.0); // zero quant still subtracts the min
+        assert_eq!(out[32], 3.0 * 2.0); // qh bit 1 unset → no +16; m1 = 0
+    }
+
+    #[test]
     fn dequant_rejects_partial_blocks_and_unimplemented_types() {
         assert!(dequantize(GgmlType::Q8_0, &[0u8; 33]).is_err());
         assert!(dequantize(GgmlType::Q8_0, &[]).is_err());
-        assert!(dequantize(GgmlType::Q2_K, &[0u8; 84]).is_err());
+        // Q8_K is an activation format, never tensor storage.
+        assert!(dequantize(GgmlType::Q8_K, &[0u8; 292]).is_err());
+    }
+
+    #[test]
+    fn dequant_to_safetensors_reverses_dims_and_round_trips_bytes() {
+        // One F32 tensor with ggml dims [2, 3] and payload 1..=6.
+        let payload: Vec<u8> = (1..=6).flat_map(|v| (v as f32).to_le_bytes()).collect();
+        let bytes = TestGguf::new()
+            .kv_str("general.architecture", "qwen2")
+            .tensor("token_embd.weight", &[2, 3], 0, 0)
+            .build_with_payload(&payload);
+        with_gguf_bytes(&bytes, |f| {
+            let f = f.expect("parses");
+            let blob = f
+                .dequant_to_safetensors(&|i| Some(GgufMap::Rename(format!("model.{}", i.name))))
+                .expect("serializes");
+            let header_len = u64::from_le_bytes(blob[0..8].try_into().unwrap());
+            let json: serde_json::Value =
+                serde_json::from_slice(&blob[8..8 + usize::try_from(header_len).unwrap()])
+                    .expect("header is valid JSON");
+            let entry = &json["model.token_embd.weight"];
+            assert_eq!(entry["dtype"], "F32");
+            assert_eq!(entry["shape"], serde_json::json!([3, 2])); // reversed
+            assert_eq!(entry["data_offsets"], serde_json::json!([0, 24]));
+            // F32 → f32 is byte-identical.
+            assert_eq!(
+                &blob[8 + usize::try_from(header_len).unwrap()..],
+                &payload[..]
+            );
+
+            // An unmapped tensor is a loud error, never a silent skip.
+            assert!(matches!(
+                f.dequant_to_safetensors(&|_| None),
+                Err(GgufError::BadTensor { .. })
+            ));
+        });
+    }
+
+    #[test]
+    fn dequant_to_safetensors_rejects_rename_collisions() {
+        let payload = [0u8; 64]; // two 8-element F32 tensors, offsets 0 and 32
+        let bytes = TestGguf::new()
+            .tensor("a.weight", &[8], 0, 0)
+            .tensor("b.weight", &[8], 0, 32)
+            .build_with_payload(&payload);
+        with_gguf_bytes(&bytes, |f| {
+            let f = f.expect("parses");
+            assert!(matches!(
+                f.dequant_to_safetensors(&|_| Some(GgufMap::Rename("same".into()))),
+                Err(GgufError::BadTensor { .. })
+            ));
+        });
     }
 
     #[test]
