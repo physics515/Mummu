@@ -41,22 +41,35 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
 - **Sampling, streaming, cancellation** — temperature / top-k / top-p sampling (deterministic per seed),
   per-token streaming through a `ControlFlow` callback, and cooperative between-token cancellation;
   greedy decoding keeps the argmax on-device.
-- **Function calling (Hermes-style)** — advertise `ToolSpec`s through `render_with_tools` (the exact
-  `# Tools`/`<tool_call>` template Qwen2.5/Qwen3 are trained on), feed results back as merged
-  `<tool_response>` turns, and extract calls with a bounded `parse_tool_calls`; proven end-to-end on
-  the real GPU (Qwen2.5-1.5B emitted a parseable `get_weather({"city": "Paris"})` call,
-  `tests/real_toolcall.rs`).
+- **Function calling (both zoo conventions)** — advertise `ToolSpec`s through `render_with_tools` in
+  the convention the model was trained on: **Hermes** for Qwen2.5/Qwen3 (the exact
+  `# Tools`/`<tool_call>` JSON template, results as merged `<tool_response>` turns) and **LFM** for
+  LFM2.5 (bare tool JSON on a `List of tools:` system line, Pythonic calls in
+  `<|tool_call_start|>` tokens, results as real `tool` turns, past-turn `</think>` stripping); both
+  parsers are bounded with a loud error taxonomy. Proven end-to-end on the real GPU: Qwen2.5-1.5B
+  emitted a parseable Hermes call and LFM2.5-1.2B emitted exactly
+  `<|tool_call_start|>[get_weather(city="Paris")]<|tool_call_end|>` (`tests/real_toolcall.rs`,
+  `tests/real_toolcall_lfm.rs`).
 - **f16 inference, validated** — Qwen2.5-1.5B runs coherently on `GpuF16` (weights + KV in f16, the
   q·kᵀ attention scores + softmax computed in an f32 island to stop f16 overflow): **~3.6 GiB runner
-  VRAM vs ~7.9 GiB f32, at identical speed** (14.1 tok/s / 88 ms TTFT); the parity gate re-passes
-  unchanged on f32, where the island casts are no-ops ([bench/BASELINE.md](bench/BASELINE.md)).
-- **Benchmarked** — Qwen2.5-1.5B on the reference GPU: **TTFT 88.4 ms, decode 14.1 tok/s** (f32, 11.9 GiB
-  whole-card peak ≈ 7.9 GiB runner; f16: 88.0 ms, 14.1 tok/s, 6.75 GiB ≈ 3.6 GiB runner) — recorded with
+  VRAM vs ~7.9 GiB f32, at identical speed**; the parity gate re-passes unchanged on f32, where the
+  island casts are no-ops ([bench/BASELINE.md](bench/BASELINE.md)).
+- **SPIR-V kernels on Vulkan** — CubeCL compiles direct SPIR-V (burn's `vulkan` feature) instead of
+  WGSL/naga on Vulkan adapters, worth **+30% decode throughput** on the reference GPU with parity
+  byte-identical; other APIs (DX12/Metal) transparently keep WGSL in the same binary.
+- **Benchmarked** — Qwen2.5-1.5B on the reference GPU: **TTFT 96.7 ms, decode 18.4 tok/s** (f32,
+  11.5 GiB whole-card peak ≈ 8.0 GiB runner; f16: 97.2 ms, 18.4 tok/s, ~3.6 GiB runner) — recorded with
   budgets in [bench/BASELINE.md](bench/BASELINE.md), enforced by an opt-in regression gate
   (`mummu-bench/tests/budget.rs`).
 - **Model management** — `ModelManager` gives settings UIs the whole lifecycle over a declarative model
   catalog (`registry::ModelSpec`): install with per-chunk download progress, `is_installed`, per-model
   disk usage, and traversal-safe removal; model switching rides `ModelSlot`.
+- **GGUF import (container + K-quant dequant)** — `mummu::gguf` parses the llama.cpp container (typed,
+  bounded metadata; fully validated tensor table) and dequantizes F32/F16/BF16, Q8_0, and the
+  **Q4_K/Q6_K superblocks** to f32 — proven against the model's true weights: on the real Qwen2.5-1.5B
+  Q4_K_M file the F32 norms come back **bit-exact** vs the bf16 safetensors of the same checkpoint and
+  Q4_K embedding rows dequantize at cosine 0.9975 (`tests/real_gguf.rs`). Next: the remaining quant
+  types and GGUF→model load (tracked in P3/P9).
 - **Hub downloads** — streaming HuggingFace fetches into the model cache: resumable (`.part` + HTTP
   Range, proven byte-identical after an interrupted transfer), length-verified, shard-index aware, with
   a per-chunk progress callback; verified end-to-end by downloading all-MiniLM and embedding with it.

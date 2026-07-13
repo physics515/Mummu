@@ -46,7 +46,11 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       ~83 GB/s vs the 4070 Ti SUPER's ~672 GB/s — the SPIR-V compiler feature (P6 item) and f16 are the
       levers to chase; re-baseline after each. *(2026-07-11) Confirmed empirically: f16 (half the weight
       traffic) decodes at exactly f32's speed — 70.9 vs 70.7 ms/token — so bandwidth isn't the limiter;
-      SPIR-V (TensorCores at f16) is the remaining lever.*
+      SPIR-V (TensorCores at f16) is the remaining lever.* *(2026-07-12) SPIR-V pulled: decode
+      70.7 → 54.3 ms/token (+30% tok/s) on BOTH dtypes — and f16 still exactly matches f32, so the path
+      stays dispatch-bound (~114 GB/s effective vs ~672). Next levers: whatever closes the remaining
+      per-token dispatch gap (fewer kernels per step — deeper fusion of the decode step, or CubeCL
+      graph/megakernel work) rather than bandwidth.*
 - [ ] Evaluate Burn 0.21's `burn.toml` project config — per-subsystem tuning + a CubeCL kernel-validation
       layer without recompiling; useful as a debug switch for kernel-level parity hunts —
       https://burn.dev/blog/release-0.21.0/
@@ -111,6 +115,12 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       semantic test (`tests/real_minilm.rs`).* *(2026-07-10) **Parity PASSED**: embedding matches the
       Candle f32 reference (`minilm-probe` fixture) at cosine 0.99999994 with max |Δcomponent| 1.2e-7
       (bound 1e-4); semantic sanity re-verified on real weights (paraphrase 0.556 vs cross-topic ≈ 0).*
+- [ ] **Qwen3.5 small tier** as the next zoo port: released Feb 2026 in 0.8B / 2B / 4B / 9B, with
+      2026 GGUF re-releases specifically improving tool-calling (chat-template fixes) — the 4B/9B are
+      the function-calling sweet spot BFCL identified (9B 66.1%), and unsloth ships ready GGUFs for the
+      P3 import path to chew on; parity reference = Ollama `qwen3.5:9b` (already pulled locally) —
+      https://unsloth.ai/docs/models/qwen3.5 · https://huggingface.co/unsloth/Qwen3.5-9B-GGUF
+      *(2026-07-12 research)*
 - [x] A `Model` trait so new architectures (Hermes-class function-callers, Gemma, Qwen3, …) slot in.
       *(2026-07-10) `models::CausalLm<B>` — associated `Cache` type; a port supplies `new_cache` /
       `forward` / `is_eos` and inherits `generate` / `greedy_generate` / `first_token` from the shared
@@ -165,6 +175,21 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       (Q2K–Q8K) AND IQ-quants, SIMD-optimized, importance-matrix support, HF-compatible config
       generation — evaluate as dependency-or-reference before hand-porting ggml-quants —
       https://docs.rs/pmetal-gguf/latest/pmetal_gguf/
+      *(2026-07-12) **Container reader shipped** (`mummu::gguf`, no new deps): magic/version (v2/v3 LE),
+      typed+bounded metadata KVs (strings ≤ 1 MiB, arrays ≤ 4M, nesting ≤ 2), tensor table with
+      per-entry validation (known dtype, aligned offset, whole blocks, unique names), K-quant block
+      layouts recorded (`block_size`/`bytes_per_block` for Q4_0…Q8_K), fail-loud error taxonomy.
+      REAL-FILE proof (`tests/real_gguf.rs`): the local Qwen2.5-1.5B **Q4_K_M** parses — v3, 26 kvs,
+      339 tensors, Q4_K `token_embd [1536, 151936]`, 198 K-quant tensors, ~1.04 GiB payload located
+      (3B file cross-checked: 435 tensors). 7 unit tests over a synthetic-bytes builder.*
+      *(2026-07-12, same run) **Dequant shipped** for the Q4_K_M set — F32/F16/BF16, Q8_0, and the
+      K-quant superblocks **Q4_K/Q6_K** (exact ports of ggml-quants' reference dequantizers, incl. the
+      packed 6-bit scale/min encoding) + `GgufFile::read_tensor_f32`. Proof against the model's TRUE
+      weights (`real_gguf.rs` — the same checkpoint exists locally as bf16 safetensors AND Q4_K_M GGUF):
+      the GGUF's F32 `output_norm.weight` is **bit-exact** vs the bf16 originals, and dequantized Q4_K
+      embedding rows hit cosine **0.9975** vs truth (garbage layout ⇒ ≈ 0) — 5 hand-computed-block unit
+      tests (121 total). NEXT slice: remaining dequants (Q4_0/Q5/Q2_K/Q3_K/Q5_K), GGUF→model load
+      (name remap + ggml dim-order transpose), tokenizer-from-GGUF-metadata.*
 - [ ] **GPTQ / AWQ** (HF safetensors) — import the calibration-quantized int4/int8 layouts most "quantized on
       the Hub" models ship as (a `.safetensors` payload + a quant config), dequant or keep-quant into Burn.
 - [ ] **ONNX** (optional) — `burn-import` ONNX→Burn for models distributed as ONNX graphs.
@@ -206,10 +231,21 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       (calls + prose, loud error taxonomy). REAL-GPU proof (`tests/real_toolcall.rs`): Qwen2.5-1.5B
       greedy-emitted `<tool_call>{"name": "get_weather", "arguments": {"city": "Paris"}}</tool_call>`
       from a rendered prompt and the parser round-tripped it. 10 new unit tests.*
-- [ ] LFM2.5 bracket-notation tool-call template + parser (`<|tool_list_start|>` special tokens,
+- [x] LFM2.5 bracket-notation tool-call template + parser (`<|tool_list_start|>` special tokens,
       Python-ish call syntax) — with Hermes/Qwen2.5 (0.880 agent score) done, LFM2.5-1.2B (same score,
       fastest at ~1.5 s on 2026's 21-model local tool-calling benchmark) is the other target —
       https://mikeveerman.be/blog/github-2026-02-06-tool-calling-benchmark/
+      *(2026-07-12) Shipped to LFM**2.5**'s actual wire format (its `chat_template.jinja` + model card —
+      NOT the gen-1 `<|tool_list_start|>` wrapping, which 2.5 dropped): tools as bare JSON on a
+      `List of tools: […]` system line (no default preamble), tool results as real `tool` role turns,
+      `</think>` reasoning stripped from all but the last assistant history turn, calls emitted as a
+      Pythonic list in `<|tool_call_start|>…<|tool_call_end|>`. `chat`: style-split `render_with_tools`,
+      `Turn::assistant_tool_calls_lfm`, and a bounded recursive-descent parser (`parse_tool_calls_lfm`,
+      depth ≤ 8, ≤ 64 calls, Python AND JSON literal spellings, byte-offset error taxonomy). REAL-GPU
+      proof (`tests/real_toolcall_lfm.rs`): LFM2.5-1.2B greedy-emitted exactly
+      `<|tool_call_start|>[get_weather(city="Paris")]<|tool_call_end|>` from our rendered prompt and the
+      parser round-tripped it; the Qwen2 parity gate re-passed both legs after the template refactor
+      (max |Δlogit| 2.670e-5, Ollama greedy byte-identical). 16 new unit tests (109 total).*
       *(2026-07-10 research)* 2026 community numbers back the plan: Qwen3-8B keeps tool-calling score
       through Q4_K_M (0.919 quantized vs 0.933 full — quant does NOT cost tool reliability, good news for
       P9); BFCL shows a capability cliff below ~7B (Qwen3.5-9B 66.1% vs 4B 50.3%), so the zoo's
@@ -263,10 +299,16 @@ that fits the model AND uses every device to the fullest.
       gate re-passed both legs (max |Δlogit| 2.670e-5, unchanged; Ollama greedy byte-identical), and f32
       perf *improved* (TTFT 100.5 → 88.4 ms, decode 13.3 → 14.1 tok/s). f16 benches recorded in
       `bench/BASELINE.md`: 88.0 ms TTFT, 14.1 tok/s — speed parity with f32, VRAM halved.*
-- [ ] Evaluate burn-wgpu's **`spirv` compiler feature** on Vulkan (CubeCL SPIR-V backend instead of
+- [x] Evaluate burn-wgpu's **`spirv` compiler feature** on Vulkan (CubeCL SPIR-V backend instead of
       WGSL/naga): claims significantly faster matmul incl. TensorCores at f16 — could be the cheapest
       decode-tok/s lever on the dev GPU; gate on the parity harness + `bench/BASELINE.md` —
       https://github.com/tracel-ai/burn/blob/main/crates/burn-wgpu/README.md
+      *(2026-07-12) **Adopted** (burn `vulkan` feature; runtime reports `fusion<cubecl<wgpu<spirv>>>`,
+      auto-selected on Vulkan adapters only — other APIs keep WGSL, no code changes): decode
+      **70.7 → 54.3 ms/token (14.1 → 18.4 tok/s, +30%)** on f32 AND f16; TTFT 88.4 → 96.7 ms (well
+      under the 150 ms ceiling); VRAM peak unchanged (11.5 GiB whole-card). Parity gate byte-identical
+      (max |Δlogit| 2.670e-5, Ollama greedy exact); f16 island + CPU budget gates re-passed
+      (108.4 ms / 11.7 tok/s GPU gate, 13.2 tok/s CPU). `bench/BASELINE.md` re-baselined.*
 - [ ] **Placement plan** — given model size + KV-cache + display headroom and the device set, choose a
       **fit-and-fill** plan: single GPU when it fits; **shard layers across multiple GPUs** (pipeline/
       layer-parallel over Burn's multi-device tensors — Burn gives the multi-device *primitives*, not automatic
@@ -299,6 +341,11 @@ that fits the model AND uses every device to the fullest.
       (temperature 0 for the greedy leg) — that plus an fp16 GGUF of the same revision is a workable
       logits leg without Python — https://docs.liquid.ai/deployment/on-device/llama-cpp ·
       https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md
+      *(2026-07-12 research)* Caution for that route: llama.cpp's own chat/tool layer mishandles
+      LFM2.5 (issue #23838 — its parser rejects the documented `<|tool_call_start|>[…]` format), so
+      drive `llama-server` in RAW completion mode (`/completion`, no chat template) and render prompts
+      with our byte-verified `ChatMl::lfm2()` — never through llama.cpp's template stack —
+      https://github.com/ggml-org/llama.cpp/issues/23838
 - [ ] Wire the perf suite (above) into the parity harness so a correctness *or* budget regression fails CI.
 
 ### P8 — Model management API
