@@ -115,6 +115,19 @@ impl GgufValue {
         }
     }
 
+    /// The value widened to i64, if it is any integer (signed or unsigned)
+    /// that fits.
+    #[must_use]
+    pub fn as_i64(&self) -> Option<i64> {
+        match *self {
+            Self::I8(v) => Some(i64::from(v)),
+            Self::I16(v) => Some(i64::from(v)),
+            Self::I32(v) => Some(i64::from(v)),
+            Self::I64(v) => Some(v),
+            _ => self.as_u64().and_then(|v| i64::try_from(v).ok()),
+        }
+    }
+
     /// The value as f32, if it is one.
     #[must_use]
     pub fn as_f32(&self) -> Option<f32> {

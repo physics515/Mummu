@@ -163,6 +163,60 @@ fn real_qwen2_gguf_dequant_matches_the_true_weights() {
     }
 }
 
+/// The tokenizer rebuilt from GGUF metadata must be **byte-identical** to the
+/// checkpoint's own `tokenizer.json` — same ids for every prompt shape we
+/// throw at it (ChatML with specials, unicode, numbers, whitespace runs), and
+/// the same decoded text back.
+#[test]
+#[ignore = "needs the local GGUF (MUMMU_GGUF_PATH) + safetensors dir (MUMMU_QWEN2_DIR)"]
+fn real_qwen2_gguf_tokenizer_matches_the_hf_tokenizer() {
+    let Some(path) = gguf_path() else {
+        panic!("set MUMMU_GGUF_PATH to the qwen2.5-1.5b-instruct q4_k_m gguf");
+    };
+    let dir = std::env::var_os("MUMMU_QWEN2_DIR")
+        .map(PathBuf::from)
+        .filter(|d| d.join("tokenizer.json").is_file())
+        .expect("set MUMMU_QWEN2_DIR to the same model's safetensors dir (tokenizer.json)");
+
+    let f = GgufFile::open(&path).expect("header parses");
+    let ours = mummu::tokenizer::tokenizer_from_gguf(&f).expect("tokenizer builds from metadata");
+    let reference =
+        tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer.json");
+
+    let chat = mummu::chat::ChatMl::qwen2();
+    let battery = [
+        chat.render(&[
+            mummu::chat::Turn::system("You are a concise assistant."),
+            mummu::chat::Turn::user("What is 2+2? Answer in one short sentence."),
+        ]),
+        "The quick brown fox jumps over the lazy dog.".into(),
+        "héllo wörld — 世界 · Ω ≠ ω · 🦀🔥".into(),
+        "  leading spaces, trailing  \n\nnewlines\r\nand\ttabs ".into(),
+        "1234567890 3.14159 1e-6 0x7F".into(),
+        "<|im_start|>user\nplain<|im_end|><|endoftext|>".into(),
+        "don't they're we've I'll it's CAN'T".into(),
+        String::new(),
+    ];
+    for text in &battery {
+        let a = ours.encode(text.as_str(), true).expect("ours encodes");
+        let b = reference.encode(text.as_str(), true).expect("ref encodes");
+        assert_eq!(
+            a.get_ids(),
+            b.get_ids(),
+            "token ids diverge on {text:?}: {:?} vs {:?}",
+            a.get_tokens(),
+            b.get_tokens()
+        );
+        let da = ours.decode(a.get_ids(), false).expect("ours decodes");
+        let db = reference.decode(b.get_ids(), false).expect("ref decodes");
+        assert_eq!(da, db, "decoded text diverges on {text:?}");
+    }
+    eprintln!(
+        "[real_gguf] tokenizer-from-GGUF: {} prompts byte-identical to tokenizer.json",
+        battery.len()
+    );
+}
+
 /// END-TO-END: the Q4_K_M GGUF alone (config + weights from the one file)
 /// becomes a running model on the GPU — greedy-decodes a correct answer, and
 /// its first-token logits agree with the bf16 safetensors build of the same
@@ -182,9 +236,10 @@ fn real_qwen2_gguf_loads_and_decodes_on_gpu() {
     assert!(use_gpu(), "this proof wants the real GPU");
     let device = burn::tensor::Device::<Gpu>::default();
 
-    // Tokenizer from the sibling checkpoint — tokenizer-from-GGUF-metadata
-    // is the next P3 slice.
-    let tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer");
+    // The tokenizer comes from the GGUF itself — the whole model is ONE file
+    // (byte-verified against tokenizer.json by the sibling test).
+    let header = GgufFile::open(&path).expect("header parses");
+    let tok = mummu::tokenizer::tokenizer_from_gguf(&header).expect("tokenizer from metadata");
     let chat = mummu::chat::ChatMl::qwen2();
     let prompt_text = chat.render(&[
         mummu::chat::Turn::system("You are a concise assistant."),

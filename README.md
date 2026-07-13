@@ -72,7 +72,9 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
   the model's true weights (`tests/real_gguf.rs`): F32 norms **bit-exact** vs the bf16 safetensors of
   the same checkpoint, Q4_K rows at cosine 0.9975, and the real Qwen2.5-1.5B **Q4_K_M file greedy-decodes
   "2+2 equals 4." on the GPU** with first-token top-1 identical to the bf16 build (logit cosine 0.977).
-  Next: tokenizer-from-GGUF metadata and the LFM2 GGUF map (tracked in P3).
+  The tokenizer comes from the GGUF too (`tokenizer_from_gguf`: NFC → per-family pre-regex → ByteLevel
+  → BPE, byte-identical ids vs the checkpoint's `tokenizer.json` on an 8-prompt battery) — **one .gguf
+  file is the whole model**. Next: the LFM2 GGUF map (tracked in P3).
 - **Hub downloads** — streaming HuggingFace fetches into the model cache: resumable (`.part` + HTTP
   Range, proven byte-identical after an interrupted transfer), length-verified, shard-index aware, with
   a per-chunk progress callback; verified end-to-end by downloading all-MiniLM and embedding with it.

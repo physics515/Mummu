@@ -203,9 +203,17 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       logit cosine 0.977 (28 layers of Q4_K drift; a layout bug reads ≈ 0). Parity gate re-passed
       byte-identically after the lm_head change (max |Δlogit| 2.670e-5, Ollama greedy exact); f16 +
       budget gates green (GPU 107.4 ms / 13.6 tok/s, CPU 14.8 tok/s).*
-- [ ] **Tokenizer-from-GGUF metadata** — build the HF `tokenizers` pipeline from `tokenizer.ggml.*`
+- [x] **Tokenizer-from-GGUF metadata** — build the HF `tokenizers` pipeline from `tokenizer.ggml.*`
       (tokens, merges, token types, BPE pre-tokenizer regex) so a GGUF needs no sibling
       `tokenizer.json`; byte-verify token ids against the HF tokenizer of the same checkpoint.
+      *(2026-07-13, same run) Shipped (`mummu::tokenizer::tokenizer_from_gguf`): NFC → Split(the
+      per-family `tokenizer.ggml.pre` regex, llama.cpp-style registry — unknown ids are loud errors) →
+      ByteLevel → BPE; token id = array index; CONTROL(3)/USER_DEFINED(4) types become special/plain
+      added tokens with post-build id verification, UNUSED(5) `[PADn]` entries skipped. REAL-FILE
+      proof: **byte-identical ids vs the checkpoint's `tokenizer.json` on an 8-prompt battery**
+      (ChatML + specials, unicode/CJK/emoji, whitespace runs, contractions, empty) and identical
+      decodes; the end-to-end GPU test now runs tokenizer + config + weights from the ONE .gguf file.
+      Only `gpt2`-model/`qwen2`-pre is registered so far — new families add a regex entry.*
 - [ ] **LFM2 GGUF name map** — extend `load_from_gguf` to the LFM2/LFM2.5 hybrid (llama.cpp `lfm2`
       arch: `shortconv.*` tensor names, `lfm2.*` metadata keys) once a same-weights GGUF is validated.
 - [ ] **Quantized-reference parity leg for GGUF loads** — the end-to-end test compares against the bf16
