@@ -222,6 +222,12 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       reference item's caveats) to assert our dequant matches ggml's compute path token-for-token.
 - [ ] **GPTQ / AWQ** (HF safetensors) — import the calibration-quantized int4/int8 layouts most "quantized on
       the Hub" models ship as (a `.safetensors` payload + a quant config), dequant or keep-quant into Burn.
+      *(2026-07-13 research)* Both are quantization *algorithms*, not formats — the artifact is ordinary
+      safetensors shards (packed int4 `qweight`/`qzeros`/`scales`, group size 128 is the de-facto
+      standard) plus `quantization_config` in `config.json`; vLLM's **compressed-tensors** is the
+      emerging unified on-disk convention to target (one reader covers GPTQ/AWQ/INT8/FP8 exports) —
+      https://github.com/vllm-project/compressed-tensors ·
+      https://www.digitalapplied.com/blog/gguf-vs-awq-vs-gptq-vs-mlx-llm-quantization-formats-2026
 - [ ] **ONNX** (optional) — `burn-import` ONNX→Burn for models distributed as ONNX graphs.
 - [ ] **Dtype handling** — a `CastFloatAdapter` (bf16→f32/f16); quantized→dequant on import; keep-quantized
       handed to P9.
@@ -376,6 +382,11 @@ that fits the model AND uses every device to the fullest.
       drive `llama-server` in RAW completion mode (`/completion`, no chat template) and render prompts
       with our byte-verified `ChatMl::lfm2()` — never through llama.cpp's template stack —
       https://github.com/ggml-org/llama.cpp/issues/23838
+      *(2026-07-13 research)* That parser bug is now FIXED upstream (PR #24178 merged ~June 2026 —
+      `is_lfm2_template()` detected only the gen-1 `<|tool_list_start|>` tags); raw completion mode
+      remains the right choice for the logits leg regardless (no template stack in the loop). Also:
+      LiquidAI officially publishes LFM2.5-1.2B GGUFs (incl. F16) — the same-weights reference artifact
+      this leg needs — https://github.com/ggml-org/llama.cpp/issues/23838
 - [ ] Wire the perf suite (above) into the parity harness so a correctness *or* budget regression fails CI.
 
 ### P8 — Model management API
@@ -394,7 +405,14 @@ The VRAM lever the P6 planner pulls to make the largest useful model fit the use
       + CPU paths; quantize on import or on the fly, keyed to the fit target from P6.
 - [ ] **Import pre-quantized** — run **GGUF K-quants** (Q2_K–Q8_0, per-layer precision) and **GPTQ / AWQ** int4
       layouts directly (dequant to the compute dtype, or a keep-quantized matmul where the kernel exists), so a
-      model already quantized on the Hub loads as-is.
+      model already quantized on the Hub loads as-is. *(2026-07-13) The dequant-to-f32 leg of the GGUF
+      path shipped in P3 (`load_from_gguf` — every storage dtype); what remains here is **keep-quantized
+      in VRAM**, which is the actual fit lever (Q4_K_M currently dequants to the same f32 footprint).*
+- [ ] Evaluate **CubeCL's quantization primitives** for the keep-quantized matmul: recent CubeCL ships
+      block-scaled MMA, global quantization for matmul, quantized tensor views, and FP4/FP2 formats —
+      the kernel substrate a Q4-weights × f16-activations decode path would ride (vs hand-writing a
+      dequant-fused kernel); gate any adoption on the parity harness + `bench/BASELINE.md` —
+      https://github.com/tracel-ai/cubecl/releases · https://burn.dev/blog/release-0.21.0/
 - [ ] **Auto-quantize-to-fit** — the planner picks the *highest* precision that fits the detected VRAM
       (f16 → int8 → int4), reports the quality/size trade, and never silently ships a worse tier than asked.
 
