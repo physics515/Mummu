@@ -15,6 +15,7 @@ use burn::nn::{Embedding, EmbeddingConfig, RmsNorm, RmsNormConfig};
 use burn::store::{ModuleAdapter, PyTorchToBurnAdapter, SafetensorsStore};
 use burn::tensor::{Int, Tensor, TensorData, backend::Backend};
 
+use crate::gguf::{GgufFile, GgufMap, GgufTensorInfo, GgufValue};
 use crate::import::{CastFloatAdapter, ImportError, load_checked, required_file};
 use crate::models::CausalLm;
 use crate::models::qwen2::EosIds;
@@ -75,6 +76,101 @@ impl Lfm2Config {
     /// Parse `config.json` bytes.
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, String> {
         let cfg: Self = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Hyperparameters from a GGUF header's `lfm2.*` metadata. Layer kinds
+    /// come from llama.cpp's per-layer `attention.head_count_kv` array:
+    /// `0` marks a shortconv layer, nonzero an attention layer.
+    /// `feed_forward_length` in a GGUF is the already-adjusted SwiGLU dim,
+    /// so auto-adjust is off.
+    pub fn from_gguf(f: &GgufFile) -> Result<Self, String> {
+        let arch = f.architecture().unwrap_or("<missing>");
+        if arch != "lfm2" {
+            return Err(format!("GGUF architecture '{arch}' is not lfm2"));
+        }
+        let meta_usize = |key: &str| -> Result<usize, String> {
+            f.get(key)
+                .and_then(GgufValue::as_u64)
+                .and_then(|v| usize::try_from(v).ok())
+                .ok_or_else(|| format!("missing or non-integer GGUF metadata '{key}'"))
+        };
+        let hidden_size = meta_usize("lfm2.embedding_length")?;
+        let num_hidden_layers = meta_usize("lfm2.block_count")?;
+
+        // Per-layer kv-head counts: 0 = conv, nonzero = attention (all
+        // nonzero entries must agree — one KV geometry per model).
+        let kv_per_layer = f
+            .get("lfm2.attention.head_count_kv")
+            .and_then(GgufValue::as_array)
+            .ok_or("missing per-layer array 'lfm2.attention.head_count_kv'")?;
+        if kv_per_layer.len() != num_hidden_layers {
+            return Err(format!(
+                "head_count_kv has {} entries for {num_hidden_layers} layers",
+                kv_per_layer.len()
+            ));
+        }
+        let mut layer_types = Vec::with_capacity(num_hidden_layers);
+        let mut kv_heads: Option<u64> = None;
+        for (i, v) in kv_per_layer.iter().enumerate() {
+            let n = v
+                .as_i64()
+                .and_then(|n| u64::try_from(n).ok()) // i32 array in real files
+                .ok_or_else(|| format!("head_count_kv[{i}] is not a non-negative integer"))?;
+            if n == 0 {
+                layer_types.push("conv".to_string());
+            } else {
+                if kv_heads.is_some_and(|k| k != n) {
+                    return Err(format!("head_count_kv mixes {kv_heads:?} and {n}"));
+                }
+                kv_heads = Some(n);
+                layer_types.push("full_attention".to_string());
+            }
+        }
+        let Some(kv_heads) = kv_heads else {
+            return Err("no attention layers in head_count_kv".into());
+        };
+
+        let embd = f
+            .tensor("token_embd.weight")
+            .ok_or("GGUF has no token_embd.weight tensor")?;
+        if embd.dims.len() != 2 || embd.dims[0] != hidden_size as u64 {
+            return Err(format!(
+                "token_embd.weight dims {:?} do not match embedding_length {hidden_size}",
+                embd.dims
+            ));
+        }
+        if f.tensor("output.weight").is_some() {
+            return Err("LFM2 GGUF carries an untied output.weight — unsupported".into());
+        }
+        let eps = f
+            .get("lfm2.attention.layer_norm_rms_epsilon")
+            .and_then(GgufValue::as_f32)
+            .ok_or("missing 'lfm2.attention.layer_norm_rms_epsilon'")?;
+        let theta = f
+            .get("lfm2.rope.freq_base")
+            .and_then(GgufValue::as_f32)
+            .ok_or("missing 'lfm2.rope.freq_base'")?;
+        let cfg = Self {
+            vocab_size: usize::try_from(embd.dims[1]).map_err(|_| "vocab too large")?,
+            hidden_size,
+            num_hidden_layers,
+            num_attention_heads: meta_usize("lfm2.attention.head_count")?,
+            num_key_value_heads: usize::try_from(kv_heads).map_err(|_| "kv heads too large")?,
+            norm_eps: f64::from(eps),
+            rope_theta: theta,
+            conv_l_cache: meta_usize("lfm2.shortconv.l_cache")?,
+            block_ff_dim: meta_usize("lfm2.feed_forward_length")?,
+            block_multiple_of: 1,
+            block_auto_adjust_ff_dim: false,
+            layer_types,
+            eos_token_id: f
+                .get("tokenizer.ggml.eos_token_id")
+                .and_then(GgufValue::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+                .map_or(EosIds::None, EosIds::One),
+        };
         cfg.validate()?;
         Ok(cfg)
     }
@@ -216,6 +312,90 @@ pub fn load_from_dir<B: Backend>(
             "$1.gamma",
         );
     load_checked(&mut model, &mut store, &weights)?;
+    Ok(LoadedLfm2 { model, config })
+}
+
+/// GGUF (llama.cpp `lfm2` arch) tensor names → the HF checkpoint names the
+/// safetensors remap chain already handles. The depthwise conv kernel is the
+/// one shape special-case: llama.cpp stores it squeezed (`[k, channels]` in
+/// ggml dims), the checkpoint as `[channels, 1, k]` — same bytes.
+fn gguf_tensor_to_hf(info: &GgufTensorInfo) -> Option<GgufMap> {
+    match info.name.as_str() {
+        "token_embd.weight" => {
+            return Some(GgufMap::Rename("model.embed_tokens.weight".into()));
+        }
+        "token_embd_norm.weight" => {
+            return Some(GgufMap::Rename("model.embedding_norm.weight".into()));
+        }
+        _ => {}
+    }
+    let rest = info.name.strip_prefix("blk.")?;
+    let (layer, field) = rest.split_once('.')?;
+    let layer: usize = layer.parse().ok()?;
+    if field == "shortconv.conv.weight" {
+        // ggml dims [k, channels] → row-major [channels, k] → the
+        // checkpoint's depthwise-Conv1d shape [channels, 1, k].
+        let (&k, &channels) = (info.dims.first()?, info.dims.get(1)?);
+        return Some(GgufMap::Reshape(
+            format!("model.layers.{layer}.conv.conv.weight"),
+            vec![channels, 1, k],
+        ));
+    }
+    let mapped = match field {
+        "attn_norm.weight" => "operator_norm.weight",
+        "ffn_norm.weight" => "ffn_norm.weight",
+        "attn_q.weight" => "self_attn.q_proj.weight",
+        "attn_k.weight" => "self_attn.k_proj.weight",
+        "attn_v.weight" => "self_attn.v_proj.weight",
+        "attn_output.weight" => "self_attn.out_proj.weight",
+        "attn_q_norm.weight" => "self_attn.q_layernorm.weight",
+        "attn_k_norm.weight" => "self_attn.k_layernorm.weight",
+        "ffn_gate.weight" => "feed_forward.w1.weight",
+        "ffn_down.weight" => "feed_forward.w2.weight",
+        "ffn_up.weight" => "feed_forward.w3.weight",
+        "shortconv.in_proj.weight" => "conv.in_proj.weight",
+        "shortconv.out_proj.weight" => "conv.out_proj.weight",
+        _ => return None,
+    };
+    Some(GgufMap::Rename(format!("model.layers.{layer}.{mapped}")))
+}
+
+/// Load an LFM2/LFM2.5 model straight from a **GGUF** file: hyperparameters
+/// from the `lfm2.*` metadata (layer kinds from the per-layer kv-head
+/// array), weights dequantized and driven through the exact store pipeline
+/// the safetensors path uses.
+pub fn load_from_gguf<B: Backend>(
+    path: &Path,
+    device: &B::Device,
+) -> Result<LoadedLfm2<B>, ImportError> {
+    let parse = |reason: String| ImportError::Parse {
+        file: path.to_path_buf(),
+        reason,
+    };
+    let f = GgufFile::open(path).map_err(|e| parse(e.to_string()))?;
+    let config = Lfm2Config::from_gguf(&f).map_err(parse)?;
+    let blob = f
+        .dequant_to_safetensors(&gguf_tensor_to_hf)
+        .map_err(|e| parse(e.to_string()))?;
+    assert!(blob.len() > 8, "a parsed GGUF yields a non-empty blob");
+
+    let mut model = build::<B>(&config, device);
+    let target_float = Tensor::<B, 1>::zeros([1], device).dtype();
+    let mut store = SafetensorsStore::from_bytes(Some(blob))
+        .with_from_adapter(PyTorchToBurnAdapter.chain(CastFloatAdapter::new(target_float)))
+        .allow_partial(true)
+        .with_key_remapping(r"^model\.", "")
+        .with_key_remapping(r"(self_attn)\.out_proj\.", "$1.o_proj.")
+        .with_key_remapping(r"(self_attn)\.q_layernorm\.weight$", "$1.q_norm.gamma")
+        .with_key_remapping(r"(self_attn)\.k_layernorm\.weight$", "$1.k_norm.gamma")
+        .with_key_remapping(r"(feed_forward)\.w1\.", "$1.gate_proj.")
+        .with_key_remapping(r"(feed_forward)\.w2\.", "$1.down_proj.")
+        .with_key_remapping(r"(feed_forward)\.w3\.", "$1.up_proj.")
+        .with_key_remapping(
+            r"(operator_norm|ffn_norm|embedding_norm)\.weight$",
+            "$1.gamma",
+        );
+    load_checked(&mut model, &mut store, path)?;
     Ok(LoadedLfm2 { model, config })
 }
 
@@ -393,5 +573,110 @@ mod tests {
         };
         let out = loaded.greedy_generate(&[1, 2], 3, &device).unwrap();
         assert!(out.len() <= 3);
+    }
+
+    /// A synthetic GGUF header shaped like the LFM2.5-1.2B file.
+    fn toy_gguf() -> GgufFile {
+        use crate::gguf::GgmlType;
+        let meta = |k: &str, v: GgufValue| (k.to_string(), v);
+        let kv_array = GgufValue::Array(
+            [0u32, 2, 0]
+                .iter()
+                .map(|&v| GgufValue::U32(v))
+                .collect::<Vec<_>>(),
+        );
+        GgufFile {
+            path: std::path::PathBuf::new(),
+            version: 3,
+            metadata: vec![
+                meta("general.architecture", GgufValue::Str("lfm2".into())),
+                meta("lfm2.embedding_length", GgufValue::U32(16)),
+                meta("lfm2.block_count", GgufValue::U32(3)),
+                meta("lfm2.feed_forward_length", GgufValue::U32(32)),
+                meta("lfm2.attention.head_count", GgufValue::U32(4)),
+                meta("lfm2.attention.head_count_kv", kv_array),
+                meta(
+                    "lfm2.attention.layer_norm_rms_epsilon",
+                    GgufValue::F32(1e-5),
+                ),
+                meta("lfm2.rope.freq_base", GgufValue::F32(1e6)),
+                meta("lfm2.shortconv.l_cache", GgufValue::U32(3)),
+                meta("tokenizer.ggml.eos_token_id", GgufValue::U32(7)),
+            ],
+            tensors: vec![GgufTensorInfo {
+                name: "token_embd.weight".into(),
+                dims: vec![16, 48],
+                dtype: GgmlType::F32,
+                offset: 0,
+            }],
+            alignment: 32,
+            data_offset: 0,
+        }
+    }
+
+    #[test]
+    fn config_from_gguf_derives_layer_types_from_kv_array() {
+        let cfg = Lfm2Config::from_gguf(&toy_gguf()).expect("parses");
+        assert_eq!(
+            cfg.layer_types,
+            vec!["conv", "full_attention", "conv"],
+            "0 = conv, nonzero = attention"
+        );
+        assert_eq!(cfg.num_key_value_heads, 2);
+        assert_eq!(cfg.vocab_size, 48); // from token_embd dims[1]
+        assert_eq!(cfg.ff_dim(), 32); // GGUF value is pre-adjusted
+        assert!(cfg.eos_token_id.contains(7));
+    }
+
+    #[test]
+    fn config_from_gguf_rejects_mixed_kv_and_missing_array() {
+        let mut f = toy_gguf();
+        f.metadata[5].1 = GgufValue::Array(vec![
+            GgufValue::U32(4),
+            GgufValue::U32(2),
+            GgufValue::U32(0),
+        ]);
+        assert!(Lfm2Config::from_gguf(&f).unwrap_err().contains("mixes"));
+
+        let mut f = toy_gguf();
+        f.metadata
+            .retain(|(k, _)| k != "lfm2.attention.head_count_kv");
+        assert!(Lfm2Config::from_gguf(&f).is_err());
+    }
+
+    #[test]
+    fn gguf_names_map_onto_hf_checkpoint_names_incl_conv_reshape() {
+        use crate::gguf::GgmlType;
+        let info = |name: &str, dims: &[u64]| GgufTensorInfo {
+            name: name.into(),
+            dims: dims.to_vec(),
+            dtype: GgmlType::F32,
+            offset: 0,
+        };
+        let name_of = |i: &GgufTensorInfo| match gguf_tensor_to_hf(i) {
+            Some(GgufMap::Rename(n)) => n,
+            other => panic!("expected Rename, got {other:?}"),
+        };
+        assert_eq!(
+            name_of(&info("blk.2.attn_q_norm.weight", &[64])),
+            "model.layers.2.self_attn.q_layernorm.weight"
+        );
+        assert_eq!(
+            name_of(&info("blk.0.shortconv.in_proj.weight", &[2048, 6144])),
+            "model.layers.0.conv.in_proj.weight"
+        );
+        assert_eq!(
+            name_of(&info("token_embd_norm.weight", &[2048])),
+            "model.embedding_norm.weight"
+        );
+        // The conv kernel un-squeezes to the checkpoint's [channels, 1, k].
+        match gguf_tensor_to_hf(&info("blk.0.shortconv.conv.weight", &[3, 2048])) {
+            Some(GgufMap::Reshape(n, shape)) => {
+                assert_eq!(n, "model.layers.0.conv.conv.weight");
+                assert_eq!(shape, vec![2048, 1, 3]);
+            }
+            other => panic!("expected Reshape, got {other:?}"),
+        }
+        assert!(gguf_tensor_to_hf(&info("rope_freqs.weight", &[64])).is_none());
     }
 }

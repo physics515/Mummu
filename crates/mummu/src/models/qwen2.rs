@@ -15,7 +15,7 @@ use burn::nn::{Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNor
 use burn::store::{ModuleAdapter, PyTorchToBurnAdapter, SafetensorsStore};
 use burn::tensor::{Int, Tensor, TensorData, backend::Backend};
 
-use crate::gguf::{GgufFile, GgufValue};
+use crate::gguf::{GgufFile, GgufMap, GgufTensorInfo, GgufValue};
 use crate::import::{CastFloatAdapter, ImportError, load_checked, required_file};
 use crate::models::CausalLm;
 use crate::nn::{
@@ -270,7 +270,11 @@ pub fn load_from_dir<B: Backend>(
 /// GGUF (llama.cpp) tensor names → the HF checkpoint names the safetensors
 /// remap chain already handles. `None` for anything unrecognized — the blob
 /// writer turns that into a loud error rather than dropping weights.
-fn gguf_tensor_to_hf(name: &str) -> Option<String> {
+fn gguf_tensor_to_hf(info: &GgufTensorInfo) -> Option<GgufMap> {
+    qwen2_gguf_name(&info.name).map(GgufMap::Rename)
+}
+
+fn qwen2_gguf_name(name: &str) -> Option<String> {
     match name {
         "token_embd.weight" => return Some("model.embed_tokens.weight".into()),
         "output_norm.weight" => return Some("model.norm.weight".into()),
@@ -590,24 +594,24 @@ mod tests {
     #[test]
     fn gguf_names_map_onto_hf_checkpoint_names() {
         assert_eq!(
-            gguf_tensor_to_hf("token_embd.weight").as_deref(),
+            qwen2_gguf_name("token_embd.weight").as_deref(),
             Some("model.embed_tokens.weight")
         );
         assert_eq!(
-            gguf_tensor_to_hf("blk.27.attn_q.bias").as_deref(),
+            qwen2_gguf_name("blk.27.attn_q.bias").as_deref(),
             Some("model.layers.27.self_attn.q_proj.bias")
         );
         assert_eq!(
-            gguf_tensor_to_hf("blk.0.ffn_down.weight").as_deref(),
+            qwen2_gguf_name("blk.0.ffn_down.weight").as_deref(),
             Some("model.layers.0.mlp.down_proj.weight")
         );
         assert_eq!(
-            gguf_tensor_to_hf("output_norm.weight").as_deref(),
+            qwen2_gguf_name("output_norm.weight").as_deref(),
             Some("model.norm.weight")
         );
         // Unknown names must map to None (the writer errors loudly).
-        assert_eq!(gguf_tensor_to_hf("rope_freqs.weight"), None);
-        assert_eq!(gguf_tensor_to_hf("blk.x.attn_q.weight"), None);
+        assert_eq!(qwen2_gguf_name("rope_freqs.weight"), None);
+        assert_eq!(qwen2_gguf_name("blk.x.attn_q.weight"), None);
     }
 
     #[test]

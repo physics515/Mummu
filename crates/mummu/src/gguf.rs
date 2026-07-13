@@ -259,6 +259,19 @@ impl GgufTensorInfo {
     }
 }
 
+/// How one GGUF tensor lands in the safetensors blob
+/// ([`GgufFile::dequant_to_safetensors`]).
+#[derive(Debug, Clone)]
+pub enum GgufMap {
+    /// Target name; shape = the GGUF dims reversed (the row-major twin of
+    /// the ggml layout — right for everything but squeezed kernels).
+    Rename(String),
+    /// Target name + explicit row-major shape (same element count, same
+    /// bytes — e.g. un-squeezing a depthwise conv kernel back to
+    /// `[channels, 1, k]`).
+    Reshape(String, Vec<u64>),
+}
+
 /// A parsed GGUF header: typed metadata + the located tensor table.
 #[derive(Debug)]
 pub struct GgufFile {
@@ -341,18 +354,21 @@ impl GgufFile {
     /// Dequantize every tensor to f32 and serialize the result as an
     /// in-memory **safetensors** file — the bridge onto the exact store
     /// pipeline (adapters, key remaps, checked load) the safetensors path
-    /// already trusts. `rename` maps each GGUF tensor name to the name the
-    /// blob should carry (HF-checkpoint naming, so per-model remap tables
-    /// apply unchanged); an unmapped tensor is a loud error, never a skip —
-    /// a name this crate doesn't recognize means weights would silently
-    /// vanish from the model.
+    /// already trusts. `map` maps each GGUF tensor to the name (and
+    /// optionally an explicit shape) the blob should carry (HF-checkpoint
+    /// naming, so per-model remap tables apply unchanged); an unmapped
+    /// tensor is a loud error, never a skip — a name this crate doesn't
+    /// recognize means weights would silently vanish from the model.
     ///
-    /// Shapes are the GGUF dims **reversed**: ggml orders dims
+    /// Default shapes are the GGUF dims **reversed**: ggml orders dims
     /// fastest-varying-first, so the raw payload bytes are exactly the
     /// row-major layout of the reversed shape — same bytes, HF convention.
+    /// [`GgufMap::Reshape`] overrides that for tensors whose checkpoint
+    /// shape differs by more than dim order (e.g. llama.cpp squeezes the
+    /// middle 1 out of depthwise-conv kernels).
     pub fn dequant_to_safetensors(
         &self,
-        rename: &dyn Fn(&str) -> Option<String>,
+        map: &dyn Fn(&GgufTensorInfo) -> Option<GgufMap>,
     ) -> Result<Vec<u8>, GgufError> {
         let total_f32_bytes: u64 = self.tensors.iter().map(|t| t.element_count() * 4).sum();
         if total_f32_bytes > MAX_DEQUANT_BYTES {
@@ -374,8 +390,25 @@ impl GgufFile {
         let mut data: Vec<u8> =
             Vec::with_capacity(usize::try_from(total_f32_bytes).expect("bounded above"));
         for (index, info) in self.tensors.iter().enumerate() {
-            let Some(name) = rename(&info.name) else {
-                return Err(bad(index, format!("unmapped tensor name '{}'", info.name)));
+            let (name, shape) = match map(info) {
+                Some(GgufMap::Rename(name)) => {
+                    (name, info.dims.iter().rev().copied().collect::<Vec<u64>>())
+                }
+                Some(GgufMap::Reshape(name, shape)) => {
+                    if shape.iter().product::<u64>() != info.element_count() {
+                        return Err(bad(
+                            index,
+                            format!(
+                                "reshape of '{}' to {shape:?} changes the element count",
+                                info.name
+                            ),
+                        ));
+                    }
+                    (name, shape)
+                }
+                None => {
+                    return Err(bad(index, format!("unmapped tensor name '{}'", info.name)));
+                }
             };
             if !names.insert(name.clone()) {
                 return Err(bad(index, format!("rename collision on '{name}'")));
@@ -383,7 +416,6 @@ impl GgufFile {
             let start = data.len();
             let values = self.read_tensor_f32(&info.name)?;
             data.extend(values.iter().flat_map(|v| v.to_le_bytes()));
-            let shape: Vec<u64> = info.dims.iter().rev().copied().collect();
             let json_name = serde_json::to_string(&name).expect("string serializes");
             if index > 0 {
                 header.push(',');
@@ -1349,7 +1381,7 @@ mod tests {
         with_gguf_bytes(&bytes, |f| {
             let f = f.expect("parses");
             let blob = f
-                .dequant_to_safetensors(&|n| Some(format!("model.{n}")))
+                .dequant_to_safetensors(&|i| Some(GgufMap::Rename(format!("model.{}", i.name))))
                 .expect("serializes");
             let header_len = u64::from_le_bytes(blob[0..8].try_into().unwrap());
             let json: serde_json::Value =
@@ -1383,7 +1415,7 @@ mod tests {
         with_gguf_bytes(&bytes, |f| {
             let f = f.expect("parses");
             assert!(matches!(
-                f.dequant_to_safetensors(&|_| Some("same".into())),
+                f.dequant_to_safetensors(&|_| Some(GgufMap::Rename("same".into()))),
                 Err(GgufError::BadTensor { .. })
             ));
         });

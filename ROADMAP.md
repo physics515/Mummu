@@ -214,8 +214,21 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       (ChatML + specials, unicode/CJK/emoji, whitespace runs, contractions, empty) and identical
       decodes; the end-to-end GPU test now runs tokenizer + config + weights from the ONE .gguf file.
       Only `gpt2`-model/`qwen2`-pre is registered so far — new families add a regex entry.*
-- [ ] **LFM2 GGUF name map** — extend `load_from_gguf` to the LFM2/LFM2.5 hybrid (llama.cpp `lfm2`
+- [x] **LFM2 GGUF name map** — extend `load_from_gguf` to the LFM2/LFM2.5 hybrid (llama.cpp `lfm2`
       arch: `shortconv.*` tensor names, `lfm2.*` metadata keys) once a same-weights GGUF is validated.
+      *(2026-07-13, same run) Shipped (`lfm2::load_from_gguf`): `Lfm2Config::from_gguf` derives
+      `layer_types` from llama.cpp's per-layer `head_count_kv` array (0 = conv, nonzero = attention;
+      i32 in real files), `feed_forward_length` arrives pre-adjusted; the name map covers the hybrid's
+      per-head q/k norms + `shortconv.{conv,in_proj,out_proj}`, with the depthwise conv kernel as the
+      one shape special-case (`GgufMap::Reshape` — llama.cpp squeezes `[C,1,K]` to ggml `[K,C]`, same
+      bytes). Tokenizer registry gained the `lfm2` pre (digits-≤3 regex, no NFC, BOS post-processor
+      from `add_bos_token`; low-id added tokens ride BPE-vocab id reuse). REAL-FILE proof against the
+      official LiquidAI Q4_K_M (697 MB, downloaded this run) vs the local bf16 safetensors of the same
+      checkpoint: 5 F32 tensors incl. both conv kernels **bit-exact**; tokenizer byte-identical on a
+      6-prompt × 2-mode battery; REAL-GPU end-to-end — the one file greedy-decodes "2 + 2 equals 4.",
+      first-token top-1 identical to the bf16 build, logit cosine **0.9914**. (Still not the P2/P7
+      strict parity gate — that needs the llama.cpp same-quant reference leg.) 138 unit tests; parity
+      (2.670e-5, byte-identical) + budget gates re-passed.*
 - [ ] **Quantized-reference parity leg for GGUF loads** — the end-to-end test compares against the bf16
       build (quantization drift bounded, not exact); a strict leg needs llama.cpp itself running the
       SAME quantized file (`llama-server` raw `/completion`, `n_probs` logprobs — see the P7 LFM2.5

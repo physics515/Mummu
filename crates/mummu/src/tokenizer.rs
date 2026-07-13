@@ -17,6 +17,7 @@ use tokenizers::normalizers::unicode::NFC;
 use tokenizers::pre_tokenizers::byte_level::ByteLevel;
 use tokenizers::pre_tokenizers::sequence::Sequence;
 use tokenizers::pre_tokenizers::split::{Split, SplitPattern};
+use tokenizers::processors::template::TemplateProcessing;
 use tokenizers::{AddedToken, SplitDelimiterBehavior, Tokenizer};
 
 use crate::gguf::{GgufFile, GgufValue};
@@ -27,16 +28,31 @@ const TOKEN_TYPE_CONTROL: i64 = 3;
 const TOKEN_TYPE_USER_DEFINED: i64 = 4;
 const TOKEN_TYPE_UNUSED: i64 = 5;
 
-/// The GPT-2-style byte-level BPE pre-tokenizer regexes, keyed by
-/// `tokenizer.ggml.pre` — the same registry llama.cpp keeps in its vocab
-/// loader. Only families we actually run are listed; unknown ids are a loud
-/// error (a wrong regex silently produces wrong token ids).
-fn pre_tokenizer_regex(pre: &str) -> Option<&'static str> {
+/// How a model family's byte-level BPE pipeline is configured — the part a
+/// GGUF names by `tokenizer.ggml.pre` id instead of carrying explicitly.
+struct PreSpec {
+    /// The pre-tokenizer split regex (from the family's `tokenizer.json`).
+    regex: &'static str,
+    /// Whether the pipeline NFC-normalizes first.
+    nfc: bool,
+}
+
+/// The per-family registry, keyed by `tokenizer.ggml.pre` — the same registry
+/// llama.cpp keeps in its vocab loader. Only families we actually run are
+/// listed; unknown ids are a loud error (a wrong regex silently produces
+/// wrong token ids).
+fn pre_spec(pre: &str) -> Option<PreSpec> {
     match pre {
         // Qwen2/2.5 (matches the checkpoint's tokenizer.json byte for byte).
-        "qwen2" => Some(
-            r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
-        ),
+        "qwen2" => Some(PreSpec {
+            regex: r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+            nfc: true,
+        }),
+        // LFM2/LFM2.5: digits split in groups of ≤3, no normalizer.
+        "lfm2" => Some(PreSpec {
+            regex: r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+            nfc: false,
+        }),
         _ => None,
     }
 }
@@ -70,7 +86,7 @@ pub fn tokenizer_from_gguf(f: &GgufFile) -> Result<Tokenizer, String> {
         .get("tokenizer.ggml.pre")
         .and_then(GgufValue::as_str)
         .ok_or("missing GGUF metadata 'tokenizer.ggml.pre'")?;
-    let Some(regex) = pre_tokenizer_regex(pre) else {
+    let Some(spec) = pre_spec(pre) else {
         return Err(format!("unknown pre-tokenizer id '{pre}'"));
     };
 
@@ -84,7 +100,10 @@ pub fn tokenizer_from_gguf(f: &GgufFile) -> Result<Tokenizer, String> {
         ));
     }
 
-    // The BPE vocab: every NORMAL token, id = array index.
+    // The BPE vocab: every non-padding token at id = array index. Control/
+    // user-defined tokens go in TOO — `add_tokens` below then reuses the
+    // model id it finds, which is what lets added tokens live at LOW ids
+    // (LFM2 puts its 500+ specials at 0..) instead of only after the vocab.
     let mut vocab = Vocab::default();
     // (index, content, is_special) for everything re-added post-BPE.
     let mut added: Vec<(usize, String, bool)> = Vec::new();
@@ -100,8 +119,10 @@ pub fn tokenizer_from_gguf(f: &GgufFile) -> Result<Tokenizer, String> {
             TOKEN_TYPE_NORMAL => {
                 vocab.insert(text.to_string(), index as u32);
             }
-            TOKEN_TYPE_CONTROL => added.push((index, text.to_string(), true)),
-            TOKEN_TYPE_USER_DEFINED => added.push((index, text.to_string(), false)),
+            TOKEN_TYPE_CONTROL | TOKEN_TYPE_USER_DEFINED => {
+                vocab.insert(text.to_string(), index as u32);
+                added.push((index, text.to_string(), ty == TOKEN_TYPE_CONTROL));
+            }
             TOKEN_TYPE_UNUSED => {} // vocab-padding entries ([PADn])
             other => return Err(format!("token {index} has unsupported type {other}")),
         }
@@ -127,9 +148,11 @@ pub fn tokenizer_from_gguf(f: &GgufFile) -> Result<Tokenizer, String> {
         .build()
         .map_err(|e| format!("BPE build: {e}"))?;
     let mut tok = Tokenizer::new(bpe);
-    tok.with_normalizer(Some(NFC));
+    if spec.nfc {
+        tok.with_normalizer(Some(NFC));
+    }
     let split = Split::new(
-        SplitPattern::Regex(regex.to_string()),
+        SplitPattern::Regex(spec.regex.to_string()),
         SplitDelimiterBehavior::Isolated,
         false,
     )
@@ -139,7 +162,37 @@ pub fn tokenizer_from_gguf(f: &GgufFile) -> Result<Tokenizer, String> {
     let byte_level = ByteLevel::new(false, false, false);
     tok.with_pre_tokenizer(Some(Sequence::new(vec![split.into(), byte_level.into()])));
     tok.with_decoder(Some(byte_level));
-    tok.with_post_processor(Some(byte_level));
+
+    // `tokenizer.ggml.add_bos_token` → a BOS-prepending template processor
+    // (what the family's tokenizer.json does); otherwise the offsets-only
+    // ByteLevel processor.
+    let add_bos = f
+        .get("tokenizer.ggml.add_bos_token")
+        .and_then(|v| match *v {
+            GgufValue::Bool(b) => Some(b),
+            _ => None,
+        })
+        .unwrap_or(false);
+    if add_bos {
+        let bos_id = f
+            .get("tokenizer.ggml.bos_token_id")
+            .and_then(GgufValue::as_u64)
+            .and_then(|v| u32::try_from(v).ok())
+            .ok_or("add_bos_token is set but tokenizer.ggml.bos_token_id is missing")?;
+        let bos = tokens
+            .get(bos_id as usize)
+            .and_then(GgufValue::as_str)
+            .ok_or_else(|| format!("bos_token_id {bos_id} is out of vocab range"))?;
+        let template = TemplateProcessing::builder()
+            .try_single(format!("{bos} $A"))
+            .map_err(|e| format!("BOS template: {e}"))?
+            .special_tokens(vec![(bos.to_string(), bos_id)])
+            .build()
+            .map_err(|e| format!("BOS template: {e}"))?;
+        tok.with_post_processor(Some(template));
+    } else {
+        tok.with_post_processor(Some(byte_level));
+    }
 
     // Re-add control/user-defined tokens in id order, then verify every id
     // landed where the GGUF says it lives.

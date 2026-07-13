@@ -217,6 +217,199 @@ fn real_qwen2_gguf_tokenizer_matches_the_hf_tokenizer() {
     );
 }
 
+// ---- LFM2.5 (the hybrid conv+attention architecture) ----------------------
+
+fn lfm2_gguf_path() -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os("MUMMU_LFM2_GGUF_PATH")?);
+    path.is_file().then_some(path)
+}
+
+fn lfm2_dir() -> Option<PathBuf> {
+    std::env::var_os("MUMMU_LFM2_DIR")
+        .map(PathBuf::from)
+        .filter(|d| d.join("model.safetensors").is_file())
+}
+
+/// LFM2.5 mapping proof against the TRUE weights: every F32 tensor in the
+/// GGUF (norms, per-head q/k norms, and the depthwise conv kernels — the
+/// reshape special-case) must equal the bf16 safetensors bit-exactly.
+#[test]
+#[ignore = "needs the local LFM2.5 GGUF (MUMMU_LFM2_GGUF_PATH) + safetensors (MUMMU_LFM2_DIR)"]
+fn real_lfm2_gguf_f32_tensors_match_the_true_weights() {
+    let Some(path) = lfm2_gguf_path() else {
+        panic!("set MUMMU_LFM2_GGUF_PATH to the lfm2.5-1.2b q4_k_m gguf");
+    };
+    let Some(dir) = lfm2_dir() else {
+        panic!("set MUMMU_LFM2_DIR to the same model's safetensors dir");
+    };
+    let st = dir.join("model.safetensors");
+    let f = GgufFile::open(&path).expect("header parses");
+
+    // (gguf name, safetensors name) — covers the plain rename, the per-head
+    // norms, and the conv-kernel reshape (same bytes, unsqueezed shape).
+    let pairs = [
+        ("token_embd_norm.weight", "model.embedding_norm.weight"),
+        (
+            "blk.0.attn_norm.weight",
+            "model.layers.0.operator_norm.weight",
+        ),
+        (
+            "blk.2.attn_q_norm.weight",
+            "model.layers.2.self_attn.q_layernorm.weight",
+        ),
+        (
+            "blk.0.shortconv.conv.weight",
+            "model.layers.0.conv.conv.weight",
+        ),
+        (
+            "blk.15.shortconv.conv.weight",
+            "model.layers.15.conv.conv.weight",
+        ),
+    ];
+    for (ours_name, ref_name) in pairs {
+        let ours = f.read_tensor_f32(ours_name).expect("dequantizes");
+        let reference = safetensors_bf16_f32(&st, ref_name);
+        assert_eq!(ours.len(), reference.len(), "{ours_name}: same size");
+        let exact = ours
+            .iter()
+            .zip(&reference)
+            .all(|(a, b)| a.to_bits() == b.to_bits());
+        assert!(exact, "{ours_name} must be bit-exact vs {ref_name}");
+    }
+    eprintln!(
+        "[real_gguf/lfm2] {} F32 tensors bit-exact vs safetensors (incl. conv kernels)",
+        pairs.len()
+    );
+}
+
+/// The LFM2.5 tokenizer rebuilt from GGUF metadata must match the
+/// checkpoint's `tokenizer.json` — with AND without the BOS-adding
+/// post-processor (LFM2 sets `add_bos_token`, unlike Qwen2).
+#[test]
+#[ignore = "needs the local LFM2.5 GGUF (MUMMU_LFM2_GGUF_PATH) + safetensors dir (MUMMU_LFM2_DIR)"]
+fn real_lfm2_gguf_tokenizer_matches_the_hf_tokenizer() {
+    let Some(path) = lfm2_gguf_path() else {
+        panic!("set MUMMU_LFM2_GGUF_PATH to the lfm2.5-1.2b q4_k_m gguf");
+    };
+    let dir = lfm2_dir().expect("set MUMMU_LFM2_DIR to the safetensors dir");
+    let f = GgufFile::open(&path).expect("header parses");
+    let ours = mummu::tokenizer::tokenizer_from_gguf(&f).expect("tokenizer builds");
+    let reference =
+        tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer.json");
+
+    let chat = mummu::chat::ChatMl::lfm2();
+    let battery = [
+        chat.render(&[
+            mummu::chat::Turn::system("You are a concise assistant."),
+            mummu::chat::Turn::user("What is 2+2? Answer in one short sentence."),
+        ]),
+        "The quick brown fox jumps over the lazy dog.".into(),
+        "héllo wörld — 世界 · Ω ≠ ω · 🦀🔥".into(),
+        "1234567890 3.14159 1e-6 0x7F".into(), // digits split in ≤3 groups
+        "  leading spaces, trailing  \n\nnewlines\r\nand\ttabs ".into(),
+        "don't they're we've I'll it's CAN'T".into(),
+    ];
+    for text in &battery {
+        for add_special in [true, false] {
+            let a = ours.encode(text.as_str(), add_special).expect("encodes");
+            let b = reference
+                .encode(text.as_str(), add_special)
+                .expect("encodes");
+            assert_eq!(
+                a.get_ids(),
+                b.get_ids(),
+                "ids diverge (add_special={add_special}) on {text:?}"
+            );
+        }
+    }
+    eprintln!(
+        "[real_gguf/lfm2] tokenizer-from-GGUF: {} prompts × 2 modes byte-identical",
+        battery.len()
+    );
+}
+
+/// END-TO-END for the hybrid: the LFM2.5 Q4_K_M GGUF alone becomes a running
+/// model on the GPU (conv layers, attention layers, per-head norms — all
+/// mapped from llama.cpp naming), greedy-decodes a correct answer, and its
+/// first-token logits agree with the bf16 safetensors build.
+#[test]
+#[ignore = "needs the local LFM2.5 GGUF (MUMMU_LFM2_GGUF_PATH) + safetensors dir (MUMMU_LFM2_DIR) + GPU"]
+fn real_lfm2_gguf_loads_and_decodes_on_gpu() {
+    use mummu::models::lfm2;
+    let Some(path) = lfm2_gguf_path() else {
+        panic!("set MUMMU_LFM2_GGUF_PATH to the lfm2.5-1.2b q4_k_m gguf");
+    };
+    let dir = lfm2_dir().expect("set MUMMU_LFM2_DIR to the safetensors dir");
+    assert!(use_gpu(), "this proof wants the real GPU");
+    let device = burn::tensor::Device::<Gpu>::default();
+
+    let header = GgufFile::open(&path).expect("header parses");
+    let tok = mummu::tokenizer::tokenizer_from_gguf(&header).expect("tokenizer from metadata");
+    let chat = mummu::chat::ChatMl::lfm2();
+    let prompt_text = chat.render(&[
+        mummu::chat::Turn::system("You are a concise assistant."),
+        mummu::chat::Turn::user("What is 2+2? Answer in one short sentence."),
+    ]);
+    // The rendered template already carries <|startoftext|>; no auto-BOS.
+    let prompt = tok
+        .encode(prompt_text, false)
+        .expect("prompt encodes")
+        .get_ids()
+        .to_vec();
+
+    let gguf_model = lfm2::load_from_gguf::<Gpu>(&path, &device).expect("gguf load is checked");
+    assert_eq!(gguf_model.config.num_hidden_layers, 16);
+    assert_eq!(
+        gguf_model
+            .config
+            .layer_types
+            .iter()
+            .filter(|t| *t == "conv")
+            .count(),
+        10,
+        "the 1.2B is 10 conv + 6 attention"
+    );
+    let ids = gguf_model
+        .greedy_generate(&prompt, 32, &device)
+        .expect("decode");
+    let text = tok.decode(&ids, true).expect("ids decode");
+    eprintln!("[real_gguf/lfm2] Q4_K_M greedy: {text:?}");
+    assert!(text.contains('4'), "expected the answer 4 in: {text:?}");
+
+    let logits_of = |m: &lfm2::LoadedLfm2<Gpu>| -> Vec<f32> {
+        let mut cache = m.new_cache();
+        m.forward(&prompt, 0, &mut cache, &device)
+            .into_data()
+            .to_vec::<f32>()
+            .expect("logits read back")
+    };
+    let gguf_logits = logits_of(&gguf_model);
+    drop(gguf_model);
+    let st_model = lfm2::load_from_dir::<Gpu>(&dir, &device).expect("safetensors load");
+    let st_logits = logits_of(&st_model);
+    drop(st_model);
+
+    let argmax = |v: &[f32]| -> usize {
+        let (mut best, mut best_v) = (0usize, f32::NEG_INFINITY);
+        for (i, &x) in v.iter().enumerate() {
+            if x > best_v {
+                (best, best_v) = (i, x);
+            }
+        }
+        best
+    };
+    let cos = cosine(&gguf_logits, &st_logits);
+    let (g_top, s_top) = (argmax(&gguf_logits), argmax(&st_logits));
+    eprintln!(
+        "[real_gguf/lfm2] first-token logits: cosine {cos:.5} vs bf16 · top-1 {g_top} vs {s_top}"
+    );
+    assert_eq!(g_top, s_top, "Q4_K_M must agree with bf16 on the top token");
+    assert!(
+        cos > 0.95,
+        "logit cosine {cos} — quantization noise should be small, layout bugs are not"
+    );
+}
+
 /// END-TO-END: the Q4_K_M GGUF alone (config + weights from the one file)
 /// becomes a running model on the GPU — greedy-decodes a correct answer, and
 /// its first-token logits agree with the bf16 safetensors build of the same
