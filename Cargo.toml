@@ -47,7 +47,17 @@ wgpu = "29"
 pollster = "1.0"
 # f16 element type for the GPU backend; the same `half` version Burn pulls.
 half = "2"
-tokenizers = "0.22"
+# `esaxx_fast` (a default feature) is off deliberately: it builds esaxx-rs's
+# C++ suffix-array with `.static_crt(true)` hardcoded in its build.rs, so the
+# object demands the static CRT (/DEFAULTLIB:LIBCMT) while rustc-msvc links the
+# dynamic one -> LNK4098. It only accelerates the Unigram *trainer*, which we
+# never run (tokenizers falls back to `esaxx_rs::suffix_rs`, pure Rust), so
+# dropping it costs nothing and needs no upstream fix (Narsil/esaxx-rs#11 is
+# open; its PR #19 is unmerged). `onig` is load-bearing (SysRegex) and stays.
+tokenizers = { version = "0.22", default-features = false, features = [
+	"onig",
+	"progressbar",
+] }
 
 # Blocking HTTP (rustls) for the P3 model downloader; small, sync like the rest
 # of the library surface.
