@@ -94,8 +94,11 @@ fn safetensors_bf16_f32(path: &std::path::Path, name: &str) -> Vec<f32> {
         .expect("seek to tensor");
     let mut raw = vec![0u8; usize::try_from(end - start).expect("sane tensor")];
     file.read_exact(&mut raw).expect("tensor bytes");
-    raw.chunks_exact(2)
-        .map(|b| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16))
+    let (pairs, rest) = raw.as_chunks::<2>();
+    assert!(rest.is_empty(), "bf16 tensor byte length must be even");
+    pairs
+        .iter()
+        .map(|b| f32::from_bits(u32::from(u16::from_le_bytes(*b)) << 16))
         .collect()
 }
 
