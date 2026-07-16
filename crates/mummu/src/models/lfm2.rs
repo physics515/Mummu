@@ -33,7 +33,14 @@ pub struct Lfm2Config {
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
     pub norm_eps: f64,
+    /// Top-level in older checkpoints (LFM2.5-1.2B); newer ones (LFM2.5-230M)
+    /// nest it under `rope_parameters` instead — resolved (and required) by
+    /// [`Self::from_json_bytes`] / [`Self::validate`].
+    #[serde(default)]
     pub rope_theta: f32,
+    /// The newer transformers convention: `{"rope_theta": …, "rope_type": …}`.
+    #[serde(default, skip_serializing)]
+    rope_parameters: Option<RopeParameters>,
     /// Conv kernel length `K` (the rolling decode state keeps `K-1`).
     #[serde(rename = "conv_L_cache")]
     pub conv_l_cache: usize,
@@ -73,9 +80,27 @@ impl Lfm2Config {
             .is_some_and(|s| s == "full_attention")
     }
 
-    /// Parse `config.json` bytes.
+    /// Parse `config.json` bytes. `rope_theta` may arrive top-level (older
+    /// checkpoints) or nested under `rope_parameters` (the newer transformers
+    /// convention, LFM2.5-230M) — only plain rotary (`rope_type: "default"`)
+    /// is implemented, anything else fails loudly.
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, String> {
-        let cfg: Self = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+        let mut cfg: Self = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+        if let Some(rp) = cfg.rope_parameters.take() {
+            if rp.rope_type != "default" {
+                return Err(format!(
+                    "rope_parameters.rope_type '{}' is not implemented (only 'default')",
+                    rp.rope_type
+                ));
+            }
+            if cfg.rope_theta != 0.0 && cfg.rope_theta != rp.rope_theta {
+                return Err(format!(
+                    "rope_theta given twice and disagreeing: {} (top-level) vs {} (rope_parameters)",
+                    cfg.rope_theta, rp.rope_theta
+                ));
+            }
+            cfg.rope_theta = rp.rope_theta;
+        }
         cfg.validate()?;
         Ok(cfg)
     }
@@ -160,6 +185,7 @@ impl Lfm2Config {
             num_key_value_heads: usize::try_from(kv_heads).map_err(|_| "kv heads too large")?,
             norm_eps: f64::from(eps),
             rope_theta: theta,
+            rope_parameters: None,
             conv_l_cache: meta_usize("lfm2.shortconv.l_cache")?,
             block_ff_dim: meta_usize("lfm2.feed_forward_length")?,
             block_multiple_of: 1,
@@ -199,7 +225,27 @@ impl Lfm2Config {
                 self.conv_l_cache
             ));
         }
+        if !(self.rope_theta.is_finite() && self.rope_theta > 0.0) {
+            return Err(format!(
+                "rope_theta must be a positive float (top-level or in rope_parameters), got {}",
+                self.rope_theta
+            ));
+        }
         Ok(())
+    }
+}
+
+/// The nested rope block newer checkpoints carry in `config.json`.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct RopeParameters {
+    rope_theta: f32,
+    #[serde(default = "RopeParameters::default_type")]
+    rope_type: String,
+}
+
+impl RopeParameters {
+    fn default_type() -> String {
+        "default".into()
     }
 }
 
@@ -492,6 +538,7 @@ mod tests {
             num_key_value_heads: 2,
             norm_eps: 1e-5,
             rope_theta: 1e4,
+            rope_parameters: None,
             conv_l_cache: 3,
             block_ff_dim: 48,
             block_multiple_of: 8,
@@ -518,6 +565,42 @@ mod tests {
         let mut cfg = toy_config();
         cfg.layer_types.pop();
         assert!(cfg.validate().is_err());
+    }
+
+    /// Both `rope_theta` spellings parse; anything but plain rotary is loud.
+    #[test]
+    fn config_reads_rope_theta_top_level_or_nested() {
+        let base = r#"{
+            "vocab_size": 48, "hidden_size": 16, "num_hidden_layers": 1,
+            "num_attention_heads": 4, "num_key_value_heads": 2,
+            "norm_eps": 1e-5, "conv_L_cache": 3,
+            "block_ff_dim": 48, "block_multiple_of": 8,
+            "layer_types": ["full_attention"]"#;
+        let top = format!(r#"{base}, "rope_theta": 10000.0}}"#);
+        assert_eq!(
+            Lfm2Config::from_json_bytes(top.as_bytes())
+                .unwrap()
+                .rope_theta,
+            1e4
+        );
+        // The 230M spelling: nested, with an explicit default rope_type.
+        let nested = format!(
+            r#"{base}, "rope_parameters": {{"rope_theta": 1000000.0, "rope_type": "default"}}}}"#
+        );
+        assert_eq!(
+            Lfm2Config::from_json_bytes(nested.as_bytes())
+                .unwrap()
+                .rope_theta,
+            1e6
+        );
+        // Negative space: a rope scheme we don't implement must not load,
+        // and a config with neither spelling must not default silently.
+        let yarn = format!(
+            r#"{base}, "rope_parameters": {{"rope_theta": 1000000.0, "rope_type": "yarn"}}}}"#
+        );
+        assert!(Lfm2Config::from_json_bytes(yarn.as_bytes()).is_err());
+        let missing = format!("{base}}}");
+        assert!(Lfm2Config::from_json_bytes(missing.as_bytes()).is_err());
     }
 
     #[test]

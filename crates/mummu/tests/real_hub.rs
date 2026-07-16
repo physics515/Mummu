@@ -198,6 +198,49 @@ fn hub_fetches_the_cpu_tier_qwen() {
     eprintln!("[real_hub] 0.5B fetched into {}", dir.display());
 }
 
+/// Registry → the new CPU-tier hybrid: LFM2.5-230M (June 2026) is the same
+/// `lfm2` architecture the zoo already covers, so the catalog entry alone
+/// makes it installable — this proof fetches it, checked-loads it on the CPU
+/// backend, and greedy-decodes real text end-to-end.
+#[test]
+#[ignore = "needs network (MUMMU_HUB_DEST names the download dir; ~470 MB)"]
+fn hub_fetches_and_runs_lfm2_230m_on_cpu() {
+    use mummu::models::CausalLm;
+    let Some(dest) = std::env::var_os("MUMMU_HUB_DEST").map(PathBuf::from) else {
+        panic!("set MUMMU_HUB_DEST to a scratch dir for the ~470 MB download");
+    };
+    let spec = mummu::registry::catalog()
+        .into_iter()
+        .find(|s| s.name == "lfm2.5-230m")
+        .expect("the 230M is in the catalog");
+    let dir = spec.fetch(&dest, |_| {}).expect("hub fetch");
+    for f in ["config.json", "tokenizer.json", "model.safetensors"] {
+        assert!(dir.join(f).is_file(), "{f} must exist after fetch");
+    }
+
+    let device = burn::tensor::Device::<Cpu>::default();
+    let loaded = mummu::models::lfm2::load_from_dir::<Cpu>(&dir, &device).expect("checked load");
+    let tok = Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer loads");
+    let raw = mummu::chat::ChatMl::lfm2().render(&[mummu::chat::Turn::user(
+        "What is 2 + 2? Answer in one short sentence.",
+    )]);
+    let ids = tok
+        .encode(raw.as_str(), false)
+        .expect("encodes")
+        .get_ids()
+        .to_vec();
+    let out = loaded
+        .greedy_generate(&ids, 16, &device)
+        .expect("greedy decode");
+    let text = tok.decode(&out, true).expect("decode");
+    eprintln!("[real_hub/230m] {} tokens: {text:?}", out.len());
+    assert!(!out.is_empty(), "decoded no tokens");
+    assert!(
+        text.contains('4'),
+        "a 230M instruct model should answer 2 + 2 = 4, got: {text:?}"
+    );
+}
+
 /// Registry → single-file GGUF install: the catalog's LFM2.5 Q4_K_M spec
 /// downloads through `fetch` (one ~700 MB file, resumable/cache-first like
 /// every hub fetch), lands where `gguf_path` says, parses as a valid GGUF of
