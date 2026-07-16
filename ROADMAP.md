@@ -233,10 +233,15 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       first-token top-1 identical to the bf16 build, logit cosine **0.9914**. (Still not the P2/P7
       strict parity gate — that needs the llama.cpp same-quant reference leg.) 138 unit tests; parity
       (2.670e-5, byte-identical) + budget gates re-passed.*
-- [ ] **Quantized-reference parity leg for GGUF loads** — the end-to-end test compares against the bf16
+- [x] **Quantized-reference parity leg for GGUF loads** — the end-to-end test compares against the bf16
       build (quantization drift bounded, not exact); a strict leg needs llama.cpp itself running the
       SAME quantized file (`llama-server` raw `/completion`, `n_probs` logprobs — see the P7 LFM2.5
       reference item's caveats) to assert our dequant matches ggml's compute path token-for-token.
+      *(2026-07-16) Shipped (`tests/parity_gguf.rs`, on the P7 `llama_ref` harness): llama.cpp runs the
+      SAME local Q4_K_M files our loader loads — 23/24-token greedy sequences **byte-identical** for
+      BOTH Qwen2.5-1.5B and LFM2.5-1.2B; top-3 first-forward ids exact in order, top-5 overlap ≥ 4/5,
+      max |Δlogprob| 2.7e-1 (the reference's own Q8_K *activation* quantization in its integer Q4_K
+      kernels — an order above the BF16 leg's 1.5e-2; our f32 path doesn't quantize activations).*
 - [ ] **GPTQ / AWQ** (HF safetensors) — import the calibration-quantized int4/int8 layouts most "quantized on
       the Hub" models ship as (a `.safetensors` payload + a quant config), dequant or keep-quant into Burn.
       *(2026-07-13 research)* Both are quantization *algorithms*, not formats — the artifact is ordinary
