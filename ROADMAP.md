@@ -12,7 +12,19 @@ offload). Reference dev machine: Ryzen 9 7950X3D · 128 GB · RTX 4070 Ti SUPER 
 *(2026-07-16) Pin watch: wgpu 30 and tokenizers 0.23.1 are out; both held (burn 0.21 resolves wgpu 29,
 and the tokenizers 0.23 change relevant to us — `add_tokens` normalizing content at insertion — touches
 exactly the added-token path `tokenizer_from_gguf` rides, so the bump waits for a parity re-run) —
-https://github.com/huggingface/tokenizers/releases.*
+https://github.com/huggingface/tokenizers/releases.* *(2026-07-16, later run) **tokenizers 0.23.1 is
+now IN** — the parity re-run that pin was waiting on happened and it is clean. Migration was two API
+shifts: `add_tokens`/`add_special_tokens` take `impl IntoIterator<Item = AddedToken>` (not a slice),
+and they plus `with_normalizer` now return `Result` — all three are handled loudly rather than
+`let _ =`'d, so a rejected added token is an error instead of a silently-missing id. The feared
+normalization-at-insertion change is a non-event for us because `tokenizer_from_gguf` already
+verifies every added token's id post-build. Evidence: both GGUF tokenizer byte-identity batteries
+still pass, and every parity number is **bit-identical to 0.22** — LFM2.5-1.2B 1.4879674843625068e-2,
+230M 3.244355439983515e-2, GGUF-vs-llama.cpp 2.6617605580289094e-1 (qwen2) / 2.5971455430462065e-1
+(lfm2), Qwen2-vs-Candle 2.29e-5 with the Ollama greedy leg exact; both tool-call emissions
+unchanged; budgets 105.5 ms / 12.2 tok/s GPU, 11.74 tok/s CPU. **wgpu 30 stays held** — it is not
+ours to pick, burn 0.21 resolves wgpu 29 transitively, so it unblocks with a burn bump, not a
+`cargo upgrade`.*
 
 ## North Star
 
@@ -105,6 +117,14 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       crates; pinned combo burn 0.21 / wgpu 29 / tokenizers 0.22 / criterion 0.7; release profile fat-LTO.*
 - [x] `cargo build` / `test` / `clippy --all-targets` green baseline; `mummu-bench` (criterion) crate stub.
       *(2026-07-09) All green; criterion harness wired via a smoke bench.*
+- [ ] Prune the **stale `candle-core` entries in the workspace `Cargo.lock`** — `tools/candle-probe` is
+      deliberately its own workspace (Candle must never become a mummu dep), yet the root lock still
+      carries candle-core and its deps as orphans: nothing in the graph reaches them (`cargo tree -i`
+      finds no dependents, `cargo metadata` lists only mummu + mummu-bench, and a workspace build never
+      compiles candle), and `cargo update` does not prune them. Harmless but misleading — it was
+      invisible while both crates shared one `tokenizers`, and surfaced when the 0.23 bump split that
+      entry so the lock now lists tokenizers twice (0.23.1 real, 0.22.2 reachable only from the orphan).
+      Predates this run. *(2026-07-16)*
 
 ### P1 — Backends & device *(ex-laurelane)*
 - [x] Backend abstraction generic over `B: Backend`; one binary compiling BOTH `Wgpu` (Vulkan/DX12/Metal,

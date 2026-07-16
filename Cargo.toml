@@ -9,8 +9,11 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/physics515/Mummu"
 
 [workspace.dependencies]
-# Intentional pins (see ROADMAP "Stack"): burn 0.21 + wgpu 29 + tokenizers 0.22 are the
-# parity-validated combination proven in laurelane (byte-identical logits vs Candle).
+# Intentional pins (see ROADMAP "Stack"): burn 0.21 + wgpu 29 are the parity-validated
+# combination proven in laurelane (byte-identical logits vs Candle). wgpu is not ours to
+# pick — burn 0.21 resolves 29 transitively, so wgpu 30 unblocks with a burn bump, not a
+# `cargo upgrade`. tokenizers rides 0.23 as of 2026-07-16: every parity number came back
+# bit-identical to 0.22, so it is no longer part of the pinned combination.
 # `fusion` + `autotune` are the throughput levers: fusion compiles streams of tensor ops
 # into far fewer GPU kernels and autotune picks the fastest kernel variant; with `fusion`,
 # `Wgpu` transparently becomes `Fusion<Wgpu>`.
@@ -54,7 +57,7 @@ half = "2"
 # never run (tokenizers falls back to `esaxx_rs::suffix_rs`, pure Rust), so
 # dropping it costs nothing and needs no upstream fix (Narsil/esaxx-rs#11 is
 # open; its PR #19 is unmerged). `onig` is load-bearing (SysRegex) and stays.
-tokenizers = { version = "0.22", default-features = false, features = [
+tokenizers = { version = "0.23", default-features = false, features = [
 	"onig",
 	"progressbar",
 ] }
