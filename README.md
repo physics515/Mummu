@@ -20,8 +20,9 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
 
 - **Workspace + backends** — `crates/mummu` (library) + `crates/mummu-bench` (criterion); one binary
   compiles both `Wgpu` (with `fusion` + `autotune`) and `burn-flex` (CPU), with a cached runtime GPU probe and a
-  device inventory that records per-adapter/per-API `SHADER_F16` and max buffer size, plus the host
-  CPU's cores and total RAM — the planner's (and settings UIs') device set.
+  device inventory that records per-adapter/per-API `SHADER_F16`, max buffer size, and **true VRAM
+  capacity** (DXGI on Windows; wgpu exposes no portable query), plus the host CPU's cores and total
+  RAM — the planner's (and settings UIs') device set.
 - **Shared blocks, generic over `B: Backend`** — cache-aware GQA attention (optional per-head q/k
   RMSNorm), manual RoPE, SwiGLU, and LFM2's double-gated causal short-conv with rolling decode state;
   unit tests prove prefill+decode ≡ full-forward for both cache kinds.
@@ -32,12 +33,15 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
 - **Three models ported and running on real weights** — Qwen2/2.5, the LFM2/2.5 hybrid, and the
   all-MiniLM sentence embedder; Qwen2.5-1.5B and LFM2.5-1.2B load and greedy-decode correctly on the
   reference GPU (wgpu/Vulkan).
-- **Qwen2.5 and MiniLM are parity-verified** — the two-leg P7 gate passes for Qwen2.5-1.5B on the
+- **All three models are parity-verified** — the two-leg P7 gate passes for Qwen2.5-1.5B on the
   reference GPU: single-forward top-5 logits match a Candle f32 reference (max |Δlogit| 2.7e-5,
   `tests/parity_qwen2.rs` + the committed `tools/candle-probe` fixture) and a 24-token greedy sequence
-  matches `ollama qwen2.5:1.5b-instruct-fp16` byte-for-byte. The MiniLM embedder matches its Candle
-  reference at cosine 0.99999994 (max |Δcomponent| 1.2e-7, `tests/real_minilm.rs`). LFM2.5 still awaits
-  a same-weights reference (tracked in P7).
+  matches `ollama qwen2.5:1.5b-instruct-fp16` byte-for-byte. **LFM2.5-1.2B** passes both legs against a
+  same-weights llama.cpp reference (`tests/parity_lfm2.rs` + the `tests/llama_ref` harness: a local
+  `llama-server` on LiquidAI's official BF16 GGUF, raw `/completion`, prompts as token-id arrays):
+  top-5 first-forward ids match exactly in order and a 24-token greedy sequence is byte-identical.
+  The MiniLM embedder matches its Candle reference at cosine 0.99999994 (max |Δcomponent| 1.2e-7,
+  `tests/real_minilm.rs`).
 - **Sampling, streaming, cancellation** — temperature / top-k / top-p sampling (deterministic per seed),
   per-token streaming through a `ControlFlow` callback, and cooperative between-token cancellation;
   greedy decoding keeps the argmax on-device.

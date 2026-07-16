@@ -9,6 +9,10 @@
 **Stack:** Rust 2024 · **Burn 0.21** (`wgpu` 29 + `burn-flex` CPU, `fusion` + `autotune`, multi-device) ·
 `burn-store` · HF `tokenizers` · runs on **any hardware** — CPU, one GPU, or several (multi-GPU + CPU
 offload). Reference dev machine: Ryzen 9 7950X3D · 128 GB · RTX 4070 Ti SUPER 16 GB.
+*(2026-07-16) Pin watch: wgpu 30 and tokenizers 0.23.1 are out; both held (burn 0.21 resolves wgpu 29,
+and the tokenizers 0.23 change relevant to us — `add_tokens` normalizing content at insertion — touches
+exactly the added-token path `tokenizer_from_gguf` rides, so the bump waits for a parity re-run) —
+https://github.com/huggingface/tokenizers/releases.*
 
 ## North Star
 
@@ -58,6 +62,11 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
 ## Phases
 
 ### P0 — Workspace scaffold
+- [ ] Silence the pre-existing `LNK4098` (LIBCMT defaultlib conflict) the 2026-07 nightly toolchain's
+      new `linker_messages` lint now surfaces when linking the `mummu` lib-test binary — find which
+      native dep object embeds the static-CRT directive (tokenizers' C++ deps are the suspects) and
+      align it, rather than allowing the lint. *(2026-07-16, predates this run's changes — verified by
+      an A/B build at HEAD.)*
 - [x] Cargo workspace: `crates/mummu` (the library), model code generic over `B: Backend`. `.gitignore`
       (Rust); commit `Cargo.lock` for reproducible builds/benchmarks. *(2026-07-09) Workspace + both
       crates; pinned combo burn 0.21 / wgpu 29 / tokenizers 0.22 / criterion 0.7; release profile fat-LTO.*
@@ -101,14 +110,18 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       unit test.* *(2026-07-10) **Parity gate PASSED** (`tests/parity_qwen2.rs`): top-5 logits match the
       Candle f32 reference exactly by id with max |Δlogit| 2.7e-5 (bound 1e-3), and a 24-token greedy
       sequence matches `ollama qwen2.5:1.5b-instruct-fp16` byte-for-byte on the 4070 Ti SUPER.*
-- [ ] **LFM2.5-1.2B** hybrid (6 GQA-attention w/ per-head q/k RMSNorm + 10 double-gated short-conv "LIV"
+- [x] **LFM2.5-1.2B** hybrid (6 GQA-attention w/ per-head q/k RMSNorm + 10 double-gated short-conv "LIV"
       blocks, SwiGLU, tied head, conv-state cache; ChatML, EOS `<|im_end|>`). *(2026-07-09) Ported
       (`models::lfm2`, hybrid cache, LFM2→shared-block key remap); toy hybrid cache-equivalence test;
       greedy-vs-Ollama parity test written (`tests/parity_lfm2.rs`). REAL GPU inference verified — the
       1.2B greedy-decoded a correct, coherent primes list on the 4070 Ti SUPER. Stays `[ ]` until the
       gate passes: the local `ollama lfm2.5:latest` tag now resolves to the 8.5B **MoE** Q4 w/ thinking
       (verified via `ollama show` 2026-07-09) — not the same weights, so no valid local reference exists;
-      see the P7 reference item.*
+      see the P7 reference item.* *(2026-07-16) **Parity gate PASSED** (`tests/parity_lfm2.rs`, both
+      legs) vs the llama.cpp same-weights reference the P7 item stood up: top-5 first-forward ids match
+      exactly in order (max |Δlogprob| 1.49e-2 — the reference's own bf16-activation rounding; our Qwen2
+      f32-vs-f32 comparison sits at 2.7e-5) and a 24-token greedy sequence is byte-identical on the
+      4070 Ti SUPER.*
 - [x] **all-MiniLM** BERT sentence-embedder (6-layer post-LN bidirectional attention + GeLU FFN,
       masked-mean-pool + L2-normalize). *(2026-07-09) Ported (`models::minilm`, ids+mask in → L2-normalized
       embedding out; tokenization stays caller-side); unit tests incl. padding-invisibility; real-weights
@@ -121,6 +134,18 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       P3 import path to chew on; parity reference = Ollama `qwen3.5:9b` (already pulled locally) —
       https://unsloth.ai/docs/models/qwen3.5 · https://huggingface.co/unsloth/Qwen3.5-9B-GGUF
       *(2026-07-12 research)*
+- [ ] **LFM2.5-230M** as the CPU-tier hybrid zoo entry: shipped June 2026 with llama.cpp / GGUF support
+      from day one — same `lfm2` architecture our loader + parity harness already cover, so this is a
+      registry manifest entry + a run of the P3 quantized-reference leg (and a candidate to replace or
+      join Qwen2.5-0.5B in the CPU decode budget row) —
+      https://www.marktechpost.com/2026/06/27/liquid-ai-ships-lfm2-5-230m-with-llama-cpp-mlx-vllm-sglang-and-onnx-support-for-on-device-inference/
+      *(2026-07-16 research)* *(2026-07-16, same run) Catalog entry + end-to-end proof landed
+      (`real_hub.rs::hub_fetches_and_runs_lfm2_230m_on_cpu`): fetched through the registry (467 MB),
+      checked-loads, greedy-decodes "2 + 2 equals 4." on the CPU backend. Its `config.json` uses the
+      newer nested `rope_parameters` convention — `Lfm2Config` now reads both spellings (non-`default`
+      rope types fail loudly; the 1.2B parity gate re-passed bit-identically after the change, max
+      |Δlogprob| 1.4879674843625068e-2 unchanged). Stays `[ ]` until its own parity-gate run
+      (llama-server on a same-weights GGUF, as the 1.2B does).*
 - [x] A `Model` trait so new architectures (Hermes-class function-callers, Gemma, Qwen3, …) slot in.
       *(2026-07-10) `models::CausalLm<B>` — associated `Cache` type; a port supplies `new_cache` /
       `forward` / `is_eos` and inherits `generate` / `greedy_generate` / `first_token` from the shared
@@ -229,10 +254,15 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       first-token top-1 identical to the bf16 build, logit cosine **0.9914**. (Still not the P2/P7
       strict parity gate — that needs the llama.cpp same-quant reference leg.) 138 unit tests; parity
       (2.670e-5, byte-identical) + budget gates re-passed.*
-- [ ] **Quantized-reference parity leg for GGUF loads** — the end-to-end test compares against the bf16
+- [x] **Quantized-reference parity leg for GGUF loads** — the end-to-end test compares against the bf16
       build (quantization drift bounded, not exact); a strict leg needs llama.cpp itself running the
       SAME quantized file (`llama-server` raw `/completion`, `n_probs` logprobs — see the P7 LFM2.5
       reference item's caveats) to assert our dequant matches ggml's compute path token-for-token.
+      *(2026-07-16) Shipped (`tests/parity_gguf.rs`, on the P7 `llama_ref` harness): llama.cpp runs the
+      SAME local Q4_K_M files our loader loads — 23/24-token greedy sequences **byte-identical** for
+      BOTH Qwen2.5-1.5B and LFM2.5-1.2B; top-3 first-forward ids exact in order, top-5 overlap ≥ 4/5,
+      max |Δlogprob| 2.7e-1 (the reference's own Q8_K *activation* quantization in its integer Q4_K
+      kernels — an order above the BF16 leg's 1.5e-2; our f32 path doesn't quantize activations).*
 - [ ] **GPTQ / AWQ** (HF safetensors) — import the calibration-quantized int4/int8 layouts most "quantized on
       the Hub" models ship as (a `.safetensors` payload + a quant config), dequant or keep-quant into Burn.
       *(2026-07-13 research)* Both are quantization *algorithms*, not formats — the artifact is ordinary
@@ -337,7 +367,12 @@ that fits the model AND uses every device to the fullest.
       `CpuInfo` (logical cores + total RAM — `GlobalMemoryStatusEx` on Windows, `/proc/meminfo` on
       Linux; dev box: 32 cores / 127 GiB). Remaining: per-adapter VRAM capacity, which wgpu does not
       expose portably — needs per-API `wgpu-hal` queries (Vulkan memory heaps / DXGI) — and a macOS RAM
-      sysctl.
+      sysctl. *(2026-07-16)* **True VRAM shipped on Windows**: `GpuAdapter.vram_bytes` from a DXGI 1.1
+      adapter walk (hand-bound frozen COM ABI — `windows-sys` 0.60+ dropped COM bindings and the
+      `windows` crate is heavy for two vtable calls), matched to wgpu adapters by name with per-API
+      decoration tolerance; wgpu still exposes nothing portable (gfx-rs/wgpu#2447 open). Dev box:
+      15.7 GiB reported for the 4070 Ti SUPER on BOTH its Vulkan and DX12 rows. Remaining: Linux
+      (Vulkan memory heaps), macOS (+ RAM sysctl).
 - [ ] **Precision selection** — pick a per-device dtype (f32 / **f16** / int8 / int4) that fits: f16 via
       `Wgpu<half::f16, i32>`; drop to int8/int4 (P9) when f16 still won't fit. *(2026-07-11) The f16
       backend itself is now **fully validated** (all 3 claims — see the islands item below); what remains
@@ -389,9 +424,13 @@ that fits the model AND uses every device to the fullest.
       Qwen greedy leg. *(2026-07-10) `tools/candle-probe` (out-of-workspace bin, Candle =0.9.1 CPU f32)
       prints top-k (id, logit) JSON for the fixed prompt; fixture committed under
       `crates/mummu/tests/fixtures/`; fp16 Ollama tag pulled and validated.*
-- [ ] LFM2.5 same-weights reference for the parity gate: no Candle port exists — candidate routes are
+- [x] LFM2.5 same-weights reference for the parity gate: no Candle port exists — candidate routes are
       llama.cpp `logprobs` on the fp16 GGUF, or a one-shot HF `transformers` logits dump matched to the
-      safetensors revision. *(2026-07-11 research)* Liquid officially documents running LFM2.5-1.2B
+      safetensors revision. *(2026-07-16) **Shipped** exactly as researched: `tests/llama_ref` spawns a
+      user-supplied `llama-server` (`MUMMU_LLAMA_SERVER` — Ollama installs bundle one, no separate
+      install) on LiquidAI's official **BF16** GGUF (bit-identical to the local bf16 safetensors), RAW
+      `/completion` with prompts as **token-id arrays** (no template stack, no BOS injection —
+      `tokens_evaluated` is asserted) and `n_probs` top-logprobs. Both P2 legs pass — see the P2 item.* *(2026-07-11 research)* Liquid officially documents running LFM2.5-1.2B
       GGUFs under `llama-server`; its completion API returns per-token top logprobs via `n_probs`
       (temperature 0 for the greedy leg) — that plus an fp16 GGUF of the same revision is a workable
       logits leg without Python — https://docs.liquid.ai/deployment/on-device/llama-cpp ·

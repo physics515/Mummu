@@ -154,6 +154,14 @@ pub fn catalog() -> Vec<ModelSpec> {
             disk_bytes_estimate: 2_400_000_000,
         },
         ModelSpec {
+            name: "lfm2.5-230m".into(),
+            repo: "LiquidAI/LFM2.5-230M".into(),
+            revision: "main".into(),
+            architecture: Architecture::Lfm2,
+            format: WeightFormat::Safetensors,
+            disk_bytes_estimate: 500_000_000,
+        },
+        ModelSpec {
             name: "all-minilm-l6-v2".into(),
             repo: "sentence-transformers/all-MiniLM-L6-v2".into(),
             revision: "main".into(),

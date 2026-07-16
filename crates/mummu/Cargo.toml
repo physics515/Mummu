@@ -23,5 +23,7 @@ burn-store = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 # One syscall (GlobalMemoryStatusEx) for the device inventory's total-RAM
-# figure; the narrow feature keeps the compile cost near zero.
+# figure; the narrow feature keeps the compile cost near zero. (The DXGI
+# VRAM walk binds its own frozen COM ABI in backend.rs — windows-sys 0.60+
+# dropped COM interface bindings entirely.)
 windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
