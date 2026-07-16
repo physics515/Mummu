@@ -31,8 +31,8 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
   `pytorch_model.bin` state dicts load through the same checked path (safetensors preferred when both
   exist) — proven byte-identical on MiniLM's real Hub checkpoint in both formats.
 - **Three models ported and running on real weights** — Qwen2/2.5, the LFM2/2.5 hybrid, and the
-  all-MiniLM sentence embedder; Qwen2.5-1.5B and LFM2.5-1.2B load and greedy-decode correctly on the
-  reference GPU (wgpu/Vulkan).
+  all-MiniLM sentence embedder; Qwen2.5-1.5B and LFM2.5-1.2B/230M load and greedy-decode correctly on
+  the reference GPU (wgpu/Vulkan), and Qwen2.5-0.5B / LFM2.5-230M do the same on the CPU backend.
 - **All three models are parity-verified** — the two-leg P7 gate passes for Qwen2.5-1.5B on the
   reference GPU: single-forward top-5 logits match a Candle f32 reference (max |Δlogit| 2.7e-5,
   `tests/parity_qwen2.rs` + the committed `tools/candle-probe` fixture) and a 24-token greedy sequence
@@ -40,8 +40,10 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
   same-weights llama.cpp reference (`tests/parity_lfm2.rs` + the `tests/llama_ref` harness: a local
   `llama-server` on LiquidAI's official BF16 GGUF, raw `/completion`, prompts as token-id arrays):
   top-5 first-forward ids match exactly in order and a 24-token greedy sequence is byte-identical.
-  The MiniLM embedder matches its Candle reference at cosine 0.99999994 (max |Δcomponent| 1.2e-7,
-  `tests/real_minilm.rs`).
+  **LFM2.5-230M** passes the same two legs through the same tier-parameterized gate (top-5 ids exact
+  in order, greedy byte-identical, max |Δlogprob| 3.2e-2) — one config-driven hybrid loader covers
+  both tiers. The MiniLM embedder matches its Candle reference at cosine 0.99999994
+  (max |Δcomponent| 1.2e-7, `tests/real_minilm.rs`).
 - **Sampling, streaming, cancellation** — temperature / top-k / top-p sampling (deterministic per seed),
   per-token streaming through a `ControlFlow` callback, and cooperative between-token cancellation;
   greedy decoding keeps the argmax on-device.
