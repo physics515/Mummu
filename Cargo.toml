@@ -78,3 +78,11 @@ criterion = "0.8"
 # buy almost nothing here while tripling the verify-loop cost. Revisit against
 # bench/BASELINE.md numbers if a CPU-bound path ever becomes hot.
 lto = "thin"
+
+# Optimize DEPENDENCIES ONLY in dev/test; our own crates stay -O0 and fully
+# debuggable. Unoptimized burn/CubeCL blow the stack of their own worker
+# thread when a real model runs (STATUS_STACK_OVERFLOW on `DSD-*`): -O0 keeps
+# every inlinable frame of a deep generic tensor call chain live at once.
+# This is why the real-weights GPU suites could only be run `--release`.
+[profile.dev.package."*"]
+opt-level = 2

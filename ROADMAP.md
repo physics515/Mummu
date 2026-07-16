@@ -87,13 +87,19 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       and all three parity gates re-passed — Qwen2 max |Δlogit| 2.29e-5 + Ollama greedy byte-identical,
       LFM2 top-5 exact at 1.4879674843625068e-2, GGUF quantized leg unchanged.
       https://github.com/Narsil/esaxx-rs/issues/11 · https://github.com/Narsil/esaxx-rs/pull/19
-- [ ] The real-weights **GPU tests overflow the stack in the `dev` profile** — `real_gguf`'s
+- [x] The real-weights **GPU tests overflow the stack in the `dev` profile** — `real_gguf`'s
       `real_{lfm2,qwen2}_gguf_loads_and_decodes_on_gpu` die with `STATUS_STACK_OVERFLOW` on a CubeCL
       worker thread (`DSD-4-0`), while the identical tests pass in `--release` (7/7 in 76.9 s). Verified
       **pre-existing** by an A/B at unmodified HEAD, so it is not the tokenizers-feature change. Until
       it is root-caused, the real-model suites must be run `--release`; the fix is likely a bigger
       spawn-time stack for the CubeCL worker (or a debug-profile `opt-level` bump for the burn stack).
-      *(2026-07-16)*
+      *(2026-07-16)* *(2026-07-16, same run) **Fixed** — it was the `opt-level`, not the stack size:
+      `[profile.dev.package."*"] opt-level = 2` optimizes **dependencies only**, so burn/CubeCL's deep
+      generic tensor call chains stop keeping every inlinable frame live at once, while our own crates
+      stay `-O0` and fully debuggable. The whole real-model suite now runs in `dev`: `real_gguf` 7/7
+      (262 s vs 76.9 s in release — slower, but no longer impossible) and `real_inference` 4/4.
+      `[profile.release]` is untouched, so parity and the perf budgets are unaffected by construction.
+      Dropping `--release` from the real-model suites is now a choice, not a workaround.*
 - [x] Cargo workspace: `crates/mummu` (the library), model code generic over `B: Backend`. `.gitignore`
       (Rust); commit `Cargo.lock` for reproducible builds/benchmarks. *(2026-07-09) Workspace + both
       crates; pinned combo burn 0.21 / wgpu 29 / tokenizers 0.22 / criterion 0.7; release profile fat-LTO.*
