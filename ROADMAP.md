@@ -168,7 +168,7 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       P5 item rather than a free win of the port. Qwen3.6 (35B-A3B) is also out now but is MoE and
       well past the single-card tier this zoo targets —
       https://huggingface.co/unsloth/Qwen3.5-4B-GGUF · https://unsloth.ai/docs/models/qwen3.5/gguf-benchmarks
-- [ ] **LFM2.5-230M** as the CPU-tier hybrid zoo entry: shipped June 2026 with llama.cpp / GGUF support
+- [x] **LFM2.5-230M** as the CPU-tier hybrid zoo entry: shipped June 2026 with llama.cpp / GGUF support
       from day one — same `lfm2` architecture our loader + parity harness already cover, so this is a
       registry manifest entry + a run of the P3 quantized-reference leg (and a candidate to replace or
       join Qwen2.5-0.5B in the CPU decode budget row) —
@@ -178,8 +178,18 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       checked-loads, greedy-decodes "2 + 2 equals 4." on the CPU backend. Its `config.json` uses the
       newer nested `rope_parameters` convention — `Lfm2Config` now reads both spellings (non-`default`
       rope types fail loudly; the 1.2B parity gate re-passed bit-identically after the change, max
-      |Δlogprob| 1.4879674843625068e-2 unchanged). Stays `[ ]` until its own parity-gate run
-      (llama-server on a same-weights GGUF, as the 1.2B does).*
+      |Δlogprob| 1.4879674843625068e-2 unchanged).* *(2026-07-16, later run) **Parity gate PASSED**,
+      both legs — the tier is now trusted. LiquidAI publishes `LFM2.5-230M-BF16.gguf`
+      (`LiquidAI/LFM2.5-230M-GGUF`, 462 MB), the same-weights artifact the leg needed; `parity_lfm2.rs`
+      is now written once and **parameterized by tier** (a `Tier` = tag + weights-dir env + BF16-GGUF
+      env), so the 1.2B and 230M share both legs — the same hybrid loader covers both, which is the
+      point of the architecture being config-driven. On the 4070 Ti SUPER: top-5 ids match the
+      llama.cpp reference **exactly in order** and the 24-token greedy sequence is byte-identical, at
+      max |Δlogprob| **3.244355439983515e-2**. That is ~2x the 1.2B's 1.49e-2 — expected, since a
+      narrower model (1024 vs 2048 hidden) accumulates over fewer terms per dot product and so hides
+      less of the reference's own per-dot bf16 activation rounding; it sits inside the existing 5e-2
+      tolerance with ~1.5x headroom (tolerance unchanged, and the strict-order id match remains the
+      real assert). Run legs with `MUMMU_LFM2_230M_DIR` + `MUMMU_LFM2_230M_BF16_GGUF`.*
 - [x] A `Model` trait so new architectures (Hermes-class function-callers, Gemma, Qwen3, …) slot in.
       *(2026-07-10) `models::CausalLm<B>` — associated `Cache` type; a port supplies `new_cache` /
       `forward` / `is_eos` and inherits `generate` / `greedy_generate` / `first_token` from the shared
