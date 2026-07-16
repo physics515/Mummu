@@ -20,8 +20,9 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
 
 - **Workspace + backends** — `crates/mummu` (library) + `crates/mummu-bench` (criterion); one binary
   compiles both `Wgpu` (with `fusion` + `autotune`) and `burn-flex` (CPU), with a cached runtime GPU probe and a
-  device inventory that records per-adapter/per-API `SHADER_F16` and max buffer size, plus the host
-  CPU's cores and total RAM — the planner's (and settings UIs') device set.
+  device inventory that records per-adapter/per-API `SHADER_F16`, max buffer size, and **true VRAM
+  capacity** (DXGI on Windows; wgpu exposes no portable query), plus the host CPU's cores and total
+  RAM — the planner's (and settings UIs') device set.
 - **Shared blocks, generic over `B: Backend`** — cache-aware GQA attention (optional per-head q/k
   RMSNorm), manual RoPE, SwiGLU, and LFM2's double-gated causal short-conv with rolling decode state;
   unit tests prove prefill+decode ≡ full-forward for both cache kinds.
