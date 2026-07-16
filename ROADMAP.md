@@ -101,14 +101,18 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       unit test.* *(2026-07-10) **Parity gate PASSED** (`tests/parity_qwen2.rs`): top-5 logits match the
       Candle f32 reference exactly by id with max |Δlogit| 2.7e-5 (bound 1e-3), and a 24-token greedy
       sequence matches `ollama qwen2.5:1.5b-instruct-fp16` byte-for-byte on the 4070 Ti SUPER.*
-- [ ] **LFM2.5-1.2B** hybrid (6 GQA-attention w/ per-head q/k RMSNorm + 10 double-gated short-conv "LIV"
+- [x] **LFM2.5-1.2B** hybrid (6 GQA-attention w/ per-head q/k RMSNorm + 10 double-gated short-conv "LIV"
       blocks, SwiGLU, tied head, conv-state cache; ChatML, EOS `<|im_end|>`). *(2026-07-09) Ported
       (`models::lfm2`, hybrid cache, LFM2→shared-block key remap); toy hybrid cache-equivalence test;
       greedy-vs-Ollama parity test written (`tests/parity_lfm2.rs`). REAL GPU inference verified — the
       1.2B greedy-decoded a correct, coherent primes list on the 4070 Ti SUPER. Stays `[ ]` until the
       gate passes: the local `ollama lfm2.5:latest` tag now resolves to the 8.5B **MoE** Q4 w/ thinking
       (verified via `ollama show` 2026-07-09) — not the same weights, so no valid local reference exists;
-      see the P7 reference item.*
+      see the P7 reference item.* *(2026-07-16) **Parity gate PASSED** (`tests/parity_lfm2.rs`, both
+      legs) vs the llama.cpp same-weights reference the P7 item stood up: top-5 first-forward ids match
+      exactly in order (max |Δlogprob| 1.49e-2 — the reference's own bf16-activation rounding; our Qwen2
+      f32-vs-f32 comparison sits at 2.7e-5) and a 24-token greedy sequence is byte-identical on the
+      4070 Ti SUPER.*
 - [x] **all-MiniLM** BERT sentence-embedder (6-layer post-LN bidirectional attention + GeLU FFN,
       masked-mean-pool + L2-normalize). *(2026-07-09) Ported (`models::minilm`, ids+mask in → L2-normalized
       embedding out; tokenization stays caller-side); unit tests incl. padding-invisibility; real-weights
@@ -389,9 +393,13 @@ that fits the model AND uses every device to the fullest.
       Qwen greedy leg. *(2026-07-10) `tools/candle-probe` (out-of-workspace bin, Candle =0.9.1 CPU f32)
       prints top-k (id, logit) JSON for the fixed prompt; fixture committed under
       `crates/mummu/tests/fixtures/`; fp16 Ollama tag pulled and validated.*
-- [ ] LFM2.5 same-weights reference for the parity gate: no Candle port exists — candidate routes are
+- [x] LFM2.5 same-weights reference for the parity gate: no Candle port exists — candidate routes are
       llama.cpp `logprobs` on the fp16 GGUF, or a one-shot HF `transformers` logits dump matched to the
-      safetensors revision. *(2026-07-11 research)* Liquid officially documents running LFM2.5-1.2B
+      safetensors revision. *(2026-07-16) **Shipped** exactly as researched: `tests/llama_ref` spawns a
+      user-supplied `llama-server` (`MUMMU_LLAMA_SERVER` — Ollama installs bundle one, no separate
+      install) on LiquidAI's official **BF16** GGUF (bit-identical to the local bf16 safetensors), RAW
+      `/completion` with prompts as **token-id arrays** (no template stack, no BOS injection —
+      `tokens_evaluated` is asserted) and `n_probs` top-logprobs. Both P2 legs pass — see the P2 item.* *(2026-07-11 research)* Liquid officially documents running LFM2.5-1.2B
       GGUFs under `llama-server`; its completion API returns per-token top logprobs via `n_probs`
       (temperature 0 for the greedy leg) — that plus an fp16 GGUF of the same revision is a workable
       logits leg without Python — https://docs.liquid.ai/deployment/on-device/llama-cpp ·
