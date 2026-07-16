@@ -9,6 +9,10 @@
 **Stack:** Rust 2024 · **Burn 0.21** (`wgpu` 29 + `burn-flex` CPU, `fusion` + `autotune`, multi-device) ·
 `burn-store` · HF `tokenizers` · runs on **any hardware** — CPU, one GPU, or several (multi-GPU + CPU
 offload). Reference dev machine: Ryzen 9 7950X3D · 128 GB · RTX 4070 Ti SUPER 16 GB.
+*(2026-07-16) Pin watch: wgpu 30 and tokenizers 0.23.1 are out; both held (burn 0.21 resolves wgpu 29,
+and the tokenizers 0.23 change relevant to us — `add_tokens` normalizing content at insertion — touches
+exactly the added-token path `tokenizer_from_gguf` rides, so the bump waits for a parity re-run) —
+https://github.com/huggingface/tokenizers/releases.*
 
 ## North Star
 
@@ -58,6 +62,11 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
 ## Phases
 
 ### P0 — Workspace scaffold
+- [ ] Silence the pre-existing `LNK4098` (LIBCMT defaultlib conflict) the 2026-07 nightly toolchain's
+      new `linker_messages` lint now surfaces when linking the `mummu` lib-test binary — find which
+      native dep object embeds the static-CRT directive (tokenizers' C++ deps are the suspects) and
+      align it, rather than allowing the lint. *(2026-07-16, predates this run's changes — verified by
+      an A/B build at HEAD.)*
 - [x] Cargo workspace: `crates/mummu` (the library), model code generic over `B: Backend`. `.gitignore`
       (Rust); commit `Cargo.lock` for reproducible builds/benchmarks. *(2026-07-09) Workspace + both
       crates; pinned combo burn 0.21 / wgpu 29 / tokenizers 0.22 / criterion 0.7; release profile fat-LTO.*
@@ -125,6 +134,18 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       P3 import path to chew on; parity reference = Ollama `qwen3.5:9b` (already pulled locally) —
       https://unsloth.ai/docs/models/qwen3.5 · https://huggingface.co/unsloth/Qwen3.5-9B-GGUF
       *(2026-07-12 research)*
+- [ ] **LFM2.5-230M** as the CPU-tier hybrid zoo entry: shipped June 2026 with llama.cpp / GGUF support
+      from day one — same `lfm2` architecture our loader + parity harness already cover, so this is a
+      registry manifest entry + a run of the P3 quantized-reference leg (and a candidate to replace or
+      join Qwen2.5-0.5B in the CPU decode budget row) —
+      https://www.marktechpost.com/2026/06/27/liquid-ai-ships-lfm2-5-230m-with-llama-cpp-mlx-vllm-sglang-and-onnx-support-for-on-device-inference/
+      *(2026-07-16 research)* *(2026-07-16, same run) Catalog entry + end-to-end proof landed
+      (`real_hub.rs::hub_fetches_and_runs_lfm2_230m_on_cpu`): fetched through the registry (467 MB),
+      checked-loads, greedy-decodes "2 + 2 equals 4." on the CPU backend. Its `config.json` uses the
+      newer nested `rope_parameters` convention — `Lfm2Config` now reads both spellings (non-`default`
+      rope types fail loudly; the 1.2B parity gate re-passed bit-identically after the change, max
+      |Δlogprob| 1.4879674843625068e-2 unchanged). Stays `[ ]` until its own parity-gate run
+      (llama-server on a same-weights GGUF, as the 1.2B does).*
 - [x] A `Model` trait so new architectures (Hermes-class function-callers, Gemma, Qwen3, …) slot in.
       *(2026-07-10) `models::CausalLm<B>` — associated `Cache` type; a port supplies `new_cache` /
       `forward` / `is_eos` and inherits `generate` / `greedy_generate` / `first_token` from the shared
@@ -346,7 +367,12 @@ that fits the model AND uses every device to the fullest.
       `CpuInfo` (logical cores + total RAM — `GlobalMemoryStatusEx` on Windows, `/proc/meminfo` on
       Linux; dev box: 32 cores / 127 GiB). Remaining: per-adapter VRAM capacity, which wgpu does not
       expose portably — needs per-API `wgpu-hal` queries (Vulkan memory heaps / DXGI) — and a macOS RAM
-      sysctl.
+      sysctl. *(2026-07-16)* **True VRAM shipped on Windows**: `GpuAdapter.vram_bytes` from a DXGI 1.1
+      adapter walk (hand-bound frozen COM ABI — `windows-sys` 0.60+ dropped COM bindings and the
+      `windows` crate is heavy for two vtable calls), matched to wgpu adapters by name with per-API
+      decoration tolerance; wgpu still exposes nothing portable (gfx-rs/wgpu#2447 open). Dev box:
+      15.7 GiB reported for the 4070 Ti SUPER on BOTH its Vulkan and DX12 rows. Remaining: Linux
+      (Vulkan memory heaps), macOS (+ RAM sysctl).
 - [ ] **Precision selection** — pick a per-device dtype (f32 / **f16** / int8 / int4) that fits: f16 via
       `Wgpu<half::f16, i32>`; drop to int8/int4 (P9) when f16 still won't fit. *(2026-07-11) The f16
       backend itself is now **fully validated** (all 3 claims — see the islands item below); what remains
