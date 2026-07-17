@@ -149,7 +149,8 @@ pub fn tokenizer_from_gguf(f: &GgufFile) -> Result<Tokenizer, String> {
         .map_err(|e| format!("BPE build: {e}"))?;
     let mut tok = Tokenizer::new(bpe);
     if spec.nfc {
-        tok.with_normalizer(Some(NFC));
+        tok.with_normalizer(Some(NFC))
+            .map_err(|e| format!("NFC normalizer: {e}"))?;
     }
     let split = Split::new(
         SplitPattern::Regex(spec.regex.to_string()),
@@ -199,9 +200,11 @@ pub fn tokenizer_from_gguf(f: &GgufFile) -> Result<Tokenizer, String> {
     for (_, text, special) in &added {
         let t = AddedToken::from(text.clone(), *special);
         if *special {
-            tok.add_special_tokens(&[t]);
+            tok.add_special_tokens([t])
+                .map_err(|e| format!("add special token '{text}': {e}"))?;
         } else {
-            tok.add_tokens(&[t]);
+            tok.add_tokens([t])
+                .map_err(|e| format!("add token '{text}': {e}"))?;
         }
     }
     for (index, text, _) in &added {

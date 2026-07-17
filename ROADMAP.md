@@ -12,7 +12,19 @@ offload). Reference dev machine: Ryzen 9 7950X3D · 128 GB · RTX 4070 Ti SUPER 
 *(2026-07-16) Pin watch: wgpu 30 and tokenizers 0.23.1 are out; both held (burn 0.21 resolves wgpu 29,
 and the tokenizers 0.23 change relevant to us — `add_tokens` normalizing content at insertion — touches
 exactly the added-token path `tokenizer_from_gguf` rides, so the bump waits for a parity re-run) —
-https://github.com/huggingface/tokenizers/releases.*
+https://github.com/huggingface/tokenizers/releases.* *(2026-07-16, later run) **tokenizers 0.23.1 is
+now IN** — the parity re-run that pin was waiting on happened and it is clean. Migration was two API
+shifts: `add_tokens`/`add_special_tokens` take `impl IntoIterator<Item = AddedToken>` (not a slice),
+and they plus `with_normalizer` now return `Result` — all three are handled loudly rather than
+`let _ =`'d, so a rejected added token is an error instead of a silently-missing id. The feared
+normalization-at-insertion change is a non-event for us because `tokenizer_from_gguf` already
+verifies every added token's id post-build. Evidence: both GGUF tokenizer byte-identity batteries
+still pass, and every parity number is **bit-identical to 0.22** — LFM2.5-1.2B 1.4879674843625068e-2,
+230M 3.244355439983515e-2, GGUF-vs-llama.cpp 2.6617605580289094e-1 (qwen2) / 2.5971455430462065e-1
+(lfm2), Qwen2-vs-Candle 2.29e-5 with the Ollama greedy leg exact; both tool-call emissions
+unchanged; budgets 105.5 ms / 12.2 tok/s GPU, 11.74 tok/s CPU. **wgpu 30 stays held** — it is not
+ours to pick, burn 0.21 resolves wgpu 29 transitively, so it unblocks with a burn bump, not a
+`cargo upgrade`.*
 
 ## North Star
 
@@ -54,7 +66,12 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       70.7 → 54.3 ms/token (+30% tok/s) on BOTH dtypes — and f16 still exactly matches f32, so the path
       stays dispatch-bound (~114 GB/s effective vs ~672). Next levers: whatever closes the remaining
       per-token dispatch gap (fewer kernels per step — deeper fusion of the decode step, or CubeCL
-      graph/megakernel work) rather than bandwidth.*
+      graph/megakernel work) rather than bandwidth.* *(2026-07-16) Third, accidental corroboration: the
+      budget gate run while a cargo compile was still busy on the CPU measured **9.2 tok/s**, and the
+      same gate on an idle machine measured **13.0 tok/s** — a ~30% swing from *host* CPU load alone,
+      on an otherwise-idle GPU (5% util). Decode throughput tracking CPU availability is what a
+      dispatch-bound path looks like. Operationally: **run the budget gates on a quiet machine** or
+      they report contention as a regression.*
 - [ ] Evaluate Burn 0.21's `burn.toml` project config — per-subsystem tuning + a CubeCL kernel-validation
       layer without recompiling; useful as a debug switch for kernel-level parity hunts —
       https://burn.dev/blog/release-0.21.0/
@@ -62,16 +79,52 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
 ## Phases
 
 ### P0 — Workspace scaffold
-- [ ] Silence the pre-existing `LNK4098` (LIBCMT defaultlib conflict) the 2026-07 nightly toolchain's
+- [x] Silence the pre-existing `LNK4098` (LIBCMT defaultlib conflict) the 2026-07 nightly toolchain's
       new `linker_messages` lint now surfaces when linking the `mummu` lib-test binary — find which
       native dep object embeds the static-CRT directive (tokenizers' C++ deps are the suspects) and
       align it, rather than allowing the lint. *(2026-07-16, predates this run's changes — verified by
-      an A/B build at HEAD.)*
+      an A/B build at HEAD.)* *(2026-07-16, later run) **Fixed at the source, no lint allow.** The
+      culprit is `esaxx-rs`: its build.rs hardcodes `.static_crt(true)`, so `esaxx.lib` embeds
+      `/DEFAULTLIB:LIBCMT` + `/FAILIFMISMATCH:RuntimeLibrary=MT_StaticRelease` while rustc-msvc links
+      the dynamic CRT (`dumpbin -directives` confirmed; the sibling `onig.lib` correctly carries
+      `/DEFAULTLIB:MSVCRT`). Upstream is aware and stalled — Narsil/esaxx-rs#11 open, its PR #19
+      (`static_crt(false)`) unmerged — so the fix is ours: tokenizers now resolves with
+      `default-features = false, features = ["onig", "progressbar"]`, dropping only `esaxx_fast`.
+      That feature exists solely to accelerate the Unigram **trainer** (`models/unigram/trainer.rs`
+      picks `esaxx_rs::suffix` over the pure-Rust `suffix_rs`), which a runner never runs; `onig` is
+      load-bearing (`SysRegex`) and stays pinned. `cargo tree -e features` now resolves `esaxx-rs`
+      with **no features** — its build.rs compiles nothing, so the C++ object is gone rather than
+      merely tolerated. A/B proof: LNK4098 1 → 0 on a forced relink, zero warnings. Behaviour proof:
+      BOTH GGUF tokenizer byte-identity tests still pass (`real_{qwen2,lfm2}_gguf_tokenizer_matches_the_hf_tokenizer`),
+      and all three parity gates re-passed — Qwen2 max |Δlogit| 2.29e-5 + Ollama greedy byte-identical,
+      LFM2 top-5 exact at 1.4879674843625068e-2, GGUF quantized leg unchanged.
+      https://github.com/Narsil/esaxx-rs/issues/11 · https://github.com/Narsil/esaxx-rs/pull/19
+- [x] The real-weights **GPU tests overflow the stack in the `dev` profile** — `real_gguf`'s
+      `real_{lfm2,qwen2}_gguf_loads_and_decodes_on_gpu` die with `STATUS_STACK_OVERFLOW` on a CubeCL
+      worker thread (`DSD-4-0`), while the identical tests pass in `--release` (7/7 in 76.9 s). Verified
+      **pre-existing** by an A/B at unmodified HEAD, so it is not the tokenizers-feature change. Until
+      it is root-caused, the real-model suites must be run `--release`; the fix is likely a bigger
+      spawn-time stack for the CubeCL worker (or a debug-profile `opt-level` bump for the burn stack).
+      *(2026-07-16)* *(2026-07-16, same run) **Fixed** — it was the `opt-level`, not the stack size:
+      `[profile.dev.package."*"] opt-level = 2` optimizes **dependencies only**, so burn/CubeCL's deep
+      generic tensor call chains stop keeping every inlinable frame live at once, while our own crates
+      stay `-O0` and fully debuggable. The whole real-model suite now runs in `dev`: `real_gguf` 7/7
+      (262 s vs 76.9 s in release — slower, but no longer impossible) and `real_inference` 4/4.
+      `[profile.release]` is untouched, so parity and the perf budgets are unaffected by construction.
+      Dropping `--release` from the real-model suites is now a choice, not a workaround.*
 - [x] Cargo workspace: `crates/mummu` (the library), model code generic over `B: Backend`. `.gitignore`
       (Rust); commit `Cargo.lock` for reproducible builds/benchmarks. *(2026-07-09) Workspace + both
       crates; pinned combo burn 0.21 / wgpu 29 / tokenizers 0.22 / criterion 0.7; release profile fat-LTO.*
 - [x] `cargo build` / `test` / `clippy --all-targets` green baseline; `mummu-bench` (criterion) crate stub.
       *(2026-07-09) All green; criterion harness wired via a smoke bench.*
+- [ ] Prune the **stale `candle-core` entries in the workspace `Cargo.lock`** — `tools/candle-probe` is
+      deliberately its own workspace (Candle must never become a mummu dep), yet the root lock still
+      carries candle-core and its deps as orphans: nothing in the graph reaches them (`cargo tree -i`
+      finds no dependents, `cargo metadata` lists only mummu + mummu-bench, and a workspace build never
+      compiles candle), and `cargo update` does not prune them. Harmless but misleading — it was
+      invisible while both crates shared one `tokenizers`, and surfaced when the 0.23 bump split that
+      entry so the lock now lists tokenizers twice (0.23.1 real, 0.22.2 reachable only from the orphan).
+      Predates this run. *(2026-07-16)*
 
 ### P1 — Backends & device *(ex-laurelane)*
 - [x] Backend abstraction generic over `B: Backend`; one binary compiling BOTH `Wgpu` (Vulkan/DX12/Metal,
@@ -133,8 +186,15 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       the function-calling sweet spot BFCL identified (9B 66.1%), and unsloth ships ready GGUFs for the
       P3 import path to chew on; parity reference = Ollama `qwen3.5:9b` (already pulled locally) —
       https://unsloth.ai/docs/models/qwen3.5 · https://huggingface.co/unsloth/Qwen3.5-9B-GGUF
-      *(2026-07-12 research)*
-- [ ] **LFM2.5-230M** as the CPU-tier hybrid zoo entry: shipped June 2026 with llama.cpp / GGUF support
+      *(2026-07-12 research)* *(2026-07-16 research)* Two refinements when this is picked up: the
+      tool-calling chat-template fix landed across **all** quant uploaders (it improved nested-object
+      parsing — re-pull any GGUF cached before it, ours included), and unsloth ships separate
+      `-MTP-GGUF` repos for the 4B/9B whose **MTP speculative decoding** claims ~1.5–2× decode; MTP
+      needs a draft-token verify loop our `decode` driver does not have, so treat it as a distinct
+      P5 item rather than a free win of the port. Qwen3.6 (35B-A3B) is also out now but is MoE and
+      well past the single-card tier this zoo targets —
+      https://huggingface.co/unsloth/Qwen3.5-4B-GGUF · https://unsloth.ai/docs/models/qwen3.5/gguf-benchmarks
+- [x] **LFM2.5-230M** as the CPU-tier hybrid zoo entry: shipped June 2026 with llama.cpp / GGUF support
       from day one — same `lfm2` architecture our loader + parity harness already cover, so this is a
       registry manifest entry + a run of the P3 quantized-reference leg (and a candidate to replace or
       join Qwen2.5-0.5B in the CPU decode budget row) —
@@ -144,8 +204,18 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       checked-loads, greedy-decodes "2 + 2 equals 4." on the CPU backend. Its `config.json` uses the
       newer nested `rope_parameters` convention — `Lfm2Config` now reads both spellings (non-`default`
       rope types fail loudly; the 1.2B parity gate re-passed bit-identically after the change, max
-      |Δlogprob| 1.4879674843625068e-2 unchanged). Stays `[ ]` until its own parity-gate run
-      (llama-server on a same-weights GGUF, as the 1.2B does).*
+      |Δlogprob| 1.4879674843625068e-2 unchanged).* *(2026-07-16, later run) **Parity gate PASSED**,
+      both legs — the tier is now trusted. LiquidAI publishes `LFM2.5-230M-BF16.gguf`
+      (`LiquidAI/LFM2.5-230M-GGUF`, 462 MB), the same-weights artifact the leg needed; `parity_lfm2.rs`
+      is now written once and **parameterized by tier** (a `Tier` = tag + weights-dir env + BF16-GGUF
+      env), so the 1.2B and 230M share both legs — the same hybrid loader covers both, which is the
+      point of the architecture being config-driven. On the 4070 Ti SUPER: top-5 ids match the
+      llama.cpp reference **exactly in order** and the 24-token greedy sequence is byte-identical, at
+      max |Δlogprob| **3.244355439983515e-2**. That is ~2x the 1.2B's 1.49e-2 — expected, since a
+      narrower model (1024 vs 2048 hidden) accumulates over fewer terms per dot product and so hides
+      less of the reference's own per-dot bf16 activation rounding; it sits inside the existing 5e-2
+      tolerance with ~1.5x headroom (tolerance unchanged, and the strict-order id match remains the
+      real assert). Run legs with `MUMMU_LFM2_230M_DIR` + `MUMMU_LFM2_230M_BF16_GGUF`.*
 - [x] A `Model` trait so new architectures (Hermes-class function-callers, Gemma, Qwen3, …) slot in.
       *(2026-07-10) `models::CausalLm<B>` — associated `Cache` type; a port supplies `new_cache` /
       `forward` / `is_eos` and inherits `generate` / `greedy_generate` / `first_token` from the shared
@@ -466,6 +536,19 @@ The VRAM lever the P6 planner pulls to make the largest useful model fit the use
       model already quantized on the Hub loads as-is. *(2026-07-13) The dequant-to-f32 leg of the GGUF
       path shipped in P3 (`load_from_gguf` — every storage dtype); what remains here is **keep-quantized
       in VRAM**, which is the actual fit lever (Q4_K_M currently dequants to the same f32 footprint).*
+- [ ] **Steal LlamaWeb's kernel split for the keep-quantized path** — a 2026 paper (LlamaWeb) does
+      exactly the P9 target on **WebGPU** (our wgpu substrate) and reports the design that worked:
+      keep every format as flat `u32` buffers in VRAM and dequantize *in-kernel*, but split by op —
+      matmul/prefill dequants a tile into **shared memory** and reuses it across outputs, while the
+      matvec that dominates decode (they measure **80–90 %** of decode time) dequants **straight into
+      registers**. One format-agnostic representation carried 21 quant formats without per-format
+      kernels. Results: peak memory **−29–33 %** and decode throughput **+45–69 %** vs WebLLM /
+      Transformers.js, though prefill lost 21–51 %. Two things to weigh against our own numbers before
+      adopting: (a) they conclude decode is **bandwidth**-bound (f16 → q8_0 bought 20–53 %), which is
+      the *opposite* of what our f16-exactly-matches-f32 measurement says about our path — so the win
+      here may be VRAM-only for us until the dispatch gap closes; (b) their gains lean on subgroup
+      matrix ops where available, with portable fallbacks. — https://arxiv.org/html/2605.20706v1
+      *(2026-07-16 research)*
 - [ ] Evaluate **CubeCL's quantization primitives** for the keep-quantized matmul: recent CubeCL ships
       block-scaled MMA, global quantization for matmul, quantized tensor views, and FP4/FP2 formats —
       the kernel substrate a Q4-weights × f16-activations decode path would ride (vs hand-writing a

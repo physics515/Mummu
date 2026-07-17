@@ -9,8 +9,11 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/physics515/Mummu"
 
 [workspace.dependencies]
-# Intentional pins (see ROADMAP "Stack"): burn 0.21 + wgpu 29 + tokenizers 0.22 are the
-# parity-validated combination proven in laurelane (byte-identical logits vs Candle).
+# Intentional pins (see ROADMAP "Stack"): burn 0.21 + wgpu 29 are the parity-validated
+# combination proven in laurelane (byte-identical logits vs Candle). wgpu is not ours to
+# pick — burn 0.21 resolves 29 transitively, so wgpu 30 unblocks with a burn bump, not a
+# `cargo upgrade`. tokenizers rides 0.23 as of 2026-07-16: every parity number came back
+# bit-identical to 0.22, so it is no longer part of the pinned combination.
 # `fusion` + `autotune` are the throughput levers: fusion compiles streams of tensor ops
 # into far fewer GPU kernels and autotune picks the fastest kernel variant; with `fusion`,
 # `Wgpu` transparently becomes `Fusion<Wgpu>`.
@@ -47,7 +50,17 @@ wgpu = "29"
 pollster = "1.0"
 # f16 element type for the GPU backend; the same `half` version Burn pulls.
 half = "2"
-tokenizers = "0.22"
+# `esaxx_fast` (a default feature) is off deliberately: it builds esaxx-rs's
+# C++ suffix-array with `.static_crt(true)` hardcoded in its build.rs, so the
+# object demands the static CRT (/DEFAULTLIB:LIBCMT) while rustc-msvc links the
+# dynamic one -> LNK4098. It only accelerates the Unigram *trainer*, which we
+# never run (tokenizers falls back to `esaxx_rs::suffix_rs`, pure Rust), so
+# dropping it costs nothing and needs no upstream fix (Narsil/esaxx-rs#11 is
+# open; its PR #19 is unmerged). `onig` is load-bearing (SysRegex) and stays.
+tokenizers = { version = "0.23", default-features = false, features = [
+	"onig",
+	"progressbar",
+] }
 
 # Blocking HTTP (rustls) for the P3 model downloader; small, sync like the rest
 # of the library surface.
@@ -68,3 +81,11 @@ criterion = "0.8"
 # buy almost nothing here while tripling the verify-loop cost. Revisit against
 # bench/BASELINE.md numbers if a CPU-bound path ever becomes hot.
 lto = "thin"
+
+# Optimize DEPENDENCIES ONLY in dev/test; our own crates stay -O0 and fully
+# debuggable. Unoptimized burn/CubeCL blow the stack of their own worker
+# thread when a real model runs (STATUS_STACK_OVERFLOW on `DSD-*`): -O0 keeps
+# every inlinable frame of a deep generic tensor call chain live at once.
+# This is why the real-weights GPU suites could only be run `--release`.
+[profile.dev.package."*"]
+opt-level = 2
