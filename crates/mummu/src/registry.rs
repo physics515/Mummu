@@ -13,6 +13,9 @@ use crate::hub::{self, HubError, Progress};
 pub enum Architecture {
     /// `models::qwen2` — Qwen2 / Qwen2.5 decoder tiers.
     Qwen2,
+    /// `models::qwen3` — Qwen3 dense decoder (per-head q/k norm, no qkv bias,
+    /// decoupled head_dim); the function-calling tier (4B / 9B).
+    Qwen3,
     /// `models::lfm2` — LFM2 / LFM2.5 hybrid conv+attention.
     Lfm2,
     /// `models::minilm` — all-MiniLM BERT sentence embedder.
@@ -190,6 +193,44 @@ pub fn catalog() -> Vec<ModelSpec> {
                 file: "LFM2.5-1.2B-Instruct-Q4_K_M.gguf".into(),
             },
             disk_bytes_estimate: 731_000_000,
+        },
+        // Qwen3 dense — the local function-calling tier. 0.6B is the fast
+        // parity-validation / CPU tier; 4B is the BFCL sweet spot.
+        ModelSpec {
+            name: "qwen3-0.6b".into(),
+            repo: "Qwen/Qwen3-0.6B".into(),
+            revision: "main".into(),
+            architecture: Architecture::Qwen3,
+            format: WeightFormat::Safetensors,
+            disk_bytes_estimate: 1_500_000_000,
+        },
+        ModelSpec {
+            name: "qwen3-0.6b-q4km".into(),
+            repo: "unsloth/Qwen3-0.6B-GGUF".into(),
+            revision: "main".into(),
+            architecture: Architecture::Qwen3,
+            format: WeightFormat::Gguf {
+                file: "Qwen3-0.6B-Q4_K_M.gguf".into(),
+            },
+            disk_bytes_estimate: 484_000_000,
+        },
+        ModelSpec {
+            name: "qwen3-4b".into(),
+            repo: "Qwen/Qwen3-4B".into(),
+            revision: "main".into(),
+            architecture: Architecture::Qwen3,
+            format: WeightFormat::Safetensors,
+            disk_bytes_estimate: 8_100_000_000,
+        },
+        ModelSpec {
+            name: "qwen3-4b-q4km".into(),
+            repo: "Qwen/Qwen3-4B-GGUF".into(),
+            revision: "main".into(),
+            architecture: Architecture::Qwen3,
+            format: WeightFormat::Gguf {
+                file: "Qwen3-4B-Q4_K_M.gguf".into(),
+            },
+            disk_bytes_estimate: 2_500_000_000,
         },
     ];
     debug_assert!(

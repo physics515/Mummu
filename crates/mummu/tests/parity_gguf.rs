@@ -24,7 +24,7 @@ use llama_ref::{LlamaServer, logprobs_at};
 use mummu::backend::Gpu;
 use mummu::gguf::GgufFile;
 use mummu::models::CausalLm;
-use mummu::models::{lfm2, qwen2};
+use mummu::models::{lfm2, qwen2, qwen3};
 
 const PROMPT: &str = "List the first five prime numbers.";
 const MAX_TOKENS: usize = 24;
@@ -172,6 +172,27 @@ fn qwen2_q4_gguf_matches_llama_cpp_on_the_same_file() {
         "qwen2",
         &gguf,
         |p, d| qwen2::load_from_gguf::<Gpu>(p, d).expect("gguf load checked"),
+        |user| {
+            mummu::chat::ChatMl::qwen2().render(&[
+                mummu::chat::Turn::system("You are a helpful assistant."),
+                mummu::chat::Turn::user(user),
+            ])
+        },
+    );
+}
+
+#[test]
+#[ignore = "needs a Qwen3 Q4_K_M GGUF (MUMMU_QWEN3_GGUF_PATH) + llama-server (MUMMU_LLAMA_SERVER)"]
+fn qwen3_q4_gguf_matches_llama_cpp_on_the_same_file() {
+    // Qwen3 is a thinking model (emits <think>…) — the greedy leg still holds
+    // byte-for-byte because both sides receive the IDENTICAL prompt-id array
+    // and greedy-decode, so the reasoning tokens match too; no chat/template
+    // stack runs on either side (the LFM2 raw-completion caveat applies).
+    let gguf = env_path("MUMMU_QWEN3_GGUF_PATH", "a qwen3 q4_k_m gguf");
+    compare_against_llama_cpp(
+        "qwen3",
+        &gguf,
+        |p, d| qwen3::load_from_gguf::<Gpu>(p, d).expect("gguf load checked"),
         |user| {
             mummu::chat::ChatMl::qwen2().render(&[
                 mummu::chat::Turn::system("You are a helpful assistant."),

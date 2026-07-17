@@ -74,7 +74,24 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       they report contention as a regression.*
 - [ ] Evaluate Burn 0.21's `burn.toml` project config — per-subsystem tuning + a CubeCL kernel-validation
       layer without recompiling; useful as a debug switch for kernel-level parity hunts —
-      https://burn.dev/blog/release-0.21.0/
+      https://burn.dev/blog/release-0.21.0/ *(2026-07-17 research)* Concretely, a `burn.toml` dropped at
+      the project root parameterizes every internal subsystem with no code change / no recompile:
+      **fusion's beam search**, **autotune aggressiveness**, **compilation-cache + validation modes**,
+      **streaming concurrency**, and **memory-pool persistence**. The load-bearing one for us is the new
+      **CubeCL kernel-validation layer** — it catches kernels that generate **out-of-bounds memory
+      accesses** (the exact failure class behind a silent wrong-logits parity drift or a
+      `STATUS_STACK_OVERFLOW`-adjacent GPU crash). Action when picked up: commit a checked-in
+      `burn.toml` with validation ON for the parity/real-model test profiles (catch OOB in CI) and OFF
+      for the benchmark profile (no validation overhead in the budget numbers), and re-confirm the
+      budgets are unmoved by its presence.
+- [ ] Evaluate **CubeCL's now-complete flash-attention kernel** for the decode/prefill attention step —
+      the releases page reports a full implementation (causal **masking**, partitions, row-wise
+      reductions, multi-plane ops). Mummu currently materializes attention explicitly (q·kᵀ → f32 softmax
+      island → ·v); a fused flash-attention kernel collapses those into one dispatch, which is squarely
+      the **fewer-kernels-per-step** lever the dispatch-bound decode note above is chasing (and it drops
+      the O(t²) scores tensor at prefill). Gate strictly: the f32-softmax island is the whole reason the
+      f16 parity holds, so any flash path must re-pass the parity harness (both legs) AND hold/beat
+      `bench/BASELINE.md` before adoption. — https://github.com/tracel-ai/cubecl/releases *(2026-07-17 research)*
 
 ## Phases
 
@@ -117,14 +134,17 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       crates; pinned combo burn 0.21 / wgpu 29 / tokenizers 0.22 / criterion 0.7; release profile fat-LTO.*
 - [x] `cargo build` / `test` / `clippy --all-targets` green baseline; `mummu-bench` (criterion) crate stub.
       *(2026-07-09) All green; criterion harness wired via a smoke bench.*
-- [ ] Prune the **stale `candle-core` entries in the workspace `Cargo.lock`** — `tools/candle-probe` is
-      deliberately its own workspace (Candle must never become a mummu dep), yet the root lock still
-      carries candle-core and its deps as orphans: nothing in the graph reaches them (`cargo tree -i`
-      finds no dependents, `cargo metadata` lists only mummu + mummu-bench, and a workspace build never
-      compiles candle), and `cargo update` does not prune them. Harmless but misleading — it was
-      invisible while both crates shared one `tokenizers`, and surfaced when the 0.23 bump split that
-      entry so the lock now lists tokenizers twice (0.23.1 real, 0.22.2 reachable only from the orphan).
-      Predates this run. *(2026-07-16)*
+- [x] The **`candle-core` entries in the workspace `Cargo.lock`** are correct and not prunable — root
+      cause was misdiagnosed. They are NOT `tools/candle-probe` orphans (that is a separate workspace with
+      its own lock); they come from **`burn`'s optional `burn-candle` backend**: `burn` declares
+      `burn-candle` as a feature-gated optional dependency, `burn-candle → candle-core → tokenizers 0.22.2`,
+      and Cargo.lock records a package's full *optional*-dependency closure regardless of which features are
+      enabled. `cargo tree -i candle-core` prints "nothing to print" (nothing reaches it under our enabled
+      features) precisely because it is an unenabled optional — that is expected, not an orphan. Proof it is
+      inherent: a from-scratch `rm Cargo.lock && cargo generate-lockfile` re-adds candle-core (and the
+      0.22.2 tokenizers it pulls). Nothing to fix — it is a normal, harmless artifact of Burn shipping a
+      Candle backend behind a feature we never turn on; it costs zero compile time (never built) and would
+      only disappear if Burn stopped declaring the optional dep. *(2026-07-17)*
 
 ### P1 — Backends & device *(ex-laurelane)*
 - [x] Backend abstraction generic over `B: Backend`; one binary compiling BOTH `Wgpu` (Vulkan/DX12/Metal,
@@ -191,9 +211,38 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       parsing — re-pull any GGUF cached before it, ours included), and unsloth ships separate
       `-MTP-GGUF` repos for the 4B/9B whose **MTP speculative decoding** claims ~1.5–2× decode; MTP
       needs a draft-token verify loop our `decode` driver does not have, so treat it as a distinct
-      P5 item rather than a free win of the port. Qwen3.6 (35B-A3B) is also out now but is MoE and
+      P5 item rather than a free win of the port. *(2026-07-17) **Qwen3 dense architecture shipped**
+      (`models::qwen3`) — the arch the Qwen3 AND Qwen3.5 dense tiers share, so this is the load-bearing
+      half of this item. It reuses the shared `nn` blocks verbatim: the three deltas from Qwen2 (per-head
+      q/k RMSNorm over `head_dim`, no q/k/v bias, a **decoupled** `head_dim` where `num_heads·head_dim`
+      need not equal `hidden`) were all already covered by `GqaAttention`'s `qk_norm_eps` path + the
+      independent `head_dim` in `GqaAttentionConfig` — HF Qwen3 orders qk-norm identically to the LFM2
+      path we validated (`q_norm(q_proj(x).view(b,t,nh,hd)).transpose(1,2)`), so ZERO nn changes. Config
+      (json + `qwen3.*` GGUF metadata, `key_length`→head_dim), safetensors + GGUF loaders (q_norm/k_norm
+      key remaps, tied/untied head), `CausalLm` impl, 10 unit tests (decoupled-head_dim path,
+      cache≡full-forward, gguf name map incl. qk-norms). Catalog: `qwen3-0.6b`, `qwen3-4b` (+ Q4_K_M
+      GGUF specs). **REAL-GPU verified** on Qwen3-0.6B (28 layers, hidden 1024, 16h/8kv, head_dim 128
+      decoupled, tied — `tests/real_qwen3.rs`): loads + greedy-decodes a correct answer from BOTH the
+      bf16 safetensors AND the Q4_K_M GGUF alone (tokenizer-from-GGUF byte-identical to `tokenizer.json`
+      on the prompt); the GGUF vs bf16 builds agree on the top first-token id (151667) at logit cosine
+      0.989. **The arch is now parity-verified** (strict `[x]` leg below — byte-identical greedy vs
+      llama.cpp on the same Q4_K_M). Stays `[ ]` only for the specific Qwen3.5-4B/9B **FC** target: a
+      catalog run on those larger weights + tool-calling validation (the Hermes template machinery Qwen2.5
+      already proved covers Qwen3, so this is a download + FC decode, not new architecture work).*
+      Qwen3.6 (35B-A3B) is also out now but is MoE and
       well past the single-card tier this zoo targets —
       https://huggingface.co/unsloth/Qwen3.5-4B-GGUF · https://unsloth.ai/docs/models/qwen3.5/gguf-benchmarks
+- [x] **Qwen3 strict parity gate PASSED** — the Qwen3 dense arch is now through the P7 trust gate.
+      `tests/parity_gguf.rs` gained a `qwen3` leg on the `llama_ref` harness: `llama-server` (Ollama's
+      bundled binary) runs the SAME local Qwen3-0.6B Q4_K_M our loader loads, RAW `/completion` with
+      token-id prompts + `n_probs`. On the 4070 Ti SUPER: top-5 first-forward ids match **exactly in
+      order** (all 5: 151667, 151644, 151645, 99966, 131545) and the 24-token greedy sequence is
+      **byte-identical** to llama.cpp — reproducing the `<think>…` reasoning tokens verbatim (both sides
+      get the identical prompt-id array and greedy-decode, so thinking mode is irrelevant to parity; no
+      template stack on either side per the LFM2 caveat). max |Δlogprob| **4.02e-1**, inside the shared
+      7.5e-1 tolerance (a touch above Qwen2's 2.66e-1 / LFM2's 2.60e-1 — the reference's Q8_K
+      activation-quant noise is proportionally larger for the narrow 0.6B). Run with
+      `MUMMU_QWEN3_GGUF_PATH` + `MUMMU_LLAMA_SERVER`. *(2026-07-17)*
 - [x] **LFM2.5-230M** as the CPU-tier hybrid zoo entry: shipped June 2026 with llama.cpp / GGUF support
       from day one — same `lfm2` architecture our loader + parity harness already cover, so this is a
       registry manifest entry + a run of the P3 quantized-reference leg (and a candidate to replace or
@@ -342,8 +391,15 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       https://github.com/vllm-project/compressed-tensors ·
       https://www.digitalapplied.com/blog/gguf-vs-awq-vs-gptq-vs-mlx-llm-quantization-formats-2026
 - [ ] **ONNX** (optional) — `burn-import` ONNX→Burn for models distributed as ONNX graphs.
-- [ ] **Dtype handling** — a `CastFloatAdapter` (bf16→f32/f16); quantized→dequant on import; keep-quantized
-      handed to P9.
+- [x] **Dtype handling** — a `CastFloatAdapter` (bf16→f32/f16); quantized→dequant on import; keep-quantized
+      handed to P9. *(2026-07-17)* All three legs are in place and proven across the zoo: `CastFloatAdapter`
+      (`import.rs`) casts bf16 (HF's shipping dtype) to the backend's float on load — f32 on the `Gpu`/`Cpu`
+      aliases, **f16** on `GpuF16` — chained after `PyTorchToBurnAdapter` on every safetensors AND GGUF
+      load path; quantized→dequant-on-import is the `load_from_gguf` pipeline (every storage dtype → f32
+      via `dequant_to_safetensors`); keep-quantized-in-VRAM stays a P9 item (the actual fit lever). Newly
+      verified on the Qwen3 arch: it loads + decodes coherently on `GpuF16` with the same f32-softmax
+      attention island Qwen2/LFM2 use (`tests/real_qwen3.rs::real_qwen3_decodes_coherently_in_f16` — no
+      overflow to NaN, sanity-smoke spread 49.4 identical to f32, "2 plus 2 equals 4").
 - [x] **Weight-name remapping + checked load** — per-architecture key-remap tables (checkpoint naming →
       Mummu module names); **fail loudly** on missing/unexpected keys with a readable diff, never silently zero-init.
       *(2026-07-09) Remap tables live in each model's `load_from_dir` (Qwen2: strip `model.` + RmsNorm→gamma;
@@ -368,8 +424,19 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       Catalog gains single-file Q4_K_M entries for Qwen2.5-1.5B and LFM2.5-1.2B (quarter the download of
       the safetensors). REAL-NETWORK proof (`real_hub.rs`): the LFM2.5 GGUF spec installed end-to-end —
       697 MB fetched, header parses as `lfm2` (148 tensors), tokenizer built from its metadata.*
-- [ ] **Import validation** — checked load + a first-token parity smoke against a reference before a model is
-      marked trusted; a clear error taxonomy (missing file, bad shard, key mismatch, unsupported dtype).
+- [x] **Import validation** — checked load + a post-import liveness smoke, with a clear error taxonomy.
+      *(2026-07-17)* Two taxonomies now cover the pipeline end to end: **`ImportError`** for the file→module
+      stage (missing file, parse, load, `Incomplete` with a per-tensor missing/errored diff — key mismatch
+      and unsupported dtype surface here, never a silent zero-init), and a new **`SanityError`** for the
+      *runtime* stage a checked load can't see — `NonFinite` (NaN/Inf logits: bad dtype or corrupt bytes
+      that still deserialize to the right shape), `WrongVocab` (logits width ≠ tokenizer/config vocab), and
+      `Degenerate` (spread < 1e-4: a dead/zero-init forward reported as fully applied). `import::logit_sanity`
+      is the pure check (6 unit tests over the taxonomy, incl. the width-before-index-access ordering);
+      `CausalLm::sanity_check(probe_ids, expected_vocab, device)` is the model-level gate an app calls right
+      after `install`. On real Qwen3-0.6B it reports a healthy live distribution (spread 49.4). The
+      *"first-token parity smoke against a reference"* is, for catalog models, the P7 parity gates (Qwen2 /
+      Qwen3 / LFM2.5 / MiniLM — all passing); an arbitrary user import has no reference, so the liveness
+      smoke is its general trust check.
 
 ### P4 — Tokenizer & chat templates *(ex-laurelane)*
 - [x] HF `tokenizers` (pinned); explicit chat templates (ChatML + per-model), correct special/EOS tokens.
@@ -564,6 +631,12 @@ The VRAM lever the P6 planner pulls to make the largest useful model fit the use
 ### P11 — Vision & OCR (retire Candle)
 - [ ] Port a vision/OCR model (DeepSeek-OCR — currently Candle in laurelane, `physics515/deepseek-ocr.rs`)
       to Burn on the same runner, so Candle can be dropped from consumers entirely.
+- [ ] **Qwen3.5-4B is multimodal** — `unsloth/Qwen3.5-4B-GGUF` ships an `mmproj-BF16.gguf` (a CLIP-style
+      vision projector) beside the text GGUF, and its text tower is the **`qwen3` dense arch Mummu now
+      runs + parity-verifies**. That makes it a strong second vision candidate whose LLM half is already
+      done: a P11 port would be the mmproj vision encoder + the projector, feeding embeddings into the
+      existing Qwen3 decoder — far less new surface than a from-scratch OCR model. Weigh against
+      DeepSeek-OCR once the P3 GGUF-mmproj parse + a vision block land. *(2026-07-17 research)*
 
 ## Consumer integration contract
 
