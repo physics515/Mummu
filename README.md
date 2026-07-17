@@ -30,6 +30,11 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
   remaps, and a fail-loud load (never silently zero-init); `config.json`-driven hyperparameters.
   `pytorch_model.bin` state dicts load through the same checked path (safetensors preferred when both
   exist) — proven byte-identical on MiniLM's real Hub checkpoint in both formats.
+- **Import validation** — a two-stage error taxonomy: `ImportError` for the file→module stage (missing
+  file, parse, load, and an `Incomplete` per-tensor missing/errored diff) and `SanityError` for the
+  runtime liveness a checked load can't see — NaN/Inf logits, a vocab-width mismatch, or a
+  degenerate/dead forward. `CausalLm::sanity_check` is the post-`install` gate an app calls to catch a
+  silently-broken import before trusting the model.
 - **Four architectures ported and running on real weights** — Qwen2/2.5, Qwen3 dense, the LFM2/2.5
   hybrid, and the all-MiniLM sentence embedder; Qwen2.5-1.5B, Qwen3-0.6B, and LFM2.5-1.2B/230M load and
   greedy-decode correctly on the reference GPU (wgpu/Vulkan), and Qwen2.5-0.5B / LFM2.5-230M do the same

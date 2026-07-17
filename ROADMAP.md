@@ -400,8 +400,19 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       Catalog gains single-file Q4_K_M entries for Qwen2.5-1.5B and LFM2.5-1.2B (quarter the download of
       the safetensors). REAL-NETWORK proof (`real_hub.rs`): the LFM2.5 GGUF spec installed end-to-end —
       697 MB fetched, header parses as `lfm2` (148 tensors), tokenizer built from its metadata.*
-- [ ] **Import validation** — checked load + a first-token parity smoke against a reference before a model is
-      marked trusted; a clear error taxonomy (missing file, bad shard, key mismatch, unsupported dtype).
+- [x] **Import validation** — checked load + a post-import liveness smoke, with a clear error taxonomy.
+      *(2026-07-17)* Two taxonomies now cover the pipeline end to end: **`ImportError`** for the file→module
+      stage (missing file, parse, load, `Incomplete` with a per-tensor missing/errored diff — key mismatch
+      and unsupported dtype surface here, never a silent zero-init), and a new **`SanityError`** for the
+      *runtime* stage a checked load can't see — `NonFinite` (NaN/Inf logits: bad dtype or corrupt bytes
+      that still deserialize to the right shape), `WrongVocab` (logits width ≠ tokenizer/config vocab), and
+      `Degenerate` (spread < 1e-4: a dead/zero-init forward reported as fully applied). `import::logit_sanity`
+      is the pure check (6 unit tests over the taxonomy, incl. the width-before-index-access ordering);
+      `CausalLm::sanity_check(probe_ids, expected_vocab, device)` is the model-level gate an app calls right
+      after `install`. On real Qwen3-0.6B it reports a healthy live distribution (spread 49.4). The
+      *"first-token parity smoke against a reference"* is, for catalog models, the P7 parity gates (Qwen2 /
+      Qwen3 / LFM2.5 / MiniLM — all passing); an arbitrary user import has no reference, so the liveness
+      smoke is its general trust check.
 
 ### P4 — Tokenizer & chat templates *(ex-laurelane)*
 - [x] HF `tokenizers` (pinned); explicit chat templates (ChatML + per-model), correct special/EOS tokens.

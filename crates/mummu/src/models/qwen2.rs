@@ -615,6 +615,26 @@ mod tests {
     }
 
     #[test]
+    fn sanity_check_passes_on_a_live_toy_model_and_flags_a_vocab_mismatch() {
+        let device = Dev::default();
+        let cfg = toy_config();
+        let vocab = cfg.vocab_size;
+        let loaded = LoadedQwen2::<Cpu> {
+            model: build(&cfg, &device),
+            config: cfg,
+        };
+        // A built (random-weight) model computes a live, finite, non-degenerate
+        // distribution — the smoke passes and reports a valid top id.
+        let smoke = loaded
+            .sanity_check(&[1, 2, 3], vocab, &device)
+            .expect("live toy model passes the smoke");
+        assert!((smoke.top_id as usize) < vocab, "top id in vocab range");
+        assert!(smoke.spread > 0.0, "a live forward has positive spread");
+        // The wrong expected vocab is caught as a mismatch, not a silent pass.
+        assert!(loaded.sanity_check(&[1, 2, 3], vocab + 1, &device).is_err());
+    }
+
+    #[test]
     fn greedy_generate_respects_max_tokens_bound() {
         let device = Dev::default();
         let cfg = toy_config();

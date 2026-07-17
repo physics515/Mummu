@@ -93,4 +93,32 @@ pub trait CausalLm<B: Backend> {
             .map_err(|e| format!("logits readback: {e:?}"))?;
         Ok(top_k_ids(&v, k))
     }
+
+    /// Post-import **sanity smoke**: one forward on `probe_ids` must yield
+    /// finite, correctly-sized (`expected_vocab`-wide), non-degenerate logits.
+    /// The liveness gate an app calls right after `install` to catch a
+    /// silently-broken import — corrupt weights (NaN), a config/tokenizer vocab
+    /// mismatch, or a dead/zero-init forward — none of which a checked *load*
+    /// can see. This is not parity (an arbitrary import has no reference); it
+    /// proves the model actually computes. See [`crate::import::logit_sanity`].
+    fn sanity_check(
+        &self,
+        probe_ids: &[u32],
+        expected_vocab: usize,
+        device: &B::Device,
+    ) -> Result<crate::import::SanitySmoke, String> {
+        assert!(!probe_ids.is_empty(), "sanity_check: empty probe prompt");
+        assert!(
+            expected_vocab > 0,
+            "sanity_check: expected_vocab must be positive"
+        );
+        let mut cache = self.new_cache();
+        let logits = self.forward(probe_ids, 0, &mut cache, device);
+        let v = logits
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .map_err(|e| format!("logits readback: {e:?}"))?;
+        crate::import::logit_sanity(&v, expected_vocab).map_err(|e| e.to_string())
+    }
 }

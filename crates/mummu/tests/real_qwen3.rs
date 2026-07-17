@@ -89,6 +89,18 @@ fn real_qwen3_safetensors_loads_and_decodes_on_gpu() {
         model.config.tie_word_embeddings,
     );
 
+    // The post-import sanity smoke passes on the real weights: one forward
+    // yields finite, vocab-wide, non-degenerate logits (the liveness gate an
+    // app runs right after install).
+    let smoke = model
+        .sanity_check(&prompt, model.config.vocab_size, &device)
+        .expect("real weights pass the import sanity smoke");
+    eprintln!(
+        "[real_qwen3] sanity smoke: top_id {} · top_logit {:.3} · spread {:.3}",
+        smoke.top_id, smoke.top_logit, smoke.spread
+    );
+    assert!((smoke.top_id as usize) < model.config.vocab_size);
+
     let ids = model.greedy_generate(&prompt, 48, &device).expect("decode");
     let text = tok.decode(&ids, true).expect("ids decode");
     eprintln!("[real_qwen3] safetensors greedy: {text:?}");

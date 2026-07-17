@@ -35,6 +35,102 @@ pub enum ImportError {
     },
 }
 
+/// Why a freshly-imported model failed its post-load **sanity smoke** (one
+/// forward, checked for liveness). These are the silent-broken-import failure
+/// modes a checked *load* cannot see — the weights all applied, but the model
+/// does not actually compute.
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub enum SanityError {
+    /// Logits contain NaN or ±Inf — the classic signature of a wrong dtype
+    /// (e.g. an f16 overflow that should have been an f32 island) or corrupt
+    /// weight bytes that still deserialized to the right shape.
+    #[error(
+        "{count} non-finite logit(s) (first at index {first_index}) — bad dtype or corrupt weights"
+    )]
+    NonFinite { count: usize, first_index: usize },
+    /// The logits width does not equal the expected vocabulary — a config /
+    /// tokenizer / checkpoint mismatch (the model and its tokenizer disagree
+    /// on how many tokens exist).
+    #[error("logits width {logits_len} != expected vocab {expected} — config/tokenizer mismatch")]
+    WrongVocab { logits_len: usize, expected: usize },
+    /// Every logit is (near-)identical — a dead forward: zero-initialized
+    /// weights, or an all-masked/zeroed activation path that a checked load
+    /// still reports as fully applied.
+    #[error("degenerate logits (spread {spread:e} < {threshold:e}) — dead/zero-init forward")]
+    Degenerate { spread: f32, threshold: f32 },
+}
+
+/// The healthy result of a [`logit_sanity`] smoke: the winning token and how
+/// sharply the distribution favors it (a coarse confidence signal for logs).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SanitySmoke {
+    /// argmax token id.
+    pub top_id: u32,
+    /// The winning logit.
+    pub top_logit: f32,
+    /// max − min over the logits (the dynamic range; large for a live model).
+    pub spread: f32,
+}
+
+/// Logits below this spread (max − min) are treated as a dead/uniform forward.
+/// A live LM's first-token logits span tens; a zero-init forward spans ~0. The
+/// gap is enormous, so a tiny threshold never false-positives a real model.
+const DEGENERATE_SPREAD: f32 = 1e-4;
+
+/// Post-load **sanity smoke** over one forward's logits: finite, the expected
+/// width, and not degenerate. This is *liveness*, not parity — an arbitrary
+/// user import has no reference to compare against (catalog models get the P7
+/// parity gates); this only proves the model actually computes rather than
+/// silently returning garbage a checked load reported as fully applied.
+pub fn logit_sanity(logits: &[f32], expected_vocab: usize) -> Result<SanitySmoke, SanityError> {
+    assert!(
+        expected_vocab > 0,
+        "logit_sanity: expected_vocab must be positive"
+    );
+    if logits.len() != expected_vocab {
+        return Err(SanityError::WrongVocab {
+            logits_len: logits.len(),
+            expected: expected_vocab,
+        });
+    }
+    assert!(
+        !logits.is_empty(),
+        "logit_sanity: width matched a positive vocab"
+    );
+
+    if let Some((first_index, _)) = logits.iter().enumerate().find(|(_, l)| !l.is_finite()) {
+        let count = logits.iter().filter(|l| !l.is_finite()).count();
+        return Err(SanityError::NonFinite { count, first_index });
+    }
+
+    // All finite: min/max define the spread and the argmax.
+    let (mut min, mut max, mut top_id) = (f32::INFINITY, f32::NEG_INFINITY, 0usize);
+    for (i, &l) in logits.iter().enumerate() {
+        if l < min {
+            min = l;
+        }
+        if l > max {
+            (max, top_id) = (l, i);
+        }
+    }
+    let spread = max - min;
+    if spread < DEGENERATE_SPREAD {
+        return Err(SanityError::Degenerate {
+            spread,
+            threshold: DEGENERATE_SPREAD,
+        });
+    }
+    debug_assert!(
+        spread > 0.0 && max.is_finite(),
+        "healthy smoke has positive finite spread"
+    );
+    Ok(SanitySmoke {
+        top_id: top_id as u32,
+        top_logit: max,
+        spread,
+    })
+}
+
 /// Cast bf16/f16/f64 float tensors to a target dtype on load. HF checkpoints
 /// are commonly stored in **bf16**; `burn-store` keeps the source dtype, which
 /// the wgpu backend can't ingest. Mirrors Burn's `HalfPrecisionAdapter` but
@@ -171,6 +267,71 @@ mod tests {
     #[should_panic(expected = "float dtype")]
     fn cast_adapter_rejects_non_float_target() {
         let _ = CastFloatAdapter::new(DType::I32);
+    }
+
+    #[test]
+    fn logit_sanity_accepts_a_live_distribution() {
+        let logits = [0.1, 2.5, -1.0, 9.0, 0.3];
+        let smoke = logit_sanity(&logits, 5).expect("live logits pass");
+        assert_eq!(smoke.top_id, 3);
+        assert_eq!(smoke.top_logit, 9.0);
+        assert!(
+            (smoke.spread - 10.0).abs() < 1e-6,
+            "spread = max-min = 9-(-1)"
+        );
+    }
+
+    #[test]
+    fn logit_sanity_catches_non_finite() {
+        let nan = [1.0, f32::NAN, 3.0, 2.0];
+        assert_eq!(
+            logit_sanity(&nan, 4),
+            Err(SanityError::NonFinite {
+                count: 1,
+                first_index: 1
+            })
+        );
+        let inf = [f32::INFINITY, 0.0, f32::NEG_INFINITY];
+        assert_eq!(
+            logit_sanity(&inf, 3),
+            Err(SanityError::NonFinite {
+                count: 2,
+                first_index: 0
+            })
+        );
+    }
+
+    #[test]
+    fn logit_sanity_catches_wrong_vocab() {
+        // The finiteness check must not run before the width check — a short
+        // vector is a mismatch, reported as such (not an index panic).
+        assert_eq!(
+            logit_sanity(&[1.0, 2.0, 3.0], 4),
+            Err(SanityError::WrongVocab {
+                logits_len: 3,
+                expected: 4
+            })
+        );
+    }
+
+    #[test]
+    fn logit_sanity_catches_degenerate_forward() {
+        // Zero-init / dead forward: all (near-)equal.
+        let flat = [0.5f32; 8];
+        assert!(matches!(
+            logit_sanity(&flat, 8),
+            Err(SanityError::Degenerate { .. })
+        ));
+        // A spread just above the threshold is live.
+        let mut live = [0.0f32; 8];
+        live[7] = 1e-3;
+        assert!(logit_sanity(&live, 8).is_ok());
+    }
+
+    #[test]
+    #[should_panic(expected = "expected_vocab must be positive")]
+    fn logit_sanity_rejects_zero_vocab() {
+        let _ = logit_sanity(&[], 0);
     }
 
     #[test]
