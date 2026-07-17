@@ -117,14 +117,17 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       crates; pinned combo burn 0.21 / wgpu 29 / tokenizers 0.22 / criterion 0.7; release profile fat-LTO.*
 - [x] `cargo build` / `test` / `clippy --all-targets` green baseline; `mummu-bench` (criterion) crate stub.
       *(2026-07-09) All green; criterion harness wired via a smoke bench.*
-- [ ] Prune the **stale `candle-core` entries in the workspace `Cargo.lock`** — `tools/candle-probe` is
-      deliberately its own workspace (Candle must never become a mummu dep), yet the root lock still
-      carries candle-core and its deps as orphans: nothing in the graph reaches them (`cargo tree -i`
-      finds no dependents, `cargo metadata` lists only mummu + mummu-bench, and a workspace build never
-      compiles candle), and `cargo update` does not prune them. Harmless but misleading — it was
-      invisible while both crates shared one `tokenizers`, and surfaced when the 0.23 bump split that
-      entry so the lock now lists tokenizers twice (0.23.1 real, 0.22.2 reachable only from the orphan).
-      Predates this run. *(2026-07-16)*
+- [x] The **`candle-core` entries in the workspace `Cargo.lock`** are correct and not prunable — root
+      cause was misdiagnosed. They are NOT `tools/candle-probe` orphans (that is a separate workspace with
+      its own lock); they come from **`burn`'s optional `burn-candle` backend**: `burn` declares
+      `burn-candle` as a feature-gated optional dependency, `burn-candle → candle-core → tokenizers 0.22.2`,
+      and Cargo.lock records a package's full *optional*-dependency closure regardless of which features are
+      enabled. `cargo tree -i candle-core` prints "nothing to print" (nothing reaches it under our enabled
+      features) precisely because it is an unenabled optional — that is expected, not an orphan. Proof it is
+      inherent: a from-scratch `rm Cargo.lock && cargo generate-lockfile` re-adds candle-core (and the
+      0.22.2 tokenizers it pulls). Nothing to fix — it is a normal, harmless artifact of Burn shipping a
+      Candle backend behind a feature we never turn on; it costs zero compile time (never built) and would
+      only disappear if Burn stopped declaring the optional dep. *(2026-07-17)*
 
 ### P1 — Backends & device *(ex-laurelane)*
 - [x] Backend abstraction generic over `B: Backend`; one binary compiling BOTH `Wgpu` (Vulkan/DX12/Metal,
