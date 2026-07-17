@@ -208,18 +208,24 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       decoupled, tied — `tests/real_qwen3.rs`): loads + greedy-decodes a correct answer from BOTH the
       bf16 safetensors AND the Q4_K_M GGUF alone (tokenizer-from-GGUF byte-identical to `tokenizer.json`
       on the prompt); the GGUF vs bf16 builds agree on the top first-token id (151667) at logit cosine
-      0.989. Stays `[ ]` pending the strict parity leg below + a run on the specific 3.5 FC weights.*
+      0.989. **The arch is now parity-verified** (strict `[x]` leg below — byte-identical greedy vs
+      llama.cpp on the same Q4_K_M). Stays `[ ]` only for the specific Qwen3.5-4B/9B **FC** target: a
+      catalog run on those larger weights + tool-calling validation (the Hermes template machinery Qwen2.5
+      already proved covers Qwen3, so this is a download + FC decode, not new architecture work).*
       Qwen3.6 (35B-A3B) is also out now but is MoE and
       well past the single-card tier this zoo targets —
       https://huggingface.co/unsloth/Qwen3.5-4B-GGUF · https://unsloth.ai/docs/models/qwen3.5/gguf-benchmarks
-- [ ] **Qwen3 strict parity gate** — the Qwen3 dense arch is real-inference-validated (both formats,
-      GGUF-vs-bf16 top-1 agreement) but not yet through the P7 trust gate. Add a Qwen3 leg to
-      `tests/parity_gguf.rs` on the `llama_ref` harness: run `llama-server` (Ollama bundles one) on the
-      SAME local Qwen3 Q4_K_M our loader loads, RAW `/completion` with token-id prompts + `n_probs`, and
-      assert top-k first-forward ids exact-in-order + a short greedy sequence byte-identical. Note Qwen3
-      is a **thinking** model (emits `<think>…`), so the greedy leg must compare raw token streams with no
-      chat/template stack on either side (the LFM2 caveat applies). Local artifacts already in place:
-      `unsloth/Qwen3-0.6B-GGUF` (incl. a BF16 same-weights reference) and Ollama `qwen3:4b` / `qwen3.5:9b`.
+- [x] **Qwen3 strict parity gate PASSED** — the Qwen3 dense arch is now through the P7 trust gate.
+      `tests/parity_gguf.rs` gained a `qwen3` leg on the `llama_ref` harness: `llama-server` (Ollama's
+      bundled binary) runs the SAME local Qwen3-0.6B Q4_K_M our loader loads, RAW `/completion` with
+      token-id prompts + `n_probs`. On the 4070 Ti SUPER: top-5 first-forward ids match **exactly in
+      order** (all 5: 151667, 151644, 151645, 99966, 131545) and the 24-token greedy sequence is
+      **byte-identical** to llama.cpp — reproducing the `<think>…` reasoning tokens verbatim (both sides
+      get the identical prompt-id array and greedy-decode, so thinking mode is irrelevant to parity; no
+      template stack on either side per the LFM2 caveat). max |Δlogprob| **4.02e-1**, inside the shared
+      7.5e-1 tolerance (a touch above Qwen2's 2.66e-1 / LFM2's 2.60e-1 — the reference's Q8_K
+      activation-quant noise is proportionally larger for the narrow 0.6B). Run with
+      `MUMMU_QWEN3_GGUF_PATH` + `MUMMU_LLAMA_SERVER`. *(2026-07-17)*
 - [x] **LFM2.5-230M** as the CPU-tier hybrid zoo entry: shipped June 2026 with llama.cpp / GGUF support
       from day one — same `lfm2` architecture our loader + parity harness already cover, so this is a
       registry manifest entry + a run of the P3 quantized-reference leg (and a candidate to replace or
