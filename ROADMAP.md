@@ -74,7 +74,24 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       they report contention as a regression.*
 - [ ] Evaluate Burn 0.21's `burn.toml` project config — per-subsystem tuning + a CubeCL kernel-validation
       layer without recompiling; useful as a debug switch for kernel-level parity hunts —
-      https://burn.dev/blog/release-0.21.0/
+      https://burn.dev/blog/release-0.21.0/ *(2026-07-17 research)* Concretely, a `burn.toml` dropped at
+      the project root parameterizes every internal subsystem with no code change / no recompile:
+      **fusion's beam search**, **autotune aggressiveness**, **compilation-cache + validation modes**,
+      **streaming concurrency**, and **memory-pool persistence**. The load-bearing one for us is the new
+      **CubeCL kernel-validation layer** — it catches kernels that generate **out-of-bounds memory
+      accesses** (the exact failure class behind a silent wrong-logits parity drift or a
+      `STATUS_STACK_OVERFLOW`-adjacent GPU crash). Action when picked up: commit a checked-in
+      `burn.toml` with validation ON for the parity/real-model test profiles (catch OOB in CI) and OFF
+      for the benchmark profile (no validation overhead in the budget numbers), and re-confirm the
+      budgets are unmoved by its presence.
+- [ ] Evaluate **CubeCL's now-complete flash-attention kernel** for the decode/prefill attention step —
+      the releases page reports a full implementation (causal **masking**, partitions, row-wise
+      reductions, multi-plane ops). Mummu currently materializes attention explicitly (q·kᵀ → f32 softmax
+      island → ·v); a fused flash-attention kernel collapses those into one dispatch, which is squarely
+      the **fewer-kernels-per-step** lever the dispatch-bound decode note above is chasing (and it drops
+      the O(t²) scores tensor at prefill). Gate strictly: the f32-softmax island is the whole reason the
+      f16 parity holds, so any flash path must re-pass the parity harness (both legs) AND hold/beat
+      `bench/BASELINE.md` before adoption. — https://github.com/tracel-ai/cubecl/releases *(2026-07-17 research)*
 
 ## Phases
 
@@ -607,6 +624,12 @@ The VRAM lever the P6 planner pulls to make the largest useful model fit the use
 ### P11 — Vision & OCR (retire Candle)
 - [ ] Port a vision/OCR model (DeepSeek-OCR — currently Candle in laurelane, `physics515/deepseek-ocr.rs`)
       to Burn on the same runner, so Candle can be dropped from consumers entirely.
+- [ ] **Qwen3.5-4B is multimodal** — `unsloth/Qwen3.5-4B-GGUF` ships an `mmproj-BF16.gguf` (a CLIP-style
+      vision projector) beside the text GGUF, and its text tower is the **`qwen3` dense arch Mummu now
+      runs + parity-verifies**. That makes it a strong second vision candidate whose LLM half is already
+      done: a P11 port would be the mmproj vision encoder + the projector, feeding embeddings into the
+      existing Qwen3 decoder — far less new surface than a from-scratch OCR model. Weigh against
+      DeepSeek-OCR once the P3 GGUF-mmproj parse + a vision block land. *(2026-07-17 research)*
 
 ## Consumer integration contract
 
