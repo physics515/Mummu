@@ -391,8 +391,15 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       https://github.com/vllm-project/compressed-tensors ·
       https://www.digitalapplied.com/blog/gguf-vs-awq-vs-gptq-vs-mlx-llm-quantization-formats-2026
 - [ ] **ONNX** (optional) — `burn-import` ONNX→Burn for models distributed as ONNX graphs.
-- [ ] **Dtype handling** — a `CastFloatAdapter` (bf16→f32/f16); quantized→dequant on import; keep-quantized
-      handed to P9.
+- [x] **Dtype handling** — a `CastFloatAdapter` (bf16→f32/f16); quantized→dequant on import; keep-quantized
+      handed to P9. *(2026-07-17)* All three legs are in place and proven across the zoo: `CastFloatAdapter`
+      (`import.rs`) casts bf16 (HF's shipping dtype) to the backend's float on load — f32 on the `Gpu`/`Cpu`
+      aliases, **f16** on `GpuF16` — chained after `PyTorchToBurnAdapter` on every safetensors AND GGUF
+      load path; quantized→dequant-on-import is the `load_from_gguf` pipeline (every storage dtype → f32
+      via `dequant_to_safetensors`); keep-quantized-in-VRAM stays a P9 item (the actual fit lever). Newly
+      verified on the Qwen3 arch: it loads + decodes coherently on `GpuF16` with the same f32-softmax
+      attention island Qwen2/LFM2 use (`tests/real_qwen3.rs::real_qwen3_decodes_coherently_in_f16` — no
+      overflow to NaN, sanity-smoke spread 49.4 identical to f32, "2 plus 2 equals 4").
 - [x] **Weight-name remapping + checked load** — per-architecture key-remap tables (checkpoint naming →
       Mummu module names); **fail loudly** on missing/unexpected keys with a readable diff, never silently zero-init.
       *(2026-07-09) Remap tables live in each model's `load_from_dir` (Qwen2: strip `model.` + RmsNorm→gamma;

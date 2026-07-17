@@ -70,7 +70,8 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
 - **f16 inference, validated** — Qwen2.5-1.5B runs coherently on `GpuF16` (weights + KV in f16, the
   q·kᵀ attention scores + softmax computed in an f32 island to stop f16 overflow): **~3.6 GiB runner
   VRAM vs ~7.9 GiB f32, at identical speed**; the parity gate re-passes unchanged on f32, where the
-  island casts are no-ops ([bench/BASELINE.md](bench/BASELINE.md)).
+  island casts are no-ops ([bench/BASELINE.md](bench/BASELINE.md)). The same island covers the Qwen3
+  arch — Qwen3-0.6B decodes coherently in f16 (its qk-norm + decoupled head_dim ride the same f32 scores).
 - **SPIR-V kernels on Vulkan** — CubeCL compiles direct SPIR-V (burn's `vulkan` feature) instead of
   WGSL/naga on Vulkan adapters, worth **+30% decode throughput** on the reference GPU with parity
   byte-identical; other APIs (DX12/Metal) transparently keep WGSL in the same binary.
