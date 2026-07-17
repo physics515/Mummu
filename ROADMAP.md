@@ -194,9 +194,32 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       parsing — re-pull any GGUF cached before it, ours included), and unsloth ships separate
       `-MTP-GGUF` repos for the 4B/9B whose **MTP speculative decoding** claims ~1.5–2× decode; MTP
       needs a draft-token verify loop our `decode` driver does not have, so treat it as a distinct
-      P5 item rather than a free win of the port. Qwen3.6 (35B-A3B) is also out now but is MoE and
+      P5 item rather than a free win of the port. *(2026-07-17) **Qwen3 dense architecture shipped**
+      (`models::qwen3`) — the arch the Qwen3 AND Qwen3.5 dense tiers share, so this is the load-bearing
+      half of this item. It reuses the shared `nn` blocks verbatim: the three deltas from Qwen2 (per-head
+      q/k RMSNorm over `head_dim`, no q/k/v bias, a **decoupled** `head_dim` where `num_heads·head_dim`
+      need not equal `hidden`) were all already covered by `GqaAttention`'s `qk_norm_eps` path + the
+      independent `head_dim` in `GqaAttentionConfig` — HF Qwen3 orders qk-norm identically to the LFM2
+      path we validated (`q_norm(q_proj(x).view(b,t,nh,hd)).transpose(1,2)`), so ZERO nn changes. Config
+      (json + `qwen3.*` GGUF metadata, `key_length`→head_dim), safetensors + GGUF loaders (q_norm/k_norm
+      key remaps, tied/untied head), `CausalLm` impl, 10 unit tests (decoupled-head_dim path,
+      cache≡full-forward, gguf name map incl. qk-norms). Catalog: `qwen3-0.6b`, `qwen3-4b` (+ Q4_K_M
+      GGUF specs). **REAL-GPU verified** on Qwen3-0.6B (28 layers, hidden 1024, 16h/8kv, head_dim 128
+      decoupled, tied — `tests/real_qwen3.rs`): loads + greedy-decodes a correct answer from BOTH the
+      bf16 safetensors AND the Q4_K_M GGUF alone (tokenizer-from-GGUF byte-identical to `tokenizer.json`
+      on the prompt); the GGUF vs bf16 builds agree on the top first-token id (151667) at logit cosine
+      0.989. Stays `[ ]` pending the strict parity leg below + a run on the specific 3.5 FC weights.*
+      Qwen3.6 (35B-A3B) is also out now but is MoE and
       well past the single-card tier this zoo targets —
       https://huggingface.co/unsloth/Qwen3.5-4B-GGUF · https://unsloth.ai/docs/models/qwen3.5/gguf-benchmarks
+- [ ] **Qwen3 strict parity gate** — the Qwen3 dense arch is real-inference-validated (both formats,
+      GGUF-vs-bf16 top-1 agreement) but not yet through the P7 trust gate. Add a Qwen3 leg to
+      `tests/parity_gguf.rs` on the `llama_ref` harness: run `llama-server` (Ollama bundles one) on the
+      SAME local Qwen3 Q4_K_M our loader loads, RAW `/completion` with token-id prompts + `n_probs`, and
+      assert top-k first-forward ids exact-in-order + a short greedy sequence byte-identical. Note Qwen3
+      is a **thinking** model (emits `<think>…`), so the greedy leg must compare raw token streams with no
+      chat/template stack on either side (the LFM2 caveat applies). Local artifacts already in place:
+      `unsloth/Qwen3-0.6B-GGUF` (incl. a BF16 same-weights reference) and Ollama `qwen3:4b` / `qwen3.5:9b`.
 - [x] **LFM2.5-230M** as the CPU-tier hybrid zoo entry: shipped June 2026 with llama.cpp / GGUF support
       from day one — same `lfm2` architecture our loader + parity harness already cover, so this is a
       registry manifest entry + a run of the P3 quantized-reference leg (and a candidate to replace or
