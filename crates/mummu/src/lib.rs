@@ -20,4 +20,5 @@ pub mod manage;
 pub mod models;
 pub mod nn;
 pub mod registry;
+pub mod tok_config;
 pub mod tokenizer;

@@ -229,6 +229,14 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       llama.cpp on the same Q4_K_M). Stays `[ ]` only for the specific Qwen3.5-4B/9B **FC** target: a
       catalog run on those larger weights + tool-calling validation (the Hermes template machinery Qwen2.5
       already proved covers Qwen3, so this is a download + FC decode, not new architecture work).*
+      *(2026-07-18) **The FC path is now real-GPU-proven on the Qwen3 dense arch** — the "download + FC
+      decode" the target needs, demonstrated on the 0.6B tier so the only remaining variable is the larger
+      weights. `tests/real_toolcall_qwen3.rs`: the checkpoint's imported `tokenizer_config.json` template is
+      detected **Hermes** (`tok_config::tool_call_convention`), that selects `ChatMl::qwen2().render_with_tools`,
+      and Qwen3-0.6B greedy-decodes (on the 4070 Ti SUPER) a `<think>…</think>` block followed by a clean
+      `<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>` which `parse_tool_calls`
+      round-trips — end to end from the model's own template metadata. What is left for the item proper is a
+      catalog run on the 4B/9B weights (a download + the same decode).*
       Qwen3.6 (35B-A3B) is also out now but is MoE and
       well past the single-card tier this zoo targets —
       https://huggingface.co/unsloth/Qwen3.5-4B-GGUF · https://unsloth.ai/docs/models/qwen3.5/gguf-benchmarks
@@ -410,7 +418,66 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       *(2026-07-09) Per-architecture serde configs with validation (`Qwen2Config`, `Lfm2Config` incl.
       `layer_types` + auto-adjusted ff_dim); both real checkpoints parse and drive the build.*
 - [ ] **Tokenizer + chat-template import** — HF `tokenizer.json` (fast), SentencePiece `tokenizer.model`, BPE
-      merges/vocab; special-tokens map + the chat template from `tokenizer_config.json`.
+      merges/vocab; special-tokens map + the chat template from `tokenizer_config.json`. *(2026-07-18)*
+      **`tokenizer_config.json` import shipped** (`mummu::tok_config::TokenizerConfig`, no new deps): parses
+      the *conventions* HF keeps beside `tokenizer.json` — `add_bos_token`/`add_eos_token`, the BOS/EOS/PAD/UNK
+      special-token slots (each `null` | bare string | `{content,special}` object, id resolved from
+      `added_tokens_decoder`), the full id-sorted `added_tokens_decoder` map, `model_max_length`, and the raw
+      Jinja `chat_template` (string, or the `default`/first entry of a `[{name,template}]` list). Total +
+      bounded (4 MiB file cap, 1M added-token cap; malformed key / missing content / duplicate numeric id /
+      non-object are loud `ImportError::Parse`, never a panic), `eos_id`/`bos_id`/`pad_id` accessors. It does
+      **not** render Jinja — prompt wrapping stays the byte-verified `chat` renderers; the imported template
+      is the check-against + tool-style-detect source, the imported ids are a config↔tokenizer cross-check.
+      `tool_call_convention()` detects the template's tool-call style from its marker tokens
+      (`ToolCallConvention::{Hermes, Lfm}` — LFM's unambiguous `<|tool_call_start|>` checked first, else
+      Hermes' `<tool_call>`, else `None`), so an app picks the matching `chat::render_with_tools` style from
+      the checkpoint instead of hardcoding it. 10 unit tests + a REAL-FILE gate
+      (`tests/real_tokenizer_config.rs`, cached qwen3-0.6b): EOS `<|im_end|>`→151645, PAD
+      `<|endoftext|>`→151643, `add_bos_token` false, 4168 B ChatML template detected **Hermes**, and **all 26
+      added-token ids agree byte-for-byte with `tokenizer.json`** (`Tokenizer::token_to_id`).
+      *(2026-07-18, same run)* **Consistency validators shipped**: `check_ids_against(token_to_id)` promotes
+      the config↔tokenizer cross-check to a first-class fn (every `added_tokens_decoder` id must equal the
+      real tokenizer's id — resolved BOS/EOS/PAD/UNK slots are subsumed, each carries an id only because its
+      content was found in the added map; returns a bounded `Vec<IdMismatch>`), and `check_eos_agrees(&[u32])`
+      cross-checks `config.json`'s `eos_token_id` set against the resolved EOS id (catches the repackaging bug
+      where the two files disagree on which token ends a turn). Both take plain data (closure / slice), so
+      `tok_config` stays free of a models/tokenizer dependency; a loader just calls them. REAL-FILE proof on
+      qwen3-0.6b: all 26 ids pass `check_ids_against`, and `config.json` eos 151645 agrees with the resolved
+      `<|im_end|>`. Remaining on this item: SentencePiece `tokenizer.model` import, and *calling* these
+      validators from `load_from_dir` (config-driven EOS + template-vs-renderer consistency) — split below.
+- [ ] **SentencePiece `tokenizer.model` import** — the `.model` proto tokenizer (Llama/Gemma/T5 family) that
+      HF ships instead of a `tokenizer.json`; build the equivalent HF `tokenizers` pipeline (or convert), and
+      byte-verify ids against a `tokenizer.json` of the same checkpoint where one exists. *(2026-07-18, split
+      from the tokenizer-import item.)* *(2026-07-18 research)* Route: the HF `tokenizers` crate we already
+      depend on carries a **Unigram** model (`tokenizers::models::unigram`) — a SentencePiece proto is a
+      Unigram vocab + scores + a `precompiled_charsmap` normalizer, so importing it is (a) parse the protobuf
+      (`google/sentencepiece`'s `ModelProto` — no serde; a tiny hand-rolled varint reader like `gguf.rs`, or
+      the `prost`/`quick-protobuf` crates) into pieces+scores, (b) feed the charsmap through HF's
+      **`spm_precompiled`** crate (purpose-built to use `sentencepiece`'s `precompiled_charsmap` inside
+      `tokenizers`), (c) assemble a `Unigram` + `Precompiled` normalizer. `guillaume-be/rust-tokenizers` loads
+      the same `.model` proto directly and is a reference. No SentencePiece checkpoint is cached locally yet,
+      so this needs a fixture fetch (a small Gemma/Llama `.model` + its `tokenizer.json` for the byte-verify) —
+      https://github.com/huggingface/spm_precompiled · https://github.com/guillaume-be/rust-tokenizers
+- [ ] **Wire `tok_config` into `load_from_dir`** — have the safetensors loaders read `tokenizer_config.json`
+      for the config-driven EOS/BOS ids (today each model hardcodes `EosIds`) and assert the imported
+      `chat_template`'s markers are consistent with the model's byte-verified `chat` renderer, so a
+      checkpoint whose template silently disagrees with our renderer fails loudly at load. *(2026-07-18,
+      discovered building `tok_config`.)* The validators this needs now exist —
+      `TokenizerConfig::check_eos_agrees` (config.json ↔ tokenizer_config EOS) and `check_ids_against` (vs the
+      loaded tokenizer); what remains is the loader *calling* them (a behavior-affecting change — the loaders
+      don't currently open the tokenizer, and a fail-loud EOS mismatch changes load semantics, so it wants a
+      deliberate decision + a re-run of the real-model suite, not a drive-by).
+- [ ] **Evaluate `hf-chat-template` to render the imported `chat_template`** — Mummu's prompt wrapping is
+      hardcoded, byte-verified `chat` renderers (one per family); the `hf-chat-template` crate (built on
+      **minijinja** + a transformers compatibility layer) renders an arbitrary HF `chat_template` Jinja string
+      **byte-identically to `transformers.apply_chat_template`**, tools included. Two payoffs to weigh: (1) a
+      test that renders the *imported* template via `hf-chat-template` and asserts it byte-matches our
+      hardcoded `ChatMl::{qwen2,lfm2}()` output — turning "template-vs-renderer consistency" into a real gate
+      instead of a marker check; (2) a general fallback renderer for a checkpoint whose family has no
+      hardcoded renderer yet (any model becomes chat-able from its own template). Gate on: it must reproduce
+      the parity-committed prompts byte-for-byte before it is trusted, and it adds a minijinja dep (weigh
+      against the from-scratch ethos — likely a dev-dependency for the consistency test first). *(2026-07-18
+      research)* — https://docs.rs/hf-chat-template · https://github.com/mitsuhiko/minijinja
 - [x] **Model registry / manifest** — a declarative `ModelSpec` (repo, architecture, weight format, dtype,
       tokenizer, chat template, size tier) + a small built-in catalog of known-good models (Qwen2.5, LFM2.5,
       MiniLM, …); adding a model = a manifest entry. *(2026-07-10) `mummu::registry`: `ModelSpec`
