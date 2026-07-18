@@ -432,12 +432,32 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
 - [ ] **SentencePiece `tokenizer.model` import** — the `.model` proto tokenizer (Llama/Gemma/T5 family) that
       HF ships instead of a `tokenizer.json`; build the equivalent HF `tokenizers` pipeline (or convert), and
       byte-verify ids against a `tokenizer.json` of the same checkpoint where one exists. *(2026-07-18, split
-      from the tokenizer-import item.)*
+      from the tokenizer-import item.)* *(2026-07-18 research)* Route: the HF `tokenizers` crate we already
+      depend on carries a **Unigram** model (`tokenizers::models::unigram`) — a SentencePiece proto is a
+      Unigram vocab + scores + a `precompiled_charsmap` normalizer, so importing it is (a) parse the protobuf
+      (`google/sentencepiece`'s `ModelProto` — no serde; a tiny hand-rolled varint reader like `gguf.rs`, or
+      the `prost`/`quick-protobuf` crates) into pieces+scores, (b) feed the charsmap through HF's
+      **`spm_precompiled`** crate (purpose-built to use `sentencepiece`'s `precompiled_charsmap` inside
+      `tokenizers`), (c) assemble a `Unigram` + `Precompiled` normalizer. `guillaume-be/rust-tokenizers` loads
+      the same `.model` proto directly and is a reference. No SentencePiece checkpoint is cached locally yet,
+      so this needs a fixture fetch (a small Gemma/Llama `.model` + its `tokenizer.json` for the byte-verify) —
+      https://github.com/huggingface/spm_precompiled · https://github.com/guillaume-be/rust-tokenizers
 - [ ] **Wire `tok_config` into `load_from_dir`** — have the safetensors loaders read `tokenizer_config.json`
       for the config-driven EOS/BOS ids (today each model hardcodes `EosIds`) and assert the imported
       `chat_template`'s markers are consistent with the model's byte-verified `chat` renderer, so a
       checkpoint whose template silently disagrees with our renderer fails loudly at load. *(2026-07-18,
       discovered building `tok_config`.)*
+- [ ] **Evaluate `hf-chat-template` to render the imported `chat_template`** — Mummu's prompt wrapping is
+      hardcoded, byte-verified `chat` renderers (one per family); the `hf-chat-template` crate (built on
+      **minijinja** + a transformers compatibility layer) renders an arbitrary HF `chat_template` Jinja string
+      **byte-identically to `transformers.apply_chat_template`**, tools included. Two payoffs to weigh: (1) a
+      test that renders the *imported* template via `hf-chat-template` and asserts it byte-matches our
+      hardcoded `ChatMl::{qwen2,lfm2}()` output — turning "template-vs-renderer consistency" into a real gate
+      instead of a marker check; (2) a general fallback renderer for a checkpoint whose family has no
+      hardcoded renderer yet (any model becomes chat-able from its own template). Gate on: it must reproduce
+      the parity-committed prompts byte-for-byte before it is trusted, and it adds a minijinja dep (weigh
+      against the from-scratch ethos — likely a dev-dependency for the consistency test first). *(2026-07-18
+      research)* — https://docs.rs/hf-chat-template · https://github.com/mitsuhiko/minijinja
 - [x] **Model registry / manifest** — a declarative `ModelSpec` (repo, architecture, weight format, dtype,
       tokenizer, chat template, size tier) + a small built-in catalog of known-good models (Qwen2.5, LFM2.5,
       MiniLM, …); adding a model = a manifest entry. *(2026-07-10) `mummu::registry`: `ModelSpec`
