@@ -420,8 +420,12 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       non-object are loud `ImportError::Parse`, never a panic), `eos_id`/`bos_id`/`pad_id` accessors. It does
       **not** render Jinja — prompt wrapping stays the byte-verified `chat` renderers; the imported template
       is the check-against + tool-style-detect source, the imported ids are a config↔tokenizer cross-check.
-      8 unit tests + a REAL-FILE gate (`tests/real_tokenizer_config.rs`, cached qwen3-0.6b): EOS `<|im_end|>`
-      →151645, PAD `<|endoftext|>`→151643, `add_bos_token` false, 4168 B ChatML template, and **all 26
+      `tool_call_convention()` detects the template's tool-call style from its marker tokens
+      (`ToolCallConvention::{Hermes, Lfm}` — LFM's unambiguous `<|tool_call_start|>` checked first, else
+      Hermes' `<tool_call>`, else `None`), so an app picks the matching `chat::render_with_tools` style from
+      the checkpoint instead of hardcoding it. 10 unit tests + a REAL-FILE gate
+      (`tests/real_tokenizer_config.rs`, cached qwen3-0.6b): EOS `<|im_end|>`→151645, PAD
+      `<|endoftext|>`→151643, `add_bos_token` false, 4168 B ChatML template detected **Hermes**, and **all 26
       added-token ids agree byte-for-byte with `tokenizer.json`** (`Tokenizer::token_to_id`). Remaining on
       this item: SentencePiece `tokenizer.model` import, and wiring the imported config into `load_from_dir`
       (config-driven EOS + a template-vs-renderer consistency assert) — split below.

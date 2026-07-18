@@ -11,7 +11,7 @@
 
 use std::path::PathBuf;
 
-use mummu::tok_config::TokenizerConfig;
+use mummu::tok_config::{TokenizerConfig, ToolCallConvention};
 use tokenizers::Tokenizer;
 
 fn dir() -> Option<PathBuf> {
@@ -45,6 +45,14 @@ fn qwen3_config_special_ids_agree_with_the_tokenizer() {
     let template = cfg.chat_template.as_deref().expect("chat template present");
     assert!(template.contains("<|im_start|>"), "ChatML start marker");
     assert!(template.contains("<|im_end|>"), "ChatML end marker");
+
+    // Qwen3 ships a Hermes tool-calling template — detected from its markers,
+    // so an app can pick chat's Hermes render style without hardcoding it.
+    assert_eq!(
+        cfg.tool_call_convention(),
+        Some(ToolCallConvention::Hermes),
+        "Qwen3 template is Hermes (<tool_call>/<tools>)"
+    );
 
     // THE cross-check: every resolved special id must equal what the real
     // tokenizer.json assigns that content. Config and tokenizer agree.

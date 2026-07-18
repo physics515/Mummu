@@ -68,6 +68,21 @@ pub struct SpecialToken {
     pub special: bool,
 }
 
+/// The tool-call convention a chat template speaks, detected from its marker
+/// tokens. Lets an app pick the matching [`crate::chat`] render style
+/// (`render_with_tools` Hermes vs LFM) from the checkpoint's own template
+/// instead of hardcoding it per model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCallConvention {
+    /// Hermes / Qwen (`<tool_call>{json}</tool_call>` with a `<tools>` block) —
+    /// [`crate::chat`]'s Hermes-style renderer + `parse_tool_calls`.
+    Hermes,
+    /// LFM2.5 (a Pythonic call list between `<|tool_call_start|>` /
+    /// `<|tool_call_end|>`) — [`crate::chat`]'s LFM-style renderer +
+    /// `parse_tool_calls_lfm`.
+    Lfm,
+}
+
 /// The conventions imported from a `tokenizer_config.json`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TokenizerConfig {
@@ -183,6 +198,23 @@ impl TokenizerConfig {
     #[must_use]
     pub fn has_chat_template(&self) -> bool {
         self.chat_template.is_some()
+    }
+
+    /// Detect the tool-call convention the imported `chat_template` implies,
+    /// by its marker tokens. `None` when there is no template or it names no
+    /// tool markers we recognize (a chat-only model). LFM's
+    /// `<|tool_call_start|>` / `<|tool_list_start|>` are checked first because
+    /// they are unambiguous; a Hermes template is identified by `<tool_call>`.
+    #[must_use]
+    pub fn tool_call_convention(&self) -> Option<ToolCallConvention> {
+        let template = self.chat_template.as_deref()?;
+        if template.contains("tool_call_start") || template.contains("tool_list_start") {
+            return Some(ToolCallConvention::Lfm);
+        }
+        if template.contains("<tool_call>") {
+            return Some(ToolCallConvention::Hermes);
+        }
+        None
     }
 }
 
@@ -389,6 +421,36 @@ mod tests {
             first.chat_template.as_deref(),
             Some("FIRST"),
             "no default → first"
+        );
+    }
+
+    #[test]
+    fn tool_call_convention_is_detected_from_template_markers() {
+        // Hermes: <tool_call> + <tools> block (Qwen-style).
+        let hermes = parse(
+            r#"{ "chat_template": "…<tools>{{sig}}</tools>…<tool_call>\n{json}\n</tool_call>…" }"#,
+        );
+        assert_eq!(
+            hermes.tool_call_convention(),
+            Some(ToolCallConvention::Hermes)
+        );
+
+        // LFM: the distinctive <|tool_call_start|> markers win even if the
+        // template also mentions a generic tool word.
+        let lfm = parse(
+            r#"{ "chat_template": "…List of tools: […]…<|tool_call_start|>[f(x=1)]<|tool_call_end|>…" }"#,
+        );
+        assert_eq!(lfm.tool_call_convention(), Some(ToolCallConvention::Lfm));
+
+        // A chat-only template names no tool markers.
+        let chat_only = parse(r#"{ "chat_template": "<|im_start|>{{content}}<|im_end|>" }"#);
+        assert_eq!(chat_only.tool_call_convention(), None);
+
+        // No template at all, and an empty template, are both None (no panic).
+        assert_eq!(parse("{}").tool_call_convention(), None);
+        assert_eq!(
+            parse(r#"{ "chat_template": "" }"#).tool_call_convention(),
+            None
         );
     }
 
