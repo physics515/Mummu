@@ -229,6 +229,14 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       llama.cpp on the same Q4_K_M). Stays `[ ]` only for the specific Qwen3.5-4B/9B **FC** target: a
       catalog run on those larger weights + tool-calling validation (the Hermes template machinery Qwen2.5
       already proved covers Qwen3, so this is a download + FC decode, not new architecture work).*
+      *(2026-07-18) **The FC path is now real-GPU-proven on the Qwen3 dense arch** — the "download + FC
+      decode" the target needs, demonstrated on the 0.6B tier so the only remaining variable is the larger
+      weights. `tests/real_toolcall_qwen3.rs`: the checkpoint's imported `tokenizer_config.json` template is
+      detected **Hermes** (`tok_config::tool_call_convention`), that selects `ChatMl::qwen2().render_with_tools`,
+      and Qwen3-0.6B greedy-decodes (on the 4070 Ti SUPER) a `<think>…</think>` block followed by a clean
+      `<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>` which `parse_tool_calls`
+      round-trips — end to end from the model's own template metadata. What is left for the item proper is a
+      catalog run on the 4B/9B weights (a download + the same decode).*
       Qwen3.6 (35B-A3B) is also out now but is MoE and
       well past the single-card tier this zoo targets —
       https://huggingface.co/unsloth/Qwen3.5-4B-GGUF · https://unsloth.ai/docs/models/qwen3.5/gguf-benchmarks
