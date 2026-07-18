@@ -30,6 +30,12 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
   remaps, and a fail-loud load (never silently zero-init); `config.json`-driven hyperparameters.
   `pytorch_model.bin` state dicts load through the same checked path (safetensors preferred when both
   exist) — proven byte-identical on MiniLM's real Hub checkpoint in both formats.
+- **`tokenizer_config.json` import** — `mummu::tok_config::TokenizerConfig` parses the conventions HF keeps
+  beside `tokenizer.json`: the BOS/EOS/PAD/UNK special-token slots (id-resolved from `added_tokens_decoder`),
+  the whole added-token map, `model_max_length`, and the raw Jinja `chat_template`. Total and bounded
+  (malformed input is a loud `ImportError::Parse`, never a panic); it doesn't render Jinja (prompt wrapping
+  stays the byte-verified `chat` renderers) but gives apps a model's declared ids + template. Cross-checked
+  on real weights: every one of Qwen3-0.6B's 26 added-token ids agrees byte-for-byte with `tokenizer.json`.
 - **Import validation** — a two-stage error taxonomy: `ImportError` for the file→module stage (missing
   file, parse, load, and an `Incomplete` per-tensor missing/errored diff) and `SanityError` for the
   runtime liveness a checked load can't see — NaN/Inf logits, a vocab-width mismatch, or a

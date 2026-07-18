@@ -410,7 +410,30 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       *(2026-07-09) Per-architecture serde configs with validation (`Qwen2Config`, `Lfm2Config` incl.
       `layer_types` + auto-adjusted ff_dim); both real checkpoints parse and drive the build.*
 - [ ] **Tokenizer + chat-template import** — HF `tokenizer.json` (fast), SentencePiece `tokenizer.model`, BPE
-      merges/vocab; special-tokens map + the chat template from `tokenizer_config.json`.
+      merges/vocab; special-tokens map + the chat template from `tokenizer_config.json`. *(2026-07-18)*
+      **`tokenizer_config.json` import shipped** (`mummu::tok_config::TokenizerConfig`, no new deps): parses
+      the *conventions* HF keeps beside `tokenizer.json` — `add_bos_token`/`add_eos_token`, the BOS/EOS/PAD/UNK
+      special-token slots (each `null` | bare string | `{content,special}` object, id resolved from
+      `added_tokens_decoder`), the full id-sorted `added_tokens_decoder` map, `model_max_length`, and the raw
+      Jinja `chat_template` (string, or the `default`/first entry of a `[{name,template}]` list). Total +
+      bounded (4 MiB file cap, 1M added-token cap; malformed key / missing content / duplicate numeric id /
+      non-object are loud `ImportError::Parse`, never a panic), `eos_id`/`bos_id`/`pad_id` accessors. It does
+      **not** render Jinja — prompt wrapping stays the byte-verified `chat` renderers; the imported template
+      is the check-against + tool-style-detect source, the imported ids are a config↔tokenizer cross-check.
+      8 unit tests + a REAL-FILE gate (`tests/real_tokenizer_config.rs`, cached qwen3-0.6b): EOS `<|im_end|>`
+      →151645, PAD `<|endoftext|>`→151643, `add_bos_token` false, 4168 B ChatML template, and **all 26
+      added-token ids agree byte-for-byte with `tokenizer.json`** (`Tokenizer::token_to_id`). Remaining on
+      this item: SentencePiece `tokenizer.model` import, and wiring the imported config into `load_from_dir`
+      (config-driven EOS + a template-vs-renderer consistency assert) — split below.
+- [ ] **SentencePiece `tokenizer.model` import** — the `.model` proto tokenizer (Llama/Gemma/T5 family) that
+      HF ships instead of a `tokenizer.json`; build the equivalent HF `tokenizers` pipeline (or convert), and
+      byte-verify ids against a `tokenizer.json` of the same checkpoint where one exists. *(2026-07-18, split
+      from the tokenizer-import item.)*
+- [ ] **Wire `tok_config` into `load_from_dir`** — have the safetensors loaders read `tokenizer_config.json`
+      for the config-driven EOS/BOS ids (today each model hardcodes `EosIds`) and assert the imported
+      `chat_template`'s markers are consistent with the model's byte-verified `chat` renderer, so a
+      checkpoint whose template silently disagrees with our renderer fails loudly at load. *(2026-07-18,
+      discovered building `tok_config`.)*
 - [x] **Model registry / manifest** — a declarative `ModelSpec` (repo, architecture, weight format, dtype,
       tokenizer, chat template, size tier) + a small built-in catalog of known-good models (Qwen2.5, LFM2.5,
       MiniLM, …); adding a model = a manifest entry. *(2026-07-10) `mummu::registry`: `ModelSpec`
