@@ -34,8 +34,12 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
   beside `tokenizer.json`: the BOS/EOS/PAD/UNK special-token slots (id-resolved from `added_tokens_decoder`),
   the whole added-token map, `model_max_length`, and the raw Jinja `chat_template`. Total and bounded
   (malformed input is a loud `ImportError::Parse`, never a panic); it doesn't render Jinja (prompt wrapping
-  stays the byte-verified `chat` renderers) but gives apps a model's declared ids + template. Cross-checked
-  on real weights: every one of Qwen3-0.6B's 26 added-token ids agrees byte-for-byte with `tokenizer.json`.
+  stays the byte-verified `chat` renderers) but gives apps a model's declared ids + template, and detects the
+  template's tool-call convention (Hermes vs LFM) so the right render style is picked from the checkpoint.
+  Two consistency validators catch repackaging bugs: `check_ids_against` (every added-token id must match the
+  real tokenizer) and `check_eos_agrees` (`config.json`'s `eos_token_id` must match the resolved EOS).
+  Cross-checked on real weights: all 26 of Qwen3-0.6B's added-token ids agree byte-for-byte with
+  `tokenizer.json`, and its `config.json` EOS 151645 agrees with the resolved `<|im_end|>`.
 - **Import validation** — a two-stage error taxonomy: `ImportError` for the file→module stage (missing
   file, parse, load, and an `Incomplete` per-tensor missing/errored diff) and `SanityError` for the
   runtime liveness a checked load can't see — NaN/Inf logits, a vocab-width mismatch, or a

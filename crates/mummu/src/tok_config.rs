@@ -83,6 +83,22 @@ pub enum ToolCallConvention {
     Lfm,
 }
 
+/// A tokenizer id disagreement found by [`TokenizerConfig::check_ids_against`]
+/// or [`TokenizerConfig::check_eos_agrees`]: the config recorded `found` for
+/// `content`, but the authoritative source says `expected`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdMismatch {
+    /// Which slot disagreed, for the message (e.g. `"eos_token_id"`).
+    pub what: &'static str,
+    /// The token text at issue.
+    pub content: String,
+    /// The authoritative id (from the tokenizer or `config.json`); `None` when
+    /// the token is absent there.
+    pub expected: Option<u32>,
+    /// The id `tokenizer_config.json` recorded.
+    pub found: Option<u32>,
+}
+
 /// The conventions imported from a `tokenizer_config.json`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TokenizerConfig {
@@ -215,6 +231,82 @@ impl TokenizerConfig {
             return Some(ToolCallConvention::Hermes);
         }
         None
+    }
+
+    /// Cross-check every added-token id against an authoritative `token_to_id`
+    /// (the loaded HF [`tokenizers::Tokenizer`]): each `added_tokens_decoder`
+    /// entry must resolve, in the real tokenizer, to exactly the id the config
+    /// recorded. Catches a checkpoint whose `tokenizer_config.json` disagrees
+    /// with its `tokenizer.json` (a repackaging bug that would silently corrupt
+    /// special-token handling). The resolved BOS/EOS/PAD/UNK slots need no
+    /// separate check — each carries an id only because its content was found
+    /// in `added_tokens_decoder`, so it is already covered here.
+    ///
+    /// Takes a closure, not a `Tokenizer`, so this module stays free of a
+    /// tokenizer dependency and any id source can be validated. `Ok` when all
+    /// agree; `Err` lists every mismatch (bounded by the added-token count).
+    pub fn check_ids_against(
+        &self,
+        token_to_id: impl Fn(&str) -> Option<u32>,
+    ) -> Result<(), Vec<IdMismatch>> {
+        assert!(
+            self.added_tokens.len() <= MAX_ADDED_TOKENS,
+            "added tokens bounded by the parser"
+        );
+        let mut bad = Vec::new();
+        for a in &self.added_tokens {
+            let found = token_to_id(&a.content);
+            if found != Some(a.id) {
+                bad.push(IdMismatch {
+                    what: "added token",
+                    content: a.content.clone(),
+                    expected: found,
+                    found: Some(a.id),
+                });
+            }
+        }
+        if bad.is_empty() {
+            return Ok(());
+        }
+        debug_assert!(
+            !bad.is_empty(),
+            "the Err branch reports at least one mismatch"
+        );
+        Err(bad)
+    }
+
+    /// Cross-check the config's declared EOS against `config.json`'s
+    /// `eos_token_id` set: if `tokenizer_config.json` resolved an EOS id, it
+    /// must be one of the ids `config.json` names. Catches the packaging bug
+    /// where the two files disagree on which token ends a turn (the model then
+    /// never stops, or stops on the wrong id). `Ok` when they agree or when no
+    /// EOS id was resolved (nothing to check); `Err` names the disagreement.
+    pub fn check_eos_agrees(&self, config_eos_ids: &[u32]) -> Result<(), IdMismatch> {
+        assert!(
+            config_eos_ids.len() <= 256,
+            "config.json eos_token_id sets are small; got {}",
+            config_eos_ids.len()
+        );
+        let Some(eos) = self.eos_token.as_ref() else {
+            return Ok(());
+        };
+        let Some(id) = eos.id else {
+            return Ok(());
+        };
+        assert!(
+            !eos.content.is_empty(),
+            "a resolved EOS has non-empty content"
+        );
+        if config_eos_ids.contains(&id) {
+            Ok(())
+        } else {
+            Err(IdMismatch {
+                what: "eos_token_id",
+                content: eos.content.clone(),
+                expected: config_eos_ids.first().copied(),
+                found: Some(id),
+            })
+        }
     }
 }
 
@@ -452,6 +544,63 @@ mod tests {
             parse(r#"{ "chat_template": "" }"#).tool_call_convention(),
             None
         );
+    }
+
+    #[test]
+    fn check_ids_against_passes_when_agreeing_and_lists_mismatches() {
+        let cfg = parse(
+            r#"{
+                "eos_token": "<|im_end|>",
+                "added_tokens_decoder": {
+                    "100": {"content": "<|im_end|>", "special": true},
+                    "200": {"content": "<|extra|>", "special": true}
+                }
+            }"#,
+        );
+        // Agreeing tokenizer: both ids match.
+        let agree = |t: &str| match t {
+            "<|im_end|>" => Some(100),
+            "<|extra|>" => Some(200),
+            _ => None,
+        };
+        assert!(cfg.check_ids_against(agree).is_ok());
+
+        // A tokenizer that disagrees on one id and is missing the other.
+        let disagree = |t: &str| match t {
+            "<|im_end|>" => Some(999),
+            _ => None,
+        };
+        let bad = cfg.check_ids_against(disagree).unwrap_err();
+        assert_eq!(bad.len(), 2, "both added tokens mismatch");
+        let end = bad.iter().find(|m| m.content == "<|im_end|>").unwrap();
+        assert_eq!(end.found, Some(100), "config recorded 100");
+        assert_eq!(end.expected, Some(999), "tokenizer says 999");
+        let extra = bad.iter().find(|m| m.content == "<|extra|>").unwrap();
+        assert_eq!(extra.expected, None, "tokenizer is missing it");
+    }
+
+    #[test]
+    fn check_eos_agrees_matches_config_json_eos_set() {
+        let cfg = parse(
+            r#"{
+                "eos_token": "<|im_end|>",
+                "added_tokens_decoder": {"151645": {"content": "<|im_end|>", "special": true}}
+            }"#,
+        );
+        // config.json eos_token_id lists the same id → agree.
+        assert!(cfg.check_eos_agrees(&[151_645]).is_ok());
+        // A list that includes it (Qwen lists multiple) → agree.
+        assert!(cfg.check_eos_agrees(&[151_643, 151_645]).is_ok());
+        // A disagreeing config.json → loud mismatch naming both sides.
+        let m = cfg.check_eos_agrees(&[151_643]).unwrap_err();
+        assert_eq!(m.what, "eos_token_id");
+        assert_eq!(m.found, Some(151_645), "tokenizer_config's eos id");
+        assert_eq!(m.expected, Some(151_643), "config.json's first eos id");
+
+        // No resolved EOS id → nothing to check, always Ok.
+        let no_eos = parse(r#"{ "eos_token": "</s>" }"#); // unresolved (no added_tokens)
+        assert!(no_eos.check_eos_agrees(&[7]).is_ok());
+        assert!(parse("{}").check_eos_agrees(&[]).is_ok());
     }
 
     #[test]

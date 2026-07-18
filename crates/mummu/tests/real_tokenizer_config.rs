@@ -66,16 +66,26 @@ fn qwen3_config_special_ids_agree_with_the_tokenizer() {
         );
     }
 
-    // And every added-token entry the config lists resolves in the tokenizer
-    // to exactly the id the config recorded.
-    for a in &cfg.added_tokens {
-        assert_eq!(
-            tok.token_to_id(&a.content),
-            Some(a.id),
-            "added token {:?} id mismatch vs tokenizer.json",
-            a.content
-        );
-    }
+    // And the library validator agrees on every added-token id (this is the
+    // same cross-check, now a first-class `tok_config` function a loader calls).
+    cfg.check_ids_against(|t| tok.token_to_id(t))
+        .expect("every added-token id agrees with tokenizer.json");
+
+    // config.json ↔ tokenizer_config.json EOS agreement: the id config.json's
+    // eos_token_id names must be the id tokenizer_config's eos_token resolves to.
+    let config_json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("config.json")).expect("config.json"))
+            .expect("config.json parses");
+    let config_eos: Vec<u32> = match &config_json["eos_token_id"] {
+        serde_json::Value::Number(n) => vec![n.as_u64().unwrap() as u32],
+        serde_json::Value::Array(a) => a
+            .iter()
+            .filter_map(|v| v.as_u64().map(|x| x as u32))
+            .collect(),
+        _ => Vec::new(),
+    };
+    cfg.check_eos_agrees(&config_eos)
+        .expect("config.json eos_token_id agrees with tokenizer_config.json eos_token");
 
     println!(
         "qwen3 tokenizer_config: eos={:?}({:?}) pad={:?}({:?}) added={} chat_template={}B — all ids agree",

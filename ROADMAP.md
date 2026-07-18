@@ -426,9 +426,17 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       the checkpoint instead of hardcoding it. 10 unit tests + a REAL-FILE gate
       (`tests/real_tokenizer_config.rs`, cached qwen3-0.6b): EOS `<|im_end|>`→151645, PAD
       `<|endoftext|>`→151643, `add_bos_token` false, 4168 B ChatML template detected **Hermes**, and **all 26
-      added-token ids agree byte-for-byte with `tokenizer.json`** (`Tokenizer::token_to_id`). Remaining on
-      this item: SentencePiece `tokenizer.model` import, and wiring the imported config into `load_from_dir`
-      (config-driven EOS + a template-vs-renderer consistency assert) — split below.
+      added-token ids agree byte-for-byte with `tokenizer.json`** (`Tokenizer::token_to_id`).
+      *(2026-07-18, same run)* **Consistency validators shipped**: `check_ids_against(token_to_id)` promotes
+      the config↔tokenizer cross-check to a first-class fn (every `added_tokens_decoder` id must equal the
+      real tokenizer's id — resolved BOS/EOS/PAD/UNK slots are subsumed, each carries an id only because its
+      content was found in the added map; returns a bounded `Vec<IdMismatch>`), and `check_eos_agrees(&[u32])`
+      cross-checks `config.json`'s `eos_token_id` set against the resolved EOS id (catches the repackaging bug
+      where the two files disagree on which token ends a turn). Both take plain data (closure / slice), so
+      `tok_config` stays free of a models/tokenizer dependency; a loader just calls them. REAL-FILE proof on
+      qwen3-0.6b: all 26 ids pass `check_ids_against`, and `config.json` eos 151645 agrees with the resolved
+      `<|im_end|>`. Remaining on this item: SentencePiece `tokenizer.model` import, and *calling* these
+      validators from `load_from_dir` (config-driven EOS + template-vs-renderer consistency) — split below.
 - [ ] **SentencePiece `tokenizer.model` import** — the `.model` proto tokenizer (Llama/Gemma/T5 family) that
       HF ships instead of a `tokenizer.json`; build the equivalent HF `tokenizers` pipeline (or convert), and
       byte-verify ids against a `tokenizer.json` of the same checkpoint where one exists. *(2026-07-18, split
@@ -446,7 +454,11 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       for the config-driven EOS/BOS ids (today each model hardcodes `EosIds`) and assert the imported
       `chat_template`'s markers are consistent with the model's byte-verified `chat` renderer, so a
       checkpoint whose template silently disagrees with our renderer fails loudly at load. *(2026-07-18,
-      discovered building `tok_config`.)*
+      discovered building `tok_config`.)* The validators this needs now exist —
+      `TokenizerConfig::check_eos_agrees` (config.json ↔ tokenizer_config EOS) and `check_ids_against` (vs the
+      loaded tokenizer); what remains is the loader *calling* them (a behavior-affecting change — the loaders
+      don't currently open the tokenizer, and a fail-loud EOS mismatch changes load semantics, so it wants a
+      deliberate decision + a re-run of the real-model suite, not a drive-by).
 - [ ] **Evaluate `hf-chat-template` to render the imported `chat_template`** — Mummu's prompt wrapping is
       hardcoded, byte-verified `chat` renderers (one per family); the `hf-chat-template` crate (built on
       **minijinja** + a transformers compatibility layer) renders an arbitrary HF `chat_template` Jinja string
