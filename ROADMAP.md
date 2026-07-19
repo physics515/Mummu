@@ -458,7 +458,7 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       the same `.model` proto directly and is a reference. No SentencePiece checkpoint is cached locally yet,
       so this needs a fixture fetch (a small Gemma/Llama `.model` + its `tokenizer.json` for the byte-verify) —
       https://github.com/huggingface/spm_precompiled · https://github.com/guillaume-be/rust-tokenizers
-- [ ] **Wire `tok_config` into `load_from_dir`** — have the safetensors loaders read `tokenizer_config.json`
+- [x] **Wire `tok_config` into `load_from_dir`** — have the safetensors loaders read `tokenizer_config.json`
       for the config-driven EOS/BOS ids (today each model hardcodes `EosIds`) and assert the imported
       `chat_template`'s markers are consistent with the model's byte-verified `chat` renderer, so a
       checkpoint whose template silently disagrees with our renderer fails loudly at load. *(2026-07-18,
@@ -467,6 +467,33 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       loaded tokenizer); what remains is the loader *calling* them (a behavior-affecting change — the loaders
       don't currently open the tokenizer, and a fail-loud EOS mismatch changes load semantics, so it wants a
       deliberate decision + a re-run of the real-model suite, not a drive-by).
+      *(2026-07-19)* **Shipped, tokenizer-free half.** A fail-loud consistency gate now runs inside all three
+      safetensors `load_from_dir`s (`qwen2`, `qwen3`, `lfm2`), right after `config.json` parses and **before**
+      any weight bytes are read: `tok_config::validate_dir(dir, config_eos_ids, expected_convention)` reads the
+      sibling `tokenizer_config.json` **if present** (a GGUF-derived / minimal dir has none → `Ok(None)`, no
+      behavior change), a *present-but-malformed* file propagates its parse error, and a well-formed file that
+      **disagrees** becomes a new loud `ImportError::Inconsistent`. Two checks, both needing no tokenizer:
+      (a) `check_eos_agrees` — the resolved `tokenizer_config` EOS must be in `config.json`'s `eos_token_id`
+      set (catches the repackaging bug where the two files name different turn-enders → the model never stops
+      or stops wrong); (b) `TokenizerConfig::check_consistency` — if the imported template *declares* a
+      tool-call convention (`tool_call_convention()` is `Some`), it must not contradict the family renderer's
+      (`Hermes` for Qwen2/Qwen3, `Lfm` for LFM2.5) — catches e.g. an LFM template dropped into a Qwen dir; a
+      tool-less base template declares nothing and is not forced to match. `EosIds::to_vec()` feeds the EOS
+      set. Proof: 3 new `tok_config` unit tests + a `tests/load_gate.rs` that drives the **real**
+      `qwen3::load_from_dir` on a temp dir (zero-byte `model.safetensors` + a mismatched
+      `tokenizer_config.json`) and confirms it returns `Inconsistent` *before* touching weights, while an
+      agreeing checkpoint clears the gate and fails only later on the empty weights (173 unit + 3 gate tests
+      green); the real Qwen3-0.6B safetensors GPU load+decode re-passed unchanged with the gate live (the
+      cached checkpoint's `tokenizer_config` EOS `<|im_end|>`→151645 agrees with `config.json` and its ChatML
+      template is Hermes). What remains is split to the item below.
+- [ ] **Loaders open the tokenizer for `check_ids_against` + config-driven BOS** — the 2026-07-19 gate is
+      tokenizer-free (it cross-checks `tokenizer_config.json` ↔ `config.json` only). The remaining half of the
+      wiring needs the loader to actually *open* the HF `tokenizer.json`: run `check_ids_against(token_to_id)`
+      (every added-token id vs the real tokenizer) at load, and *drive* the model's EOS/BOS ids from
+      `tokenizer_config.json` instead of only cross-checking the hardcoded `EosIds`. That is a larger change —
+      the loaders don't currently construct a `Tokenizer` (tokenization is caller-side by design), so it adds a
+      tokenizer dependency to the load path and shifts where the source-of-truth EOS lives; wants its own
+      deliberate decision + real-model re-run. *(2026-07-19, split from the wiring item above.)*
 - [ ] **Evaluate `hf-chat-template` to render the imported `chat_template`** — Mummu's prompt wrapping is
       hardcoded, byte-verified `chat` renderers (one per family); the `hf-chat-template` crate (built on
       **minijinja** + a transformers compatibility layer) renders an arbitrary HF `chat_template` Jinja string
@@ -478,6 +505,15 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       the parity-committed prompts byte-for-byte before it is trusted, and it adds a minijinja dep (weigh
       against the from-scratch ethos — likely a dev-dependency for the consistency test first). *(2026-07-18
       research)* — https://docs.rs/hf-chat-template · https://github.com/mitsuhiko/minijinja
+      *(2026-07-19 research)* Now concrete: `hf-chat-template` is at **0.2.0** and its `RenderInput` carries
+      `tools`/`documents`/the generation-prompt flag with **tool-calls supported** (assistant `tool_calls` +
+      `tool` responses), claiming byte-identical output to `transformers.apply_chat_template`. This is the
+      natural upgrade to payoff (1): the 2026-07-19 gate above is the *cheap, marker-based* consistency check
+      (it only asserts the template's tool-call **convention** matches the family renderer); a dev-dependency
+      test that renders the **imported** template via `hf-chat-template::RenderInput` and asserts byte-equality
+      with `ChatMl::{qwen2,lfm2}().render_with_tools(...)` on the parity-committed prompts would turn
+      "template-vs-renderer consistency" into a true byte gate. Still gate on reproducing the committed prompts
+      byte-for-byte before trusting it. — https://lib.rs/crates/hf-chat-template
 - [x] **Model registry / manifest** — a declarative `ModelSpec` (repo, architecture, weight format, dtype,
       tokenizer, chat template, size tier) + a small built-in catalog of known-good models (Qwen2.5, LFM2.5,
       MiniLM, …); adding a model = a manifest entry. *(2026-07-10) `mummu::registry`: `ModelSpec`
