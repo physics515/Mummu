@@ -33,6 +33,14 @@ pub enum ImportError {
         errors: usize,
         report: String,
     },
+    /// A checkpoint's own metadata files disagree with each other (e.g.
+    /// `tokenizer_config.json` names an EOS `config.json` does not, or a
+    /// chat-template whose tool-call convention is not the one this family's
+    /// byte-verified renderer speaks). A repackaging bug that a checked *weight*
+    /// load cannot see; surfaced loudly at load rather than mis-stopping or
+    /// mis-templating at generate time.
+    #[error("inconsistent metadata ({file}): {reason}")]
+    Inconsistent { file: PathBuf, reason: String },
 }
 
 /// Why a freshly-imported model failed its post-load **sanity smoke** (one

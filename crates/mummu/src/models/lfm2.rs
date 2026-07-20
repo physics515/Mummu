@@ -341,6 +341,15 @@ pub fn load_from_dir<B: Backend>(
         reason,
     })?;
 
+    // Cross-check the sibling tokenizer_config.json (when present): EOS agreement
+    // with config.json + a chat-template that speaks LFM2.5's bracket-notation
+    // tool-call convention — a repackaging mismatch fails loudly at load.
+    crate::tok_config::validate_dir(
+        dir,
+        &config.eos_token_id.to_vec(),
+        Some(crate::tok_config::ToolCallConvention::Lfm),
+    )?;
+
     let mut model = build::<B>(&config, device);
     let target_float = Tensor::<B, 1>::zeros([1], device).dtype();
     let mut store = SafetensorsStore::from_file(weights.clone())

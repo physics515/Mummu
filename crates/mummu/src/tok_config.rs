@@ -275,6 +275,42 @@ impl TokenizerConfig {
         Err(bad)
     }
 
+    /// The fail-loud consistency gate a safetensors loader runs after parsing
+    /// `config.json`: the imported `tokenizer_config.json` must not contradict
+    /// (a) `config.json`'s EOS set, nor (b) this family's byte-verified
+    /// [`crate::chat`] renderer, whose tool-call convention is
+    /// `expected_convention` (`None` = the family has no tool renderer, so the
+    /// template's convention is not checked). Returns a human-readable reason on
+    /// the first disagreement; the loader wraps it as
+    /// [`ImportError::Inconsistent`].
+    ///
+    /// The template check only fires when the imported template *declares* a
+    /// convention (`tool_call_convention()` is `Some`): a base/chat-only
+    /// checkpoint whose template names no tool markers is not forced to match.
+    /// This catches the real bug — a checkpoint packaged with a *different*
+    /// tool-call style than the loader's renderer emits (e.g. an LFM template
+    /// dropped into a Qwen dir) — without rejecting tool-less templates.
+    pub fn check_consistency(
+        &self,
+        config_eos_ids: &[u32],
+        expected_convention: Option<ToolCallConvention>,
+    ) -> Result<(), String> {
+        if let Err(m) = self.check_eos_agrees(config_eos_ids) {
+            return Err(format!(
+                "tokenizer_config EOS {:?} ({:?}) is not in config.json eos_token_id {config_eos_ids:?}",
+                m.found, m.content
+            ));
+        }
+        if let (Some(expected), Some(found)) = (expected_convention, self.tool_call_convention())
+            && found != expected
+        {
+            return Err(format!(
+                "chat_template tool-call convention {found:?} contradicts this model's {expected:?} renderer",
+            ));
+        }
+        Ok(())
+    }
+
     /// Cross-check the config's declared EOS against `config.json`'s
     /// `eos_token_id` set: if `tokenizer_config.json` resolved an EOS id, it
     /// must be one of the ids `config.json` names. Catches the packaging bug
@@ -308,6 +344,35 @@ impl TokenizerConfig {
             })
         }
     }
+}
+
+/// Run the [`TokenizerConfig::check_consistency`] gate against the
+/// `tokenizer_config.json` beside a checkpoint's other files, if one is present.
+///
+/// `tokenizer_config.json` is **optional** — a GGUF-derived dir or a minimal
+/// checkpoint may not ship one — so a missing file is `Ok(None)` (nothing to
+/// validate). A file that is *present but malformed* propagates its parse error,
+/// and a present, well-formed file that *disagrees* with `config_eos_ids` or the
+/// family renderer becomes [`ImportError::Inconsistent`]. On success the parsed
+/// config is returned (`Some`) so a loader can reuse it (e.g. future BOS wiring).
+pub fn validate_dir(
+    dir: &Path,
+    config_eos_ids: &[u32],
+    expected_convention: Option<ToolCallConvention>,
+) -> Result<Option<TokenizerConfig>, ImportError> {
+    assert!(!dir.as_os_str().is_empty(), "validate_dir: empty dir");
+    let cfg = match TokenizerConfig::from_dir(dir) {
+        Ok(cfg) => cfg,
+        // The file is optional: absence is not an error, it is "nothing to check".
+        Err(ImportError::MissingFile(_)) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    cfg.check_consistency(config_eos_ids, expected_convention)
+        .map_err(|reason| ImportError::Inconsistent {
+            file: dir.join(FILE_NAME),
+            reason,
+        })?;
+    Ok(Some(cfg))
 }
 
 /// A boolean field, defaulting to `false` when absent or non-boolean.
@@ -601,6 +666,82 @@ mod tests {
         let no_eos = parse(r#"{ "eos_token": "</s>" }"#); // unresolved (no added_tokens)
         assert!(no_eos.check_eos_agrees(&[7]).is_ok());
         assert!(parse("{}").check_eos_agrees(&[]).is_ok());
+    }
+
+    #[test]
+    fn check_consistency_passes_agreeing_and_flags_each_disagreement() {
+        // A well-formed Hermes checkpoint: EOS agrees, template is Hermes.
+        let cfg = parse(
+            r#"{
+                "eos_token": "<|im_end|>",
+                "chat_template": "…<tools>{{s}}</tools>…<tool_call>\n{j}\n</tool_call>…",
+                "added_tokens_decoder": {"151645": {"content": "<|im_end|>", "special": true}}
+            }"#,
+        );
+        assert!(
+            cfg.check_consistency(&[151_645], Some(ToolCallConvention::Hermes))
+                .is_ok()
+        );
+        // EOS not in config.json's set → loud reason mentioning the id.
+        let eos_err = cfg
+            .check_consistency(&[151_643], Some(ToolCallConvention::Hermes))
+            .unwrap_err();
+        assert!(eos_err.contains("151645"), "reason names the stray id");
+        // Right EOS, but the loader expected the LFM convention → contradiction.
+        let conv_err = cfg
+            .check_consistency(&[151_645], Some(ToolCallConvention::Lfm))
+            .unwrap_err();
+        assert!(conv_err.contains("Hermes") && conv_err.contains("Lfm"));
+    }
+
+    #[test]
+    fn check_consistency_skips_template_check_when_none_expected_or_declared() {
+        // A tool-less (base) template declares no convention: any expectation is
+        // fine, only the EOS is checked.
+        let base = parse(
+            r#"{
+                "eos_token": "<|end|>",
+                "chat_template": "<|im_start|>{{content}}<|im_end|>",
+                "added_tokens_decoder": {"9": {"content": "<|end|>", "special": true}}
+            }"#,
+        );
+        assert!(
+            base.check_consistency(&[9], Some(ToolCallConvention::Hermes))
+                .is_ok(),
+            "no declared convention → template not forced to match"
+        );
+        // expected None → the template convention is never checked even if set.
+        let lfm = parse(r#"{ "chat_template": "…<|tool_call_start|>[f()]<|tool_call_end|>…" }"#);
+        assert!(lfm.check_consistency(&[], None).is_ok());
+    }
+
+    #[test]
+    fn validate_dir_is_ok_when_file_absent_and_loud_on_mismatch() {
+        use crate::import::ImportError;
+        let dir = std::env::temp_dir().join("mummu_tokcfg_validate_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = std::fs::remove_file(dir.join(FILE_NAME));
+        // Absent file → Ok(None): the file is optional.
+        assert!(matches!(
+            validate_dir(&dir, &[1, 2], Some(ToolCallConvention::Hermes)),
+            Ok(None)
+        ));
+        // Present + agreeing → Ok(Some(cfg)).
+        std::fs::write(
+            dir.join(FILE_NAME),
+            br#"{"eos_token":"<|im_end|>","added_tokens_decoder":{"5":{"content":"<|im_end|>","special":true}}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_dir(&dir, &[5], Some(ToolCallConvention::Hermes)),
+            Ok(Some(_))
+        ));
+        // Present + disagreeing EOS → loud Inconsistent (not a silent pass).
+        assert!(matches!(
+            validate_dir(&dir, &[7], Some(ToolCallConvention::Hermes)),
+            Err(ImportError::Inconsistent { .. })
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

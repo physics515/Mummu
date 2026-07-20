@@ -62,6 +62,17 @@ impl EosIds {
             Self::Many(v) => v.contains(&id),
         }
     }
+
+    /// The EOS ids as an owned list (empty when `None`) — the shape the
+    /// `tokenizer_config.json` cross-check ([`crate::tok_config`]) consumes.
+    #[must_use]
+    pub fn to_vec(&self) -> Vec<u32> {
+        match self {
+            Self::None => Vec::new(),
+            Self::One(e) => vec![*e],
+            Self::Many(v) => v.clone(),
+        }
+    }
 }
 
 /// A required GGUF metadata integer, as usize. Shared with the Qwen3 loader.
@@ -252,6 +263,15 @@ pub fn load_from_dir<B: Backend>(
         file: cfg_path,
         reason,
     })?;
+
+    // Cross-check the sibling tokenizer_config.json (when present): EOS agreement
+    // with config.json + a chat-template that speaks Qwen2's Hermes/ChatML
+    // tool-call convention — a repackaging mismatch fails loudly at load.
+    crate::tok_config::validate_dir(
+        dir,
+        &config.eos_token_id.to_vec(),
+        Some(crate::tok_config::ToolCallConvention::Hermes),
+    )?;
 
     let mut model = build::<B>(&config, device);
     // The backend's own float dtype (f32, or f16 on the GpuF16 alias).
