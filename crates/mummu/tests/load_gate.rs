@@ -127,6 +127,36 @@ fn load_from_dir_passes_the_gate_when_metadata_agrees() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+#[test]
+fn load_from_dir_rejects_a_foreign_convention_from_a_standalone_jinja_file() {
+    // tokenizer_config.json agrees on EOS (id 5) and carries NO chat_template
+    // key; the template lives in a sibling chat_template.jinja (Gemma4-style) and
+    // speaks LFM's bracket convention while the Qwen3 loader's renderer is Hermes.
+    // Without the .jinja fallback this would read as "no template" and pass
+    // silently — the gate must catch it.
+    let dir = make_dir(
+        "mummu_load_gate_jinja_convention_mismatch",
+        r#"{
+            "eos_token": "<|end|>",
+            "added_tokens_decoder": {"5": {"content": "<|end|>", "special": true}}
+        }"#,
+    );
+    std::fs::write(
+        dir.join("chat_template.jinja"),
+        b"<|im_start|>{{x}}<|tool_call_start|>[f(x=1)]<|tool_call_end|><|im_end|>",
+    )
+    .expect("write chat_template.jinja");
+    let device = burn::tensor::Device::<Cpu>::default();
+    match qwen3::load_from_dir::<Cpu>(&dir, &device) {
+        Err(ImportError::Inconsistent { .. }) => {}
+        Err(other) => {
+            panic!("expected Inconsistent for a foreign .jinja convention, got {other:?}")
+        }
+        Ok(_) => panic!("expected the gate to reject, but the load succeeded"),
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Write a minimal but real `tokenizer.json` into `dir` whose model vocab maps
 /// each `(token, id)` in `entries` — enough for `Tokenizer::token_to_id` (what
 /// the gate's id cross-check calls) to resolve them. Loaded back by the real

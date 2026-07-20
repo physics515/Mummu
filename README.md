@@ -32,7 +32,9 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
   exist) — proven byte-identical on MiniLM's real Hub checkpoint in both formats.
 - **`tokenizer_config.json` import** — `mummu::tok_config::TokenizerConfig` parses the conventions HF keeps
   beside `tokenizer.json`: the BOS/EOS/PAD/UNK special-token slots (id-resolved from `added_tokens_decoder`),
-  the whole added-token map, `model_max_length`, and the raw Jinja `chat_template`. Total and bounded
+  the whole added-token map, `model_max_length`, and the raw Jinja `chat_template` (from the JSON key, or a
+  standalone sibling `chat_template.jinja` when that key is absent — the layout recent `transformers` writes).
+  Total and bounded
   (malformed input is a loud `ImportError::Parse`, never a panic); it doesn't render Jinja (prompt wrapping
   stays the byte-verified `chat` renderers) but gives apps a model's declared ids + template, and detects the
   template's tool-call convention (Hermes vs LFM) so the right render style is picked from the checkpoint.

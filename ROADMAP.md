@@ -458,15 +458,21 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       the same `.model` proto directly and is a reference. No SentencePiece checkpoint is cached locally yet,
       so this needs a fixture fetch (a small Gemma/Llama `.model` + its `tokenizer.json` for the byte-verify) —
       https://github.com/huggingface/spm_precompiled · https://github.com/guillaume-be/rust-tokenizers
-- [ ] **`tok_config` reads a standalone `chat_template.jinja`** — recent `transformers` `save_pretrained`
+- [x] **`tok_config` reads a standalone `chat_template.jinja`** — recent `transformers` `save_pretrained`
       (and the v5 tokenizer split) writes the chat template to a separate **`chat_template.jinja`** file in the
       tokenizer dir rather than the `chat_template` key of `tokenizer_config.json`; some checkpoints ship it
-      *only* there (Gemma4 — transformers #45205). Mummu's `TokenizerConfig::from_dir` reads the template from
-      `tokenizer_config.json` alone, so for such a checkpoint `chat_template` is `None`, `tool_call_convention()`
-      is `None`, and the load-time convention check (the 2026-07-19 gate) silently no-ops — a foreign-template
-      mismatch would go uncaught. Fix: `from_dir` should fall back to reading `dir/chat_template.jinja` when the
-      JSON key is absent (bounded like the JSON read), so the convention gate keeps working for these
-      checkpoints. *(2026-07-20 research)* — https://github.com/huggingface/transformers/issues/45205 ·
+      *only* there (Gemma4 — transformers #45205). Mummu's `TokenizerConfig::from_dir` read the template from
+      `tokenizer_config.json` alone, so for such a checkpoint `chat_template` was `None`, `tool_call_convention()`
+      `None`, and the load-time convention check (the 2026-07-19 gate) silently no-op'd — a foreign-template
+      mismatch went uncaught. *(2026-07-20)* **Fixed:** `from_dir` now falls back to reading
+      `dir/chat_template.jinja` when the JSON key is absent (a present JSON key wins, never overridden;
+      absent/non-file/empty → `None`; oversized or non-UTF-8 → a loud `ImportError::Parse`, bounded by the same
+      4 MiB cap as the JSON). So `has_chat_template()`/`tool_call_convention()` — and thus the loader's
+      convention gate — keep working for these checkpoints. 3 new unit tests (fallback picks up the file +
+      detects its convention; JSON key wins over the file; a whitespace-only file is treated as absent) and a
+      `tests/load_gate.rs` end-to-end case: a Qwen3 dir with an LFM-convention template in `chat_template.jinja`
+      (no JSON key) is now rejected `Inconsistent` at load rather than passing silently. — 
+      https://github.com/huggingface/transformers/issues/45205 ·
       https://huggingface.co/docs/transformers/chat_templating_writing
 - [x] **Wire `tok_config` into `load_from_dir`** — have the safetensors loaders read `tokenizer_config.json`
       for the config-driven EOS/BOS ids (today each model hardcodes `EosIds`) and assert the imported
