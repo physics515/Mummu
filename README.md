@@ -40,11 +40,13 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
   real tokenizer) and `check_eos_agrees` (`config.json`'s `eos_token_id` must match the resolved EOS).
   Cross-checked on real weights: all 26 of Qwen3-0.6B's added-token ids agree byte-for-byte with
   `tokenizer.json`, and its `config.json` EOS 151645 agrees with the resolved `<|im_end|>`. The safetensors
-  loaders **enforce this at load**: `load_from_dir` (Qwen2/Qwen3/LFM2.5) runs the gate right after
+  loaders **enforce all of this at load**: `load_from_dir` (Qwen2/Qwen3/LFM2.5) runs the gate right after
   `config.json` parses and before any weights are read — a sibling `tokenizer_config.json` whose EOS
-  disagrees with `config.json`, or whose chat-template speaks a different tool-call convention than the
-  family's renderer, is a loud `ImportError::Inconsistent` instead of a model that silently mis-stops or
-  mis-templates. The file is optional (a GGUF-derived dir has none → no behavior change).
+  disagrees with `config.json`, whose chat-template speaks a different tool-call convention than the
+  family's renderer, or — when a `tokenizer.json` sits beside it — whose declared added-token ids don't
+  match that real tokenizer, is a loud `ImportError::Inconsistent` instead of a model that silently
+  mis-stops, mis-templates, or mis-tokenizes. Both sibling files are optional (a GGUF-derived dir has
+  neither → no behavior change).
 - **Import validation** — a two-stage error taxonomy: `ImportError` for the file→module stage (missing
   file, parse, load, and an `Incomplete` per-tensor missing/errored diff) and `SanityError` for the
   runtime liveness a checked load can't see — NaN/Inf logits, a vocab-width mismatch, or a

@@ -341,10 +341,11 @@ pub fn load_from_dir<B: Backend>(
         reason,
     })?;
 
-    // Cross-check the sibling tokenizer_config.json (when present): EOS agreement
-    // with config.json + a chat-template that speaks LFM2.5's bracket-notation
-    // tool-call convention — a repackaging mismatch fails loudly at load.
-    crate::tok_config::validate_dir(
+    // Cross-check the sibling metadata (when present) before touching weights:
+    // tokenizer_config.json EOS agreement with config.json, a chat-template that
+    // speaks LFM2.5's bracket-notation tool-call convention, and added-token ids
+    // that match the real tokenizer.json — a repackaging mismatch fails loudly.
+    crate::tokenizer::validate_checkpoint_dir(
         dir,
         &config.eos_token_id.to_vec(),
         Some(crate::tok_config::ToolCallConvention::Lfm),

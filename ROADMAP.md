@@ -458,6 +458,16 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       the same `.model` proto directly and is a reference. No SentencePiece checkpoint is cached locally yet,
       so this needs a fixture fetch (a small Gemma/Llama `.model` + its `tokenizer.json` for the byte-verify) —
       https://github.com/huggingface/spm_precompiled · https://github.com/guillaume-be/rust-tokenizers
+- [ ] **`tok_config` reads a standalone `chat_template.jinja`** — recent `transformers` `save_pretrained`
+      (and the v5 tokenizer split) writes the chat template to a separate **`chat_template.jinja`** file in the
+      tokenizer dir rather than the `chat_template` key of `tokenizer_config.json`; some checkpoints ship it
+      *only* there (Gemma4 — transformers #45205). Mummu's `TokenizerConfig::from_dir` reads the template from
+      `tokenizer_config.json` alone, so for such a checkpoint `chat_template` is `None`, `tool_call_convention()`
+      is `None`, and the load-time convention check (the 2026-07-19 gate) silently no-ops — a foreign-template
+      mismatch would go uncaught. Fix: `from_dir` should fall back to reading `dir/chat_template.jinja` when the
+      JSON key is absent (bounded like the JSON read), so the convention gate keeps working for these
+      checkpoints. *(2026-07-20 research)* — https://github.com/huggingface/transformers/issues/45205 ·
+      https://huggingface.co/docs/transformers/chat_templating_writing
 - [x] **Wire `tok_config` into `load_from_dir`** — have the safetensors loaders read `tokenizer_config.json`
       for the config-driven EOS/BOS ids (today each model hardcodes `EosIds`) and assert the imported
       `chat_template`'s markers are consistent with the model's byte-verified `chat` renderer, so a
@@ -494,6 +504,24 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       the loaders don't currently construct a `Tokenizer` (tokenization is caller-side by design), so it adds a
       tokenizer dependency to the load path and shifts where the source-of-truth EOS lives; wants its own
       deliberate decision + real-model re-run. *(2026-07-19, split from the wiring item above.)*
+      *(2026-07-20)* **`check_ids_against` half shipped — the loaders now open the tokenizer.** New
+      `tokenizer::validate_checkpoint_dir` wraps the tokenizer-free 2026-07-19 gate and, when a sibling
+      `tokenizer.json` is present, loads it (the `tokenizers` crate the crate already depends on) and runs
+      `TokenizerConfig::check_ids_against(|t| tok.token_to_id(t))`: every added-token id `tokenizer_config.json`
+      declares must equal the real tokenizer's id, else a loud `ImportError::Inconsistent` naming the
+      disagreeing tokens — fired *before* any weight bytes are read. All three safetensors loaders
+      (`qwen2`/`qwen3`/`lfm2`) now call it in place of `tok_config::validate_dir`; `tok_config` stays
+      tokenizer-free (the closure seam does the opening in `tokenizer.rs`). Both sibling files stay optional —
+      a GGUF-derived dir (no `tokenizer.json`) skips the id check, the EOS/convention checks still run. Proof:
+      `tests/load_gate.rs` gains a mismatch case (a real `tokenizer.json` built via the `tokenizers` BPE model
+      declares `<|extra|>` at id 999 while the config says 6 → rejected, error names `tokenizer.json` + `999`)
+      and an agree case (ids match → gate clears, load then fails on the empty weights); 5/5 load-gate tests
+      green, and the real Qwen3-0.6B safetensors GPU load re-passed with the id check live (its 26 added-token
+      ids all agree). **Remaining (kept `[ ]`): config-driven EOS/BOS** — driving the model's EOS/BOS *from*
+      `tokenizer_config.json` rather than the hardcoded `EosIds` was deliberately NOT done here: `config.json`'s
+      `eos_token_id` is already the source of truth and is now cross-checked to agree, and BOS/tokenization
+      stays caller-side by design; surfacing the parsed `TokenizerConfig` on the `Loaded*` structs for a
+      consumer to read is the intended shape, left to a dedicated decision.
 - [ ] **Evaluate `hf-chat-template` to render the imported `chat_template`** — Mummu's prompt wrapping is
       hardcoded, byte-verified `chat` renderers (one per family); the `hf-chat-template` crate (built on
       **minijinja** + a transformers compatibility layer) renders an arbitrary HF `chat_template` Jinja string

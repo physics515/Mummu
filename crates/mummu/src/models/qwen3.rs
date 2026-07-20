@@ -236,11 +236,13 @@ pub fn load_from_dir<B: Backend>(
         reason,
     })?;
 
-    // Cross-check the sibling tokenizer_config.json (when present): its EOS must
-    // agree with config.json's, and its chat-template must not speak a different
-    // tool-call convention than Qwen3's Hermes/ChatML renderer. A repackaging
-    // mismatch fails loudly here rather than mis-stopping / mis-templating later.
-    crate::tok_config::validate_dir(
+    // Cross-check the sibling metadata (when present) before touching weights:
+    // tokenizer_config.json's EOS must agree with config.json's, its chat-template
+    // must not speak a different tool-call convention than Qwen3's Hermes/ChatML
+    // renderer, and every added-token id it declares must match the real
+    // tokenizer.json. A repackaging mismatch fails loudly here rather than
+    // mis-stopping / mis-templating / mis-tokenizing later.
+    crate::tokenizer::validate_checkpoint_dir(
         dir,
         &config.eos_token_id.to_vec(),
         Some(crate::tok_config::ToolCallConvention::Hermes),

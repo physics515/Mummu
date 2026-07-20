@@ -1,17 +1,27 @@
-//! The `tokenizer_config.json` consistency gate is wired into the real
+//! The checkpoint-metadata consistency gate is wired into the real
 //! `load_from_dir` entry point — and fires *before* weight loading.
 //!
 //! Unit tests in `tok_config` prove the gate's logic in isolation; this proves
 //! the loaders actually *call* it. The gate runs right after `config.json` is
 //! parsed and before any weight bytes are read, so these tests need neither a
 //! GPU nor real weights: a zero-byte `model.safetensors` satisfies the loader's
-//! existence check, and a deliberately-mismatched `tokenizer_config.json` makes
-//! the gate reject the load with [`ImportError::Inconsistent`] before the empty
-//! weights are ever touched.
+//! existence check, and deliberately-mismatched metadata makes the gate reject
+//! the load with [`ImportError::Inconsistent`] before the empty weights are ever
+//! touched.
+//!
+//! Coverage spans both halves of the gate: the tokenizer-free
+//! `tokenizer_config.json` ↔ `config.json` checks (EOS agreement, tool-call
+//! convention) and the tokenizer-opening id cross-check (every added-token id in
+//! `tokenizer_config.json` must equal the id the sibling `tokenizer.json`
+//! assigns that content).
+
+use std::path::Path;
 
 use mummu::backend::Cpu;
 use mummu::import::ImportError;
 use mummu::models::qwen3;
+use tokenizers::Tokenizer;
+use tokenizers::models::bpe::{BPE, Vocab};
 
 /// A minimal but valid Qwen3 `config.json` (tiny dims — the model is never
 /// built in the negative case; the gate rejects first). `eos_token_id` is 5.
@@ -107,6 +117,94 @@ fn load_from_dir_passes_the_gate_when_metadata_agrees() {
         // that is NOT Inconsistent proves the agreeing checkpoint cleared it.
         Err(ImportError::Inconsistent { .. }) => {
             panic!("an agreeing checkpoint must clear the gate, but it was rejected")
+        }
+        Err(
+            ImportError::Load { .. } | ImportError::Incomplete { .. } | ImportError::Parse { .. },
+        ) => {}
+        Err(other) => panic!("expected a downstream weight error, got {other:?}"),
+        Ok(_) => panic!("empty weights must fail the load after the gate"),
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Write a minimal but real `tokenizer.json` into `dir` whose model vocab maps
+/// each `(token, id)` in `entries` — enough for `Tokenizer::token_to_id` (what
+/// the gate's id cross-check calls) to resolve them. Loaded back by the real
+/// `tokenizers` crate the loader uses, so this exercises the true path.
+fn write_tokenizer_json(dir: &Path, entries: &[(&str, u32)]) {
+    // A BPE model with an explicit vocab and no merges: `token_to_id` (what the
+    // gate calls) resolves each entry straight from the vocab. Mirrors the
+    // production `tokenizer_from_gguf` builder so it uses the same crate types.
+    let mut vocab: Vocab = Vocab::default();
+    vocab.insert("<unk>".to_string(), 0);
+    for (token, id) in entries {
+        vocab.insert((*token).to_string(), *id);
+    }
+    let model = BPE::builder()
+        .vocab_and_merges(vocab, Vec::new())
+        .unk_token("<unk>".to_string())
+        .build()
+        .expect("bpe model builds");
+    let tok = Tokenizer::new(model);
+    tok.save(dir.join("tokenizer.json"), false)
+        .expect("write tokenizer.json");
+}
+
+#[test]
+fn load_from_dir_rejects_an_added_token_id_mismatch_before_reading_weights() {
+    // EOS agrees (id 5) and there is no chat template, so the tokenizer-free
+    // checks pass — the *id cross-check* is what must fire. tokenizer_config
+    // declares <|extra|> at id 6, but the real tokenizer.json puts it at 999.
+    let dir = make_dir(
+        "mummu_load_gate_added_id_mismatch",
+        r#"{
+            "eos_token": "<|end|>",
+            "added_tokens_decoder": {
+                "5": {"content": "<|end|>", "special": true},
+                "6": {"content": "<|extra|>", "special": true}
+            }
+        }"#,
+    );
+    write_tokenizer_json(&dir, &[("<|end|>", 5), ("<|extra|>", 999)]);
+    let device = burn::tensor::Device::<Cpu>::default();
+    match qwen3::load_from_dir::<Cpu>(&dir, &device) {
+        Err(ImportError::Inconsistent { reason, file }) => {
+            assert!(
+                file.ends_with("tokenizer.json"),
+                "the id cross-check names tokenizer.json: {}",
+                file.display()
+            );
+            assert!(
+                reason.contains("<|extra|>") && reason.contains("999"),
+                "reason names the disagreeing token and the tokenizer's id: {reason}"
+            );
+        }
+        Err(other) => panic!("expected Inconsistent from the id cross-check, got {other:?}"),
+        Ok(_) => panic!("expected the gate to reject, but the load succeeded"),
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn load_from_dir_passes_the_gate_when_tokenizer_ids_agree() {
+    // Same declared ids, but now the real tokenizer.json agrees on both — the id
+    // cross-check clears and the load proceeds to fail on the empty weights (an
+    // error that is NOT Inconsistent proves the agreeing tokenizer let it past).
+    let dir = make_dir(
+        "mummu_load_gate_added_id_agrees",
+        r#"{
+            "eos_token": "<|end|>",
+            "added_tokens_decoder": {
+                "5": {"content": "<|end|>", "special": true},
+                "6": {"content": "<|extra|>", "special": true}
+            }
+        }"#,
+    );
+    write_tokenizer_json(&dir, &[("<|end|>", 5), ("<|extra|>", 6)]);
+    let device = burn::tensor::Device::<Cpu>::default();
+    match qwen3::load_from_dir::<Cpu>(&dir, &device) {
+        Err(ImportError::Inconsistent { reason, .. }) => {
+            panic!("agreeing tokenizer ids must clear the gate, but it was rejected: {reason}")
         }
         Err(
             ImportError::Load { .. } | ImportError::Incomplete { .. } | ImportError::Parse { .. },
