@@ -32,6 +32,13 @@ use crate::import::ImportError;
 /// The file this module reads.
 pub const FILE_NAME: &str = "tokenizer_config.json";
 
+/// A standalone chat-template file recent `transformers` `save_pretrained`
+/// writes *instead of* the `chat_template` key of [`FILE_NAME`] (some
+/// checkpoints — e.g. Gemma4 — ship it only here). [`TokenizerConfig::from_dir`]
+/// falls back to it when the JSON key is absent, so the template-dependent
+/// checks keep working for those checkpoints.
+pub const CHAT_TEMPLATE_FILE: &str = "chat_template.jinja";
+
 /// Hard cap on the config file size. Chat templates (esp. tool-calling ones)
 /// are the large part — a few tens of KiB in practice; 4 MiB is generous
 /// headroom while still refusing a pathological or wrong file outright.
@@ -112,7 +119,9 @@ pub struct TokenizerConfig {
     pub unk_token: Option<SpecialToken>,
     /// `model_max_length`, when present and an integer.
     pub model_max_length: Option<u64>,
-    /// The raw Jinja chat template (not rendered here).
+    /// The raw Jinja chat template (not rendered here). From the JSON
+    /// `chat_template` key, or — via [`Self::from_dir`] when that key is absent —
+    /// a standalone sibling [`CHAT_TEMPLATE_FILE`].
     pub chat_template: Option<String>,
     /// The full `added_tokens_decoder` map, sorted by ascending id.
     pub added_tokens: Vec<AddedTokenInfo>,
@@ -124,6 +133,45 @@ fn parse_err(file: &Path, reason: impl Into<String>) -> ImportError {
         file: file.to_path_buf(),
         reason: reason.into(),
     }
+}
+
+/// Read `dir/chat_template.jinja` if present — the standalone template file
+/// recent `transformers` writes instead of the `chat_template` JSON key. Absent,
+/// a non-file, or an empty/whitespace-only body → `Ok(None)` (as good as no
+/// template); a present but oversized or non-UTF-8 file is a loud
+/// [`ImportError::Parse`], never a panic. Bounded by the same [`MAX_CONFIG_BYTES`]
+/// cap as the JSON file (a real template is tens of KiB).
+fn read_chat_template_file(dir: &Path) -> Result<Option<String>, ImportError> {
+    assert!(
+        !dir.as_os_str().is_empty(),
+        "read_chat_template_file: empty dir"
+    );
+    let path = dir.join(CHAT_TEMPLATE_FILE);
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return Ok(None); // no standalone template beside the checkpoint
+    };
+    if !meta.is_file() {
+        return Ok(None);
+    }
+    if meta.len() > MAX_CONFIG_BYTES {
+        return Err(parse_err(
+            &path,
+            format!(
+                "{CHAT_TEMPLATE_FILE} is {} bytes (> {MAX_CONFIG_BYTES} cap)",
+                meta.len()
+            ),
+        ));
+    }
+    let bytes = std::fs::read(&path).map_err(|e| parse_err(&path, format!("read: {e}")))?;
+    let text = String::from_utf8(bytes).map_err(|e| parse_err(&path, format!("not utf-8: {e}")))?;
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    debug_assert!(
+        !text.trim().is_empty(),
+        "a returned template has non-whitespace content"
+    );
+    Ok(Some(text))
 }
 
 impl TokenizerConfig {
@@ -152,7 +200,15 @@ impl TokenizerConfig {
             bytes.len() as u64 <= MAX_CONFIG_BYTES,
             "size checked before read"
         );
-        Self::from_json(&bytes, &path)
+        let mut cfg = Self::from_json(&bytes, &path)?;
+        // Fall back to a standalone `chat_template.jinja` only when the JSON key
+        // was absent — a checkpoint that ships the template in the file (Gemma4)
+        // otherwise reads as having no template, silently disabling the
+        // template-dependent checks. A present JSON key wins (never overridden).
+        if cfg.chat_template.is_none() {
+            cfg.chat_template = read_chat_template_file(dir)?;
+        }
+        Ok(cfg)
     }
 
     /// Parse `tokenizer_config.json` bytes (`file` only labels errors).
@@ -806,6 +862,73 @@ mod tests {
         std::fs::write(dir.join(FILE_NAME), br#"{"eos_token": "<|end|>"}"#).unwrap();
         let cfg = TokenizerConfig::from_dir(&dir).expect("present config parses");
         assert_eq!(cfg.eos_token.unwrap().content, "<|end|>");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn from_dir_falls_back_to_standalone_chat_template_jinja() {
+        let dir = std::env::temp_dir().join("mummu_tokcfg_jinja_fallback");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // tokenizer_config.json has NO chat_template key; the template lives in a
+        // sibling chat_template.jinja (the Gemma4-style layout).
+        std::fs::write(dir.join(FILE_NAME), br#"{"eos_token": "<|im_end|>"}"#).unwrap();
+        std::fs::write(
+            dir.join(CHAT_TEMPLATE_FILE),
+            b"<|im_start|>system\n{{x}}<|im_end|>\n<tools>{{s}}</tools>\n<tool_call>\n{j}\n</tool_call>",
+        )
+        .unwrap();
+        let cfg = TokenizerConfig::from_dir(&dir).expect("config + jinja fallback parses");
+        assert!(cfg.has_chat_template(), "the .jinja template was picked up");
+        assert!(
+            cfg.chat_template
+                .as_deref()
+                .unwrap()
+                .contains("<|im_start|>")
+        );
+        // The convention gate now works for this checkpoint (it would have been
+        // None — silently unchecked — without the fallback).
+        assert_eq!(
+            cfg.tool_call_convention(),
+            Some(ToolCallConvention::Hermes),
+            "the standalone template's tool-call convention is detected"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn from_dir_json_chat_template_wins_over_the_jinja_file() {
+        let dir = std::env::temp_dir().join("mummu_tokcfg_jinja_precedence");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Both present: the JSON key is authoritative and must not be overridden.
+        std::fs::write(
+            dir.join(FILE_NAME),
+            br#"{"chat_template": "FROM_JSON_KEY"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join(CHAT_TEMPLATE_FILE), b"FROM_JINJA_FILE").unwrap();
+        let cfg = TokenizerConfig::from_dir(&dir).expect("parses");
+        assert_eq!(
+            cfg.chat_template.as_deref(),
+            Some("FROM_JSON_KEY"),
+            "a present JSON chat_template wins over the standalone file"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn from_dir_treats_an_empty_jinja_file_as_absent() {
+        let dir = std::env::temp_dir().join("mummu_tokcfg_jinja_empty");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(FILE_NAME), b"{}").unwrap();
+        std::fs::write(dir.join(CHAT_TEMPLATE_FILE), b"   \n\t  ").unwrap();
+        let cfg = TokenizerConfig::from_dir(&dir).expect("parses");
+        assert!(
+            !cfg.has_chat_template(),
+            "a whitespace-only .jinja is as good as no template"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

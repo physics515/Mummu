@@ -12,6 +12,8 @@
 //! Faithfulness is verified against the same checkpoint's `tokenizer.json`
 //! (byte-identical ids over a battery of prompts) in `tests/real_gguf.rs`.
 
+use std::path::Path;
+
 use tokenizers::models::bpe::{BPE, Merges, Vocab};
 use tokenizers::normalizers::unicode::NFC;
 use tokenizers::pre_tokenizers::byte_level::ByteLevel;
@@ -21,6 +23,8 @@ use tokenizers::processors::template::TemplateProcessing;
 use tokenizers::{AddedToken, SplitDelimiterBehavior, Tokenizer};
 
 use crate::gguf::{GgufFile, GgufValue};
+use crate::import::ImportError;
+use crate::tok_config::{self, TokenizerConfig, ToolCallConvention};
 
 /// llama.cpp token types (`llama_token_type`).
 const TOKEN_TYPE_NORMAL: i64 = 1;
@@ -218,6 +222,102 @@ pub fn tokenizer_from_gguf(f: &GgufFile) -> Result<Tokenizer, String> {
         }
     }
     Ok(tok)
+}
+
+/// The HF fast-tokenizer file a checkpoint ships beside its weights.
+pub const TOKENIZER_JSON: &str = "tokenizer.json";
+
+/// Cap on the number of individual mismatches spelled out in an
+/// [`ImportError::Inconsistent`] message — the rest are summarized as a count so
+/// a pathologically-broken checkpoint can't produce an unbounded error string.
+const MAX_LISTED_MISMATCHES: usize = 8;
+
+/// The full checkpoint-metadata gate a safetensors loader runs after parsing
+/// `config.json` and **before** reading any weight bytes. It layers the
+/// tokenizer-opening id cross-check on top of the tokenizer-free
+/// [`tok_config::validate_dir`] gate (EOS agreement + tool-call convention),
+/// giving the loaders one call that fails loudly on *any* metadata
+/// disagreement at load time rather than at generate time.
+///
+/// Both sibling files are optional, and each absence is "nothing to check", not
+/// an error:
+///   * no `tokenizer_config.json` (a GGUF-derived or minimal dir) → `Ok(None)`;
+///   * a `tokenizer_config.json` present but no `tokenizer.json` beside it → the
+///     EOS/convention checks still run, the id cross-check is skipped.
+///
+/// A present, well-formed `tokenizer_config.json` whose declared added-token ids
+/// disagree with the real `tokenizer.json` is an [`ImportError::Inconsistent`]
+/// (a repackaging bug a checked *weight* load cannot see). On success the parsed
+/// config is returned so a loader can reuse it (e.g. future config-driven BOS).
+pub fn validate_checkpoint_dir(
+    dir: &Path,
+    config_eos_ids: &[u32],
+    expected_convention: Option<ToolCallConvention>,
+) -> Result<Option<TokenizerConfig>, ImportError> {
+    assert!(
+        !dir.as_os_str().is_empty(),
+        "validate_checkpoint_dir: empty dir"
+    );
+    assert!(
+        config_eos_ids.len() <= 256,
+        "config.json eos_token_id sets are small; got {}",
+        config_eos_ids.len()
+    );
+    let cfg = tok_config::validate_dir(dir, config_eos_ids, expected_convention)?;
+    if let Some(cfg) = &cfg {
+        check_added_token_ids(dir, cfg)?;
+    }
+    Ok(cfg)
+}
+
+/// Cross-check every added-token id `cfg` declares against the id the sibling
+/// `dir/tokenizer.json` assigns that content. `Ok` when the tokenizer file is
+/// absent (nothing to cross-check) or every id agrees; an
+/// [`ImportError::Inconsistent`] naming the disagreements otherwise. A
+/// `tokenizer.json` that is present but unreadable/malformed is a loud
+/// [`ImportError::Parse`], never a panic.
+fn check_added_token_ids(dir: &Path, cfg: &TokenizerConfig) -> Result<(), ImportError> {
+    assert!(
+        !dir.as_os_str().is_empty(),
+        "check_added_token_ids: empty dir"
+    );
+    let path = dir.join(TOKENIZER_JSON);
+    if !path.is_file() {
+        return Ok(()); // no fast tokenizer beside the checkpoint — nothing to check
+    }
+    let tok = Tokenizer::from_file(&path).map_err(|e| ImportError::Parse {
+        file: path.clone(),
+        reason: format!("load {TOKENIZER_JSON}: {e}"),
+    })?;
+    let mismatches = match cfg.check_ids_against(|t| tok.token_to_id(t)) {
+        Ok(()) => return Ok(()),
+        Err(m) => m,
+    };
+    assert!(
+        !mismatches.is_empty(),
+        "the Err branch lists at least one mismatch"
+    );
+    debug_assert!(
+        mismatches.len() <= cfg.added_tokens.len(),
+        "at most one mismatch per declared added token"
+    );
+    let shown = mismatches.len().min(MAX_LISTED_MISMATCHES);
+    let mut reason = format!(
+        "{} added-token id(s) in {} disagree with {}:",
+        mismatches.len(),
+        tok_config::FILE_NAME,
+        TOKENIZER_JSON,
+    );
+    for m in mismatches.iter().take(shown) {
+        reason.push_str(&format!(
+            " {:?} (config={:?}, tokenizer={:?});",
+            m.content, m.found, m.expected
+        ));
+    }
+    if mismatches.len() > shown {
+        reason.push_str(&format!(" (+{} more)", mismatches.len() - shown));
+    }
+    Err(ImportError::Inconsistent { file: path, reason })
 }
 
 #[cfg(test)]
