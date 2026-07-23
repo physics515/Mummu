@@ -288,8 +288,11 @@ pub fn load_from_dir<B: Backend>(
     );
 
     let mut model = build::<B>(&config, device);
-    // The backend's own float dtype (f32, or f16 on the GpuF16 alias).
-    let target_float = Tensor::<B, 1>::zeros([1], device).dtype();
+    // The backend's own float dtype (f32, or f16 on the GpuF16 alias), taken
+    // from the TYPE (`B::FloatElem`), never from a probe tensor: unspecified-
+    // dtype tensor creation follows the per-DEVICE default policy, which
+    // another backend alias sharing the device may have flipped in-process.
+    let target_float = <B::FloatElem as burn::tensor::Element>::dtype();
     let mut store = SafetensorsStore::from_file(weights.clone())
         .with_from_adapter(PyTorchToBurnAdapter.chain(CastFloatAdapter::new(target_float)))
         .allow_partial(true)
@@ -360,7 +363,10 @@ pub fn load_from_gguf<B: Backend>(
     assert!(blob.len() > 8, "a parsed GGUF yields a non-empty blob");
 
     let mut model = build::<B>(&config, device);
-    let target_float = Tensor::<B, 1>::zeros([1], device).dtype();
+    // Type-level float dtype (`B::FloatElem`) — a probe tensor would follow
+    // the per-DEVICE default policy, which another backend alias sharing the
+    // device (Gpu vs GpuF16) may have flipped in this process.
+    let target_float = <B::FloatElem as burn::tensor::Element>::dtype();
     let mut store = SafetensorsStore::from_bytes(Some(blob))
         .with_from_adapter(PyTorchToBurnAdapter.chain(CastFloatAdapter::new(target_float)))
         .allow_partial(true)

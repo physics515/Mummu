@@ -715,7 +715,20 @@ that fits the model AND uses every device to the fullest.
       under the 150 ms ceiling); VRAM peak unchanged (11.5 GiB whole-card). Parity gate byte-identical
       (max |Δlogit| 2.670e-5, Ollama greedy exact); f16 island + CPU budget gates re-passed
       (108.4 ms / 11.7 tok/s GPU gate, 13.2 tok/s CPU). `bench/BASELINE.md` re-baselined.*
-- [ ] **Placement plan** — given model size + KV-cache + display headroom and the device set, choose a
+- [ ] **Per-device default-dtype policy when mixing precisions in one process** — Burn 0.21 resolves
+      unspecified-dtype tensor creation against a per-DEVICE settings policy (`get_device_settings` /
+      `set_default_dtypes`), not the backend type alias: a `GpuF16` client and a `Gpu` client sharing the
+      same device inside one process flip each other's ambient float dtype. *(2026-07-23, found live)*: with
+      the three `real_qwen3` GPU tests in one binary, running the f16 leg before the f32 GGUF leg made the
+      GGUF load's zeros-probed `target_float` come back **F16**, so the whole f32 model loaded/ran in f16 and
+      the strict f32 logits readback died `TypeMismatch("expected F16, got F32")` — deterministic
+      sequentially, racy in parallel; A/B-confirmed pre-existing at f1e547a. Two mitigations landed
+      (2026-07-23): every loader now takes `target_float` from the TYPE (`<B::FloatElem as Element>::dtype()`,
+      never a probe tensor), and all `GpuF16` legs live in their own test binary (`real_f16.rs`) = separate
+      process. What remains for the P6 planner (which will legitimately run f32 and f16 models side by side):
+      decide the policy explicitly — call `set_default_dtypes` per device at model-load/planner level (or pin
+      every runtime tensor creation site's dtype) so in-process mixed-precision is defined behavior, and add a
+      two-alias regression test once it is.
       **fit-and-fill** plan: single GPU when it fits; **shard layers across multiple GPUs** (pipeline/
       layer-parallel over Burn's multi-device tensors — Burn gives the multi-device *primitives*, not automatic
       tensor-parallel, so we place modules on devices ourselves); **spill cold layers to CPU** (GGUF-style
