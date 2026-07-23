@@ -568,7 +568,7 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       proof (`tests/real_qwen3.rs`): the safetensors leg asserts the surfaced config's `eos_id()` == 151645
       (`<|im_end|>`) and agrees with `config.json`; the GGUF leg asserts `tokenizer_config.is_none()`. 176 unit
       tests + parity + budget gates unmoved (additive field, off every hot path).
-- [ ] **Evaluate `hf-chat-template` to render the imported `chat_template`** — Mummu's prompt wrapping is
+- [x] **Evaluate `hf-chat-template` to render the imported `chat_template`** — Mummu's prompt wrapping is
       hardcoded, byte-verified `chat` renderers (one per family); the `hf-chat-template` crate (built on
       **minijinja** + a transformers compatibility layer) renders an arbitrary HF `chat_template` Jinja string
       **byte-identically to `transformers.apply_chat_template`**, tools included. Two payoffs to weigh: (1) a
@@ -590,6 +590,29 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       byte-for-byte before trusting it. — https://lib.rs/crates/hf-chat-template
       *(2026-07-22)* Crate is now at **0.2.1** (June 20, 2026 — a same-day patch over the 0.2.0 evaluated
       above; same `RenderInput` surface). Version to use when this is picked up.
+      *(2026-07-23)* **Adopted as a dev-dependency; payoff (1) SHIPPED as `tests/template_gate.rs` — and it
+      caught two real divergences.** The gate renders the cached Qwen3-0.6B checkpoint's own imported
+      template through `hf-chat-template` 0.2.1 (default features on — real HF templates call minijinja's
+      Python-compat string methods, `startswith` included) and byte-compares against `ChatMl::qwen2()`:
+      **all four legs are byte-identical** — plain (142 B), multi-turn (201 B), full Hermes tools block
+      (748 B), and FC history (`<tool_call>` turn + tool response, 324 B). Getting there surfaced: (a)
+      `hf-chat-template` hard-requires `serde_json/preserve_order`, so as a dev-dep it silently flipped
+      test builds to insertion-order JSON while production builds stayed alphabetical — prompt bytes would
+      have differed between what tests verify and what consumers ship. Resolved by making `preserve_order`
+      a first-class workspace feature (insertion order is what Python/transformers renders — the training
+      distribution). (b) our tool JSON was serde-compact (`{"a":1}`) where transformers' `tojson` emits
+      Python `json.dumps` spacing (`{"a": 1}` — the spacing models emit back in their own tool calls);
+      fixed with a ~30-line `python_json` serializer (custom `serde_json::ser::Formatter`) now used for
+      every prompt-JSON site (Hermes `<tools>` block, LFM `List of tools:` line, `<tool_call>` history
+      blocks). Live re-proof after both changes: Qwen3-0.6B greedy-emitted a clean parseable
+      `<tool_call>{"name": "get_weather", ...}</tool_call>` from the new prompt bytes on the 4070 Ti SUPER.
+      Payoff (2) — a general fallback renderer for checkpoints without a hardcoded family renderer — is
+      split below.
+- [ ] **General fallback chat renderer via `hf-chat-template`** — payoff (2) of the evaluation above: for a
+      checkpoint whose family has no hardcoded `chat` renderer, render prompts from its own imported
+      `chat_template` (the byte gate proved fidelity on Qwen3). Weigh promoting the dep from dev to optional
+      runtime feature vs the from-scratch ethos; needs the P8/consumer-facing API decision of when to prefer
+      the imported template over a family renderer. *(2026-07-23, split from the evaluation.)*
 - [x] **Model registry / manifest** — a declarative `ModelSpec` (repo, architecture, weight format, dtype,
       tokenizer, chat template, size tier) + a small built-in catalog of known-good models (Qwen2.5, LFM2.5,
       MiniLM, …); adding a model = a manifest entry. *(2026-07-10) `mummu::registry`: `ModelSpec`
