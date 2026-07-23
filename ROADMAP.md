@@ -24,7 +24,12 @@ still pass, and every parity number is **bit-identical to 0.22** — LFM2.5-1.2B
 (lfm2), Qwen2-vs-Candle 2.29e-5 with the Ollama greedy leg exact; both tool-call emissions
 unchanged; budgets 105.5 ms / 12.2 tok/s GPU, 11.74 tok/s CPU. **wgpu 30 stays held** — it is not
 ours to pick, burn 0.21 resolves wgpu 29 transitively, so it unblocks with a burn bump, not a
-`cargo upgrade`.*
+`cargo upgrade`.* *(2026-07-22) Pin watch re-checked: burn is still 0.21 (no 0.22), tokenizers still
+0.23.1 — the pinned combo is current. Worth knowing for the eventual burn bump: wgpu 30's changelog
+lifts `SHADER_F16` to **all** shader kinds (WGSL included — previously SPIR-V passthrough only) and
+adds the Vulkan f16 IO polyfill (PR #7884, already confirmed live here) — so when burn moves to
+wgpu 30, f16 stops being SPIR-V-only and the WGSL fallback path (non-Vulkan APIs) can run f16 too —
+https://github.com/gfx-rs/wgpu/blob/trunk/CHANGELOG.md.*
 
 ## North Star
 
@@ -84,6 +89,21 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       `burn.toml` with validation ON for the parity/real-model test profiles (catch OOB in CI) and OFF
       for the benchmark profile (no validation overhead in the budget numbers), and re-confirm the
       budgets are unmoved by its presence.
+      *(2026-07-21 research)* **Caveat found — `burn.toml` has no per-profile mechanism.** The documented
+      schema is a single, global project-root file with flat sections (verified against the release notes):
+      `[fusion.beam_search] max_blocks`; `[cubecl.autotune] level = "minimal"|"balanced"|"extensive"|"full"`,
+      `cache = "local"|"target"|"global"|{file=…}`; `[cubecl.compilation] check_mode =
+      "enforce"|"validate"|"auto"`, `cache`; `[cubecl.streaming] max_streams`; `[cubecl.memory]
+      persistent_memory = "enabled"|"disabled"|"enforced"`. Validation is the `[cubecl.compilation]
+      check_mode` knob (`"validate"` = the OOB-catching layer). So the item's "ON for test / OFF for bench
+      **profiles**" premise isn't directly expressible — one checked-in file applies to *every* cargo
+      invocation, benches included. Workable routes when picked up: (a) accept global `check_mode = "validate"`
+      only if a bench A/B shows the budgets are unmoved by it (measure the overhead first — it may be
+      negligible and the whole ON/OFF split moot); (b) if it does move the budgets, drive it from an
+      **env-var/CI-only file** (drop `burn.toml` in the test/CI working dir but not where `cargo bench` runs,
+      or gate it behind a CI env var the bench job clears) rather than committing a repo-root file. Confirm
+      whether Burn reads `burn.toml` from cwd or repo-root (determines whether the per-dir trick works) before
+      adopting either.
 - [ ] Evaluate **CubeCL's now-complete flash-attention kernel** for the decode/prefill attention step —
       the releases page reports a full implementation (causal **masking**, partitions, row-wise
       reductions, multi-plane ops). Mummu currently materializes attention explicitly (q·kᵀ → f32 softmax
@@ -240,6 +260,13 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       Qwen3.6 (35B-A3B) is also out now but is MoE and
       well past the single-card tier this zoo targets —
       https://huggingface.co/unsloth/Qwen3.5-4B-GGUF · https://unsloth.ai/docs/models/qwen3.5/gguf-benchmarks
+      *(2026-07-22 research)* The mid-2026 function-calling field guides converge on the same picture: for
+      ≤ 8 GB cards **Qwen3.5-9B** is the general-purpose FC pick and **Qwen3.5-4B** the CPU-only pick
+      (reinforces the 4B/9B target of this item); the Qwen3.6 tier (27B dense / 35B-A3B MoE) ships a new
+      `qwen3_coder` tool-call parser in vLLM/SGLang — if its emission format differs from Hermes ChatML,
+      a Qwen3.6-class port would need a new `chat` convention entry, so check the template's markers before
+      assuming Hermes covers it — https://insiderllm.com/guides/function-calling-local-llms/ ·
+      https://www.popularai.org/p/best-cpu-only-local-llm-2026
 - [x] **Qwen3 strict parity gate PASSED** — the Qwen3 dense arch is now through the P7 trust gate.
       `tests/parity_gguf.rs` gained a `qwen3` leg on the `llama_ref` harness: `llama-server` (Ollama's
       bundled binary) runs the SAME local Qwen3-0.6B Q4_K_M our loader loads, RAW `/completion` with
@@ -502,7 +529,7 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       green); the real Qwen3-0.6B safetensors GPU load+decode re-passed unchanged with the gate live (the
       cached checkpoint's `tokenizer_config` EOS `<|im_end|>`→151645 agrees with `config.json` and its ChatML
       template is Hermes). What remains is split to the item below.
-- [ ] **Loaders open the tokenizer for `check_ids_against` + config-driven BOS** — the 2026-07-19 gate is
+- [x] **Loaders open the tokenizer for `check_ids_against` + config-driven BOS** — the 2026-07-19 gate is
       tokenizer-free (it cross-checks `tokenizer_config.json` ↔ `config.json` only). The remaining half of the
       wiring needs the loader to actually *open* the HF `tokenizer.json`: run `check_ids_against(token_to_id)`
       (every added-token id vs the real tokenizer) at load, and *drive* the model's EOS/BOS ids from
@@ -528,6 +555,19 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       `eos_token_id` is already the source of truth and is now cross-checked to agree, and BOS/tokenization
       stays caller-side by design; surfacing the parsed `TokenizerConfig` on the `Loaded*` structs for a
       consumer to read is the intended shape, left to a dedicated decision.
+      *(2026-07-21)* **Config-driven EOS/BOS shipped — the intended shape, exactly as scoped.**
+      `validate_checkpoint_dir` already parsed and *returned* the sibling `TokenizerConfig`, but all three
+      safetensors loaders discarded it; they now capture it and surface it as a new public
+      `tokenizer_config: Option<TokenizerConfig>` field on `LoadedQwen2`/`LoadedQwen3`/`LoadedLfm2`. A consumer
+      reads config-driven EOS/BOS/PAD straight off the loaded model (`m.tokenizer_config.as_ref().and_then(|c|
+      c.eos_id())`, `.bos_id()`, `.add_bos_token`) instead of hardcoding. Deliberately *additive*: the model's
+      internal `is_eos` still rides `config.json`'s `eos_token_id` (already the cross-checked source of truth per
+      the 2026-07-19 gate), so decode/parity behavior is byte-unchanged; a debug-assert in each safetensors
+      loader upholds the invariant that any surfaced EOS agrees with `config.json`. GGUF loads surface `None`
+      (self-contained — that path reads no sibling `tokenizer_config.json`; EOS rides GGUF metadata). REAL-GPU
+      proof (`tests/real_qwen3.rs`): the safetensors leg asserts the surfaced config's `eos_id()` == 151645
+      (`<|im_end|>`) and agrees with `config.json`; the GGUF leg asserts `tokenizer_config.is_none()`. 176 unit
+      tests + parity + budget gates unmoved (additive field, off every hot path).
 - [ ] **Evaluate `hf-chat-template` to render the imported `chat_template`** — Mummu's prompt wrapping is
       hardcoded, byte-verified `chat` renderers (one per family); the `hf-chat-template` crate (built on
       **minijinja** + a transformers compatibility layer) renders an arbitrary HF `chat_template` Jinja string
@@ -548,6 +588,8 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       with `ChatMl::{qwen2,lfm2}().render_with_tools(...)` on the parity-committed prompts would turn
       "template-vs-renderer consistency" into a true byte gate. Still gate on reproducing the committed prompts
       byte-for-byte before trusting it. — https://lib.rs/crates/hf-chat-template
+      *(2026-07-22)* Crate is now at **0.2.1** (June 20, 2026 — a same-day patch over the 0.2.0 evaluated
+      above; same `RenderInput` surface). Version to use when this is picked up.
 - [x] **Model registry / manifest** — a declarative `ModelSpec` (repo, architecture, weight format, dtype,
       tokenizer, chat template, size tier) + a small built-in catalog of known-good models (Qwen2.5, LFM2.5,
       MiniLM, …); adding a model = a manifest entry. *(2026-07-10) `mummu::registry`: `ModelSpec`

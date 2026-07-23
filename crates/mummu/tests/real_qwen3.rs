@@ -89,6 +89,26 @@ fn real_qwen3_safetensors_loads_and_decodes_on_gpu() {
         model.config.tie_word_embeddings,
     );
 
+    // The sibling tokenizer_config.json is surfaced on the loaded struct so a
+    // consumer can read config-driven EOS/BOS ids (P3). The cached Qwen3-0.6B
+    // ships one; its resolved EOS agrees with config.json's (the load-time gate
+    // guarantees it), and add_bos_token is false (ChatML).
+    let tc = model
+        .tokenizer_config
+        .as_ref()
+        .expect("Qwen3-0.6B ships a tokenizer_config.json, surfaced on the loaded struct");
+    eprintln!(
+        "[real_qwen3] tokenizer_config: eos_id {:?} · bos_id {:?} · add_bos {}",
+        tc.eos_id(),
+        tc.bos_id(),
+        tc.add_bos_token,
+    );
+    assert_eq!(tc.eos_id(), Some(151_645), "config-driven EOS = <|im_end|>");
+    assert!(
+        model.config.eos_token_id.contains(151_645),
+        "surfaced EOS agrees with config.json"
+    );
+
     // The post-import sanity smoke passes on the real weights: one forward
     // yields finite, vocab-wide, non-degenerate logits (the liveness gate an
     // app runs right after install).
@@ -197,6 +217,13 @@ fn real_qwen3_gguf_loads_and_agrees_with_safetensors() {
     );
 
     let gguf_model = qwen3::load_from_gguf::<Gpu>(&path, &device).expect("gguf load is checked");
+    // A GGUF is self-contained — the load path reads no sibling
+    // tokenizer_config.json, so the surfaced field is None (EOS still rides
+    // config.eos_token_id, derived from GGUF metadata).
+    assert!(
+        gguf_model.tokenizer_config.is_none(),
+        "a GGUF load surfaces no tokenizer_config"
+    );
     let ids = gguf_model
         .greedy_generate(&prompt, 48, &device)
         .expect("decode");

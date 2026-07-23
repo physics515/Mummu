@@ -48,7 +48,9 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
   family's renderer, or — when a `tokenizer.json` sits beside it — whose declared added-token ids don't
   match that real tokenizer, is a loud `ImportError::Inconsistent` instead of a model that silently
   mis-stops, mis-templates, or mis-tokenizes. Both sibling files are optional (a GGUF-derived dir has
-  neither → no behavior change).
+  neither → no behavior change). On a successful safetensors load the parsed `TokenizerConfig` is surfaced
+  on the returned `Loaded{Qwen2,Qwen3,Lfm2}` struct (`tokenizer_config`), so a consumer reads config-driven
+  EOS/BOS/PAD ids straight off the model; a GGUF load surfaces `None` (self-contained).
 - **Import validation** — a two-stage error taxonomy: `ImportError` for the file→module stage (missing
   file, parse, load, and an `Incomplete` per-tensor missing/errored diff) and `SanityError` for the
   runtime liveness a checked load can't see — NaN/Inf logits, a vocab-width mismatch, or a
