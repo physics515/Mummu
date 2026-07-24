@@ -1,0 +1,17 @@
+# Burn/CubeCL project config (Burn 0.21+). Discovered at runtime by walking UP
+# from the process CWD (cubecl.toml is checked before burn.toml at each level),
+# so this file governs every process launched from inside this repo — i.e. the
+# `crates/mummu` test suites (cargo runs tests with CWD = the package dir, and
+# the walk-up lands here). Consumers of the library run from their own
+# directories and are untouched.
+#
+# `validate` = enforce bounds checks on EVERY kernel launch AND validate
+# explicitly-unchecked kernels for out-of-bounds accesses — the failure class
+# behind silent wrong-logits drift or a GPU crash. We want that armed under
+# the parity/real-model suites, where correctness is the whole point.
+#
+# The perf-budget/benchmark crate must NOT pay validation overhead in its
+# recorded numbers: `crates/mummu-bench/cubecl.toml` opts that crate back out
+# (its CWD finds the crate-local file first and stops the walk-up).
+[cubecl.compilation]
+check_mode = "validate"

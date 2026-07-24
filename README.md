@@ -91,7 +91,12 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
 - **Template byte gate** — the hardcoded renderers are proven **byte-identical to
   `transformers.apply_chat_template`** rendering the checkpoint's own imported `chat_template`
   (via the `hf-chat-template` dev-dependency): plain, multi-turn, the full Hermes `# Tools` block,
-  and function-call history all match byte-for-byte on Qwen3-0.6B (`tests/template_gate.rs`).
+  and function-call history match byte-for-byte on **Qwen3-0.6B, Qwen2.5-1.5B, and LFM2.5-1.2B**
+  (LFM's legs cover both tool conventions, its `tool` role turns, its history think-stripping, and
+  the standalone `chat_template.jinja` import path), `tests/template_gate.rs`. The known family
+  divergences are pinned to their exact deltas so any other drift fails loudly: Qwen2.5's no-system
+  branding preamble vs our neutral one, Qwen3's no-system no-preamble, and Qwen3's history
+  think-stripping (ours re-renders history verbatim — a `ChatMl::qwen3()` is a roadmap item).
   Prompt JSON deliberately serializes with Python `json.dumps` spacing and insertion-order keys
   (serde_json `preserve_order`) — the exact bytes the reference stack renders and models emit back.
 - **f16 inference, validated** — Qwen2.5-1.5B runs coherently on `GpuF16` (weights + KV in f16, the

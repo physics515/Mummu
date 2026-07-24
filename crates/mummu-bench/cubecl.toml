@@ -1,0 +1,9 @@
+# Opt the benchmark/budget crate OUT of the repo-root burn.toml's
+# `check_mode = "validate"`: CubeCL's config discovery walks up from the
+# process CWD and stops at the FIRST cubecl.toml/burn.toml it finds, and
+# cargo runs this crate's benches + budget-gate tests with CWD = this
+# directory. Bench numbers must never include kernel-validation overhead —
+# `auto` is CubeCL's default (bounds-check standard launches, trust
+# explicitly-unchecked ones).
+[compilation]
+check_mode = "auto"

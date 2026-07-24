@@ -219,3 +219,382 @@ fn qwen3_tool_history_render_byte_matches_the_imported_template() {
     println!("{}", diff_context("tool-history", &ours, &reference));
     assert_eq!(ours, reference, "FC history render must byte-match");
 }
+
+// ---------------------------------------------------------------------------
+// Coverage beyond Qwen3 (2026-07-24): Qwen2.5 + LFM2.5 legs, and the known
+// family divergences PINNED to their exact deltas so any other drift fails.
+// Extra env keys: MUMMU_QWEN2_DIR, MUMMU_LFM2_DIR (LFM's legs also exercise
+// the standalone `chat_template.jinja` import fallback — the checkpoint dir
+// carries the template only as that file).
+// ---------------------------------------------------------------------------
+
+fn dir_from(var: &str) -> Option<PathBuf> {
+    let dir = PathBuf::from(std::env::var_os(var)?);
+    dir.is_dir().then_some(dir)
+}
+
+fn weather_spec() -> ToolSpec {
+    ToolSpec {
+        name: "get_weather".into(),
+        description: "Get the current weather in a city.".into(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "city": {"type": "string", "description": "City name"}
+            },
+            "required": ["city"]
+        }),
+    }
+}
+
+/// The Hermes wire JSON transformers hands the template as one `tools` entry.
+fn hermes_tool_json() -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather in a city.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string", "description": "City name"}
+                },
+                "required": ["city"]
+            }
+        }
+    })
+}
+
+/// LFM tools are BARE tool JSON (no Hermes wrapper) — the template runs
+/// `tool | tojson` on whatever is passed; the model card shows bare.
+fn lfm_tool_json() -> serde_json::Value {
+    serde_json::json!({
+        "name": "get_weather",
+        "description": "Get the current weather in a city.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "city": {"type": "string", "description": "City name"}
+            },
+            "required": ["city"]
+        }
+    })
+}
+
+/// LFM's template opens with `{{- bos_token -}}` — pass it in the context,
+/// exactly as transformers does from the tokenizer's special tokens.
+fn lfm_input(messages: Vec<Message>, tools: Vec<serde_json::Value>) -> RenderInput {
+    let mut extra = serde_json::Map::new();
+    extra.insert(
+        "bos_token".into(),
+        serde_json::Value::String("<|startoftext|>".into()),
+    );
+    RenderInput {
+        messages,
+        tools,
+        add_generation_prompt: true,
+        extra,
+        ..RenderInput::default()
+    }
+}
+
+const SYSTEM: &str = "You are a helpful assistant.";
+const USER: &str = "List the first five prime numbers.";
+
+// ---- Qwen2.5 ---------------------------------------------------------------
+
+/// Qwen2.5's plain + tools + FC-history legs, byte-identical like Qwen3's.
+#[test]
+#[ignore = "needs the local Qwen2.5 checkpoint dir (MUMMU_QWEN2_DIR)"]
+fn qwen2_renders_byte_match_the_imported_template() {
+    let dir = dir_from("MUMMU_QWEN2_DIR").expect("set MUMMU_QWEN2_DIR");
+    let template = imported_template(&dir);
+
+    // Plain — the exact shape the Qwen2 parity gate commits.
+    let reference = template
+        .render(&RenderInput {
+            messages: vec![Message::system(SYSTEM), Message::user(USER)],
+            add_generation_prompt: true,
+            ..RenderInput::default()
+        })
+        .expect("reference render succeeds");
+    let ours = ChatMl::qwen2().render(&[Turn::system(SYSTEM), Turn::user(USER)]);
+    println!("{}", diff_context("qwen2 plain", &ours, &reference));
+    assert_eq!(ours, reference, "Qwen2.5 plain render must byte-match");
+
+    // Tools.
+    let reference = template
+        .render(&RenderInput {
+            messages: vec![Message::system(SYSTEM), Message::user(USER)],
+            tools: vec![hermes_tool_json()],
+            add_generation_prompt: true,
+            ..RenderInput::default()
+        })
+        .expect("reference render succeeds");
+    let ours = ChatMl::qwen2()
+        .render_with_tools(&[weather_spec()], &[Turn::system(SYSTEM), Turn::user(USER)]);
+    println!("{}", diff_context("qwen2 tools", &ours, &reference));
+    assert_eq!(ours, reference, "Qwen2.5 tools render must byte-match");
+
+    // FC history: a <tool_call> turn + two tool responses (merged user turn).
+    let mut assistant_call = Message::assistant("");
+    assistant_call.content = None;
+    assistant_call.tool_calls =
+        vec![serde_json::json!({"name": "get_weather", "arguments": {"city": "Paris"}})];
+    let reference = template
+        .render(&RenderInput {
+            messages: vec![
+                Message::system(SYSTEM),
+                Message::user("What's the weather in Paris?"),
+                assistant_call,
+                Message::new("tool", "{\"temp_c\": 21}"),
+                Message::new("tool", "{\"temp_c\": 24}"),
+            ],
+            tools: vec![hermes_tool_json()],
+            add_generation_prompt: true,
+            ..RenderInput::default()
+        })
+        .expect("reference render succeeds");
+    let calls = [mummu::chat::ToolCall {
+        name: "get_weather".into(),
+        arguments: serde_json::json!({"city": "Paris"}),
+    }];
+    let ours = ChatMl::qwen2().render_with_tools(
+        &[weather_spec()],
+        &[
+            Turn::system(SYSTEM),
+            Turn::user("What's the weather in Paris?"),
+            Turn::assistant_tool_calls(&calls),
+            Turn::tool_response("{\"temp_c\": 21}"),
+            Turn::tool_response("{\"temp_c\": 24}"),
+        ],
+    );
+    println!("{}", diff_context("qwen2 fc-history", &ours, &reference));
+    assert_eq!(ours, reference, "Qwen2.5 FC history render must byte-match");
+}
+
+/// Documented divergence, pinned exactly: without a system turn Qwen2.5's
+/// template injects its branding preamble where we inject a neutral one (one
+/// renderer serves Qwen2 AND Qwen3, and Qwen3 injects nothing — no single
+/// default can match both). The delta must be EXACTLY the preamble swap.
+#[test]
+#[ignore = "needs the local Qwen2.5 checkpoint dir (MUMMU_QWEN2_DIR)"]
+fn qwen2_no_system_defaults_diverge_only_by_the_documented_preamble() {
+    let dir = dir_from("MUMMU_QWEN2_DIR").expect("set MUMMU_QWEN2_DIR");
+    let template = imported_template(&dir);
+    const QWEN_PREAMBLE: &str =
+        "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.";
+
+    // With tools: both sides synthesize a system turn; preambles differ.
+    let reference = template
+        .render(&RenderInput {
+            messages: vec![Message::user(USER)],
+            tools: vec![hermes_tool_json()],
+            add_generation_prompt: true,
+            ..RenderInput::default()
+        })
+        .expect("reference render succeeds");
+    let ours = ChatMl::qwen2().render_with_tools(&[weather_spec()], &[Turn::user(USER)]);
+    let ours_with_qwen_preamble = ours.replacen(SYSTEM, QWEN_PREAMBLE, 1);
+    assert_ne!(
+        ours_with_qwen_preamble, ours,
+        "our preamble must be present"
+    );
+    assert_eq!(
+        ours_with_qwen_preamble, reference,
+        "no-system tools render must diverge ONLY by the default preamble"
+    );
+
+    // Without tools: the template injects a whole default system turn; our
+    // render() injects nothing (explicit turns are the caller's contract).
+    let reference = template
+        .render(&RenderInput {
+            messages: vec![Message::user(USER)],
+            add_generation_prompt: true,
+            ..RenderInput::default()
+        })
+        .expect("reference render succeeds");
+    let ours = ChatMl::qwen2().render(&[Turn::user(USER)]);
+    assert_eq!(
+        format!("<|im_start|>system\n{QWEN_PREAMBLE}<|im_end|>\n{ours}"),
+        reference,
+        "no-system plain render must diverge ONLY by the injected default turn"
+    );
+}
+
+// ---- Qwen3 divergences ------------------------------------------------------
+
+/// Qwen3's documented divergences, pinned exactly: (a) with tools and no
+/// system turn its template injects NO preamble (ours injects the neutral
+/// one); (b) it strips `<think>` reasoning from assistant turns at/before the
+/// last user query (ours re-renders history verbatim — `ChatMl::qwen3()` with
+/// the strip is a ROADMAP item; flip this case to byte-equal when it lands).
+#[test]
+#[ignore = "needs the local Qwen3 checkpoint dir (MUMMU_QWEN3_DIR)"]
+fn qwen3_divergences_are_exactly_the_documented_ones() {
+    let dir = dir().expect("set MUMMU_QWEN3_DIR to a Qwen3 checkpoint dir");
+    let template = imported_template(&dir);
+
+    let reference = template
+        .render(&RenderInput {
+            messages: vec![Message::user(USER)],
+            tools: vec![hermes_tool_json()],
+            add_generation_prompt: true,
+            ..RenderInput::default()
+        })
+        .expect("reference render succeeds");
+    let ours = ChatMl::qwen2().render_with_tools(&[weather_spec()], &[Turn::user(USER)]);
+    assert_eq!(
+        ours.replacen(&format!("{SYSTEM}\n\n"), "", 1),
+        reference,
+        "Qwen3 no-system tools render must diverge ONLY by our neutral preamble"
+    );
+
+    let think_turn = "<think>2 then 3.</think>The first primes are 2 and 3.";
+    let reference = template
+        .render(&RenderInput {
+            messages: vec![
+                Message::system(SYSTEM),
+                Message::user(USER),
+                Message::assistant(think_turn),
+                Message::user("And the next two?"),
+            ],
+            add_generation_prompt: true,
+            ..RenderInput::default()
+        })
+        .expect("reference render succeeds");
+    let ours = ChatMl::qwen2().render(&[
+        Turn::system(SYSTEM),
+        Turn::user(USER),
+        Turn::assistant(think_turn),
+        Turn::user("And the next two?"),
+    ]);
+    assert!(ours.contains("<think>"), "ours re-renders history verbatim");
+    assert!(
+        !reference.contains("<think>"),
+        "Qwen3's template strips history reasoning"
+    );
+    assert_eq!(
+        ours.replacen("<think>2 then 3.</think>", "", 1),
+        reference,
+        "the think block must be the ONLY delta"
+    );
+}
+
+// ---- LFM2.5 -----------------------------------------------------------------
+
+/// LFM2.5 plain legs (±system) — these also prove the standalone
+/// `chat_template.jinja` import fallback end-to-end on a real checkpoint:
+/// the dir ships NO `chat_template` JSON key, only the sibling file.
+#[test]
+#[ignore = "needs the local LFM2.5 checkpoint dir (MUMMU_LFM2_DIR) with chat_template.jinja"]
+fn lfm2_plain_renders_byte_match_the_imported_template() {
+    let dir = dir_from("MUMMU_LFM2_DIR").expect("set MUMMU_LFM2_DIR");
+    let template = imported_template(&dir);
+
+    let reference = template
+        .render(&lfm_input(vec![Message::user(USER)], vec![]))
+        .expect("reference render succeeds");
+    let ours = ChatMl::lfm2().render(&[Turn::user(USER)]);
+    println!("{}", diff_context("lfm plain", &ours, &reference));
+    assert_eq!(ours, reference, "LFM no-system render must byte-match");
+
+    let reference = template
+        .render(&lfm_input(
+            vec![Message::system(SYSTEM), Message::user(USER)],
+            vec![],
+        ))
+        .expect("reference render succeeds");
+    let ours = ChatMl::lfm2().render(&[Turn::system(SYSTEM), Turn::user(USER)]);
+    println!("{}", diff_context("lfm system", &ours, &reference));
+    assert_eq!(ours, reference, "LFM system render must byte-match");
+}
+
+/// LFM2.5 tools legs (±system, bare tool JSON): with no system turn BOTH
+/// sides inject nothing — LFM has no default preamble, so unlike the Qwen
+/// families this case is byte-equal, not a pinned divergence.
+#[test]
+#[ignore = "needs the local LFM2.5 checkpoint dir (MUMMU_LFM2_DIR) with chat_template.jinja"]
+fn lfm2_tools_renders_byte_match_the_imported_template() {
+    let dir = dir_from("MUMMU_LFM2_DIR").expect("set MUMMU_LFM2_DIR");
+    let template = imported_template(&dir);
+
+    let reference = template
+        .render(&lfm_input(
+            vec![Message::system(SYSTEM), Message::user(USER)],
+            vec![lfm_tool_json()],
+        ))
+        .expect("reference render succeeds");
+    let ours = ChatMl::lfm2()
+        .render_with_tools(&[weather_spec()], &[Turn::system(SYSTEM), Turn::user(USER)]);
+    println!("{}", diff_context("lfm tools+system", &ours, &reference));
+    assert_eq!(ours, reference, "LFM tools+system render must byte-match");
+
+    let reference = template
+        .render(&lfm_input(vec![Message::user(USER)], vec![lfm_tool_json()]))
+        .expect("reference render succeeds");
+    let ours = ChatMl::lfm2().render_with_tools(&[weather_spec()], &[Turn::user(USER)]);
+    println!("{}", diff_context("lfm tools no-system", &ours, &reference));
+    assert_eq!(
+        ours, reference,
+        "LFM tools no-system render must byte-match"
+    );
+}
+
+/// LFM2.5 history semantics: past assistant turns lose their `</think>`
+/// reasoning on BOTH sides (keep_past_thinking=false), the LAST assistant
+/// turn keeps it; pythonic call turns + real `tool` role turns round-trip.
+#[test]
+#[ignore = "needs the local LFM2.5 checkpoint dir (MUMMU_LFM2_DIR) with chat_template.jinja"]
+fn lfm2_history_renders_byte_match_the_imported_template() {
+    let dir = dir_from("MUMMU_LFM2_DIR").expect("set MUMMU_LFM2_DIR");
+    let template = imported_template(&dir);
+
+    let past = "<think>2, 3.</think>\n\nThe first two primes are 2 and 3.";
+    let last = "<think>5, 7 next.</think>\n\n5 and 7.";
+    let turns = [
+        Turn::user(USER),
+        Turn::assistant(past),
+        Turn::user("And the next two?"),
+        Turn::assistant(last),
+        Turn::user("Thanks — one more?"),
+    ];
+    let messages = vec![
+        Message::user(USER),
+        Message::assistant(past),
+        Message::user("And the next two?"),
+        Message::assistant(last),
+        Message::user("Thanks — one more?"),
+    ];
+    let reference = template
+        .render(&lfm_input(messages, vec![]))
+        .expect("reference render succeeds");
+    let ours = ChatMl::lfm2().render(&turns);
+    println!("{}", diff_context("lfm think-strip", &ours, &reference));
+    assert_eq!(ours, reference, "LFM think-stripping must byte-match");
+
+    // Pythonic call turn + a real `tool` role turn: the LFM template renders
+    // assistant content verbatim, so the reference sees the emitted text.
+    let calls = [mummu::chat::ToolCall {
+        name: "get_weather".into(),
+        arguments: serde_json::json!({"city": "Paris"}),
+    }];
+    let call_turn = Turn::assistant_tool_calls_lfm(&calls);
+    let reference = template
+        .render(&lfm_input(
+            vec![
+                Message::user("Weather in Paris?"),
+                Message::assistant(call_turn.content.clone()),
+                Message::new("tool", "{\"temp_c\": 21}"),
+            ],
+            vec![],
+        ))
+        .expect("reference render succeeds");
+    let ours = ChatMl::lfm2().render(&[
+        Turn::user("Weather in Paris?"),
+        call_turn,
+        Turn::tool_response("{\"temp_c\": 21}"),
+    ]);
+    println!("{}", diff_context("lfm pythonic+tool", &ours, &reference));
+    assert_eq!(ours, reference, "LFM pythonic/tool turns must byte-match");
+}

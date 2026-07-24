@@ -77,7 +77,7 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       on an otherwise-idle GPU (5% util). Decode throughput tracking CPU availability is what a
       dispatch-bound path looks like. Operationally: **run the budget gates on a quiet machine** or
       they report contention as a regression.*
-- [ ] Evaluate Burn 0.21's `burn.toml` project config — per-subsystem tuning + a CubeCL kernel-validation
+- [x] Evaluate Burn 0.21's `burn.toml` project config — per-subsystem tuning + a CubeCL kernel-validation
       layer without recompiling; useful as a debug switch for kernel-level parity hunts —
       https://burn.dev/blog/release-0.21.0/ *(2026-07-17 research)* Concretely, a `burn.toml` dropped at
       the project root parameterizes every internal subsystem with no code change / no recompile:
@@ -96,14 +96,21 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       "enforce"|"validate"|"auto"`, `cache`; `[cubecl.streaming] max_streams`; `[cubecl.memory]
       persistent_memory = "enabled"|"disabled"|"enforced"`. Validation is the `[cubecl.compilation]
       check_mode` knob (`"validate"` = the OOB-catching layer). So the item's "ON for test / OFF for bench
-      **profiles**" premise isn't directly expressible — one checked-in file applies to *every* cargo
-      invocation, benches included. Workable routes when picked up: (a) accept global `check_mode = "validate"`
-      only if a bench A/B shows the budgets are unmoved by it (measure the overhead first — it may be
-      negligible and the whole ON/OFF split moot); (b) if it does move the budgets, drive it from an
-      **env-var/CI-only file** (drop `burn.toml` in the test/CI working dir but not where `cargo bench` runs,
-      or gate it behind a CI env var the bench job clears) rather than committing a repo-root file. Confirm
-      whether Burn reads `burn.toml` from cwd or repo-root (determines whether the per-dir trick works) before
-      adopting either.
+      **profiles**" premise isn't directly expressible in ONE file — the open question was whether the
+      discovery rule allows a per-directory split.
+      *(2026-07-24)* **Shipped — the per-directory split works.** The discovery rule read from
+      cubecl-runtime 0.10 source answers the 07-21 question: `RuntimeConfig::from_current_dir` walks UP
+      from the process CWD, `cubecl.toml` checked before `burn.toml` at each level, first hit wins — and
+      cargo runs each crate's tests/benches with CWD = the package dir. So a repo-root **`burn.toml`**
+      sets `[cubecl.compilation] check_mode = "validate"` (bounds-check every launch AND validate
+      explicitly-unchecked kernels for OOB) arming the `crates/mummu` parity/real-model suites, while
+      **`crates/mummu-bench/cubecl.toml`** opts the budget/bench crate back to the `auto` default so
+      recorded numbers never carry validation overhead. Consumers run from their own CWD — untouched.
+      Verified live: an A/B with a malformed root burn.toml makes a GPU test fail at config load naming
+      the bad key (proof of discovery + parse, from BOTH crates' CWDs), the real-model GPU suite passes
+      with validation armed (no OOB found — clean bill), and the budget gates hold their numbers from
+      the opted-out bench crate (12.4 tok/s with the files ≈ 12.1 without; first run after a config
+      change can read ~30% low while autotune re-tunes — re-run before believing a regression).
 - [ ] Evaluate **CubeCL's now-complete flash-attention kernel** for the decode/prefill attention step —
       the releases page reports a full implementation (causal **masking**, partitions, row-wise
       reductions, multi-plane ops). Mummu currently materializes attention explicitly (q·kᵀ → f32 softmax
@@ -608,11 +615,27 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       `<tool_call>{"name": "get_weather", ...}</tool_call>` from the new prompt bytes on the 4070 Ti SUPER.
       Payoff (2) — a general fallback renderer for checkpoints without a hardcoded family renderer — is
       split below.
+      *(2026-07-24, merged from the parallel nightly)* **Gate coverage extended beyond Qwen3**: the same
+      in-process harness now byte-verifies **Qwen2.5-1.5B** (plain / tools / FC history) and **LFM2.5-1.2B**
+      (plain±system, tools±system in the LFM bare-JSON convention, history think-stripping, pythonic
+      `<|tool_call_start|>` + `tool` role turns — LFM's legs also exercise the standalone
+      `chat_template.jinja` import fallback on the real checkpoint, whose template file was fetched into
+      the local cache). Known family divergences are PINNED to their exact deltas so any other drift still
+      fails: Qwen2.5's no-system branding preamble ("You are Qwen, …") vs our neutral one (with tools AND
+      the plain injected default turn), Qwen3's no-system no-preamble, Qwen3's history think-stripping.
 - [ ] **General fallback chat renderer via `hf-chat-template`** — payoff (2) of the evaluation above: for a
       checkpoint whose family has no hardcoded `chat` renderer, render prompts from its own imported
       `chat_template` (the byte gate proved fidelity on Qwen3). Weigh promoting the dep from dev to optional
       runtime feature vs the from-scratch ethos; needs the P8/consumer-facing API decision of when to prefer
       the imported template over a family renderer. *(2026-07-23, split from the evaluation.)*
+- [ ] **`ChatMl::qwen3()` with history think-stripping** — the byte gate documented that Qwen3's template
+      strips `<think>…</think>` reasoning from assistant turns at/before the last user query while our
+      shared `ChatMl::qwen2()` renderer re-renders history verbatim (fine for fresh prompts + tool loops,
+      wrong for long multi-turn chats with a thinking Qwen3). A `qwen3()` constructor wants the LFM-style
+      strip (the machinery exists — `turn_content` already does it for `Lfm`) but keyed to Qwen3's
+      "at/before the last user query" rule rather than LFM's "every but the last assistant turn"; gate it
+      on the template byte gate's think case flipping from documented-divergence to byte-equal.
+      *(2026-07-24, found by the byte gate.)*
 - [x] **Model registry / manifest** — a declarative `ModelSpec` (repo, architecture, weight format, dtype,
       tokenizer, chat template, size tier) + a small built-in catalog of known-good models (Qwen2.5, LFM2.5,
       MiniLM, …); adding a model = a manifest entry. *(2026-07-10) `mummu::registry`: `ModelSpec`
@@ -670,6 +693,11 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       `<|tool_call_start|>[get_weather(city="Paris")]<|tool_call_end|>` from our rendered prompt and the
       parser round-tripped it; the Qwen2 parity gate re-passed both legs after the template refactor
       (max |Δlogit| 2.670e-5, Ollama greedy byte-identical). 16 new unit tests (109 total).*
+      *(2026-07-23/24) Template-embedded tool JSON now spells `json.dumps` separators (`python_json` —
+      `{"a": 1}`, not compact `{"a":1}`) in BOTH conventions, with insertion-order keys (serde_json
+      `preserve_order`, a workspace feature): the P3 template byte gate proved the checkpoints' own
+      templates (Jinja `tojson`) and the models' own emissions use that spelling, and the renders are
+      now byte-identical to `transformers.apply_chat_template` — see the P3 gate item.*
       *(2026-07-10 research)* 2026 community numbers back the plan: Qwen3-8B keeps tool-calling score
       through Q4_K_M (0.919 quantized vs 0.933 full — quant does NOT cost tool reliability, good news for
       P9); BFCL shows a capability cliff below ~7B (Qwen3.5-9B 66.1% vs 4B 50.3%), so the zoo's
@@ -752,10 +780,35 @@ that fits the model AND uses every device to the fullest.
       decide the policy explicitly — call `set_default_dtypes` per device at model-load/planner level (or pin
       every runtime tensor creation site's dtype) so in-process mixed-precision is defined behavior, and add a
       two-alias regression test once it is.
+- [ ] **Placement plan** — given model size + KV-cache + display headroom and the device set, choose a
       **fit-and-fill** plan: single GPU when it fits; **shard layers across multiple GPUs** (pipeline/
       layer-parallel over Burn's multi-device tensors — Burn gives the multi-device *primitives*, not automatic
       tensor-parallel, so we place modules on devices ourselves); **spill cold layers to CPU** (GGUF-style
       hybrid) when total VRAM is short. Largest-model-that-fits, every device busy.
+      *(2026-07-24, design settled)* **Heterogeneous per-device precision comes from ONE source file —
+      no new format.** The checkpoint stores weights once (bf16 safetensors, or a GGUF); each pipeline
+      stage *derives* its own in-memory representation at load: cast bf16→f32 for the big GPU and
+      bf16→f16 for a SHADER_F16-capable iGPU (both = the existing `CastFloatAdapter` path, quality-free
+      casts), and quantize int8/int4 for the CPU stage (the P9 keep-quantized leg; naive round-to-nearest
+      from bf16 is worse than a calibrated GPTQ/K-quant artifact, so prefer an on-the-fly *block-wise*
+      Q4_K-style quant — llama.cpp's offline K-quants are data-free, same math). The inverse also holds
+      and already runs: one Q4_K_M GGUF can serve f32/f16 stages by dequant/upcast (at Q4 quality) and
+      the CPU stage keep-quantized — so "one file" is a quality-vs-disk choice (bf16 = quality-max,
+      GGUF = size-min), never a format question. The only format-adjacent addition is a later
+      **derived-artifact cache** (don't re-quantize 30 layers per launch): a per-user cache dir of
+      ordinary safetensors/GGUF shards keyed by (source hash, dtype, layer range) — a cache, not a
+      format. The real work is runtime, in dependency order: (1) test the dtype-policy hazard above
+      *across* devices first — the flip is per-device, so f32-on-discrete + f16-on-iGPU in one process
+      is expected to work but is exactly the unproven experiment; (2) the stage-composed model type —
+      `CausalLm<B>` is generic over ONE backend, a GPU+iGPU split can stay one `Wgpu` backend with
+      per-tensor dtypes (Burn 0.21 multi-dtype, the f32-softmax island already does per-tensor casts),
+      but the CPU stage is a different backend *type* (`burn-flex`), so the GPU→CPU seam is a
+      host-memory transfer between two backend generics; (3) activations cast at stage seams (small
+      tensors, cheap); (4) per-stage KV-cache shards + the micro-batch schedule (the multi-GPU item).
+      Expectation to encode in the planner: pipeline throughput = the slowest stage, so iGPU/CPU stages
+      exist to make a model FIT, not to make a fitting model faster — fit-and-fill, per-device precision
+      picked by what fits + what the device advertises (`inventory()` already records SHADER_F16 +
+      max_buffer_bytes + true VRAM per adapter).
 - [ ] **Multi-GPU execution** — run the sharded plan: per-device sub-modules, activations handed across the
       device boundary between stages, KV-cache per shard, and a micro-batch/pipeline schedule so the GPUs
       overlap rather than idle. *(Tensor-parallel within a layer is the stretch goal; layer/pipeline split is
@@ -836,6 +889,16 @@ The VRAM lever the P6 planner pulls to make the largest useful model fit the use
       the kernel substrate a Q4-weights × f16-activations decode path would ride (vs hand-writing a
       dequant-fused kernel); gate any adoption on the parity harness + `bench/BASELINE.md` —
       https://github.com/tracel-ai/cubecl/releases · https://burn.dev/blog/release-0.21.0/
+- [ ] **KV-cache quantization (FP8/e4m3)** — quantize the KV cache (and optionally the QK/ScoreV attention
+      matmuls) to 8-bit, halving per-token cache footprint — the *other* VRAM lever besides weights, and the
+      one that grows with context length. vLLM shipped exactly this (April 2026) and published the lessons
+      that transfer: uncalibrated per-head e4m3 scales recover 97%+ on reasoning tasks and 94–98% AUC at
+      1M-token contexts; **two-level accumulation is critical** (intermediate f32 writes on long contexts —
+      the same failure our f32-softmax island guards); layer-selective beats uniform (sliding-window layers
+      pay overhead for no benefit); head_dim 256 loses at prefill (~1.6× register pressure) while 64/128 win.
+      For Mummu: our KV cache is f16 on `GpuF16` — an e4m3-quantized cache would halve it again; gate on the
+      parity harness + budgets like every numeric change. — https://vllm.ai/blog/2026-04-22-fp8-kvcache
+      *(2026-07-24 research)*
 - [ ] **Auto-quantize-to-fit** — the planner picks the *highest* precision that fits the detected VRAM
       (f16 → int8 → int4), reports the quality/size trade, and never silently ships a worse tier than asked.
 
