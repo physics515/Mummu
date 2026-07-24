@@ -66,3 +66,61 @@ fn qwen2_decodes_coherently_in_f16_on_gpu() {
     // Claim 2 (VRAM) is measured outside the process (nvidia-smi peak while
     // this test runs) — recorded in bench/BASELINE.md.
 }
+
+fn qwen3_dir() -> Option<PathBuf> {
+    std::env::var_os("MUMMU_QWEN3_DIR")
+        .map(PathBuf::from)
+        .filter(|d| d.join("model.safetensors").is_file())
+}
+
+/// f16 leg of the Qwen3 port: bf16 weights cast to f16 on load
+/// (`CastFloatAdapter`), the per-head q/k RMSNorm + decoupled head_dim riding
+/// the SAME f32-softmax attention island Qwen2/LFM2 use, so the q·kᵀ scores
+/// never overflow f16. Lives HERE and not in `real_qwen3.rs` because every
+/// `GpuF16` leg needs its own process: instantiating `GpuF16` flips Burn's
+/// per-device default dtype policy, and any `Gpu` (f32) test that runs later
+/// in the same process then reads its logits back as F16 — a deterministic
+/// `TypeMismatch` panic, reproduced on unmodified HEAD (2026-07-24) by
+/// running the old mixed `real_qwen3` suite serially.
+#[test]
+#[ignore = "needs the Qwen3 safetensors dir (MUMMU_QWEN3_DIR) + a SHADER_F16 GPU"]
+fn real_qwen3_decodes_coherently_in_f16() {
+    let dir = qwen3_dir().expect("set MUMMU_QWEN3_DIR to a Qwen3 safetensors dir");
+    assert!(
+        inventory().any_shader_f16(),
+        "no adapter advertises SHADER_F16 — cannot validate f16 here"
+    );
+    let device = burn::tensor::Device::<GpuF16>::default();
+
+    let tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer.json");
+    let prompt_text = mummu::chat::ChatMl::qwen2().render(&[
+        mummu::chat::Turn::system("You are a concise assistant. Do not think, answer directly."),
+        mummu::chat::Turn::user("What is 2+2? Answer in one short sentence."),
+    ]);
+    let prompt = tok
+        .encode(prompt_text, true)
+        .expect("prompt encodes")
+        .get_ids()
+        .to_vec();
+
+    // bf16 -> f16 on load; the build must not NaN through the qk-norm + softmax.
+    let model =
+        mummu::models::qwen3::load_from_dir::<GpuF16>(&dir, &device).expect("f16 load checked");
+    let smoke = model
+        .sanity_check(&prompt, model.config.vocab_size, &device)
+        .expect("f16 forward is finite and non-degenerate (no overflow to NaN)");
+    eprintln!(
+        "[real_f16/qwen3] sanity smoke: top_id {} · spread {:.3}",
+        smoke.top_id, smoke.spread
+    );
+
+    let ids = model
+        .greedy_generate(&prompt, 48, &device)
+        .expect("f16 decode");
+    let text = tok.decode(&ids, true).expect("ids decode");
+    eprintln!("[real_f16/qwen3] greedy: {text:?}");
+    assert!(
+        text.contains('4'),
+        "expected the f16 answer to mention 4: {text:?}"
+    );
+}
