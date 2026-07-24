@@ -85,7 +85,13 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
   parsers are bounded with a loud error taxonomy. Proven end-to-end on the real GPU: Qwen2.5-1.5B
   emitted a parseable Hermes call and LFM2.5-1.2B emitted exactly
   `<|tool_call_start|>[get_weather(city="Paris")]<|tool_call_end|>` (`tests/real_toolcall.rs`,
-  `tests/real_toolcall_lfm.rs`).
+  `tests/real_toolcall_lfm.rs`). And the renders are **byte-identical to
+  `transformers.apply_chat_template`** running each checkpoint's own imported template — plain,
+  tools, and tool-call-history shapes for Qwen2.5/Qwen3/LFM2.5 all pass a 9-case byte gate
+  (`tests/template_gate.rs` against the `tools/template-probe` reference renderer; embedded tool JSON
+  spells json.dumps' separators via `chat::py_json`, the same spelling the models emit back); the only
+  family divergences (default no-system preambles, Qwen3 history think-stripping) are pinned to their
+  exact deltas in the gate.
 - **f16 inference, validated** — Qwen2.5-1.5B runs coherently on `GpuF16` (weights + KV in f16, the
   q·kᵀ attention scores + softmax computed in an f32 island to stop f16 overflow): **~3.6 GiB runner
   VRAM vs ~7.9 GiB f32, at identical speed**; the parity gate re-passes unchanged on f32, where the

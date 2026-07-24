@@ -72,7 +72,7 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       on an otherwise-idle GPU (5% util). Decode throughput tracking CPU availability is what a
       dispatch-bound path looks like. Operationally: **run the budget gates on a quiet machine** or
       they report contention as a regression.*
-- [ ] Evaluate Burn 0.21's `burn.toml` project config — per-subsystem tuning + a CubeCL kernel-validation
+- [x] Evaluate Burn 0.21's `burn.toml` project config — per-subsystem tuning + a CubeCL kernel-validation
       layer without recompiling; useful as a debug switch for kernel-level parity hunts —
       https://burn.dev/blog/release-0.21.0/ *(2026-07-17 research)* Concretely, a `burn.toml` dropped at
       the project root parameterizes every internal subsystem with no code change / no recompile:
@@ -83,7 +83,17 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       `STATUS_STACK_OVERFLOW`-adjacent GPU crash). Action when picked up: commit a checked-in
       `burn.toml` with validation ON for the parity/real-model test profiles (catch OOB in CI) and OFF
       for the benchmark profile (no validation overhead in the budget numbers), and re-confirm the
-      budgets are unmoved by its presence.
+      budgets are unmoved by its presence. *(2026-07-24)* **Shipped exactly that shape**, exploiting the
+      discovery rule read from cubecl-runtime 0.10 source (`RuntimeConfig::from_current_dir` walks UP
+      from the process CWD, `cubecl.toml` checked before `burn.toml` at each level, first hit wins; cargo
+      runs each crate's tests/benches with CWD = the package dir): a repo-root **`burn.toml`** sets
+      `[cubecl.compilation] check_mode = "validate"` (bounds-check every launch AND validate
+      explicitly-unchecked kernels for OOB) so the `crates/mummu` parity/real-model suites run armed,
+      and **`crates/mummu-bench/cubecl.toml`** opts the budget/bench crate back to the `auto` default so
+      recorded numbers never carry validation overhead. Consumers run from their own CWD — untouched.
+      Verified live: an A/B with a malformed root burn.toml makes a GPU test fail at config load (proof
+      the file is discovered + parsed), the real-model GPU suite passes with validation armed (no OOB
+      found — clean bill), and the budget gates hold their numbers from the opted-out bench crate.
 - [ ] Evaluate **CubeCL's now-complete flash-attention kernel** for the decode/prefill attention step —
       the releases page reports a full implementation (causal **masking**, partitions, row-wise
       reductions, multi-plane ops). Mummu currently materializes attention explicitly (q·kᵀ → f32 softmax
@@ -528,7 +538,7 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       `eos_token_id` is already the source of truth and is now cross-checked to agree, and BOS/tokenization
       stays caller-side by design; surfacing the parsed `TokenizerConfig` on the `Loaded*` structs for a
       consumer to read is the intended shape, left to a dedicated decision.
-- [ ] **Evaluate `hf-chat-template` to render the imported `chat_template`** — Mummu's prompt wrapping is
+- [x] **Evaluate `hf-chat-template` to render the imported `chat_template`** — Mummu's prompt wrapping is
       hardcoded, byte-verified `chat` renderers (one per family); the `hf-chat-template` crate (built on
       **minijinja** + a transformers compatibility layer) renders an arbitrary HF `chat_template` Jinja string
       **byte-identically to `transformers.apply_chat_template`**, tools included. Two payoffs to weigh: (1) a
@@ -548,6 +558,42 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       with `ChatMl::{qwen2,lfm2}().render_with_tools(...)` on the parity-committed prompts would turn
       "template-vs-renderer consistency" into a true byte gate. Still gate on reproducing the committed prompts
       byte-for-byte before trusting it. — https://lib.rs/crates/hf-chat-template
+      *(2026-07-24)* **Payoff (1) shipped — the byte gate is real and PASSES 9/9.** Two build decisions:
+      (a) hf-chat-template 0.2.1 is NOT a dev-dependency — it enables serde_json's `preserve_order`
+      feature, and features being additive that would silently flip our own test builds from serde_json's
+      default (sorted) map order to insertion order, diverging the very renders the tests verify from what
+      plain-feature consumers build; it lives in **`tools/template-probe`** (own workspace, the
+      candle-probe pattern), a 60-line bin: argv = template file, stdin = RenderInput JSON, stdout = the
+      transformers-identical render. (b) The gate exposed a REAL byte divergence and it is now FIXED:
+      our renders embedded tool JSON compact (`{"a":1}`) where every checkpoint template runs Jinja
+      `tojson` = Python `json.dumps` separators (`{"a": 1}`) — and the models emit that spacing back
+      (the 07-11 real-GPU proof literally logged `{"name": "get_weather", "arguments": {"city":
+      "Paris"}}`). `chat::py_json` (a `json.dumps`-separator serde Formatter, public — consumers
+      composing history turns need the same spelling) now feeds all template-embedded JSON.
+      `tests/template_gate.rs` (ignored, env-keyed `MUMMU_TEMPLATE_PROBE` + the three checkpoint dirs)
+      byte-compares our renderers against each checkpoint's OWN imported template (through
+      `TokenizerConfig::from_dir`, incl. LFM's standalone `chat_template.jinja` — fetched into the local
+      cache this run) rendered by the reference engine: **Qwen2.5 plain/tools/tool-call-history, Qwen3
+      plain/tools, LFM2.5 plain±system/tools±system/think-stripping/pythonic-call+tool turns — all
+      byte-identical**; the only divergences are pinned to their exact deltas (Qwen2.5's no-system
+      branding preamble "You are Qwen, …" vs our neutral one, Qwen3's no-system no-preamble, Qwen3's
+      history think-stripping) so any OTHER drift fails loudly. Payoff (2) — a general fallback renderer
+      for family-less checkpoints — stays open below.
+- [ ] **`ChatMl::qwen3()` with history think-stripping** — the byte gate documented that Qwen3's template
+      strips `<think>…</think>` reasoning from assistant turns at/before the last user query while our
+      shared `ChatMl::qwen2()` renderer re-renders history verbatim (fine for fresh prompts + tool loops,
+      wrong for long multi-turn chats with a thinking Qwen3). A `qwen3()` constructor wants the LFM-style
+      strip (the machinery exists — `turn_content` already does it for `Lfm`) but keyed to Qwen3's
+      "at/before the last user query" rule rather than LFM's "every but the last assistant turn"; gate it
+      on the template byte gate's think case flipping from documented-divergence to byte-equal.
+      *(2026-07-24, found by the byte gate.)*
+- [ ] **General fallback chat renderer from the imported template** — payoff (2) of the hf-chat-template
+      evaluation: for a checkpoint whose family has no hardcoded renderer, render prompts from its own
+      imported `chat_template` (the byte gate now proves the engine is transformers-identical on our
+      three families). Weigh the minijinja dependency against the from-scratch ethos — as a *runtime*
+      feature it puts a Jinja engine on the prompt path, so it wants an explicit opt-in surface (e.g.
+      `chat::from_template(&TokenizerConfig)`) and the preserve_order caveat re-examined (the probe
+      sidesteps it today by living out-of-workspace). *(2026-07-24, split from the evaluation item.)*
 - [x] **Model registry / manifest** — a declarative `ModelSpec` (repo, architecture, weight format, dtype,
       tokenizer, chat template, size tier) + a small built-in catalog of known-good models (Qwen2.5, LFM2.5,
       MiniLM, …); adding a model = a manifest entry. *(2026-07-10) `mummu::registry`: `ModelSpec`
@@ -605,6 +651,10 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       `<|tool_call_start|>[get_weather(city="Paris")]<|tool_call_end|>` from our rendered prompt and the
       parser round-tripped it; the Qwen2 parity gate re-passed both legs after the template refactor
       (max |Δlogit| 2.670e-5, Ollama greedy byte-identical). 16 new unit tests (109 total).*
+      *(2026-07-24) Template-embedded tool JSON now spells `json.dumps` separators (`chat::py_json` —
+      `{"a": 1}`, not compact `{"a":1}`) in BOTH conventions: the P3 template byte gate proved the
+      checkpoints' own templates (Jinja `tojson`) and the models' own emissions use that spacing, and
+      the renders are now byte-identical to `transformers.apply_chat_template` — see the P3 gate item.*
       *(2026-07-10 research)* 2026 community numbers back the plan: Qwen3-8B keeps tool-calling score
       through Q4_K_M (0.919 quantized vs 0.933 full — quant does NOT cost tool reliability, good news for
       P9); BFCL shows a capability cliff below ~7B (Qwen3.5-9B 66.1% vs 4B 50.3%), so the zoo's
@@ -673,6 +723,15 @@ that fits the model AND uses every device to the fullest.
       under the 150 ms ceiling); VRAM peak unchanged (11.5 GiB whole-card). Parity gate byte-identical
       (max |Δlogit| 2.670e-5, Ollama greedy exact); f16 island + CPU budget gates re-passed
       (108.4 ms / 11.7 tok/s GPU gate, 13.2 tok/s CPU). `bench/BASELINE.md` re-baselined.*
+- [ ] **One process cannot mix `Gpu` (f32) and `GpuF16` on the same device** — instantiating `GpuF16`
+      flips Burn's per-device default dtype policy process-wide: a `Gpu` f32 forward that runs afterwards
+      panics reading its logits back (`TypeMismatch: expected F16, got F32`). Found 2026-07-24 as a
+      deterministic pre-existing failure of the old mixed `real_qwen3` suite (reproduced serially on
+      unmodified HEAD, exonerating that run's changes); the test-side fix is the convention that every
+      `GpuF16` leg lives in `real_f16.rs` (own process — qwen3's f16 leg moved there). But the LIBRARY
+      hazard remains for consumers: the P6 precision-*selection* work (pick f16 vs f32 at runtime) must
+      either pin one dtype alias per process, isolate per-device policy, or root-cause the Burn policy
+      flip upstream before an app can switch precision on the fly.
 - [ ] **Placement plan** — given model size + KV-cache + display headroom and the device set, choose a
       **fit-and-fill** plan: single GPU when it fits; **shard layers across multiple GPUs** (pipeline/
       layer-parallel over Burn's multi-device tensors — Burn gives the multi-device *primitives*, not automatic
@@ -758,6 +817,16 @@ The VRAM lever the P6 planner pulls to make the largest useful model fit the use
       the kernel substrate a Q4-weights × f16-activations decode path would ride (vs hand-writing a
       dequant-fused kernel); gate any adoption on the parity harness + `bench/BASELINE.md` —
       https://github.com/tracel-ai/cubecl/releases · https://burn.dev/blog/release-0.21.0/
+- [ ] **KV-cache quantization (FP8/e4m3)** — quantize the KV cache (and optionally the QK/ScoreV attention
+      matmuls) to 8-bit, halving per-token cache footprint — the *other* VRAM lever besides weights, and the
+      one that grows with context length. vLLM shipped exactly this (April 2026) and published the lessons
+      that transfer: uncalibrated per-head e4m3 scales recover 97%+ on reasoning tasks and 94–98% AUC at
+      1M-token contexts; **two-level accumulation is critical** (intermediate f32 writes on long contexts —
+      the same failure our f32-softmax island guards); layer-selective beats uniform (sliding-window layers
+      pay overhead for no benefit); head_dim 256 loses at prefill (~1.6× register pressure) while 64/128 win.
+      For Mummu: our KV cache is f16 on `GpuF16` — an e4m3-quantized cache would halve it again; gate on the
+      parity harness + budgets like every numeric change. — https://vllm.ai/blog/2026-04-22-fp8-kvcache
+      *(2026-07-24 research)*
 - [ ] **Auto-quantize-to-fit** — the planner picks the *highest* precision that fits the detected VRAM
       (f16 → int8 → int4), reports the quality/size trade, and never silently ships a worse tier than asked.
 
