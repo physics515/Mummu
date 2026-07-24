@@ -737,6 +737,30 @@ that fits the model AND uses every device to the fullest.
       layer-parallel over Burn's multi-device tensors — Burn gives the multi-device *primitives*, not automatic
       tensor-parallel, so we place modules on devices ourselves); **spill cold layers to CPU** (GGUF-style
       hybrid) when total VRAM is short. Largest-model-that-fits, every device busy.
+      *(2026-07-24, design settled)* **Heterogeneous per-device precision comes from ONE source file —
+      no new format.** The checkpoint stores weights once (bf16 safetensors, or a GGUF); each pipeline
+      stage *derives* its own in-memory representation at load: cast bf16→f32 for the big GPU and
+      bf16→f16 for a SHADER_F16-capable iGPU (both = the existing `CastFloatAdapter` path, quality-free
+      casts), and quantize int8/int4 for the CPU stage (the P9 keep-quantized leg; naive round-to-nearest
+      from bf16 is worse than a calibrated GPTQ/K-quant artifact, so prefer an on-the-fly *block-wise*
+      Q4_K-style quant — llama.cpp's offline K-quants are data-free, same math). The inverse also holds
+      and already runs: one Q4_K_M GGUF can serve f32/f16 stages by dequant/upcast (at Q4 quality) and
+      the CPU stage keep-quantized — so "one file" is a quality-vs-disk choice (bf16 = quality-max,
+      GGUF = size-min), never a format question. The only format-adjacent addition is a later
+      **derived-artifact cache** (don't re-quantize 30 layers per launch): a per-user cache dir of
+      ordinary safetensors/GGUF shards keyed by (source hash, dtype, layer range) — a cache, not a
+      format. The real work is runtime, in dependency order: (1) test the dtype-policy hazard above
+      *across* devices first — the flip is per-device, so f32-on-discrete + f16-on-iGPU in one process
+      is expected to work but is exactly the unproven experiment; (2) the stage-composed model type —
+      `CausalLm<B>` is generic over ONE backend, a GPU+iGPU split can stay one `Wgpu` backend with
+      per-tensor dtypes (Burn 0.21 multi-dtype, the f32-softmax island already does per-tensor casts),
+      but the CPU stage is a different backend *type* (`burn-flex`), so the GPU→CPU seam is a
+      host-memory transfer between two backend generics; (3) activations cast at stage seams (small
+      tensors, cheap); (4) per-stage KV-cache shards + the micro-batch schedule (the multi-GPU item).
+      Expectation to encode in the planner: pipeline throughput = the slowest stage, so iGPU/CPU stages
+      exist to make a model FIT, not to make a fitting model faster — fit-and-fill, per-device precision
+      picked by what fits + what the device advertises (`inventory()` already records SHADER_F16 +
+      max_buffer_bytes + true VRAM per adapter).
 - [ ] **Multi-GPU execution** — run the sharded plan: per-device sub-modules, activations handed across the
       device boundary between stages, KV-cache per shard, and a micro-batch/pipeline schedule so the GPUs
       overlap rather than idle. *(Tensor-parallel within a layer is the stretch goal; layer/pipeline split is
