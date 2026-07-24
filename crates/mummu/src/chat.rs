@@ -96,7 +96,7 @@ impl Turn {
         let blocks: Vec<String> = calls
             .iter()
             .map(|c| {
-                let json = serde_json::to_string(c).unwrap_or_default();
+                let json = py_json(c);
                 debug_assert!(!json.is_empty(), "a ToolCall always serializes");
                 format!("<tool_call>\n{json}\n</tool_call>")
             })
@@ -251,6 +251,64 @@ pub struct ToolSpec {
 struct ToolWire<'a> {
     r#type: &'static str,
     function: &'a ToolSpec,
+}
+
+/// Serialize exactly as Python's `json.dumps(value, ensure_ascii=False)`
+/// spells it: `", "` between items and `": "` after keys (json.dumps'
+/// default separators). The checkpoint chat templates these renders are
+/// byte-verified against embed tool JSON via Jinja's `tojson` — json.dumps
+/// underneath — and the models were trained on (and emit back) that spacing,
+/// e.g. Qwen2.5's observed `{"name": "get_weather", "arguments": {"city":
+/// "Paris"}}`, so byte-stable rendering must match it. Escaping needs no
+/// shim: serde_json and `ensure_ascii=False` agree (`"`, `\`, and control
+/// chars escaped; unicode kept raw). Public because anything composing wire
+/// JSON for a prompt (a consumer building history turns by hand, the
+/// template byte gate) must spell it identically.
+#[must_use]
+pub fn py_json<T: serde::Serialize>(value: &T) -> String {
+    let mut out = Vec::with_capacity(128);
+    let mut ser = serde_json::Serializer::with_formatter(&mut out, PyJsonFormatter);
+    if value.serialize(&mut ser).is_err() {
+        debug_assert!(false, "py_json: a chat wire value always serializes");
+        return String::new();
+    }
+    debug_assert!(!out.is_empty(), "py_json: JSON of any value is non-empty");
+    String::from_utf8(out).unwrap_or_default()
+}
+
+/// The `json.dumps`-separator formatter behind [`py_json`]: `", "`/`": "`
+/// instead of serde_json's compact `","`/`":"`. Everything else is default.
+struct PyJsonFormatter;
+
+impl serde_json::ser::Formatter for PyJsonFormatter {
+    fn begin_array_value<W>(&mut self, writer: &mut W, first: bool) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(b", ")
+        }
+    }
+
+    fn begin_object_key<W>(&mut self, writer: &mut W, first: bool) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(b", ")
+        }
+    }
+
+    fn begin_object_value<W>(&mut self, writer: &mut W) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        writer.write_all(b": ")
+    }
 }
 
 /// One tool invocation, as emitted by the model inside `<tool_call>` tags.
@@ -767,11 +825,10 @@ impl ChatMl {
              You are provided with function signatures within <tools></tools> XML tags:\n<tools>",
         );
         for tool in tools {
-            let json = serde_json::to_string(&ToolWire {
+            let json = py_json(&ToolWire {
                 r#type: "function",
                 function: tool,
-            })
-            .unwrap_or_default();
+            });
             debug_assert!(!json.is_empty(), "a ToolSpec always serializes");
             system.push('\n');
             system.push_str(&json);
@@ -804,7 +861,7 @@ impl ChatMl {
             if i > 0 {
                 system.push_str(", ");
             }
-            let json = serde_json::to_string(tool).unwrap_or_default();
+            let json = py_json(tool);
             debug_assert!(!json.is_empty(), "a ToolSpec always serializes");
             system.push_str(&json);
         }
@@ -869,6 +926,29 @@ mod tests {
         let _ = ChatMl::qwen2().render(&[]);
     }
 
+    /// `py_json` must spell values exactly as Python's
+    /// `json.dumps(..., ensure_ascii=False)` — the `tojson` the checkpoint
+    /// templates run. Expected strings below are literal CPython output.
+    #[test]
+    fn py_json_matches_json_dumps_spelling() {
+        let v = serde_json::json!({
+            "b": [1, 2.5, true, false, null],
+            "a": {"nested": "va\"l\n"},
+            "c": "héllo→"
+        });
+        // serde_json Value maps iterate sorted (BTreeMap), so keys come out
+        // a, b, c — json.dumps of the same (sorted) dict spells:
+        assert_eq!(
+            py_json(&v),
+            "{\"a\": {\"nested\": \"va\\\"l\\n\"}, \
+             \"b\": [1, 2.5, true, false, null], \
+             \"c\": \"héllo→\"}"
+        );
+        // Empty containers carry no inner spacing, same as json.dumps.
+        assert_eq!(py_json(&serde_json::json!({})), "{}");
+        assert_eq!(py_json(&serde_json::json!([])), "[]");
+    }
+
     fn weather_tool() -> ToolSpec {
         ToolSpec {
             name: "get_weather".into(),
@@ -898,7 +978,7 @@ mod tests {
              You may call one or more functions to assist with the user query.\n\n\
              You are provided with function signatures within <tools></tools> XML tags:\n\
              <tools>\n\
-             {\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"description\":\"Get the current weather for a city.\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"}}}\n\
+             {\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}}\n\
              </tools>\n\n\
              For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n\
              <tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n\
@@ -930,7 +1010,7 @@ mod tests {
         // The assistant history turn carries the <tool_call> block it emitted.
         assert!(raw.contains(
             "<|im_start|>assistant\n<tool_call>\n\
-             {\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}\n\
+             {\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n\
              </tool_call><|im_end|>\n"
         ));
         // Both results ride in ONE user turn, each in its own block.
@@ -1010,7 +1090,7 @@ mod tests {
             ],
         );
         let expected = "<|startoftext|><|im_start|>system\nYou are a helpful assistant.\n\
-             List of tools: [{\"name\":\"get_weather\",\"description\":\"Get the current weather for a city.\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"}}]<|im_end|>\n\
+             List of tools: [{\"name\": \"get_weather\", \"description\": \"Get the current weather for a city.\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}]<|im_end|>\n\
              <|im_start|>user\nWeather in Paris?<|im_end|>\n\
              <|im_start|>assistant\n";
         assert_eq!(raw, expected);
@@ -1030,8 +1110,8 @@ mod tests {
         let mut second = weather_tool();
         second.name = "get_time".into();
         let raw = ChatMl::lfm2().render_with_tools(&[weather_tool(), second], &[Turn::user("hi")]);
-        assert!(raw.contains("\"name\":\"get_weather\""));
-        assert!(raw.contains("}, {\"name\":\"get_time\""));
+        assert!(raw.contains("\"name\": \"get_weather\""));
+        assert!(raw.contains("}, {\"name\": \"get_time\""));
         assert_eq!(raw.matches("List of tools: [").count(), 1);
     }
 

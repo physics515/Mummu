@@ -1,0 +1,22 @@
+# A standalone reference renderer for the P3/P4 template byte gate: render a
+# checkpoint's own `chat_template` Jinja exactly as Python
+# `transformers.apply_chat_template` would (hf-chat-template = minijinja + a
+# transformers compatibility layer, corpus-checked byte-identical upstream),
+# so crates/mummu/tests/template_gate.rs can assert our hardcoded `chat`
+# renderers reproduce the imported template byte-for-byte. Deliberately
+# OUTSIDE the cargo workspace: hf-chat-template enables serde_json's
+# `preserve_order` feature, and features being additive, a dev-dependency
+# would silently flip mummu's own test builds from serde_json's default
+# (sorted) map order to insertion order — diverging the very renders the
+# tests byte-verify from what plain-feature consumers build.
+[package]
+name = "template-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+hf-chat-template = "0.2.1"
+serde_json = "1"
+
+[workspace]
