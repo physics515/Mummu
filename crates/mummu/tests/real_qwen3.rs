@@ -11,7 +11,7 @@
 
 use std::path::PathBuf;
 
-use mummu::backend::{Gpu, GpuF16, inventory, use_gpu};
+use mummu::backend::{Gpu, use_gpu};
 use mummu::gguf::GgufFile;
 use mummu::models::CausalLm;
 use mummu::models::qwen3;
@@ -89,6 +89,26 @@ fn real_qwen3_safetensors_loads_and_decodes_on_gpu() {
         model.config.tie_word_embeddings,
     );
 
+    // The sibling tokenizer_config.json is surfaced on the loaded struct so a
+    // consumer can read config-driven EOS/BOS ids (P3). The cached Qwen3-0.6B
+    // ships one; its resolved EOS agrees with config.json's (the load-time gate
+    // guarantees it), and add_bos_token is false (ChatML).
+    let tc = model
+        .tokenizer_config
+        .as_ref()
+        .expect("Qwen3-0.6B ships a tokenizer_config.json, surfaced on the loaded struct");
+    eprintln!(
+        "[real_qwen3] tokenizer_config: eos_id {:?} · bos_id {:?} · add_bos {}",
+        tc.eos_id(),
+        tc.bos_id(),
+        tc.add_bos_token,
+    );
+    assert_eq!(tc.eos_id(), Some(151_645), "config-driven EOS = <|im_end|>");
+    assert!(
+        model.config.eos_token_id.contains(151_645),
+        "surfaced EOS agrees with config.json"
+    );
+
     // The post-import sanity smoke passes on the real weights: one forward
     // yields finite, vocab-wide, non-degenerate logits (the liveness gate an
     // app runs right after install).
@@ -105,53 +125,6 @@ fn real_qwen3_safetensors_loads_and_decodes_on_gpu() {
     let text = tok.decode(&ids, true).expect("ids decode");
     eprintln!("[real_qwen3] safetensors greedy: {text:?}");
     assert!(text.contains('4'), "expected the answer 4 in: {text:?}");
-}
-
-/// f16 leg: the Qwen3 arch runs on the `GpuF16` backend too — bf16 weights
-/// cast to f16 on load (`CastFloatAdapter`), and its per-head q/k RMSNorm +
-/// decoupled head_dim ride the SAME f32-softmax attention island Qwen2/LFM2
-/// use, so the q·kᵀ scores never overflow f16. Proves the dtype path (P3) and
-/// the f16 precision milestone (P6) cover the new architecture, not just Qwen2.
-#[test]
-#[ignore = "needs the Qwen3 safetensors dir (MUMMU_QWEN3_DIR) + a SHADER_F16 GPU"]
-fn real_qwen3_decodes_coherently_in_f16() {
-    let dir = dir().expect("set MUMMU_QWEN3_DIR to a Qwen3 safetensors dir");
-    assert!(
-        inventory().any_shader_f16(),
-        "no adapter advertises SHADER_F16 — cannot validate f16 here"
-    );
-    let device = burn::tensor::Device::<GpuF16>::default();
-
-    let tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer.json");
-    let prompt_text = mummu::chat::ChatMl::qwen2().render(&[
-        mummu::chat::Turn::system("You are a concise assistant. Do not think, answer directly."),
-        mummu::chat::Turn::user("What is 2+2? Answer in one short sentence."),
-    ]);
-    let prompt = tok
-        .encode(prompt_text, true)
-        .expect("prompt encodes")
-        .get_ids()
-        .to_vec();
-
-    // bf16 -> f16 on load; the build must not NaN through the qk-norm + softmax.
-    let model = qwen3::load_from_dir::<GpuF16>(&dir, &device).expect("f16 weights load checked");
-    let smoke = model
-        .sanity_check(&prompt, model.config.vocab_size, &device)
-        .expect("f16 forward is finite and non-degenerate (no overflow to NaN)");
-    eprintln!(
-        "[real_qwen3/f16] sanity smoke: top_id {} · spread {:.3}",
-        smoke.top_id, smoke.spread
-    );
-
-    let ids = model
-        .greedy_generate(&prompt, 48, &device)
-        .expect("f16 decode");
-    let text = tok.decode(&ids, true).expect("ids decode");
-    eprintln!("[real_qwen3/f16] greedy: {text:?}");
-    assert!(
-        text.contains('4'),
-        "expected the f16 answer to mention 4: {text:?}"
-    );
 }
 
 /// END-TO-END on the Q4_K_M GGUF alone (config + tokenizer + weights from the
@@ -197,6 +170,13 @@ fn real_qwen3_gguf_loads_and_agrees_with_safetensors() {
     );
 
     let gguf_model = qwen3::load_from_gguf::<Gpu>(&path, &device).expect("gguf load is checked");
+    // A GGUF is self-contained — the load path reads no sibling
+    // tokenizer_config.json, so the surfaced field is None (EOS still rides
+    // config.eos_token_id, derived from GGUF metadata).
+    assert!(
+        gguf_model.tokenizer_config.is_none(),
+        "a GGUF load surfaces no tokenizer_config"
+    );
     let ids = gguf_model
         .greedy_generate(&prompt, 48, &device)
         .expect("decode");

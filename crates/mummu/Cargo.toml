@@ -21,6 +21,15 @@ once_cell = { workspace = true }
 burn-flex = { workspace = true }
 burn-store = { workspace = true }
 
+[dev-dependencies]
+# Test-only reference renderer for the imported `chat_template` Jinja: claims
+# byte-identical output to `transformers.apply_chat_template`. Powers the
+# template-vs-renderer BYTE gate (tests/template_gate.rs); production prompt
+# wrapping stays the hardcoded, byte-verified `chat` renderers.
+# Default features stay ON: they carry minijinja's Python-compat layer
+# (str.startswith etc.), which real HF templates (Qwen3's included) call.
+hf-chat-template = "0.2.1"
+
 [target.'cfg(windows)'.dependencies]
 # One syscall (GlobalMemoryStatusEx) for the device inventory's total-RAM
 # figure; the narrow feature keeps the compile cost near zero. (The DXGI

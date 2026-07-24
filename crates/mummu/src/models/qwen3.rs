@@ -166,6 +166,12 @@ pub struct Qwen3<B: Backend> {
 pub struct LoadedQwen3<B: Backend> {
     pub model: Qwen3<B>,
     pub config: Qwen3Config,
+    /// The parsed sibling `tokenizer_config.json`, when one was present and
+    /// well-formed beside a safetensors checkpoint (the load-time gate has
+    /// already cross-checked its EOS against `config.json`). A consumer reads
+    /// config-driven EOS/BOS/PAD ids from it (`eos_id()`, `bos_id()`, …). `None`
+    /// for a GGUF load (self-contained; no sibling file) or a dir without one.
+    pub tokenizer_config: Option<crate::tok_config::TokenizerConfig>,
 }
 
 fn build<B: Backend>(cfg: &Qwen3Config, device: &B::Device) -> Qwen3<B> {
@@ -242,21 +248,36 @@ pub fn load_from_dir<B: Backend>(
     // renderer, and every added-token id it declares must match the real
     // tokenizer.json. A repackaging mismatch fails loudly here rather than
     // mis-stopping / mis-templating / mis-tokenizing later.
-    crate::tokenizer::validate_checkpoint_dir(
+    let tokenizer_config = crate::tokenizer::validate_checkpoint_dir(
         dir,
         &config.eos_token_id.to_vec(),
         Some(crate::tok_config::ToolCallConvention::Hermes),
     )?;
+    debug_assert!(
+        tokenizer_config
+            .as_ref()
+            .and_then(crate::tok_config::TokenizerConfig::eos_id)
+            .is_none_or(|id| config.eos_token_id.contains(id)),
+        "validate_checkpoint_dir returned a config whose EOS disagrees with config.json"
+    );
 
     let mut model = build::<B>(&config, device);
-    let target_float = Tensor::<B, 1>::zeros([1], device).dtype();
+    // The backend's float dtype, taken from the TYPE (`B::FloatElem`), never
+    // from a probe tensor: unspecified-dtype tensor creation follows the
+    // per-DEVICE default policy, which another backend alias sharing the
+    // device (Gpu vs GpuF16) may have flipped in this process.
+    let target_float = <B::FloatElem as burn::tensor::Element>::dtype();
     let mut store = install_remaps(
         SafetensorsStore::from_file(weights.clone())
             .with_from_adapter(PyTorchToBurnAdapter.chain(CastFloatAdapter::new(target_float)))
             .allow_partial(true),
     );
     load_checked(&mut model, &mut store, &weights)?;
-    Ok(LoadedQwen3 { model, config })
+    Ok(LoadedQwen3 {
+        model,
+        config,
+        tokenizer_config,
+    })
 }
 
 /// GGUF (llama.cpp `qwen3` arch) tensor names → the HF checkpoint names the
@@ -311,14 +332,23 @@ pub fn load_from_gguf<B: Backend>(
     assert!(blob.len() > 8, "a parsed GGUF yields a non-empty blob");
 
     let mut model = build::<B>(&config, device);
-    let target_float = Tensor::<B, 1>::zeros([1], device).dtype();
+    // The backend's float dtype, taken from the TYPE (`B::FloatElem`), never
+    // from a probe tensor: unspecified-dtype tensor creation follows the
+    // per-DEVICE default policy, which another backend alias sharing the
+    // device (Gpu vs GpuF16) may have flipped in this process.
+    let target_float = <B::FloatElem as burn::tensor::Element>::dtype();
     let mut store = install_remaps(
         SafetensorsStore::from_bytes(Some(blob))
             .with_from_adapter(PyTorchToBurnAdapter.chain(CastFloatAdapter::new(target_float)))
             .allow_partial(true),
     );
     load_checked(&mut model, &mut store, path)?;
-    Ok(LoadedQwen3 { model, config })
+    // A GGUF is self-contained — no sibling tokenizer_config.json in this path.
+    Ok(LoadedQwen3 {
+        model,
+        config,
+        tokenizer_config: None,
+    })
 }
 
 impl<B: Backend> CausalLm<B> for LoadedQwen3<B> {
@@ -468,6 +498,7 @@ mod tests {
         let loaded = LoadedQwen3::<Cpu> {
             model: build(&cfg, &device),
             config: cfg,
+            tokenizer_config: None,
         };
 
         let prompt: Vec<u32> = vec![3, 14, 15, 9, 26];
@@ -502,6 +533,7 @@ mod tests {
         let loaded = LoadedQwen3::<Cpu> {
             model: build(&cfg, &device),
             config: cfg,
+            tokenizer_config: None,
         };
         assert!(loaded.model.lm_head.is_some());
         let mut cache = loaded.new_cache();
@@ -611,6 +643,7 @@ mod tests {
         let loaded = LoadedQwen3::<Cpu> {
             model: build(&cfg, &device),
             config: cfg,
+            tokenizer_config: None,
         };
         let out = loaded.greedy_generate(&[1, 2, 3], 4, &device).unwrap();
         assert!(out.len() <= 4);

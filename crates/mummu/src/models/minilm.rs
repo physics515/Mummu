@@ -172,7 +172,10 @@ pub fn load_from_dir<B: Backend>(
     })?;
 
     let mut model = build::<B>(&config, device);
-    let target_float = Tensor::<B, 1>::zeros([1], device).dtype();
+    // Type-level float dtype (`B::FloatElem`) — a probe tensor would follow
+    // the per-DEVICE default policy, which another backend alias sharing the
+    // device (Gpu vs GpuF16) may have flipped in this process.
+    let target_float = <B::FloatElem as burn::tensor::Element>::dtype();
     match weights_file(dir)? {
         WeightsFile::Safetensors(weights) => {
             let mut store = SafetensorsStore::from_file(weights.clone())

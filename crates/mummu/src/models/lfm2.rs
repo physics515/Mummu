@@ -279,6 +279,12 @@ pub enum HybridKv<B: Backend> {
 pub struct LoadedLfm2<B: Backend> {
     pub model: Lfm2<B>,
     pub config: Lfm2Config,
+    /// The parsed sibling `tokenizer_config.json`, when one was present and
+    /// well-formed beside a safetensors checkpoint (the load-time gate has
+    /// already cross-checked its EOS against `config.json`). A consumer reads
+    /// config-driven EOS/BOS/PAD ids from it (`eos_id()`, `bos_id()`, …). `None`
+    /// for a GGUF load (self-contained; no sibling file) or a dir without one.
+    pub tokenizer_config: Option<crate::tok_config::TokenizerConfig>,
 }
 
 fn build<B: Backend>(cfg: &Lfm2Config, device: &B::Device) -> Lfm2<B> {
@@ -345,14 +351,24 @@ pub fn load_from_dir<B: Backend>(
     // tokenizer_config.json EOS agreement with config.json, a chat-template that
     // speaks LFM2.5's bracket-notation tool-call convention, and added-token ids
     // that match the real tokenizer.json — a repackaging mismatch fails loudly.
-    crate::tokenizer::validate_checkpoint_dir(
+    let tokenizer_config = crate::tokenizer::validate_checkpoint_dir(
         dir,
         &config.eos_token_id.to_vec(),
         Some(crate::tok_config::ToolCallConvention::Lfm),
     )?;
+    debug_assert!(
+        tokenizer_config
+            .as_ref()
+            .and_then(crate::tok_config::TokenizerConfig::eos_id)
+            .is_none_or(|id| config.eos_token_id.contains(id)),
+        "validate_checkpoint_dir returned a config whose EOS disagrees with config.json"
+    );
 
     let mut model = build::<B>(&config, device);
-    let target_float = Tensor::<B, 1>::zeros([1], device).dtype();
+    // Type-level float dtype (`B::FloatElem`) — a probe tensor would follow
+    // the per-DEVICE default policy, which another backend alias sharing the
+    // device (Gpu vs GpuF16) may have flipped in this process.
+    let target_float = <B::FloatElem as burn::tensor::Element>::dtype();
     let mut store = SafetensorsStore::from_file(weights.clone())
         .with_from_adapter(PyTorchToBurnAdapter.chain(CastFloatAdapter::new(target_float)))
         .allow_partial(true)
@@ -368,7 +384,11 @@ pub fn load_from_dir<B: Backend>(
             "$1.gamma",
         );
     load_checked(&mut model, &mut store, &weights)?;
-    Ok(LoadedLfm2 { model, config })
+    Ok(LoadedLfm2 {
+        model,
+        config,
+        tokenizer_config,
+    })
 }
 
 /// GGUF (llama.cpp `lfm2` arch) tensor names → the HF checkpoint names the
@@ -436,7 +456,10 @@ pub fn load_from_gguf<B: Backend>(
     assert!(blob.len() > 8, "a parsed GGUF yields a non-empty blob");
 
     let mut model = build::<B>(&config, device);
-    let target_float = Tensor::<B, 1>::zeros([1], device).dtype();
+    // Type-level float dtype (`B::FloatElem`) — a probe tensor would follow
+    // the per-DEVICE default policy, which another backend alias sharing the
+    // device (Gpu vs GpuF16) may have flipped in this process.
+    let target_float = <B::FloatElem as burn::tensor::Element>::dtype();
     let mut store = SafetensorsStore::from_bytes(Some(blob))
         .with_from_adapter(PyTorchToBurnAdapter.chain(CastFloatAdapter::new(target_float)))
         .allow_partial(true)
@@ -452,7 +475,12 @@ pub fn load_from_gguf<B: Backend>(
             "$1.gamma",
         );
     load_checked(&mut model, &mut store, path)?;
-    Ok(LoadedLfm2 { model, config })
+    // A GGUF is self-contained — no sibling tokenizer_config.json in this path.
+    Ok(LoadedLfm2 {
+        model,
+        config,
+        tokenizer_config: None,
+    })
 }
 
 impl<B: Backend> CausalLm<B> for LoadedLfm2<B> {
@@ -632,6 +660,7 @@ mod tests {
         let loaded = LoadedLfm2::<Cpu> {
             model: build(&cfg, &device),
             config: cfg,
+            tokenizer_config: None,
         };
 
         let prompt: Vec<u32> = vec![5, 11, 2, 30];
@@ -663,6 +692,7 @@ mod tests {
         let loaded = LoadedLfm2::<Cpu> {
             model: build(&cfg, &device),
             config: cfg,
+            tokenizer_config: None,
         };
         let out = loaded.greedy_generate(&[1, 2], 3, &device).unwrap();
         assert!(out.len() <= 3);
