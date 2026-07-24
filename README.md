@@ -48,7 +48,9 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
   family's renderer, or — when a `tokenizer.json` sits beside it — whose declared added-token ids don't
   match that real tokenizer, is a loud `ImportError::Inconsistent` instead of a model that silently
   mis-stops, mis-templates, or mis-tokenizes. Both sibling files are optional (a GGUF-derived dir has
-  neither → no behavior change).
+  neither → no behavior change). On a successful safetensors load the parsed `TokenizerConfig` is surfaced
+  on the returned `Loaded{Qwen2,Qwen3,Lfm2}` struct (`tokenizer_config`), so a consumer reads config-driven
+  EOS/BOS/PAD ids straight off the model; a GGUF load surfaces `None` (self-contained).
 - **Import validation** — a two-stage error taxonomy: `ImportError` for the file→module stage (missing
   file, parse, load, and an `Incomplete` per-tensor missing/errored diff) and `SanityError` for the
   runtime liveness a checked load can't see — NaN/Inf logits, a vocab-width mismatch, or a
@@ -85,13 +87,18 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
   parsers are bounded with a loud error taxonomy. Proven end-to-end on the real GPU: Qwen2.5-1.5B
   emitted a parseable Hermes call and LFM2.5-1.2B emitted exactly
   `<|tool_call_start|>[get_weather(city="Paris")]<|tool_call_end|>` (`tests/real_toolcall.rs`,
-  `tests/real_toolcall_lfm.rs`). And the renders are **byte-identical to
-  `transformers.apply_chat_template`** running each checkpoint's own imported template — plain,
-  tools, and tool-call-history shapes for Qwen2.5/Qwen3/LFM2.5 all pass a 9-case byte gate
-  (`tests/template_gate.rs` against the `tools/template-probe` reference renderer; embedded tool JSON
-  spells json.dumps' separators via `chat::py_json`, the same spelling the models emit back); the only
-  family divergences (default no-system preambles, Qwen3 history think-stripping) are pinned to their
-  exact deltas in the gate.
+  `tests/real_toolcall_lfm.rs`).
+- **Template byte gate** — the hardcoded renderers are proven **byte-identical to
+  `transformers.apply_chat_template`** rendering the checkpoint's own imported `chat_template`
+  (via the `hf-chat-template` dev-dependency): plain, multi-turn, the full Hermes `# Tools` block,
+  and function-call history match byte-for-byte on **Qwen3-0.6B, Qwen2.5-1.5B, and LFM2.5-1.2B**
+  (LFM's legs cover both tool conventions, its `tool` role turns, its history think-stripping, and
+  the standalone `chat_template.jinja` import path), `tests/template_gate.rs`. The known family
+  divergences are pinned to their exact deltas so any other drift fails loudly: Qwen2.5's no-system
+  branding preamble vs our neutral one, Qwen3's no-system no-preamble, and Qwen3's history
+  think-stripping (ours re-renders history verbatim — a `ChatMl::qwen3()` is a roadmap item).
+  Prompt JSON deliberately serializes with Python `json.dumps` spacing and insertion-order keys
+  (serde_json `preserve_order`) — the exact bytes the reference stack renders and models emit back.
 - **f16 inference, validated** — Qwen2.5-1.5B runs coherently on `GpuF16` (weights + KV in f16, the
   q·kᵀ attention scores + softmax computed in an f32 island to stop f16 overflow): **~3.6 GiB runner
   VRAM vs ~7.9 GiB f32, at identical speed**; the parity gate re-passes unchanged on f32, where the

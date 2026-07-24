@@ -1,22 +1,36 @@
-//! f16 on-GPU validation (the P6 precision milestone): load Qwen2.5 on the
-//! `GpuF16` backend and prove the three claims — no shader-compile crash,
+//! f16 on-GPU validation (the P6 precision milestone): load real checkpoints
+//! on the `GpuF16` backend and prove the claims — no shader-compile crash,
 //! materially lower VRAM than f32, coherent greedy output. Ignored by
 //! default; run with
 //!
 //! ```text
-//! MUMMU_QWEN2_DIR=path/to/qwen2.5-1.5b cargo test -p mummu --release --test real_f16 -- --ignored --nocapture
+//! MUMMU_QWEN2_DIR=path/to/qwen2.5-1.5b MUMMU_QWEN3_DIR=path/to/qwen3-0.6b \
+//!   cargo test -p mummu --release --test real_f16 -- --ignored --nocapture
 //! ```
+//!
+//! Every `GpuF16` leg lives in THIS binary, isolated from the f32 suites:
+//! Burn resolves unspecified-dtype tensor creation against a per-DEVICE
+//! default policy, so a `GpuF16` client and a `Gpu` client sharing the
+//! device inside one process can flip each other's ambient float dtype
+//! (observed 2026-07-23: an f32 GGUF leg read back F16 logits after an f16
+//! test ran first). Separate test binaries = separate processes = isolation.
 
 use std::path::PathBuf;
 
 use mummu::backend::{GpuF16, inventory};
 use mummu::models::CausalLm;
-use mummu::models::qwen2;
+use mummu::models::{qwen2, qwen3};
 use tokenizers::Tokenizer;
 
 fn qwen2_dir() -> Option<PathBuf> {
     let dir = PathBuf::from(std::env::var_os("MUMMU_QWEN2_DIR")?);
     dir.is_dir().then_some(dir)
+}
+
+fn qwen3_dir() -> Option<PathBuf> {
+    std::env::var_os("MUMMU_QWEN3_DIR")
+        .map(PathBuf::from)
+        .filter(|d| d.join("model.safetensors").is_file())
 }
 
 #[test]
@@ -67,21 +81,13 @@ fn qwen2_decodes_coherently_in_f16_on_gpu() {
     // this test runs) — recorded in bench/BASELINE.md.
 }
 
-fn qwen3_dir() -> Option<PathBuf> {
-    std::env::var_os("MUMMU_QWEN3_DIR")
-        .map(PathBuf::from)
-        .filter(|d| d.join("model.safetensors").is_file())
-}
-
-/// f16 leg of the Qwen3 port: bf16 weights cast to f16 on load
-/// (`CastFloatAdapter`), the per-head q/k RMSNorm + decoupled head_dim riding
-/// the SAME f32-softmax attention island Qwen2/LFM2 use, so the q·kᵀ scores
-/// never overflow f16. Lives HERE and not in `real_qwen3.rs` because every
-/// `GpuF16` leg needs its own process: instantiating `GpuF16` flips Burn's
-/// per-device default dtype policy, and any `Gpu` (f32) test that runs later
-/// in the same process then reads its logits back as F16 — a deterministic
-/// `TypeMismatch` panic, reproduced on unmodified HEAD (2026-07-24) by
-/// running the old mixed `real_qwen3` suite serially.
+/// f16 leg for the Qwen3 dense arch — bf16 weights cast to f16 on load
+/// (`CastFloatAdapter`), and its per-head q/k RMSNorm + decoupled head_dim
+/// ride the SAME f32-softmax attention island Qwen2/LFM2 use, so the q·kᵀ
+/// scores never overflow f16. Proves the dtype path (P3) and the f16
+/// precision milestone (P6) cover the new architecture, not just Qwen2.
+/// (Moved here from `real_qwen3.rs` for the process isolation the module
+/// docs describe.)
 #[test]
 #[ignore = "needs the Qwen3 safetensors dir (MUMMU_QWEN3_DIR) + a SHADER_F16 GPU"]
 fn real_qwen3_decodes_coherently_in_f16() {
@@ -92,7 +98,7 @@ fn real_qwen3_decodes_coherently_in_f16() {
     );
     let device = burn::tensor::Device::<GpuF16>::default();
 
-    let tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer.json");
+    let tok = Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer.json");
     let prompt_text = mummu::chat::ChatMl::qwen2().render(&[
         mummu::chat::Turn::system("You are a concise assistant. Do not think, answer directly."),
         mummu::chat::Turn::user("What is 2+2? Answer in one short sentence."),
@@ -104,8 +110,7 @@ fn real_qwen3_decodes_coherently_in_f16() {
         .to_vec();
 
     // bf16 -> f16 on load; the build must not NaN through the qk-norm + softmax.
-    let model =
-        mummu::models::qwen3::load_from_dir::<GpuF16>(&dir, &device).expect("f16 load checked");
+    let model = qwen3::load_from_dir::<GpuF16>(&dir, &device).expect("f16 weights load checked");
     let smoke = model
         .sanity_check(&prompt, model.config.vocab_size, &device)
         .expect("f16 forward is finite and non-degenerate (no overflow to NaN)");
