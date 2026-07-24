@@ -740,7 +740,7 @@ that fits the model AND uses every device to the fullest.
       decoration tolerance; wgpu still exposes nothing portable (gfx-rs/wgpu#2447 open). Dev box:
       15.7 GiB reported for the 4070 Ti SUPER on BOTH its Vulkan and DX12 rows. Remaining: Linux
       (Vulkan memory heaps), macOS (+ RAM sysctl).
-- [ ] **Precision selection** — pick a per-device dtype (f32 / **f16** / int8 / int4) that fits: f16 via
+- [ ] **Precision selection** — pick a per-device dtype (f64 /f32 / **f16** / int8 / int4) that fits: f16 via
       `Wgpu<half::f16, i32>`; drop to int8/int4 (P9) when f16 still won't fit. *(2026-07-11) The f16
       backend itself is now **fully validated** (all 3 claims — see the islands item below); what remains
       here is the *picking* logic, which rides the placement-plan item + P9.*
