@@ -1,16 +1,20 @@
-//! Tokenizer from GGUF metadata — the piece that makes a GGUF file fully
-//! self-contained (no sibling `tokenizer.json` needed).
+//! Tokenizer construction from non-`tokenizer.json` sources.
 //!
-//! llama.cpp stores the tokenizer as `tokenizer.ggml.*` metadata: the vocab
-//! (`tokens`, index = token id), per-token types, BPE `merges`, and a `pre`
-//! identifier naming the pre-tokenizer regex (the ecosystem hardcodes the
-//! regex per model family, exactly as llama.cpp's `llama_vocab` does). This
-//! module rebuilds the equivalent HF `tokenizers` pipeline:
+//! **GGUF metadata** ([`tokenizer_from_gguf`]) — llama.cpp stores the
+//! tokenizer as `tokenizer.ggml.*` metadata: the vocab (`tokens`, index =
+//! token id), per-token types, BPE `merges`, and a `pre` identifier naming
+//! the pre-tokenizer regex (the ecosystem hardcodes the regex per model
+//! family, exactly as llama.cpp's `llama_vocab` does). Rebuilt as:
 //! NFC → Split(pre regex) → ByteLevel → BPE, with control/user-defined
-//! tokens re-added as special/non-special added tokens.
+//! tokens re-added as special/non-special added tokens. Verified
+//! byte-identical vs the checkpoint's `tokenizer.json` in `tests/real_gguf.rs`.
 //!
-//! Faithfulness is verified against the same checkpoint's `tokenizer.json`
-//! (byte-identical ids over a battery of prompts) in `tests/real_gguf.rs`.
+//! **SentencePiece `tokenizer.model`** ([`tokenizer_from_spm`]) — the SPM
+//! proto the Llama/Gemma/T5 families ship. A bounded hand-rolled protobuf
+//! reader (the `gguf.rs` approach — the schema is tiny and frozen) feeds the
+//! same pipeline HF's `convert_slow_tokenizer` assembles: Precompiled
+//! charsmap (+ multi-space collapse) → Metaspace → **Unigram**. Verified
+//! byte-identical vs the checkpoint's `tokenizer.json` in `tests/real_spm.rs`.
 
 use std::path::Path;
 
@@ -320,6 +324,342 @@ fn check_added_token_ids(dir: &Path, cfg: &TokenizerConfig) -> Result<(), Import
     Err(ImportError::Inconsistent { file: path, reason })
 }
 
+// ---------------------------------------------------------------------------
+// SentencePiece `tokenizer.model` import (Llama/Gemma/T5-family checkpoints
+// that ship the SPM proto instead of — or beside — a `tokenizer.json`).
+// ---------------------------------------------------------------------------
+
+/// Largest `tokenizer.model` file the reader will load — an order of magnitude
+/// past the largest real proto (Gemma's 256k-piece model is ~4 MiB).
+const MAX_SPM_FILE_BYTES: u64 = 64 * 1024 * 1024;
+/// Most pieces a proto may declare (Gemma: 256k; bound leaves headroom).
+const MAX_SPM_PIECES: usize = 1_048_576;
+
+/// SentencePiece `ModelProto.SentencePiece.Type` values.
+const SPM_TYPE_NORMAL: i64 = 1;
+const SPM_TYPE_UNKNOWN: i64 = 2;
+const SPM_TYPE_CONTROL: i64 = 3;
+const SPM_TYPE_USER_DEFINED: i64 = 4;
+const SPM_TYPE_UNUSED: i64 = 5;
+const SPM_TYPE_BYTE: i64 = 6;
+
+/// `TrainerSpec.model_type` values.
+const SPM_MODEL_UNIGRAM: i64 = 1;
+const SPM_MODEL_BPE: i64 = 2;
+
+/// One vocab piece out of the proto: `(text, score, type)` at index = id.
+struct SpmPiece {
+    text: String,
+    score: f64,
+    kind: i64,
+}
+
+/// The slice of a SentencePiece `ModelProto` that tokenizer assembly needs.
+struct SpmProto {
+    pieces: Vec<SpmPiece>,
+    model_type: i64,
+    unk_id: i64,
+    precompiled_charsmap: Vec<u8>,
+    add_dummy_prefix: bool,
+    remove_extra_whitespaces: bool,
+}
+
+/// A bounded protobuf wire-format reader (the same hand-rolled-parser approach
+/// as `gguf.rs` — the proto schema is tiny and frozen, a protobuf codegen
+/// dependency would be heavier than the format).
+struct ProtoReader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> ProtoReader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    fn done(&self) -> bool {
+        debug_assert!(self.pos <= self.buf.len(), "pos never overshoots");
+        self.pos >= self.buf.len()
+    }
+
+    /// A base-128 varint, bounded to 10 bytes (the u64 maximum).
+    fn varint(&mut self) -> Result<u64, String> {
+        let mut out: u64 = 0;
+        for shift in 0..10u32 {
+            let Some(&b) = self.buf.get(self.pos) else {
+                return Err("varint runs past the end of the buffer".into());
+            };
+            self.pos += 1;
+            out |= u64::from(b & 0x7f) << (7 * shift).min(63);
+            if b & 0x80 == 0 {
+                return Ok(out);
+            }
+        }
+        Err("varint longer than 10 bytes".into())
+    }
+
+    /// The next field key as `(field_number, wire_type)`.
+    fn key(&mut self) -> Result<(u64, u8), String> {
+        let key = self.varint()?;
+        #[allow(clippy::cast_possible_truncation)] // wire type is 3 bits
+        Ok((key >> 3, (key & 0x7) as u8))
+    }
+
+    /// A length-delimited payload (wire type 2).
+    fn bytes(&mut self) -> Result<&'a [u8], String> {
+        let len = usize::try_from(self.varint()?).map_err(|_| "length overflows usize")?;
+        let end = self
+            .pos
+            .checked_add(len)
+            .filter(|&e| e <= self.buf.len())
+            .ok_or_else(|| format!("length-delimited field of {len} B runs past the end"))?;
+        let out = &self.buf[self.pos..end];
+        self.pos = end;
+        Ok(out)
+    }
+
+    /// Skip one field of the given wire type (unknown/uninteresting fields).
+    fn skip(&mut self, wire_type: u8) -> Result<(), String> {
+        match wire_type {
+            0 => self.varint().map(|_| ()),
+            1 => self.advance(8),
+            2 => self.bytes().map(|_| ()),
+            5 => self.advance(4),
+            other => Err(format!("unsupported protobuf wire type {other}")),
+        }
+    }
+
+    fn advance(&mut self, n: usize) -> Result<(), String> {
+        let end = self
+            .pos
+            .checked_add(n)
+            .filter(|&e| e <= self.buf.len())
+            .ok_or("fixed-width field runs past the end")?;
+        self.pos = end;
+        Ok(())
+    }
+
+    /// A fixed32 float (wire type 5).
+    fn float32(&mut self) -> Result<f32, String> {
+        let end = self.pos + 4;
+        let bytes: [u8; 4] = self
+            .buf
+            .get(self.pos..end)
+            .and_then(|s| s.try_into().ok())
+            .ok_or("float32 runs past the end")?;
+        self.pos = end;
+        Ok(f32::from_le_bytes(bytes))
+    }
+}
+
+/// Parse one `ModelProto.SentencePiece` message: `piece`(1), `score`(2),
+/// `type`(3, default NORMAL).
+fn parse_spm_piece(buf: &[u8]) -> Result<SpmPiece, String> {
+    let mut r = ProtoReader::new(buf);
+    let mut piece = SpmPiece {
+        text: String::new(),
+        score: 0.0,
+        kind: SPM_TYPE_NORMAL,
+    };
+    while !r.done() {
+        let (field, wire) = r.key()?;
+        match (field, wire) {
+            (1, 2) => {
+                piece.text = String::from_utf8(r.bytes()?.to_vec())
+                    .map_err(|_| "piece text is not UTF-8".to_string())?;
+            }
+            (2, 5) => piece.score = f64::from(r.float32()?),
+            (3, 0) => {
+                piece.kind = i64::try_from(r.varint()?).map_err(|_| "piece type overflows")?;
+            }
+            (_, w) => r.skip(w)?,
+        }
+    }
+    Ok(piece)
+}
+
+/// Parse a SentencePiece `ModelProto`: `pieces`(1, repeated),
+/// `trainer_spec`(2) for `model_type`(3)/`unk_id`(40), `normalizer_spec`(3)
+/// for `precompiled_charsmap`(2)/`add_dummy_prefix`(3)/
+/// `remove_extra_whitespaces`(4). Unknown fields are skipped, truncation is a
+/// loud error, and the piece count is bounded.
+fn parse_model_proto(buf: &[u8]) -> Result<SpmProto, String> {
+    let mut proto = SpmProto {
+        pieces: Vec::new(),
+        model_type: SPM_MODEL_UNIGRAM,
+        // The sentencepiece defaults (overridden by every real trainer_spec).
+        unk_id: 0,
+        precompiled_charsmap: Vec::new(),
+        add_dummy_prefix: true,
+        remove_extra_whitespaces: true,
+    };
+    let mut r = ProtoReader::new(buf);
+    while !r.done() {
+        let (field, wire) = r.key()?;
+        match (field, wire) {
+            (1, 2) => {
+                if proto.pieces.len() >= MAX_SPM_PIECES {
+                    return Err(format!("more than {MAX_SPM_PIECES} pieces"));
+                }
+                proto.pieces.push(parse_spm_piece(r.bytes()?)?);
+            }
+            (2, 2) => {
+                let mut t = ProtoReader::new(r.bytes()?);
+                while !t.done() {
+                    let (f, w) = t.key()?;
+                    match (f, w) {
+                        (3, 0) => {
+                            proto.model_type =
+                                i64::try_from(t.varint()?).map_err(|_| "model_type overflows")?;
+                        }
+                        (40, 0) => {
+                            proto.unk_id =
+                                i64::try_from(t.varint()?).map_err(|_| "unk_id overflows")?;
+                        }
+                        (_, w) => t.skip(w)?,
+                    }
+                }
+            }
+            (3, 2) => {
+                let mut n = ProtoReader::new(r.bytes()?);
+                while !n.done() {
+                    let (f, w) = n.key()?;
+                    match (f, w) {
+                        (2, 2) => proto.precompiled_charsmap = n.bytes()?.to_vec(),
+                        (3, 0) => proto.add_dummy_prefix = n.varint()? != 0,
+                        (4, 0) => proto.remove_extra_whitespaces = n.varint()? != 0,
+                        (_, w) => n.skip(w)?,
+                    }
+                }
+            }
+            (_, w) => r.skip(w)?,
+        }
+    }
+    if proto.pieces.is_empty() {
+        return Err("proto declares no pieces".into());
+    }
+    Ok(proto)
+}
+
+/// Build an HF [`Tokenizer`] from a SentencePiece `tokenizer.model` proto
+/// (the Llama/Gemma/T5-family format) — the same pipeline HF's own
+/// `convert_slow_tokenizer` assembles: `Precompiled` charsmap normalizer
+/// (+ a `{2,}`-space collapse when `remove_extra_whitespaces`), a Metaspace
+/// pre-tokenizer/decoder driven by `add_dummy_prefix`, and a **Unigram**
+/// model over the proto's pieces (index = token id). CONTROL/UNKNOWN pieces
+/// become special added tokens, USER_DEFINED become plain added tokens, and
+/// every added id is verified post-build exactly like the GGUF path.
+///
+/// Only `model_type = UNIGRAM` protos are supported so far; the BPE-type
+/// protos (Llama-2 family) are a loud error until that leg lands. Tokens a
+/// checkpoint adds *beyond* the proto (T5's `<extra_id_*>`, chat specials)
+/// live in sibling metadata (`tokenizer_config.json`), not the proto — add
+/// them via [`Tokenizer::add_special_tokens`] after this returns.
+///
+/// Faithfulness is verified against the same checkpoint's `tokenizer.json`
+/// (byte-identical ids over a battery of prompts) in `tests/real_spm.rs`.
+pub fn tokenizer_from_spm(path: &Path) -> Result<Tokenizer, String> {
+    use tokenizers::decoders::metaspace::{Metaspace, PrependScheme};
+    use tokenizers::models::unigram::Unigram;
+    use tokenizers::normalizers::replace::ReplacePattern;
+    use tokenizers::normalizers::{Precompiled, Replace, Sequence as NormSequence};
+
+    let meta = std::fs::metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
+    if meta.len() > MAX_SPM_FILE_BYTES {
+        return Err(format!(
+            "{} is {} B — over the {MAX_SPM_FILE_BYTES} B tokenizer.model bound",
+            path.display(),
+            meta.len()
+        ));
+    }
+    let buf = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let proto = parse_model_proto(&buf).map_err(|e| format!("{}: {e}", path.display()))?;
+    if proto.model_type != SPM_MODEL_UNIGRAM {
+        let name = if proto.model_type == SPM_MODEL_BPE {
+            "BPE".to_string()
+        } else {
+            format!("type {}", proto.model_type)
+        };
+        return Err(format!(
+            "SentencePiece model_type {name} is not supported yet (only UNIGRAM)"
+        ));
+    }
+
+    let unk = usize::try_from(proto.unk_id)
+        .ok()
+        .filter(|&u| u < proto.pieces.len())
+        .ok_or_else(|| format!("unk_id {} is out of vocab range", proto.unk_id))?;
+    let byte_fallback = proto.pieces.iter().any(|p| p.kind == SPM_TYPE_BYTE);
+    let vocab: Vec<(String, f64)> = proto
+        .pieces
+        .iter()
+        .map(|p| (p.text.clone(), p.score))
+        .collect();
+    debug_assert!(vocab.len() == proto.pieces.len(), "vocab keeps every index");
+    let model =
+        Unigram::from(vocab, Some(unk), byte_fallback).map_err(|e| format!("unigram: {e}"))?;
+    let mut tok = Tokenizer::new(model);
+
+    let mut normalizers: Vec<tokenizers::normalizers::NormalizerWrapper> = Vec::with_capacity(2);
+    if !proto.precompiled_charsmap.is_empty() {
+        let pre = Precompiled::from(&proto.precompiled_charsmap)
+            .map_err(|e| format!("precompiled charsmap: {e}"))?;
+        normalizers.push(pre.into());
+    }
+    if proto.remove_extra_whitespaces {
+        // A REGEX pattern (multi-space collapse), exactly as the reference
+        // tokenizer.json spells it — a string pattern would match literally.
+        let collapse = Replace::new(ReplacePattern::Regex(" {2,}".into()), " ")
+            .map_err(|e| format!("replace: {e}"))?;
+        normalizers.push(collapse.into());
+    }
+    if !normalizers.is_empty() {
+        tok.with_normalizer(Some(NormSequence::new(normalizers)))
+            .map_err(|e| format!("normalizer: {e}"))?;
+    }
+
+    let prepend = if proto.add_dummy_prefix {
+        PrependScheme::Always
+    } else {
+        PrependScheme::Never
+    };
+    let metaspace = Metaspace::new('\u{2581}', prepend, true);
+    tok.with_pre_tokenizer(Some(metaspace.clone()));
+    tok.with_decoder(Some(metaspace));
+
+    // CONTROL/UNKNOWN pieces are the proto's specials (<s>, </s>, <unk>, …);
+    // USER_DEFINED are plain added tokens. Re-add + verify like the GGUF path.
+    let mut added: Vec<(usize, &str, bool)> = Vec::new();
+    for (index, p) in proto.pieces.iter().enumerate() {
+        match p.kind {
+            SPM_TYPE_CONTROL | SPM_TYPE_UNKNOWN => added.push((index, &p.text, true)),
+            SPM_TYPE_USER_DEFINED => added.push((index, &p.text, false)),
+            SPM_TYPE_NORMAL | SPM_TYPE_UNUSED | SPM_TYPE_BYTE => {}
+            other => return Err(format!("piece {index} has unsupported type {other}")),
+        }
+    }
+    for &(_, text, special) in &added {
+        let t = AddedToken::from(text.to_string(), special);
+        if special {
+            tok.add_special_tokens([t])
+                .map_err(|e| format!("add special token '{text}': {e}"))?;
+        } else {
+            tok.add_tokens([t])
+                .map_err(|e| format!("add token '{text}': {e}"))?;
+        }
+    }
+    for &(index, text, _) in &added {
+        let got = tok.token_to_id(text);
+        #[allow(clippy::cast_possible_truncation)] // bounded by MAX_SPM_PIECES
+        if got != Some(index as u32) {
+            return Err(format!(
+                "added token '{text}' resolved to id {got:?}, the proto says {index}"
+            ));
+        }
+    }
+    Ok(tok)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,5 +719,132 @@ mod tests {
         let mut f = toy_gguf();
         f.metadata[4].1 = GgufValue::Array(vec![GgufValue::Str("nospace".into())]);
         assert!(tokenizer_from_gguf(&f).unwrap_err().contains("merge"));
+    }
+
+    // ---- SentencePiece proto reader + assembly ----------------------------
+
+    fn pb_varint(mut v: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let byte = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(byte);
+                return out;
+            }
+            out.push(byte | 0x80);
+        }
+    }
+
+    fn pb_field(field: u64, wire: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = pb_varint((field << 3) | u64::from(wire));
+        if wire == 2 {
+            out.extend(pb_varint(payload.len() as u64));
+        }
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// One `SentencePiece` message: piece(1)=text, score(2)=f32, type(3).
+    fn pb_piece(text: &str, score: f32, kind: Option<i64>) -> Vec<u8> {
+        let mut msg = pb_field(1, 2, text.as_bytes());
+        msg.extend(pb_field(2, 5, &score.to_le_bytes()));
+        if let Some(k) = kind {
+            msg.extend(pb_field(3, 0, &pb_varint(k as u64)));
+        }
+        msg
+    }
+
+    /// A tiny UNIGRAM proto: `<unk>`(UNKNOWN) `<s>`(CONTROL) then normal
+    /// pieces, `unk_id = 0`, `add_dummy_prefix` + `remove_extra_whitespaces`.
+    fn toy_spm(model_type: i64) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for msg in [
+            pb_piece("<unk>", 0.0, Some(SPM_TYPE_UNKNOWN)),
+            pb_piece("<s>", 0.0, Some(SPM_TYPE_CONTROL)),
+            pb_piece("\u{2581}", -2.0, None),
+            pb_piece("\u{2581}hello", -1.0, None),
+            pb_piece("hello", -3.0, None),
+        ] {
+            buf.extend(pb_field(1, 2, &msg));
+        }
+        let mut trainer = pb_field(3, 0, &pb_varint(model_type as u64));
+        trainer.extend(pb_field(40, 0, &pb_varint(0))); // unk_id
+        buf.extend(pb_field(2, 2, &trainer));
+        let mut norm = pb_field(3, 0, &pb_varint(1)); // add_dummy_prefix
+        norm.extend(pb_field(4, 0, &pb_varint(1))); // remove_extra_whitespaces
+        buf.extend(pb_field(3, 2, &norm));
+        buf
+    }
+
+    fn spm_file(bytes: &[u8]) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // Unique per call: parallel tests in this process must never share a
+        // file (same-length protos would otherwise collide and race).
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("mummu-spm-test-{}-{n}.model", std::process::id()));
+        std::fs::write(&path, bytes).expect("temp proto writes");
+        path
+    }
+
+    #[test]
+    fn toy_spm_tokenizer_encodes_with_metaspace_and_specials() {
+        let path = spm_file(&toy_spm(SPM_MODEL_UNIGRAM));
+        let tok = tokenizer_from_spm(&path).expect("builds");
+        let _ = std::fs::remove_file(&path);
+
+        // add_dummy_prefix: "hello" → "▁hello" → piece 3.
+        let ids = tok.encode("hello", false).expect("encodes");
+        assert_eq!(ids.get_ids(), &[3], "metaspace prefix + unigram pick");
+        // remove_extra_whitespaces collapses the run before metaspace.
+        let ids = tok.encode("hello  hello", false).expect("encodes");
+        assert_eq!(ids.get_ids(), &[3, 3], "space run collapses to one");
+        // The CONTROL piece is a special added token at its proto index.
+        assert_eq!(tok.token_to_id("<s>"), Some(1));
+        let ids = tok.encode("<s>hello", false).expect("encodes");
+        assert_eq!(ids.get_ids()[0], 1, "special token is never split");
+    }
+
+    #[test]
+    fn spm_rejects_bpe_type_truncation_and_bad_unk() {
+        let path = spm_file(&toy_spm(SPM_MODEL_BPE));
+        let err = tokenizer_from_spm(&path).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert!(err.contains("BPE"), "BPE protos are a loud error: {err}");
+
+        let full = toy_spm(SPM_MODEL_UNIGRAM);
+        let path = spm_file(&full[..full.len() - 3]);
+        let err = tokenizer_from_spm(&path).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            err.contains("end") || err.contains("varint"),
+            "truncation is a loud error, not a panic: {err}"
+        );
+
+        // unk_id past the vocab is rejected.
+        let mut buf = Vec::new();
+        buf.extend(pb_field(1, 2, &pb_piece("x", 0.0, None)));
+        let mut trainer = pb_field(3, 0, &pb_varint(SPM_MODEL_UNIGRAM as u64));
+        trainer.extend(pb_field(40, 0, &pb_varint(7)));
+        buf.extend(pb_field(2, 2, &trainer));
+        let path = spm_file(&buf);
+        let err = tokenizer_from_spm(&path).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert!(err.contains("unk_id"), "out-of-range unk_id: {err}");
+    }
+
+    #[test]
+    fn spm_proto_reader_skips_unknown_fields() {
+        // An unknown length-delimited field (99) + an unknown varint field
+        // (98) must be skipped, leaving the known fields intact.
+        let mut buf = pb_field(99, 2, b"ignored");
+        buf.extend(pb_field(98, 0, &pb_varint(12345)));
+        buf.extend(toy_spm(SPM_MODEL_UNIGRAM));
+        let proto = parse_model_proto(&buf).expect("parses around unknown fields");
+        assert_eq!(proto.pieces.len(), 5);
+        assert_eq!(proto.unk_id, 0);
+        assert!(proto.add_dummy_prefix);
     }
 }

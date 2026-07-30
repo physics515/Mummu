@@ -540,7 +540,7 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       qwen3-0.6b: all 26 ids pass `check_ids_against`, and `config.json` eos 151645 agrees with the resolved
       `<|im_end|>`. Remaining on this item: SentencePiece `tokenizer.model` import, and *calling* these
       validators from `load_from_dir` (config-driven EOS + template-vs-renderer consistency) — split below.
-- [ ] **SentencePiece `tokenizer.model` import** — the `.model` proto tokenizer (Llama/Gemma/T5 family) that
+- [x] **SentencePiece `tokenizer.model` import** — the `.model` proto tokenizer (Llama/Gemma/T5 family) that
       HF ships instead of a `tokenizer.json`; build the equivalent HF `tokenizers` pipeline (or convert), and
       byte-verify ids against a `tokenizer.json` of the same checkpoint where one exists. *(2026-07-18, split
       from the tokenizer-import item.)* *(2026-07-18 research)* Route: the HF `tokenizers` crate we already
@@ -553,6 +553,29 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       the same `.model` proto directly and is a reference. No SentencePiece checkpoint is cached locally yet,
       so this needs a fixture fetch (a small Gemma/Llama `.model` + its `tokenizer.json` for the byte-verify) —
       https://github.com/huggingface/spm_precompiled · https://github.com/guillaume-be/rust-tokenizers
+      *(2026-07-30)* **Shipped exactly along the researched route, Unigram leg — and the byte gate passed
+      first run.** `tokenizer::tokenizer_from_spm(path)`: a bounded hand-rolled protobuf wire reader (the
+      `gguf.rs` approach — varint/length-delimited/fixed32, unknown fields skipped, 64 MiB file / 1M piece
+      caps, truncation is a loud error) parses `ModelProto` pieces(+scores+types), `trainer_spec.model_type`
+      /`unk_id`, and `normalizer_spec.{precompiled_charsmap, add_dummy_prefix, remove_extra_whitespaces}`;
+      assembly mirrors HF's `convert_slow_tokenizer`: `Precompiled` charsmap (via the `spm_precompiled` the
+      `tokenizers` dep already carries — **zero new dependencies**) + a regex `" {2,}"→" "` collapse →
+      Metaspace(`▁`, Always/Never by `add_dummy_prefix`) as pre-tokenizer AND decoder → `Unigram(pieces,
+      unk_id, byte_fallback = any BYTE piece)`; CONTROL/UNKNOWN pieces become special added tokens,
+      USER_DEFINED plain, every added id verified post-build like the GGUF path. BPE-type protos (Llama-2
+      family) are a loud not-yet-supported error (split below). Proof: 4 new unit tests over synthetic proto
+      bytes (assembly + metaspace/collapse behavior, BPE/truncation/bad-unk rejection, unknown-field skip),
+      and `tests/real_spm.rs` on the real **flan-t5-small** fixture (`spiece.model` vs its shipped
+      `tokenizer.json`): a 10-prompt battery — whitespace runs, leading/trailing space, `™`/`½`/ligature/
+      fullwidth (the charsmap leg), CJK+emoji, contractions, newlines, empty — is **byte-identical in ids
+      AND decode round-trips**, and `<unk>`/`</s>`/`<pad>` resolve to the same ids. Tokens beyond the proto
+      (T5's 100 `<extra_id_*>`) are sibling-metadata territory by design (`tokenizer_config.json` /
+      `added_tokens_decoder`), documented on the fn.
+- [ ] **BPE-type SentencePiece protos** (Llama-2 family: `trainer_spec.model_type = BPE`) — the other half
+      of the SPM import: same proto reader, but the pieces feed a BPE model (scores encode merge ranks)
+      instead of Unigram; needs a byte-verify fixture with both files (TinyLlama ships `tokenizer.model` +
+      `tokenizer.json`, non-gated). Currently a loud not-yet-supported error in `tokenizer_from_spm`.
+      *(2026-07-30, split from the SentencePiece item.)*
 - [x] **`tok_config` reads a standalone `chat_template.jinja`** — recent `transformers` `save_pretrained`
       (and the v5 tokenizer split) writes the chat template to a separate **`chat_template.jinja`** file in the
       tokenizer dir rather than the `chat_template` key of `tokenizer_config.json`; some checkpoints ship it

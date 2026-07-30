@@ -138,6 +138,13 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
   kv-head array, conv kernels un-squeezed bit-exactly): the official LiquidAI Q4_K_M greedy-decodes
   "2 + 2 equals 4." with top-1 identical to bf16 (logit cosine 0.991). Next: keep-quantized VRAM
   (tracked in P9).
+- **SentencePiece `tokenizer.model` import** — `tokenizer_from_spm` builds the HF pipeline straight
+  from the SPM proto the Llama/Gemma/T5 families ship (a bounded hand-rolled protobuf reader, zero new
+  dependencies): `Precompiled` charsmap + whitespace-collapse normalizers, Metaspace, and a Unigram
+  model with the proto's specials re-added and id-verified. Proven **byte-identical** to the same
+  checkpoint's shipped `tokenizer.json` on flan-t5-small — ids and decode round-trips — across a
+  unicode/whitespace/CJK/emoji battery (`tests/real_spm.rs`). BPE-type protos (Llama-2 family) are a
+  loud not-yet-supported error.
 - **Hub downloads** — streaming HuggingFace fetches into the model cache: resumable (`.part` + HTTP
   Range, proven byte-identical after an interrupted transfer), length-verified, shard-index aware, with
   a per-chunk progress callback; verified end-to-end by downloading all-MiniLM and embedding with it.
