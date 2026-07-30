@@ -307,6 +307,17 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       less of the reference's own per-dot bf16 activation rounding; it sits inside the existing 5e-2
       tolerance with ~1.5x headroom (tolerance unchanged, and the strict-order id match remains the
       real assert). Run legs with `MUMMU_LFM2_230M_DIR` + `MUMMU_LFM2_230M_BF16_GGUF`.*
+- [ ] **First MoE architecture** *(colibri parity)* — the zoo is dense-only and has so far deferred MoE
+      ("Qwen3.6 35B-A3B … well past the single-card tier"), but colibri demonstrates the counter-thesis
+      on our exact hardware class: frontier MoE (GLM-5.2 744B-A40B, Kimi K3 2.8T-A104B) on consumer
+      boxes, because only the ~40B *active* params compute per token — dense parts (~10 GB at int4) stay
+      resident and the 19k routed experts stream from NVMe on demand. The entry ticket for Mummu is a
+      *small* MoE as a from-scratch Burn port — **OLMoE-7B-A1B** (colibri's own dev-tier model) or
+      **Qwen3-30B-A3B** — new blocks: top-k router/gating + per-layer expert FFN banks, the GGUF
+      `*.ffn_{gate,down,up}_exps` fused 3-D expert tensors in the name map, and the P7 parity gate vs
+      llama.cpp like every port. This is the architecture prerequisite for the P6 expert-streaming item;
+      resident-everything (no streaming) is a valid first cut for the small tier. *(2026-07-30 research)* —
+      https://github.com/JustVugg/colibri
 - [x] A `Model` trait so new architectures (Hermes-class function-callers, Gemma, Qwen3, …) slot in.
       *(2026-07-10) `models::CausalLm<B>` — associated `Cache` type; a port supplies `new_cache` /
       `forward` / `is_eos` and inherits `generate` / `greedy_generate` / `first_token` from the shared
@@ -723,6 +734,26 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       loads once, reuses on key match, drop-then-swap on a different checkpoint dir (the P8
       active-model-switch primitive), `clear()` frees VRAM; real-GPU proof: two decodes through a static
       slot performed exactly one 3.1 GB load (6 unit tests + threaded-static test).*
+- [ ] **Speculative decoding (draft-verify loop)** *(colibri parity; promotes the Qwen3.5 MTP note from P2)* —
+      the decode driver is strictly one-token-per-forward; a draft-verify loop (draft k tokens cheaply,
+      verify in one batched forward, accept the agreeing prefix) is the standard decode-latency lever and
+      is byte-identical to greedy *by construction* — exactly the kind of speedup our parity ethos allows.
+      Two draft sources, in order of reach: (a) **native MTP heads** — Qwen3.5-4B/9B ship `-MTP-GGUF`
+      repos claiming ~1.5–2×, and colibri measures GLM-5.2's built-in MTP head at 2.2–2.8 accepted
+      tokens/forward *end-to-end* with a disable switch (`SPEC_PIN=1`/`DRAFT=0`) — the gate discipline to
+      copy: measure acceptance end-to-end, keep a kill switch, assert byte-equality vs non-speculative
+      greedy; (b) a small same-tokenizer zoo model as drafter (0.5B drafts for 9B). Needs: batched-verify
+      forward through the existing KV cache (rollback on reject), driver support in `generate_loop`.
+      *(2026-07-30 research)* — https://github.com/JustVugg/colibri
+- [ ] **Grammar-constrained decoding** *(colibri parity)* — colibri forces structured output via `.gbnf`
+      grammars (llama.cpp's GBNF convention) and even uses grammar-forced *drafts* to speed structured
+      generation. Mummu's tool-calling currently *trusts* the model to emit parseable `<tool_call>` JSON
+      and catches failure only in `parse_tool_calls`. A constrained-sampler stage — mask invalid next
+      tokens against a grammar/JSON-schema automaton before `sample_id` — makes tool-call emission
+      *guaranteed*-parseable, which is worth more to the apps (agent loops) than raw tok/s. Rust
+      substrates to evaluate before hand-rolling: `llguidance` (the guidance-ai engine, token-level
+      masks), GBNF-port crates. Gate: greedy path byte-unchanged when no grammar is armed; masked decode
+      re-passes the FC real-GPU tests with the parser's error leg now unreachable. *(2026-07-30 research)*
 
 ### P6 — Hardware planner: precision, placement & full utilization
 The "use all the hardware" phase — inventory the machine, then pick the precision and the device placement
@@ -813,6 +844,28 @@ that fits the model AND uses every device to the fullest.
       device boundary between stages, KV-cache per shard, and a micro-batch/pipeline schedule so the GPUs
       overlap rather than idle. *(Tensor-parallel within a layer is the stretch goal; layer/pipeline split is
       the tractable first cut.)*
+- [ ] **Third tier: stream weights from NVMe** *(colibri parity)* — the placement plan above stops at
+      GPU→CPU-RAM spill; colibri's core result is that **disk is a usable third tier**: VRAM/RAM/NVMe as
+      one hierarchy ("a JIT for weights") with a per-layer LRU residency cache, a *learned* pinned hot
+      set driven by recorded routing history (`.coli_usage`), one-layer-ahead prefetch off a lookahead
+      thread (71.6 % next-layer predictability measured), and an async I/O pool overlapping reads with
+      compute. For dense models the payoff is modest (every layer is touched every token — streaming =
+      bandwidth-bound layer paging, only worth it when RAM is also short); the real unlock is **MoE
+      expert streaming** (P2 MoE item is the prerequisite), where per-token active weights are a tiny
+      fraction of the total so an LRU + prefetch hides most staging latency. Mummu shape: extend
+      fit-and-fill with a `Disk` placement class — keep-quantized expert blocks paged into a bounded
+      RAM/VRAM pool, residency keyed by routing frequency, prefetch keyed by the router's early output.
+      Gate like everything: parity unaffected by placement (colibri's own invariant — "placement only
+      affects speed, never precision"), and a bench proving the streamed model beats the
+      largest-fitting resident one on task throughput. *(2026-07-30 research)* —
+      https://github.com/JustVugg/colibri
+- [ ] **Planner introspection (`plan` / `doctor`)** *(colibri parity)* — colibri ships `coli plan`
+      (print the placement decision without running) and `coli doctor` (readiness checks). Mummu's
+      planner should expose the same as *API*, consumer UIs render it: a `Plan` report (per-device
+      layers/dtype/VRAM-projection + why) computable without loading weights, and a `doctor`-style
+      preflight (weights present + hash-verified, VRAM/RAM headroom vs plan, backend/adapter features
+      like SHADER_F16) with a clear error taxonomy. Cheap to build once the placement plan exists —
+      it *is* the plan, printed instead of executed. *(2026-07-30 research)*
 - [ ] **`[hardware]` config + overrides** — auto by default; explicit overrides (device list, per-device layer
       counts, precision, CPU-offload cap) for power users.
 
@@ -899,6 +952,17 @@ The VRAM lever the P6 planner pulls to make the largest useful model fit the use
       For Mummu: our KV cache is f16 on `GpuF16` — an e4m3-quantized cache would halve it again; gate on the
       parity harness + budgets like every numeric change. — https://vllm.ai/blog/2026-04-22-fp8-kvcache
       *(2026-07-24 research)*
+- [ ] **KV-cache persistence (warm session reopen)** *(colibri parity)* — colibri persists compressed KV
+      state to disk (`.coli_kv`) so reopening a conversation skips the whole prefill; its 57× compression
+      comes from MLA, which is architecture-specific (DeepSeek-family latent attention — not our GQA
+      models), but the *persistence* transfers as-is and compounds with the FP8 item above (an e4m3
+      cache is already half the bytes to write/read). Mummu shape: serialize the per-layer KV (+
+      conv-state for hybrids) cache keyed by (model id + revision, dtype, prompt-prefix token hash);
+      on reopen, load + verify the key and resume decode at the suffix. For the apps this converts
+      long-system-prompt agent restarts from a full prefill (~100 ms/KB-of-prompt and growing with
+      context) into a file read. Gate: a resumed decode must be byte-identical to the uninterrupted
+      one (the cache-equivalence proofs extend naturally to a serialize/deserialize round-trip).
+      *(2026-07-30 research)* — https://github.com/JustVugg/colibri
 - [ ] **Auto-quantize-to-fit** — the planner picks the *highest* precision that fits the detected VRAM
       (f16 → int8 → int4), reports the quality/size trade, and never silently ships a worse tier than asked.
 
@@ -915,6 +979,34 @@ The VRAM lever the P6 planner pulls to make the largest useful model fit the use
       done: a P11 port would be the mmproj vision encoder + the projector, feeding embeddings into the
       existing Qwen3 decoder — far less new surface than a from-scratch OCR model. Weigh against
       DeepSeek-OCR once the P3 GGUF-mmproj parse + a vision block land. *(2026-07-17 research)*
+
+## Colibri parity scan *(2026-07-30)*
+
+[colibri](https://github.com/JustVugg/colibri) is a pure-C, zero-dependency inference engine whose thesis
+is running frontier **MoE** models (GLM-5.2 744B-A40B reference; Kimi K3 2.8T) on consumer hardware by
+treating VRAM/RAM/**NVMe** as one memory hierarchy — int4 dense parts resident, routed experts streamed
+from disk behind an LRU + learned hot-pinning + one-ahead prefetch. Same North-Star hardware class as
+Mummu (a 128 GB box with one consumer GPU), opposite bet: Mummu shrinks the model to fit the fast tiers
+(quantize-to-fit), colibri keeps the model huge and moves the working set. The scan spawned one item per
+gap, each gated by the usual parity + budget discipline:
+
+- **P2 — first MoE architecture** (OLMoE-7B-A1B / Qwen3-30B-A3B): router + expert blocks + GGUF expert
+  tensors; the prerequisite for everything expert-shaped.
+- **P5 — speculative decoding** (MTP heads / small-model drafts, byte-identical by construction) and
+  **grammar-constrained decoding** (guaranteed-parseable tool calls — worth more to the apps than tok/s).
+- **P6 — NVMe as a third placement tier** (expert streaming; the headline feature) and **planner
+  introspection** (`plan`/`doctor` as API).
+- **P9 — KV-cache persistence** (warm conversation reopen; MLA's 57× is architecture-specific, the
+  persistence isn't).
+
+**Already at or past parity:** token-exact validation (our P7 gates are the same discipline, run per
+port), quantized import (P3 GGUF dequant covers colibri's int4 tier; keep-quantized is the open P9 half
+on both sides' terms), CPU path (burn-flex ≈ their OpenMP), model-format-agnostic loading (P3 is
+data-driven by design). **Non-goals, deliberately:** the `serve`/`chat`/`web` surfaces (OpenAI-compatible
+server, TUI, dashboard, Tauri wrapper) are consumer glue per the contract below — Nanna/laurelane own the
+app surface, Mummu stays the library; and no C rewrite — parity here means *capabilities on Burn*, never
+a second runtime. Dual-SSD mirroring, `O_DIRECT`, and NUMA interleave are streaming-tier tuning knobs to
+revisit only if/when the P6 disk tier exists and measures I/O-bound.
 
 ## Consumer integration contract
 
@@ -938,3 +1030,5 @@ Each app depends on Mummu (path/git dep) and keeps its own glue:
   GEMV/top-k, per-tensor + per-block int8/int4/int2 quant on some backends — https://burn.dev/blog/release-0.21.0/
 - wgpu f16 IO polyfill on Vulkan (SHADER_F16 without storageInputOutput16), wgpu PR #7884 — confirmed
   live on the dev box: Vulkan advertises SHADER_F16 on the 4070 Ti SUPER, DX12 does not (2026-07-09 probe).
+- colibri — pure-C MoE weight-streaming engine (VRAM/RAM/NVMe hierarchy, MTP speculation, GBNF grammars,
+  persistent compressed KV); the 2026-07-30 parity scan's source — https://github.com/JustVugg/colibri
