@@ -358,6 +358,17 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       llama.cpp like every port. This is the architecture prerequisite for the P6 expert-streaming item;
       resident-everything (no streaming) is a valid first cut for the small tier. *(2026-07-30 research)* —
       https://github.com/JustVugg/colibri
+      *(2026-07-30, same run)* Port groundwork made concrete: **OLMoE-1B-7B** (64 experts, top-8 routing,
+      1B active / 7B total) is the right first target — allenai publishes an official
+      **`OLMoE-1B-7B-0125-Instruct-GGUF`** (Q2_K 2.6 GB … Q4_K_M **4.21 GB** … F16 13.8 GB, chat template
+      in-metadata), llama.cpp runs it (arch `olmoe` — the parity reference leg is free), and the expert
+      tensors follow the standard fused-3-D naming (`blk.N.ffn_{gate,down,up}_exps.weight`) our GGUF
+      reader already parses structurally. Fit math for the first resident-everything cut: f32 dequant is
+      28 GB — CPU-only (fits 128 GB RAM, slow) or **GpuF16 at ~14 GB** (marginal on the 16 GB card with
+      ambient; the keep-quantized P9 leg or expert-CPU-offload makes it comfortable — expert tensors are
+      the textbook offload candidates since only 8/64 fire per token) —
+      https://huggingface.co/allenai/OLMoE-1B-7B-0125-Instruct-GGUF ·
+      https://huggingface.co/blog/Doctor-Shotgun/llamacpp-moe-offload-guide
 - [ ] **Qwen3.5 hybrid (`qwen35`) architecture port** — split from the Qwen3.5-tier item when the
       2026-07-30 header probe showed Qwen3.5-4B/9B are a hybrid **linear-attention/SSM + periodic
       full-attention** arch (`qwen35.ssm.*` metadata: conv_kernel/state_size/group_count/time_step_rank/
@@ -408,7 +419,12 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       weights. Remaining follow-ups: sharded `.bin` indexes, a bf16-cast on this path (PytorchStore has
       no adapter chaining; `.bin`-era checkpoints are f32), decoder loaders adopt `weights_file` when a
       real `.pth` decoder checkpoint exists to verify against, and `hub::fetch_model` learning the
-      `pytorch_model.bin` fallback.
+      `pytorch_model.bin` fallback. *(2026-07-30)* The fetch-fallback follow-up is **deprioritized after a
+      fixture hunt**: the Hub's safetensors-conversion backfill has made "has `tokenizer.json` + only
+      `pytorch_model.bin`" repos effectively extinct (every candidate checked — tiny-gpt2,
+      hf-internal-testing, cross-encoder — either got safetensors or predates fast tokenizers and lacks
+      `tokenizer.json`, which `fetch_model` requires first). A real proof would need relaxing the
+      tokenizer.json contract too — do it only if a consumer actually hits such a repo.
 - [x] **GGUF** (llama.cpp) — parse the GGUF container (metadata KV + tensor table), map tensors to modules,
       and **dequantize** Q4/Q5/Q8/K-quant blocks into Burn tensors (or hand keep-quantized to P9). GGUF is how
       most small models are distributed — this makes the whole ecosystem importable. *(2026-07-10 research)*
