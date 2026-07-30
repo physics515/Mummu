@@ -29,7 +29,15 @@ ours to pick, burn 0.21 resolves wgpu 29 transitively, so it unblocks with a bur
 lifts `SHADER_F16` to **all** shader kinds (WGSL included — previously SPIR-V passthrough only) and
 adds the Vulkan f16 IO polyfill (PR #7884, already confirmed live here) — so when burn moves to
 wgpu 30, f16 stops being SPIR-V-only and the WGSL fallback path (non-Vulkan APIs) can run f16 too —
-https://github.com/gfx-rs/wgpu/blob/trunk/CHANGELOG.md.*
+https://github.com/gfx-rs/wgpu/blob/trunk/CHANGELOG.md.* *(2026-07-30) Pin watch: **burn
+v0.22.0-pre.1 tagged 2026-07-29** — 0.21 is still the latest stable and stays pinned, but the pre-release
+telegraphs a MAJOR migration (see the new P0 item below): the `Tensor` backend generic is removed in
+favor of a high-level `Device` struct, and backends **lose their associated element types** in favor of
+device defaults — the exact `B::FloatElem` seam Mummu's dtype pinning and `GpuF16` alias ride. Also
+upstream: a `FloatCastAdapter` in burn-store (our `CastFloatAdapter`'s role), burnpack split into
+`burn-pack`, BitNet `Calibration::AbsMean` ternary quant, quant fallbacks for slice/gather/select/expand,
+and a remote multi-device backend (iroh). tokenizers 0.23.1 remains current —
+https://github.com/Tracel-AI/burn/releases*
 
 ## North Star
 
@@ -123,6 +131,18 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
 ## Phases
 
 ### P0 — Workspace scaffold
+- [ ] **Prepare the burn 0.22 migration** — v0.22.0-pre.1 (2026-07-29) is a breaking release aimed right
+      at Mummu's core seams: (a) the `Tensor` **backend generic is removed** (a high-level `Device`
+      struct replaces it) and (b) backends **lose associated element types** (`B::FloatElem` /
+      `B::IntElem`) in favor of per-device defaults — which dissolves the `Gpu`/`GpuF16` alias split AND
+      the type-level dtype pinning shipped 2026-07-30 (`backend::{float_dtype,int_dtype}` read
+      `B::FloatElem`; under 0.22 the explicit-dtype path becomes the only correct one, likely
+      simplifying the P6 mixed-precision story since dtype stops being a type parameter at all). Also
+      relevant: burn-store ships its own `FloatCastAdapter` (evaluate replacing our `CastFloatAdapter`),
+      burnpack moves to a `burn-pack` crate, and wgpu 30 lands with it (f16 beyond SPIR-V — the P6 note).
+      Do NOT adopt a pre-release; when 0.22.0 stabilizes: migrate on a branch, re-run every parity gate +
+      budget, and expect the backend aliases + dtype helpers + all loaders' `target_float` derivation to
+      change shape. *(2026-07-30 research)* — https://github.com/Tracel-AI/burn/releases
 - [x] Silence the pre-existing `LNK4098` (LIBCMT defaultlib conflict) the 2026-07 nightly toolchain's
       new `linker_messages` lint now surfaces when linking the `mummu` lib-test binary — find which
       native dep object embeds the static-CRT directive (tokenizers' C++ deps are the suspects) and
@@ -267,6 +287,16 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       Qwen3.6 (35B-A3B) is also out now but is MoE and
       well past the single-card tier this zoo targets —
       https://huggingface.co/unsloth/Qwen3.5-4B-GGUF · https://unsloth.ai/docs/models/qwen3.5/gguf-benchmarks
+      *(2026-07-30)* **Premise correction — Qwen3.5 is NOT the qwen3 dense arch.** A header probe of
+      `unsloth/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q4_K_M.gguf` (HTTP-range fetch, metadata keys read directly)
+      shows `general.architecture = "qwen35"` with `qwen35.ssm.{conv_kernel, state_size, group_count,
+      time_step_rank, inner_size}`, `qwen35.full_attention_interval`, and `qwen35.rope.dimension_sections`
+      — a **hybrid linear-attention/SSM + periodic full-attention architecture** (Qwen3-Next-style), not a
+      dense decoder. So "a download + the same decode" does NOT cover Qwen3.5: it needs its own from-scratch
+      port (new SSM/gated-delta blocks + the hybrid cache machinery the LFM2 port pioneered, plus the
+      `qwen35.*` config/name maps) and a fresh parity gate. Re-scoped: the *FC-tier-at-4B* half of this item
+      rides **Qwen3-4B dense** (catalog entry existed; FC decode proven this run — see below), and the
+      Qwen3.5 hybrid port is now its own P2 architecture item beside the MoE one.
       *(2026-07-22 research)* The mid-2026 function-calling field guides converge on the same picture: for
       ≤ 8 GB cards **Qwen3.5-9B** is the general-purpose FC pick and **Qwen3.5-4B** the CPU-only pick
       (reinforces the 4B/9B target of this item); the Qwen3.6 tier (27B dense / 35B-A3B MoE) ships a new
@@ -318,6 +348,16 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       llama.cpp like every port. This is the architecture prerequisite for the P6 expert-streaming item;
       resident-everything (no streaming) is a valid first cut for the small tier. *(2026-07-30 research)* —
       https://github.com/JustVugg/colibri
+- [ ] **Qwen3.5 hybrid (`qwen35`) architecture port** — split from the Qwen3.5-tier item when the
+      2026-07-30 header probe showed Qwen3.5-4B/9B are a hybrid **linear-attention/SSM + periodic
+      full-attention** arch (`qwen35.ssm.*` metadata: conv_kernel/state_size/group_count/time_step_rank/
+      inner_size; `full_attention_interval`; `rope.dimension_sections` partial-rotary), not qwen3 dense.
+      A port needs: the SSM/gated-delta block (recurrent state cache — the LFM2 conv-state machinery
+      generalizes), the interval-scheduled full-attention layers, `qwen35.*` config + GGUF name maps, and
+      the P7 parity gate vs llama.cpp (which runs it — the GGUFs ship working). Worth it when picked up:
+      the 4B/9B are 2026's local-FC sweet spot (BFCL 9B 66.1%) and the 4B ships an `mmproj` vision
+      projector (P11 candidate). *(2026-07-30 research)* —
+      https://huggingface.co/unsloth/Qwen3.5-4B-GGUF
 - [x] A `Model` trait so new architectures (Hermes-class function-callers, Gemma, Qwen3, …) slot in.
       *(2026-07-10) `models::CausalLm<B>` — associated `Cache` type; a port supplies `new_cache` /
       `forward` / `is_eos` and inherits `generate` / `greedy_generate` / `first_token` from the shared
@@ -768,6 +808,15 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       substrates to evaluate before hand-rolling: `llguidance` (the guidance-ai engine, token-level
       masks), GBNF-port crates. Gate: greedy path byte-unchanged when no grammar is armed; masked decode
       re-passes the FC real-GPU tests with the parser's error leg now unreachable. *(2026-07-30 research)*
+      *(2026-07-30, same run)* `llguidance` evaluated concretely: **1.7.6** (June 2026), MIT, pure Rust —
+      JSON Schema + Lark-variant CFGs, ~50 µs/token masks on a 128k vocab (Earley + derivative-based lazy
+      lexer + a tokenizer trie), the engine OpenAI credited for Structured Outputs. Integration shape for
+      our driver: build a `TokenParser`/`Constraint` from the grammar + vocabulary (the sibling
+      `toktrie_hf_tokenizers` crate bridges HF `tokenizers`, which we already load), then in
+      `generate_loop`: `compute_mask()` → mask the logits before `sample_id`/argmax → `commit_token()`.
+      Weigh the dep tree (toktrie, derivre, rayon) against a hand-rolled JSON-schema automaton; 2026
+      benchmarks note XGrammar edges it on repeated-schema caching, but llguidance's Rust-native API is
+      the fit here — https://lib.rs/crates/llguidance · https://github.com/guidance-ai/llguidance
 
 ### P6 — Hardware planner: precision, placement & full utilization
 The "use all the hardware" phase — inventory the machine, then pick the precision and the device placement
