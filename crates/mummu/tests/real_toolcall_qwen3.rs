@@ -50,8 +50,9 @@ fn qwen3_emits_a_parseable_hermes_tool_call() {
             "required": ["city"]
         }),
     }];
-    // Hermes renderer (Qwen2.5/Qwen3 share it), chosen per the detection above.
-    let raw = ChatMl::qwen2().render_with_tools(
+    // The Qwen3 renderer (Hermes wire format + the template's own
+    // no-preamble/think-strip deltas), chosen per the detection above.
+    let raw = ChatMl::qwen3().render_with_tools(
         &tools,
         &[Turn::user(
             "What is the weather in Paris right now? Use the tool.",

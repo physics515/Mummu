@@ -639,14 +639,28 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       `chat_template` (the byte gate proved fidelity on Qwen3). Weigh promoting the dep from dev to optional
       runtime feature vs the from-scratch ethos; needs the P8/consumer-facing API decision of when to prefer
       the imported template over a family renderer. *(2026-07-23, split from the evaluation.)*
-- [ ] **`ChatMl::qwen3()` with history think-stripping** — the byte gate documented that Qwen3's template
+- [x] **`ChatMl::qwen3()` with history think-stripping** — the byte gate documented that Qwen3's template
       strips `<think>…</think>` reasoning from assistant turns at/before the last user query while our
       shared `ChatMl::qwen2()` renderer re-renders history verbatim (fine for fresh prompts + tool loops,
       wrong for long multi-turn chats with a thinking Qwen3). A `qwen3()` constructor wants the LFM-style
       strip (the machinery exists — `turn_content` already does it for `Lfm`) but keyed to Qwen3's
       "at/before the last user query" rule rather than LFM's "every but the last assistant turn"; gate it
       on the template byte gate's think case flipping from documented-divergence to byte-equal.
-      *(2026-07-24, found by the byte gate.)*
+      *(2026-07-24, found by the byte gate.)* *(2026-07-30) **Shipped, and the gate flipped** — plus the
+      other pinned Qwen3 divergence for free. `ChatMl::qwen3()`: think-strip is now a per-family
+      `ThinkStrip` policy on `ChatMl` (`Keep` Qwen2.5 / `PastAssistant` LFM / `BeforeLastUserQuery`
+      Qwen3), implemented byte-for-byte from the template's Python chain — strip = text after the final
+      `</think>` `lstrip('\n')` (newlines only, NOT LFM's full trim), "last user query" excludes
+      pre-wrapped `<tool_response>` user turns, and an assistant turn AFTER the last query (mid tool
+      loop) keeps its reasoning re-emitted in the normalized `<think>\n…\n</think>\n\n` shape. The
+      no-system tools preamble also became per-family (`qwen2()` keeps the neutral default; `qwen3()`
+      injects none, per its template). Byte gate: the think case AND the no-preamble case flipped from
+      pinned-divergence to **byte-equal** (think-strip 249 B, tools-no-system 724 B, and a new
+      think+tool_call normalization leg 361 B — all byte-identical vs the imported template through
+      hf-chat-template; every other leg unchanged, qwen2/LFM divergences still pinned exactly). 5 new
+      unit tests (181 total). REAL-GPU proof: `real_toolcall_qwen3` now renders with `qwen3()` — from
+      the no-preamble prompt, Qwen3-0.6B greedy-emitted `<think>…</think>` + a clean parseable
+      `<tool_call>{"name": "get_weather", …}</tool_call>` on the 4070 Ti SUPER.*
 - [x] **Model registry / manifest** — a declarative `ModelSpec` (repo, architecture, weight format, dtype,
       tokenizer, chat template, size tier) + a small built-in catalog of known-good models (Qwen2.5, LFM2.5,
       MiniLM, …); adding a model = a manifest entry. *(2026-07-10) `mummu::registry`: `ModelSpec`

@@ -374,9 +374,9 @@ fn qwen2_renders_byte_match_the_imported_template() {
 }
 
 /// Documented divergence, pinned exactly: without a system turn Qwen2.5's
-/// template injects its branding preamble where we inject a neutral one (one
-/// renderer serves Qwen2 AND Qwen3, and Qwen3 injects nothing — no single
-/// default can match both). The delta must be EXACTLY the preamble swap.
+/// template injects its branding preamble where `qwen2()` injects a neutral
+/// one (a deliberate neutrality choice — `qwen3()` matches ITS template's
+/// no-preamble exactly). The delta must be EXACTLY the preamble swap.
 #[test]
 #[ignore = "needs the local Qwen2.5 checkpoint dir (MUMMU_QWEN2_DIR)"]
 fn qwen2_no_system_defaults_diverge_only_by_the_documented_preamble() {
@@ -422,19 +422,23 @@ fn qwen2_no_system_defaults_diverge_only_by_the_documented_preamble() {
     );
 }
 
-// ---- Qwen3 divergences ------------------------------------------------------
+// ---- Qwen3 behavioral deltas (ChatMl::qwen3) --------------------------------
 
-/// Qwen3's documented divergences, pinned exactly: (a) with tools and no
-/// system turn its template injects NO preamble (ours injects the neutral
-/// one); (b) it strips `<think>` reasoning from assistant turns at/before the
-/// last user query (ours re-renders history verbatim — `ChatMl::qwen3()` with
-/// the strip is a ROADMAP item; flip this case to byte-equal when it lands).
+/// `ChatMl::qwen3()` carries the template's two behavioral deltas exactly —
+/// what used to be pinned divergences of the shared `qwen2()` renderer are
+/// now byte-equal: (a) with tools and no system turn the template injects NO
+/// preamble; (b) `<think>` reasoning is stripped from assistant turns
+/// at/before the last user query; (c) an assistant turn AFTER the last user
+/// query (mid tool loop) keeps its reasoning in the template's normalized
+/// `<think>\n…\n</think>\n\n` re-emission. `qwen2()` still re-renders
+/// history verbatim (its own template has no think path — pinned below).
 #[test]
 #[ignore = "needs the local Qwen3 checkpoint dir (MUMMU_QWEN3_DIR)"]
-fn qwen3_divergences_are_exactly_the_documented_ones() {
+fn qwen3_history_and_no_system_renders_byte_match_the_imported_template() {
     let dir = dir().expect("set MUMMU_QWEN3_DIR to a Qwen3 checkpoint dir");
     let template = imported_template(&dir);
 
+    // (a) Tools without a system turn: no preamble on either side.
     let reference = template
         .render(&RenderInput {
             messages: vec![Message::user(USER)],
@@ -443,13 +447,17 @@ fn qwen3_divergences_are_exactly_the_documented_ones() {
             ..RenderInput::default()
         })
         .expect("reference render succeeds");
-    let ours = ChatMl::qwen2().render_with_tools(&[weather_spec()], &[Turn::user(USER)]);
+    let ours = ChatMl::qwen3().render_with_tools(&[weather_spec()], &[Turn::user(USER)]);
+    println!(
+        "{}",
+        diff_context("qwen3 tools no-system", &ours, &reference)
+    );
     assert_eq!(
-        ours.replacen(&format!("{SYSTEM}\n\n"), "", 1),
-        reference,
-        "Qwen3 no-system tools render must diverge ONLY by our neutral preamble"
+        ours, reference,
+        "Qwen3 no-system tools render must byte-match"
     );
 
+    // (b) Think-strip: reasoning at/before the last user query disappears.
     let think_turn = "<think>2 then 3.</think>The first primes are 2 and 3.";
     let reference = template
         .render(&RenderInput {
@@ -463,22 +471,70 @@ fn qwen3_divergences_are_exactly_the_documented_ones() {
             ..RenderInput::default()
         })
         .expect("reference render succeeds");
-    let ours = ChatMl::qwen2().render(&[
+    let ours = ChatMl::qwen3().render(&[
         Turn::system(SYSTEM),
         Turn::user(USER),
         Turn::assistant(think_turn),
         Turn::user("And the next two?"),
     ]);
-    assert!(ours.contains("<think>"), "ours re-renders history verbatim");
+    println!("{}", diff_context("qwen3 think-strip", &ours, &reference));
     assert!(
-        !reference.contains("<think>"),
-        "Qwen3's template strips history reasoning"
+        !ours.contains("<think>"),
+        "history reasoning must be stripped"
     );
+    assert_eq!(ours, reference, "Qwen3 think-strip render must byte-match");
+
+    // The shared qwen2() renderer keeps re-rendering verbatim (pinned).
+    let verbatim = ChatMl::qwen2().render(&[
+        Turn::system(SYSTEM),
+        Turn::user(USER),
+        Turn::assistant(think_turn),
+        Turn::user("And the next two?"),
+    ]);
     assert_eq!(
-        ours.replacen("<think>2 then 3.</think>", "", 1),
+        verbatim.replacen("<think>2 then 3.</think>", "", 1),
         reference,
-        "the think block must be the ONLY delta"
+        "qwen2()'s divergence stays exactly the think block"
     );
+
+    // (c) Reasoning + tool call AFTER the last user query: the template
+    // re-emits the think block normalized, then the structural tool_calls;
+    // our pre-rendered turn must produce the same bytes.
+    let calls = [mummu::chat::ToolCall {
+        name: "get_weather".into(),
+        arguments: serde_json::json!({"city": "Paris"}),
+    }];
+    let mut assistant_call = Message::assistant("<think>\nneed the live temp\n</think>\n\n");
+    assistant_call.tool_calls =
+        vec![serde_json::json!({"name": "get_weather", "arguments": {"city": "Paris"}})];
+    let reference = template
+        .render(&RenderInput {
+            messages: vec![
+                Message::system(SYSTEM),
+                Message::user("What's the weather in Paris?"),
+                assistant_call,
+                Message::new("tool", "{\"temp_c\": 21}"),
+            ],
+            add_generation_prompt: true,
+            ..RenderInput::default()
+        })
+        .expect("reference render succeeds");
+    let call_turn = Turn::assistant_tool_calls(&calls);
+    let ours = ChatMl::qwen3().render(&[
+        Turn::system(SYSTEM),
+        Turn::user("What's the weather in Paris?"),
+        Turn::assistant(format!(
+            "<think>\nneed the live temp\n</think>\n\n{}",
+            call_turn.content
+        )),
+        Turn::tool_response("{\"temp_c\": 21}"),
+    ]);
+    println!("{}", diff_context("qwen3 think+call", &ours, &reference));
+    assert!(
+        ours.contains("<think>"),
+        "reasoning after the last user query is kept"
+    );
+    assert_eq!(ours, reference, "Qwen3 think+call render must byte-match");
 }
 
 // ---- LFM2.5 -----------------------------------------------------------------
