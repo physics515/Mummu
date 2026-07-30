@@ -571,11 +571,23 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       AND decode round-trips**, and `<unk>`/`</s>`/`<pad>` resolve to the same ids. Tokens beyond the proto
       (T5's 100 `<extra_id_*>`) are sibling-metadata territory by design (`tokenizer_config.json` /
       `added_tokens_decoder`), documented on the fn.
-- [ ] **BPE-type SentencePiece protos** (Llama-2 family: `trainer_spec.model_type = BPE`) — the other half
+- [x] **BPE-type SentencePiece protos** (Llama-2 family: `trainer_spec.model_type = BPE`) — the other half
       of the SPM import: same proto reader, but the pieces feed a BPE model (scores encode merge ranks)
       instead of Unigram; needs a byte-verify fixture with both files (TinyLlama ships `tokenizer.model` +
       `tokenizer.json`, non-gated). Currently a loud not-yet-supported error in `tokenizer_from_spm`.
-      *(2026-07-30, split from the SentencePiece item.)*
+      *(2026-07-30, split from the SentencePiece item.)* *(2026-07-30, same run) **Shipped, byte gate
+      passed first run.** `tokenizer_from_spm` now dispatches on `model_type`: the BPE leg reconstructs
+      the merge list from vocab + scores exactly as HF's `SentencePieceExtractor` does (every piece's
+      valid splits, local `(id_l, id_r)` order, stable global sort by score DESCENDING — higher score =
+      earlier merge), builds `BPE { fuse_unk, byte_fallback }`, with the Llama-family pipeline its own
+      `tokenizer.json` pins: `Prepend(▁)` + `Replace(" "→"▁")` normalizers (driven by
+      `add_dummy_prefix`/`escape_whitespaces`, now parsed), NO pre-tokenizer, and the
+      `Replace(▁→" ")`/`ByteFallback`/`Fuse`/`Strip` decoder chain. Proof: a synthetic BPE toy proto
+      whose merge chain must fire in score order (unit test, 185 total), and `tests/real_spm.rs` gains a
+      TinyLlama-1.1B leg — the reconstructed 61 249-merge tokenizer is **byte-identical in ids and
+      decode round-trips** to the checkpoint's shipped `tokenizer.json` across the 10-prompt battery,
+      byte-fallback cases included; `<unk>`/`<s>`/`</s>` ids agree. Both SPM legs (Unigram + BPE) now
+      cover the `.model`-shipping families end to end.*
 - [x] **`tok_config` reads a standalone `chat_template.jinja`** — recent `transformers` `save_pretrained`
       (and the v5 tokenizer split) writes the chat template to a separate **`chat_template.jinja`** file in the
       tokenizer dir rather than the `chat_template` key of `tokenizer_config.json`; some checkpoints ship it

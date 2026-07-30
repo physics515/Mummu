@@ -99,3 +99,65 @@ fn spm_proto_ids_byte_match_the_reference_tokenizer_json() {
         reference.get_vocab_size(false),
     );
 }
+
+/// The BPE leg (Llama-2 family): merges reconstructed from vocab + scores
+/// must reproduce the reference's 60k+ merge list faithfully enough that
+/// every encoding — byte-fallback cases included — is byte-identical.
+#[test]
+#[ignore = "needs a local BPE-type SentencePiece dir (MUMMU_SPM_BPE_DIR) with tokenizer.json"]
+fn spm_bpe_proto_ids_byte_match_the_reference_tokenizer_json() {
+    let dir = PathBuf::from(
+        std::env::var_os("MUMMU_SPM_BPE_DIR")
+            .expect("set MUMMU_SPM_BPE_DIR to a dir with tokenizer.model + tokenizer.json"),
+    );
+    let proto = proto_path(&dir);
+    assert!(proto.is_file(), "no tokenizer.model in {dir:?}");
+
+    let ours = mummu::tokenizer::tokenizer_from_spm(&proto).expect("proto import builds");
+    let reference =
+        Tokenizer::from_file(dir.join("tokenizer.json")).expect("reference tokenizer loads");
+
+    let battery = [
+        "The first five prime numbers are 2, 3, 5, 7 and 11.",
+        "hello world",
+        "  leading and trailing  ",
+        "spaces    stay    intact here",
+        "Bonjour, ça va? Ærøskøbing — ﬁne.",
+        "日本語のテキストと emoji 🙂🚀 mixed",
+        "don't can't won't it's",
+        "line\nbreaks\n\nand\ttabs",
+        "™ and ½ and byte-fallback: \u{07ff}\u{10348}",
+        "",
+    ];
+    for prompt in battery {
+        let a = ours.encode(prompt, false).expect("ours encodes");
+        let b = reference.encode(prompt, false).expect("reference encodes");
+        assert_eq!(
+            a.get_ids(),
+            b.get_ids(),
+            "ids diverge on {prompt:?}: ours {:?} vs reference {:?} (tokens {:?} vs {:?})",
+            a.get_ids(),
+            b.get_ids(),
+            a.get_tokens(),
+            b.get_tokens(),
+        );
+        let ad = ours.decode(a.get_ids(), true).expect("ours decodes");
+        let bd = reference
+            .decode(b.get_ids(), true)
+            .expect("reference decodes");
+        assert_eq!(ad, bd, "decodes diverge on {prompt:?}");
+    }
+    for special in ["<unk>", "<s>", "</s>"] {
+        assert_eq!(
+            ours.token_to_id(special),
+            reference.token_to_id(special),
+            "special {special:?} id diverges"
+        );
+    }
+    eprintln!(
+        "[real_spm/bpe] {} battery prompts byte-identical; vocab {} vs reference {}",
+        battery.len(),
+        ours.get_vocab_size(false),
+        reference.get_vocab_size(false),
+    );
+}

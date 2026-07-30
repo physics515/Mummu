@@ -362,6 +362,7 @@ struct SpmProto {
     precompiled_charsmap: Vec<u8>,
     add_dummy_prefix: bool,
     remove_extra_whitespaces: bool,
+    escape_whitespaces: bool,
 }
 
 /// A bounded protobuf wire-format reader (the same hand-rolled-parser approach
@@ -492,6 +493,7 @@ fn parse_model_proto(buf: &[u8]) -> Result<SpmProto, String> {
         precompiled_charsmap: Vec::new(),
         add_dummy_prefix: true,
         remove_extra_whitespaces: true,
+        escape_whitespaces: true,
     };
     let mut r = ProtoReader::new(buf);
     while !r.done() {
@@ -528,6 +530,7 @@ fn parse_model_proto(buf: &[u8]) -> Result<SpmProto, String> {
                         (2, 2) => proto.precompiled_charsmap = n.bytes()?.to_vec(),
                         (3, 0) => proto.add_dummy_prefix = n.varint()? != 0,
                         (4, 0) => proto.remove_extra_whitespaces = n.varint()? != 0,
+                        (5, 0) => proto.escape_whitespaces = n.varint()? != 0,
                         (_, w) => n.skip(w)?,
                     }
                 }
@@ -542,28 +545,29 @@ fn parse_model_proto(buf: &[u8]) -> Result<SpmProto, String> {
 }
 
 /// Build an HF [`Tokenizer`] from a SentencePiece `tokenizer.model` proto
-/// (the Llama/Gemma/T5-family format) — the same pipeline HF's own
-/// `convert_slow_tokenizer` assembles: `Precompiled` charsmap normalizer
-/// (+ a `{2,}`-space collapse when `remove_extra_whitespaces`), a Metaspace
-/// pre-tokenizer/decoder driven by `add_dummy_prefix`, and a **Unigram**
-/// model over the proto's pieces (index = token id). CONTROL/UNKNOWN pieces
-/// become special added tokens, USER_DEFINED become plain added tokens, and
-/// every added id is verified post-build exactly like the GGUF path.
+/// (the Llama/Gemma/T5-family format) — the same pipelines HF's own
+/// `convert_slow_tokenizer` assembles, dispatched on the proto's
+/// `model_type`:
 ///
-/// Only `model_type = UNIGRAM` protos are supported so far; the BPE-type
-/// protos (Llama-2 family) are a loud error until that leg lands. Tokens a
-/// checkpoint adds *beyond* the proto (T5's `<extra_id_*>`, chat specials)
-/// live in sibling metadata (`tokenizer_config.json`), not the proto — add
-/// them via [`Tokenizer::add_special_tokens`] after this returns.
+/// - **UNIGRAM** (T5/ALBERT/Gemma): `Precompiled` charsmap normalizer (+ a
+///   `{2,}`-space collapse when `remove_extra_whitespaces`), a Metaspace
+///   pre-tokenizer/decoder driven by `add_dummy_prefix`, and a `Unigram`
+///   model over the proto's pieces (index = token id).
+/// - **BPE** (Llama-2 family): merges reconstructed from the vocab + scores
+///   (HF's `SentencePieceExtractor` algorithm, literally), a `▁`-prepend +
+///   space→`▁` normalizer, no pre-tokenizer, and the
+///   Replace/ByteFallback/Fuse/Strip decoder chain.
 ///
-/// Faithfulness is verified against the same checkpoint's `tokenizer.json`
+/// In both, CONTROL/UNKNOWN pieces become special added tokens, USER_DEFINED
+/// become plain added tokens, and every added id is verified post-build
+/// exactly like the GGUF path. Tokens a checkpoint adds *beyond* the proto
+/// (T5's `<extra_id_*>`, chat specials) live in sibling metadata
+/// (`tokenizer_config.json`), not the proto — add them via
+/// [`Tokenizer::add_special_tokens`] after this returns.
+///
+/// Faithfulness is verified against the same checkpoints' `tokenizer.json`
 /// (byte-identical ids over a battery of prompts) in `tests/real_spm.rs`.
 pub fn tokenizer_from_spm(path: &Path) -> Result<Tokenizer, String> {
-    use tokenizers::decoders::metaspace::{Metaspace, PrependScheme};
-    use tokenizers::models::unigram::Unigram;
-    use tokenizers::normalizers::replace::ReplacePattern;
-    use tokenizers::normalizers::{Precompiled, Replace, Sequence as NormSequence};
-
     let meta = std::fs::metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
     if meta.len() > MAX_SPM_FILE_BYTES {
         return Err(format!(
@@ -574,21 +578,36 @@ pub fn tokenizer_from_spm(path: &Path) -> Result<Tokenizer, String> {
     }
     let buf = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let proto = parse_model_proto(&buf).map_err(|e| format!("{}: {e}", path.display()))?;
-    if proto.model_type != SPM_MODEL_UNIGRAM {
-        let name = if proto.model_type == SPM_MODEL_BPE {
-            "BPE".to_string()
-        } else {
-            format!("type {}", proto.model_type)
-        };
-        return Err(format!(
-            "SentencePiece model_type {name} is not supported yet (only UNIGRAM)"
-        ));
-    }
+    let mut tok = match proto.model_type {
+        SPM_MODEL_UNIGRAM => assemble_spm_unigram(&proto)?,
+        SPM_MODEL_BPE => assemble_spm_bpe(&proto)?,
+        other => {
+            return Err(format!(
+                "SentencePiece model_type {other} is not supported (UNIGRAM and BPE are)"
+            ));
+        }
+    };
+    add_and_verify_spm_specials(&mut tok, &proto)?;
+    Ok(tok)
+}
 
-    let unk = usize::try_from(proto.unk_id)
+/// The proto's declared `unk_id`, range-checked against the pieces.
+fn spm_unk_index(proto: &SpmProto) -> Result<usize, String> {
+    debug_assert!(!proto.pieces.is_empty(), "parse rejects empty protos");
+    usize::try_from(proto.unk_id)
         .ok()
         .filter(|&u| u < proto.pieces.len())
-        .ok_or_else(|| format!("unk_id {} is out of vocab range", proto.unk_id))?;
+        .ok_or_else(|| format!("unk_id {} is out of vocab range", proto.unk_id))
+}
+
+/// The UNIGRAM assembly (T5/ALBERT/Gemma family) — see [`tokenizer_from_spm`].
+fn assemble_spm_unigram(proto: &SpmProto) -> Result<Tokenizer, String> {
+    use tokenizers::decoders::metaspace::{Metaspace, PrependScheme};
+    use tokenizers::models::unigram::Unigram;
+    use tokenizers::normalizers::replace::ReplacePattern;
+    use tokenizers::normalizers::{Precompiled, Replace, Sequence as NormSequence};
+
+    let unk = spm_unk_index(proto)?;
     let byte_fallback = proto.pieces.iter().any(|p| p.kind == SPM_TYPE_BYTE);
     let vocab: Vec<(String, f64)> = proto
         .pieces
@@ -626,9 +645,109 @@ pub fn tokenizer_from_spm(path: &Path) -> Result<Tokenizer, String> {
     let metaspace = Metaspace::new('\u{2581}', prepend, true);
     tok.with_pre_tokenizer(Some(metaspace.clone()));
     tok.with_decoder(Some(metaspace));
+    Ok(tok)
+}
 
-    // CONTROL/UNKNOWN pieces are the proto's specials (<s>, </s>, <unk>, …);
-    // USER_DEFINED are plain added tokens. Re-add + verify like the GGUF path.
+/// The BPE assembly (Llama-2 family) — see [`tokenizer_from_spm`]. The
+/// pipeline shape is pinned by the family's own `tokenizer.json`:
+/// `Prepend(▁)` + `Replace(" "→"▁")` normalizers, NO pre-tokenizer, and the
+/// `Replace("▁"→" ")` / `ByteFallback` / `Fuse` / `Strip(" ")` decoder chain.
+fn assemble_spm_bpe(proto: &SpmProto) -> Result<Tokenizer, String> {
+    use tokenizers::decoders::byte_fallback::ByteFallback;
+    use tokenizers::decoders::fuse::Fuse;
+    use tokenizers::decoders::sequence::Sequence as DecoderSequence;
+    use tokenizers::decoders::strip::Strip;
+    use tokenizers::normalizers::replace::ReplacePattern;
+    use tokenizers::normalizers::{Precompiled, Prepend, Replace, Sequence as NormSequence};
+
+    let unk = spm_unk_index(proto)?;
+    let byte_fallback = proto.pieces.iter().any(|p| p.kind == SPM_TYPE_BYTE);
+    let mut vocab = Vocab::default();
+    for (index, p) in proto.pieces.iter().enumerate() {
+        #[allow(clippy::cast_possible_truncation)] // bounded by MAX_SPM_PIECES
+        vocab.insert(p.text.clone(), index as u32);
+    }
+    if vocab.len() != proto.pieces.len() {
+        return Err("duplicate piece text in the proto".into());
+    }
+    let merges = extract_spm_merges(&proto.pieces, &vocab);
+    let bpe = BPE::builder()
+        .vocab_and_merges(vocab, merges)
+        .unk_token(proto.pieces[unk].text.clone())
+        .fuse_unk(true)
+        .byte_fallback(byte_fallback)
+        .build()
+        .map_err(|e| format!("BPE build: {e}"))?;
+    let mut tok = Tokenizer::new(bpe);
+
+    let mut normalizers: Vec<tokenizers::normalizers::NormalizerWrapper> = Vec::with_capacity(3);
+    if !proto.precompiled_charsmap.is_empty() {
+        let pre = Precompiled::from(&proto.precompiled_charsmap)
+            .map_err(|e| format!("precompiled charsmap: {e}"))?;
+        normalizers.push(pre.into());
+    }
+    if proto.add_dummy_prefix {
+        normalizers.push(Prepend::new("\u{2581}".into()).into());
+    }
+    if proto.escape_whitespaces {
+        let escape = Replace::new(ReplacePattern::String(" ".into()), "\u{2581}")
+            .map_err(|e| format!("replace: {e}"))?;
+        normalizers.push(escape.into());
+    }
+    if !normalizers.is_empty() {
+        tok.with_normalizer(Some(NormSequence::new(normalizers)))
+            .map_err(|e| format!("normalizer: {e}"))?;
+    }
+
+    let unescape = Replace::new(ReplacePattern::String("\u{2581}".into()), " ")
+        .map_err(|e| format!("replace: {e}"))?;
+    let mut decoders: Vec<tokenizers::DecoderWrapper> = vec![unescape.into()];
+    if byte_fallback {
+        decoders.push(ByteFallback::new().into());
+    }
+    decoders.push(Fuse::new().into());
+    if proto.add_dummy_prefix {
+        // Strip the ONE leading space the dummy prefix injected.
+        decoders.push(Strip::new(' ', 1, 0).into());
+    }
+    tok.with_decoder(Some(DecoderSequence::new(decoders)));
+    Ok(tok)
+}
+
+/// Reconstruct BPE merges from a SentencePiece BPE proto's vocab + scores —
+/// HF's `SentencePieceExtractor.extract(vocab_scores)`, literally: every
+/// piece contributes each split `(l, r)` whose halves are both pieces, local
+/// candidates ordered by `(id(l), id(r))`; the whole list is then
+/// STABLE-sorted by score **descending** (a higher score is an earlier
+/// merge; ties keep piece-id order, exactly like Python's stable sort over
+/// an insertion-ordered dict).
+fn extract_spm_merges(pieces: &[SpmPiece], vocab: &Vocab) -> Merges {
+    debug_assert!(!pieces.is_empty(), "parse rejects empty protos");
+    debug_assert!(vocab.len() == pieces.len(), "one vocab entry per piece");
+    let mut scored: Vec<(String, String, f64)> = Vec::new();
+    for p in pieces {
+        let mut local: Vec<(&str, &str)> = Vec::new();
+        for (split, _) in p.text.char_indices().skip(1) {
+            let (l, r) = p.text.split_at(split);
+            if vocab.contains_key(l) && vocab.contains_key(r) {
+                local.push((l, r));
+            }
+        }
+        local.sort_by_key(|&(l, r)| (vocab[l], vocab[r]));
+        scored.extend(
+            local
+                .into_iter()
+                .map(|(l, r)| (l.to_string(), r.to_string(), p.score)),
+        );
+    }
+    scored.sort_by(|a, b| b.2.total_cmp(&a.2));
+    scored.into_iter().map(|(l, r, _)| (l, r)).collect()
+}
+
+/// CONTROL/UNKNOWN pieces are the proto's specials (`<s>`, `</s>`, `<unk>`,
+/// …); USER_DEFINED are plain added tokens. Re-add + verify every id like
+/// the GGUF path — a drifted id would silently corrupt every prompt.
+fn add_and_verify_spm_specials(tok: &mut Tokenizer, proto: &SpmProto) -> Result<(), String> {
     let mut added: Vec<(usize, &str, bool)> = Vec::new();
     for (index, p) in proto.pieces.iter().enumerate() {
         match p.kind {
@@ -657,7 +776,7 @@ pub fn tokenizer_from_spm(path: &Path) -> Result<Tokenizer, String> {
             ));
         }
     }
-    Ok(tok)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -808,11 +927,15 @@ mod tests {
     }
 
     #[test]
-    fn spm_rejects_bpe_type_truncation_and_bad_unk() {
-        let path = spm_file(&toy_spm(SPM_MODEL_BPE));
+    fn spm_rejects_unknown_type_truncation_and_bad_unk() {
+        // model_type 3 = WORD — neither UNIGRAM nor BPE.
+        let path = spm_file(&toy_spm(3));
         let err = tokenizer_from_spm(&path).unwrap_err();
         let _ = std::fs::remove_file(&path);
-        assert!(err.contains("BPE"), "BPE protos are a loud error: {err}");
+        assert!(
+            err.contains("not supported"),
+            "WORD protos are a loud error: {err}"
+        );
 
         let full = toy_spm(SPM_MODEL_UNIGRAM);
         let path = spm_file(&full[..full.len() - 3]);
@@ -833,6 +956,52 @@ mod tests {
         let err = tokenizer_from_spm(&path).unwrap_err();
         let _ = std::fs::remove_file(&path);
         assert!(err.contains("unk_id"), "out-of-range unk_id: {err}");
+    }
+
+    /// A BPE-shaped toy proto: single chars + the merged pieces, scores
+    /// encoding merge order (higher = earlier merge, the SPM convention).
+    fn toy_spm_bpe() -> Vec<u8> {
+        let mut buf = Vec::new();
+        for msg in [
+            pb_piece("<unk>", 0.0, Some(SPM_TYPE_UNKNOWN)),
+            pb_piece("<s>", 0.0, Some(SPM_TYPE_CONTROL)),
+            pb_piece("\u{2581}", 0.0, None),
+            pb_piece("h", 0.0, None),
+            pb_piece("e", 0.0, None),
+            pb_piece("l", 0.0, None),
+            pb_piece("o", 0.0, None),
+            pb_piece("he", -1.0, None),
+            pb_piece("ll", -2.0, None),
+            pb_piece("llo", -3.0, None),
+            pb_piece("hello", -4.0, None),
+            pb_piece("\u{2581}hello", -5.0, None),
+        ] {
+            buf.extend(pb_field(1, 2, &msg));
+        }
+        let mut trainer = pb_field(3, 0, &pb_varint(SPM_MODEL_BPE as u64));
+        trainer.extend(pb_field(40, 0, &pb_varint(0)));
+        buf.extend(pb_field(2, 2, &trainer));
+        let mut norm = pb_field(3, 0, &pb_varint(1)); // add_dummy_prefix
+        norm.extend(pb_field(5, 0, &pb_varint(1))); // escape_whitespaces
+        buf.extend(pb_field(3, 2, &norm));
+        buf
+    }
+
+    #[test]
+    fn toy_spm_bpe_merges_chain_and_decode_round_trips() {
+        let path = spm_file(&toy_spm_bpe());
+        let tok = tokenizer_from_spm(&path).expect("BPE proto builds");
+        let _ = std::fs::remove_file(&path);
+
+        // "hello" → prepend+escape "▁hello" → chars merge all the way up the
+        // score-ordered chain (h+e, l+l, ll+o, he+llo, ▁+hello) → one piece.
+        let ids = tok.encode("hello", false).expect("encodes");
+        assert_eq!(ids.get_ids(), &[11], "the merge chain reaches ▁hello");
+        // Decode chain strips the dummy prefix back off.
+        let text = tok.decode(&[11], true).expect("decodes");
+        assert_eq!(text, "hello", "Replace/Fuse/Strip decode chain");
+        // The CONTROL piece is a special added token at its proto index.
+        assert_eq!(tok.token_to_id("<s>"), Some(1));
     }
 
     #[test]
