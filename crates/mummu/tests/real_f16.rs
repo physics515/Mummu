@@ -129,3 +129,87 @@ fn real_qwen3_decodes_coherently_in_f16() {
         "expected the f16 answer to mention 4: {text:?}"
     );
 }
+
+/// The P2 function-calling TIER proof on real 4B weights: the catalog's
+/// Qwen3-4B Q4_K_M spec downloads through the registry (resumable,
+/// hash-verified, cache-first), parses as the `qwen3` dense arch, loads on
+/// `GpuF16` (8 GB resident — the only precision the 16 GB card fits; the f32
+/// dequant blob is transient host RAM), and greedy-emits a parseable Hermes
+/// `<tool_call>` from a `ChatMl::qwen3()` prompt. The same "download + FC
+/// decode" the 0.6B tier proved, at the BFCL-relevant size.
+#[test]
+#[ignore = "needs network (MUMMU_HUB_DEST; ~2.5 GB), a SHADER_F16 GPU, and ~9 GB free VRAM"]
+fn qwen3_4b_gguf_downloads_and_emits_a_tool_call_in_f16() {
+    use mummu::chat::{ChatMl, ToolSpec, Turn, parse_tool_calls};
+
+    let Some(dest) = std::env::var_os("MUMMU_HUB_DEST").map(PathBuf::from) else {
+        panic!("set MUMMU_HUB_DEST to the models dir for the ~2.5 GB download");
+    };
+    assert!(
+        inventory().any_shader_f16(),
+        "no adapter advertises SHADER_F16 — the 4B only fits this card in f16"
+    );
+
+    let spec = mummu::registry::catalog()
+        .into_iter()
+        .find(|s| s.name == "qwen3-4b-q4km")
+        .expect("the 4B GGUF is in the catalog");
+    spec.fetch(&dest, |_| {}).expect("registry fetch");
+    let path = spec.gguf_path(&dest).expect("gguf specs have a file path");
+    assert!(path.is_file(), "downloaded file exists at {path:?}");
+
+    let f = mummu::gguf::GgufFile::open(&path).expect("valid GGUF");
+    assert_eq!(
+        f.architecture(),
+        Some("qwen3"),
+        "Qwen3-4B is the dense arch (Qwen3.5 is `qwen35`, a hybrid SSM — not this loader)"
+    );
+    let tok = mummu::tokenizer::tokenizer_from_gguf(&f).expect("tokenizer from metadata");
+
+    let tools = [ToolSpec {
+        name: "get_weather".into(),
+        description: "Get the current weather for a city.".into(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "city": { "type": "string", "description": "City name" }
+            },
+            "required": ["city"]
+        }),
+    }];
+    let raw = ChatMl::qwen3().render_with_tools(
+        &tools,
+        &[Turn::user(
+            "What is the weather in Paris right now? Use the tool.",
+        )],
+    );
+    let prompt = tok
+        .encode(raw.as_str(), false)
+        .expect("encodes")
+        .get_ids()
+        .to_vec();
+
+    let device = burn::tensor::Device::<GpuF16>::default();
+    let model =
+        mummu::models::qwen3::load_from_gguf::<GpuF16>(&path, &device).expect("checked f16 load");
+    // Generous budget: the 4B thinks before calling the tool.
+    let ids = model
+        .greedy_generate(&prompt, 512, &device)
+        .expect("f16 greedy decode");
+    let text = tok.decode(&ids, false).expect("decode");
+    eprintln!("[real_f16/qwen3-4b] emitted: {text:?}");
+
+    let (calls, prose) = parse_tool_calls(&text).expect("emitted tool call parses");
+    assert!(!calls.is_empty(), "expected a tool call, prose: {prose:?}");
+    assert_eq!(calls[0].name, "get_weather", "calls: {calls:?}");
+    assert_eq!(
+        calls[0].arguments["city"].as_str(),
+        Some("Paris"),
+        "arguments: {:?}",
+        calls[0].arguments
+    );
+    eprintln!(
+        "[real_f16/qwen3-4b] parsed: {} with {}",
+        calls[0].name, calls[0].arguments
+    );
+}

@@ -248,7 +248,7 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       semantic test (`tests/real_minilm.rs`).* *(2026-07-10) **Parity PASSED**: embedding matches the
       Candle f32 reference (`minilm-probe` fixture) at cosine 0.99999994 with max |Δcomponent| 1.2e-7
       (bound 1e-4); semantic sanity re-verified on real weights (paraphrase 0.556 vs cross-topic ≈ 0).*
-- [ ] **Qwen3.5 small tier** as the next zoo port: released Feb 2026 in 0.8B / 2B / 4B / 9B, with
+- [x] **Qwen3.5 small tier** as the next zoo port: released Feb 2026 in 0.8B / 2B / 4B / 9B, with
       2026 GGUF re-releases specifically improving tool-calling (chat-template fixes) — the 4B/9B are
       the function-calling sweet spot BFCL identified (9B 66.1%), and unsloth ships ready GGUFs for the
       P3 import path to chew on; parity reference = Ollama `qwen3.5:9b` (already pulled locally) —
@@ -297,6 +297,16 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       `qwen35.*` config/name maps) and a fresh parity gate. Re-scoped: the *FC-tier-at-4B* half of this item
       rides **Qwen3-4B dense** (catalog entry existed; FC decode proven this run — see below), and the
       Qwen3.5 hybrid port is now its own P2 architecture item beside the MoE one.
+      *(2026-07-30, same run)* **FC tier at 4B PROVEN — item closed on the dense arch.**
+      `tests/real_f16.rs::qwen3_4b_gguf_downloads_and_emits_a_tool_call_in_f16`: the catalog's
+      `qwen3-4b-q4km` spec downloaded `Qwen3-4B-Q4_K_M.gguf` (2.50 GB) through the registry's
+      resumable/hash-verified fetch, the header asserts arch `qwen3`, the one file loaded on **GpuF16**
+      (the only precision a 16 GB card fits — ~8 GB resident), and from a `ChatMl::qwen3()` tools
+      prompt it greedy-emitted a `<think>` block + a clean
+      `<tool_call>{"name": "get_weather", "arguments": {"city": "Paris"}}</tool_call>` that
+      `parse_tool_calls` round-tripped — on the 4070 Ti SUPER, under heavy VRAM contention (15.7/16 GiB
+      in use). The 9B tier stays out of reach on this card (18 GB in f16) until P9 keep-quantized or a
+      P6 placement plan makes it fit.
       *(2026-07-22 research)* The mid-2026 function-calling field guides converge on the same picture: for
       ≤ 8 GB cards **Qwen3.5-9B** is the general-purpose FC pick and **Qwen3.5-4B** the CPU-only pick
       (reinforces the 4B/9B target of this item); the Qwen3.6 tier (27B dense / 35B-A3B MoE) ships a new
