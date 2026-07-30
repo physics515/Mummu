@@ -41,9 +41,12 @@ pub fn rope_tables<B: Backend>(
             sin[i * head_dim + k + half] = s;
         }
     }
-    let cos = Tensor::<B, 2>::from_data(TensorData::new(cos, [t, head_dim]), device)
+    // Dtype pinned to the backend TYPE: unspecified-dtype creation follows
+    // the per-DEVICE policy another alias sharing the device may have locked.
+    let dtype = crate::backend::float_dtype::<B>();
+    let cos = Tensor::<B, 2>::from_data(TensorData::new(cos, [t, head_dim]), (device, dtype))
         .reshape([1, 1, t, head_dim]);
-    let sin = Tensor::<B, 2>::from_data(TensorData::new(sin, [t, head_dim]), device)
+    let sin = Tensor::<B, 2>::from_data(TensorData::new(sin, [t, head_dim]), (device, dtype))
         .reshape([1, 1, t, head_dim]);
     (cos, sin)
 }

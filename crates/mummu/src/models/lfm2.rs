@@ -522,9 +522,13 @@ impl<B: Backend> CausalLm<B> for LoadedLfm2<B> {
         );
         let cfg = &self.config;
 
+        // Dtype pinned to the backend TYPE, never the per-device policy.
         let ids32: Vec<i32> = new_ids.iter().map(|&i| i as i32).collect();
-        let input =
-            Tensor::<B, 1, Int>::from_data(TensorData::new(ids32, [t]), device).reshape([1, t]);
+        let input = Tensor::<B, 1, Int>::from_data(
+            TensorData::new(ids32, [t]),
+            (device, crate::backend::int_dtype::<B>()),
+        )
+        .reshape([1, t]);
         let mut x = self.model.embed_tokens.forward(input);
 
         let (cos, sin) = rope_tables::<B>(t, past, cfg.head_dim(), cfg.rope_theta, device);

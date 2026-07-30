@@ -811,7 +811,7 @@ that fits the model AND uses every device to the fullest.
       under the 150 ms ceiling); VRAM peak unchanged (11.5 GiB whole-card). Parity gate byte-identical
       (max |Δlogit| 2.670e-5, Ollama greedy exact); f16 island + CPU budget gates re-passed
       (108.4 ms / 11.7 tok/s GPU gate, 13.2 tok/s CPU). `bench/BASELINE.md` re-baselined.*
-- [ ] **Per-device default-dtype policy when mixing precisions in one process** — Burn 0.21 resolves
+- [x] **Per-device default-dtype policy when mixing precisions in one process** — Burn 0.21 resolves
       unspecified-dtype tensor creation against a per-DEVICE settings policy (`get_device_settings` /
       `set_default_dtypes`), not the backend type alias: a `GpuF16` client and a `Gpu` client sharing the
       same device inside one process flip each other's ambient float dtype. *(2026-07-23, found live)*: with
@@ -825,6 +825,24 @@ that fits the model AND uses every device to the fullest.
       decide the policy explicitly — call `set_default_dtypes` per device at model-load/planner level (or pin
       every runtime tensor creation site's dtype) so in-process mixed-precision is defined behavior, and add a
       two-alias regression test once it is.
+      *(2026-07-30)* **Decided and shipped: pin every runtime creation site; the policy registry is not the
+      tool.** Reading burn-backend 0.21 source settled it — `set_default_dtypes` is ONE-SHOT per device
+      (`OnceLock` semantics: first tensor touch permanently locks the defaults, later calls error
+      `AlreadyInitialized`), and the registry key is the *device* type, which `Gpu`/`GpuF16` share — so a
+      runtime per-model policy flip is impossible by design, and pinning is the only correct shape. New
+      `backend::{float_dtype, int_dtype}::<B>()` expose the TYPE-level dtypes; all 7 policy-dependent
+      runtime creation sites now pass an explicit dtype (`from_data(…, (device, dtype))`): rope cos/sin
+      tables, the causal mask, MiniLM's ids+mask, and the three decoders' token-id tensors (the f32-softmax
+      island was already input-derived via `q.dtype()`; load paths were type-pinned 2026-07-23). Proof:
+      new `tests/real_mixed_dtype.rs` (own binary — its policy pollution is the experiment) runs the
+      historically poisonous order on the real GPU: an f16 Qwen3-0.6B forward locks the shared device
+      policy to F16, then the f32 model in the SAME process loads, forwards with `logits.dtype() == F32`,
+      survives the exact strict-f32 readback that died `TypeMismatch` on 2026-07-23, agrees with the f16
+      leg on the greedy top token (151667, spreads 49.4), and greedy-decodes "2 + 2 = 4." coherently.
+      Parity unchanged by construction AND by measurement: the Qwen3 GGUF-vs-llama.cpp strict leg re-passed
+      bit-identically (top-5 exact in order, max |Δlogprob| 4.015608155114805e-1 unchanged, 24-token greedy
+      byte-identical). The one-alias-per-process test convention stays for the OTHER suites (defense in
+      depth), but is no longer load-bearing for pinned code paths.
 - [ ] **Placement plan** — given model size + KV-cache + display headroom and the device set, choose a
       **fit-and-fill** plan: single GPU when it fits; **shard layers across multiple GPUs** (pipeline/
       layer-parallel over Burn's multi-device tensors — Burn gives the multi-device *primitives*, not automatic

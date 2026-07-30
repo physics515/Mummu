@@ -278,10 +278,17 @@ impl<B: Backend> LoadedMiniLm<B> {
         );
 
         let ids32: Vec<i32> = ids.iter().map(|&i| i as i32).collect();
-        let id_t =
-            Tensor::<B, 1, Int>::from_data(TensorData::new(ids32, [n]), device).reshape([1, n]);
-        let mask_t =
-            Tensor::<B, 1>::from_data(TensorData::new(mask.to_vec(), [n]), device).reshape([1, n]);
+        // Dtypes pinned to the backend TYPE, never the per-device policy.
+        let id_t = Tensor::<B, 1, Int>::from_data(
+            TensorData::new(ids32, [n]),
+            (device, crate::backend::int_dtype::<B>()),
+        )
+        .reshape([1, n]);
+        let mask_t = Tensor::<B, 1>::from_data(
+            TensorData::new(mask.to_vec(), [n]),
+            (device, crate::backend::float_dtype::<B>()),
+        )
+        .reshape([1, n]);
 
         // Additive padding mask [1, 1, 1, n]: 0 for real tokens, large-negative
         // for padding, broadcast across heads and query positions.
