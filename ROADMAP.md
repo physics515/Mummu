@@ -29,7 +29,15 @@ ours to pick, burn 0.21 resolves wgpu 29 transitively, so it unblocks with a bur
 lifts `SHADER_F16` to **all** shader kinds (WGSL included — previously SPIR-V passthrough only) and
 adds the Vulkan f16 IO polyfill (PR #7884, already confirmed live here) — so when burn moves to
 wgpu 30, f16 stops being SPIR-V-only and the WGSL fallback path (non-Vulkan APIs) can run f16 too —
-https://github.com/gfx-rs/wgpu/blob/trunk/CHANGELOG.md.*
+https://github.com/gfx-rs/wgpu/blob/trunk/CHANGELOG.md.* *(2026-07-30) Pin watch: **burn
+v0.22.0-pre.1 tagged 2026-07-29** — 0.21 is still the latest stable and stays pinned, but the pre-release
+telegraphs a MAJOR migration (see the new P0 item below): the `Tensor` backend generic is removed in
+favor of a high-level `Device` struct, and backends **lose their associated element types** in favor of
+device defaults — the exact `B::FloatElem` seam Mummu's dtype pinning and `GpuF16` alias ride. Also
+upstream: a `FloatCastAdapter` in burn-store (our `CastFloatAdapter`'s role), burnpack split into
+`burn-pack`, BitNet `Calibration::AbsMean` ternary quant, quant fallbacks for slice/gather/select/expand,
+and a remote multi-device backend (iroh). tokenizers 0.23.1 remains current —
+https://github.com/Tracel-AI/burn/releases*
 
 ## North Star
 
@@ -123,6 +131,18 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
 ## Phases
 
 ### P0 — Workspace scaffold
+- [ ] **Prepare the burn 0.22 migration** — v0.22.0-pre.1 (2026-07-29) is a breaking release aimed right
+      at Mummu's core seams: (a) the `Tensor` **backend generic is removed** (a high-level `Device`
+      struct replaces it) and (b) backends **lose associated element types** (`B::FloatElem` /
+      `B::IntElem`) in favor of per-device defaults — which dissolves the `Gpu`/`GpuF16` alias split AND
+      the type-level dtype pinning shipped 2026-07-30 (`backend::{float_dtype,int_dtype}` read
+      `B::FloatElem`; under 0.22 the explicit-dtype path becomes the only correct one, likely
+      simplifying the P6 mixed-precision story since dtype stops being a type parameter at all). Also
+      relevant: burn-store ships its own `FloatCastAdapter` (evaluate replacing our `CastFloatAdapter`),
+      burnpack moves to a `burn-pack` crate, and wgpu 30 lands with it (f16 beyond SPIR-V — the P6 note).
+      Do NOT adopt a pre-release; when 0.22.0 stabilizes: migrate on a branch, re-run every parity gate +
+      budget, and expect the backend aliases + dtype helpers + all loaders' `target_float` derivation to
+      change shape. *(2026-07-30 research)* — https://github.com/Tracel-AI/burn/releases
 - [x] Silence the pre-existing `LNK4098` (LIBCMT defaultlib conflict) the 2026-07 nightly toolchain's
       new `linker_messages` lint now surfaces when linking the `mummu` lib-test binary — find which
       native dep object embeds the static-CRT directive (tokenizers' C++ deps are the suspects) and
@@ -228,7 +248,7 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       semantic test (`tests/real_minilm.rs`).* *(2026-07-10) **Parity PASSED**: embedding matches the
       Candle f32 reference (`minilm-probe` fixture) at cosine 0.99999994 with max |Δcomponent| 1.2e-7
       (bound 1e-4); semantic sanity re-verified on real weights (paraphrase 0.556 vs cross-topic ≈ 0).*
-- [ ] **Qwen3.5 small tier** as the next zoo port: released Feb 2026 in 0.8B / 2B / 4B / 9B, with
+- [x] **Qwen3.5 small tier** as the next zoo port: released Feb 2026 in 0.8B / 2B / 4B / 9B, with
       2026 GGUF re-releases specifically improving tool-calling (chat-template fixes) — the 4B/9B are
       the function-calling sweet spot BFCL identified (9B 66.1%), and unsloth ships ready GGUFs for the
       P3 import path to chew on; parity reference = Ollama `qwen3.5:9b` (already pulled locally) —
@@ -267,6 +287,26 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       Qwen3.6 (35B-A3B) is also out now but is MoE and
       well past the single-card tier this zoo targets —
       https://huggingface.co/unsloth/Qwen3.5-4B-GGUF · https://unsloth.ai/docs/models/qwen3.5/gguf-benchmarks
+      *(2026-07-30)* **Premise correction — Qwen3.5 is NOT the qwen3 dense arch.** A header probe of
+      `unsloth/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q4_K_M.gguf` (HTTP-range fetch, metadata keys read directly)
+      shows `general.architecture = "qwen35"` with `qwen35.ssm.{conv_kernel, state_size, group_count,
+      time_step_rank, inner_size}`, `qwen35.full_attention_interval`, and `qwen35.rope.dimension_sections`
+      — a **hybrid linear-attention/SSM + periodic full-attention architecture** (Qwen3-Next-style), not a
+      dense decoder. So "a download + the same decode" does NOT cover Qwen3.5: it needs its own from-scratch
+      port (new SSM/gated-delta blocks + the hybrid cache machinery the LFM2 port pioneered, plus the
+      `qwen35.*` config/name maps) and a fresh parity gate. Re-scoped: the *FC-tier-at-4B* half of this item
+      rides **Qwen3-4B dense** (catalog entry existed; FC decode proven this run — see below), and the
+      Qwen3.5 hybrid port is now its own P2 architecture item beside the MoE one.
+      *(2026-07-30, same run)* **FC tier at 4B PROVEN — item closed on the dense arch.**
+      `tests/real_f16.rs::qwen3_4b_gguf_downloads_and_emits_a_tool_call_in_f16`: the catalog's
+      `qwen3-4b-q4km` spec downloaded `Qwen3-4B-Q4_K_M.gguf` (2.50 GB) through the registry's
+      resumable/hash-verified fetch, the header asserts arch `qwen3`, the one file loaded on **GpuF16**
+      (the only precision a 16 GB card fits — ~8 GB resident), and from a `ChatMl::qwen3()` tools
+      prompt it greedy-emitted a `<think>` block + a clean
+      `<tool_call>{"name": "get_weather", "arguments": {"city": "Paris"}}</tool_call>` that
+      `parse_tool_calls` round-tripped — on the 4070 Ti SUPER, under heavy VRAM contention (15.7/16 GiB
+      in use). The 9B tier stays out of reach on this card (18 GB in f16) until P9 keep-quantized or a
+      P6 placement plan makes it fit.
       *(2026-07-22 research)* The mid-2026 function-calling field guides converge on the same picture: for
       ≤ 8 GB cards **Qwen3.5-9B** is the general-purpose FC pick and **Qwen3.5-4B** the CPU-only pick
       (reinforces the 4B/9B target of this item); the Qwen3.6 tier (27B dense / 35B-A3B MoE) ships a new
@@ -318,6 +358,27 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       llama.cpp like every port. This is the architecture prerequisite for the P6 expert-streaming item;
       resident-everything (no streaming) is a valid first cut for the small tier. *(2026-07-30 research)* —
       https://github.com/JustVugg/colibri
+      *(2026-07-30, same run)* Port groundwork made concrete: **OLMoE-1B-7B** (64 experts, top-8 routing,
+      1B active / 7B total) is the right first target — allenai publishes an official
+      **`OLMoE-1B-7B-0125-Instruct-GGUF`** (Q2_K 2.6 GB … Q4_K_M **4.21 GB** … F16 13.8 GB, chat template
+      in-metadata), llama.cpp runs it (arch `olmoe` — the parity reference leg is free), and the expert
+      tensors follow the standard fused-3-D naming (`blk.N.ffn_{gate,down,up}_exps.weight`) our GGUF
+      reader already parses structurally. Fit math for the first resident-everything cut: f32 dequant is
+      28 GB — CPU-only (fits 128 GB RAM, slow) or **GpuF16 at ~14 GB** (marginal on the 16 GB card with
+      ambient; the keep-quantized P9 leg or expert-CPU-offload makes it comfortable — expert tensors are
+      the textbook offload candidates since only 8/64 fire per token) —
+      https://huggingface.co/allenai/OLMoE-1B-7B-0125-Instruct-GGUF ·
+      https://huggingface.co/blog/Doctor-Shotgun/llamacpp-moe-offload-guide
+- [ ] **Qwen3.5 hybrid (`qwen35`) architecture port** — split from the Qwen3.5-tier item when the
+      2026-07-30 header probe showed Qwen3.5-4B/9B are a hybrid **linear-attention/SSM + periodic
+      full-attention** arch (`qwen35.ssm.*` metadata: conv_kernel/state_size/group_count/time_step_rank/
+      inner_size; `full_attention_interval`; `rope.dimension_sections` partial-rotary), not qwen3 dense.
+      A port needs: the SSM/gated-delta block (recurrent state cache — the LFM2 conv-state machinery
+      generalizes), the interval-scheduled full-attention layers, `qwen35.*` config + GGUF name maps, and
+      the P7 parity gate vs llama.cpp (which runs it — the GGUFs ship working). Worth it when picked up:
+      the 4B/9B are 2026's local-FC sweet spot (BFCL 9B 66.1%) and the 4B ships an `mmproj` vision
+      projector (P11 candidate). *(2026-07-30 research)* —
+      https://huggingface.co/unsloth/Qwen3.5-4B-GGUF
 - [x] A `Model` trait so new architectures (Hermes-class function-callers, Gemma, Qwen3, …) slot in.
       *(2026-07-10) `models::CausalLm<B>` — associated `Cache` type; a port supplies `new_cache` /
       `forward` / `is_eos` and inherits `generate` / `greedy_generate` / `first_token` from the shared
@@ -358,7 +419,12 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       weights. Remaining follow-ups: sharded `.bin` indexes, a bf16-cast on this path (PytorchStore has
       no adapter chaining; `.bin`-era checkpoints are f32), decoder loaders adopt `weights_file` when a
       real `.pth` decoder checkpoint exists to verify against, and `hub::fetch_model` learning the
-      `pytorch_model.bin` fallback.
+      `pytorch_model.bin` fallback. *(2026-07-30)* The fetch-fallback follow-up is **deprioritized after a
+      fixture hunt**: the Hub's safetensors-conversion backfill has made "has `tokenizer.json` + only
+      `pytorch_model.bin`" repos effectively extinct (every candidate checked — tiny-gpt2,
+      hf-internal-testing, cross-encoder — either got safetensors or predates fast tokenizers and lacks
+      `tokenizer.json`, which `fetch_model` requires first). A real proof would need relaxing the
+      tokenizer.json contract too — do it only if a consumer actually hits such a repo.
 - [x] **GGUF** (llama.cpp) — parse the GGUF container (metadata KV + tensor table), map tensors to modules,
       and **dequantize** Q4/Q5/Q8/K-quant blocks into Burn tensors (or hand keep-quantized to P9). GGUF is how
       most small models are distributed — this makes the whole ecosystem importable. *(2026-07-10 research)*
@@ -490,7 +556,7 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       qwen3-0.6b: all 26 ids pass `check_ids_against`, and `config.json` eos 151645 agrees with the resolved
       `<|im_end|>`. Remaining on this item: SentencePiece `tokenizer.model` import, and *calling* these
       validators from `load_from_dir` (config-driven EOS + template-vs-renderer consistency) — split below.
-- [ ] **SentencePiece `tokenizer.model` import** — the `.model` proto tokenizer (Llama/Gemma/T5 family) that
+- [x] **SentencePiece `tokenizer.model` import** — the `.model` proto tokenizer (Llama/Gemma/T5 family) that
       HF ships instead of a `tokenizer.json`; build the equivalent HF `tokenizers` pipeline (or convert), and
       byte-verify ids against a `tokenizer.json` of the same checkpoint where one exists. *(2026-07-18, split
       from the tokenizer-import item.)* *(2026-07-18 research)* Route: the HF `tokenizers` crate we already
@@ -503,6 +569,41 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       the same `.model` proto directly and is a reference. No SentencePiece checkpoint is cached locally yet,
       so this needs a fixture fetch (a small Gemma/Llama `.model` + its `tokenizer.json` for the byte-verify) —
       https://github.com/huggingface/spm_precompiled · https://github.com/guillaume-be/rust-tokenizers
+      *(2026-07-30)* **Shipped exactly along the researched route, Unigram leg — and the byte gate passed
+      first run.** `tokenizer::tokenizer_from_spm(path)`: a bounded hand-rolled protobuf wire reader (the
+      `gguf.rs` approach — varint/length-delimited/fixed32, unknown fields skipped, 64 MiB file / 1M piece
+      caps, truncation is a loud error) parses `ModelProto` pieces(+scores+types), `trainer_spec.model_type`
+      /`unk_id`, and `normalizer_spec.{precompiled_charsmap, add_dummy_prefix, remove_extra_whitespaces}`;
+      assembly mirrors HF's `convert_slow_tokenizer`: `Precompiled` charsmap (via the `spm_precompiled` the
+      `tokenizers` dep already carries — **zero new dependencies**) + a regex `" {2,}"→" "` collapse →
+      Metaspace(`▁`, Always/Never by `add_dummy_prefix`) as pre-tokenizer AND decoder → `Unigram(pieces,
+      unk_id, byte_fallback = any BYTE piece)`; CONTROL/UNKNOWN pieces become special added tokens,
+      USER_DEFINED plain, every added id verified post-build like the GGUF path. BPE-type protos (Llama-2
+      family) are a loud not-yet-supported error (split below). Proof: 4 new unit tests over synthetic proto
+      bytes (assembly + metaspace/collapse behavior, BPE/truncation/bad-unk rejection, unknown-field skip),
+      and `tests/real_spm.rs` on the real **flan-t5-small** fixture (`spiece.model` vs its shipped
+      `tokenizer.json`): a 10-prompt battery — whitespace runs, leading/trailing space, `™`/`½`/ligature/
+      fullwidth (the charsmap leg), CJK+emoji, contractions, newlines, empty — is **byte-identical in ids
+      AND decode round-trips**, and `<unk>`/`</s>`/`<pad>` resolve to the same ids. Tokens beyond the proto
+      (T5's 100 `<extra_id_*>`) are sibling-metadata territory by design (`tokenizer_config.json` /
+      `added_tokens_decoder`), documented on the fn.
+- [x] **BPE-type SentencePiece protos** (Llama-2 family: `trainer_spec.model_type = BPE`) — the other half
+      of the SPM import: same proto reader, but the pieces feed a BPE model (scores encode merge ranks)
+      instead of Unigram; needs a byte-verify fixture with both files (TinyLlama ships `tokenizer.model` +
+      `tokenizer.json`, non-gated). Currently a loud not-yet-supported error in `tokenizer_from_spm`.
+      *(2026-07-30, split from the SentencePiece item.)* *(2026-07-30, same run) **Shipped, byte gate
+      passed first run.** `tokenizer_from_spm` now dispatches on `model_type`: the BPE leg reconstructs
+      the merge list from vocab + scores exactly as HF's `SentencePieceExtractor` does (every piece's
+      valid splits, local `(id_l, id_r)` order, stable global sort by score DESCENDING — higher score =
+      earlier merge), builds `BPE { fuse_unk, byte_fallback }`, with the Llama-family pipeline its own
+      `tokenizer.json` pins: `Prepend(▁)` + `Replace(" "→"▁")` normalizers (driven by
+      `add_dummy_prefix`/`escape_whitespaces`, now parsed), NO pre-tokenizer, and the
+      `Replace(▁→" ")`/`ByteFallback`/`Fuse`/`Strip` decoder chain. Proof: a synthetic BPE toy proto
+      whose merge chain must fire in score order (unit test, 185 total), and `tests/real_spm.rs` gains a
+      TinyLlama-1.1B leg — the reconstructed 61 249-merge tokenizer is **byte-identical in ids and
+      decode round-trips** to the checkpoint's shipped `tokenizer.json` across the 10-prompt battery,
+      byte-fallback cases included; `<unk>`/`<s>`/`</s>` ids agree. Both SPM legs (Unigram + BPE) now
+      cover the `.model`-shipping families end to end.*
 - [x] **`tok_config` reads a standalone `chat_template.jinja`** — recent `transformers` `save_pretrained`
       (and the v5 tokenizer split) writes the chat template to a separate **`chat_template.jinja`** file in the
       tokenizer dir rather than the `chat_template` key of `tokenizer_config.json`; some checkpoints ship it
@@ -639,14 +740,28 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       `chat_template` (the byte gate proved fidelity on Qwen3). Weigh promoting the dep from dev to optional
       runtime feature vs the from-scratch ethos; needs the P8/consumer-facing API decision of when to prefer
       the imported template over a family renderer. *(2026-07-23, split from the evaluation.)*
-- [ ] **`ChatMl::qwen3()` with history think-stripping** — the byte gate documented that Qwen3's template
+- [x] **`ChatMl::qwen3()` with history think-stripping** — the byte gate documented that Qwen3's template
       strips `<think>…</think>` reasoning from assistant turns at/before the last user query while our
       shared `ChatMl::qwen2()` renderer re-renders history verbatim (fine for fresh prompts + tool loops,
       wrong for long multi-turn chats with a thinking Qwen3). A `qwen3()` constructor wants the LFM-style
       strip (the machinery exists — `turn_content` already does it for `Lfm`) but keyed to Qwen3's
       "at/before the last user query" rule rather than LFM's "every but the last assistant turn"; gate it
       on the template byte gate's think case flipping from documented-divergence to byte-equal.
-      *(2026-07-24, found by the byte gate.)*
+      *(2026-07-24, found by the byte gate.)* *(2026-07-30) **Shipped, and the gate flipped** — plus the
+      other pinned Qwen3 divergence for free. `ChatMl::qwen3()`: think-strip is now a per-family
+      `ThinkStrip` policy on `ChatMl` (`Keep` Qwen2.5 / `PastAssistant` LFM / `BeforeLastUserQuery`
+      Qwen3), implemented byte-for-byte from the template's Python chain — strip = text after the final
+      `</think>` `lstrip('\n')` (newlines only, NOT LFM's full trim), "last user query" excludes
+      pre-wrapped `<tool_response>` user turns, and an assistant turn AFTER the last query (mid tool
+      loop) keeps its reasoning re-emitted in the normalized `<think>\n…\n</think>\n\n` shape. The
+      no-system tools preamble also became per-family (`qwen2()` keeps the neutral default; `qwen3()`
+      injects none, per its template). Byte gate: the think case AND the no-preamble case flipped from
+      pinned-divergence to **byte-equal** (think-strip 249 B, tools-no-system 724 B, and a new
+      think+tool_call normalization leg 361 B — all byte-identical vs the imported template through
+      hf-chat-template; every other leg unchanged, qwen2/LFM divergences still pinned exactly). 5 new
+      unit tests (181 total). REAL-GPU proof: `real_toolcall_qwen3` now renders with `qwen3()` — from
+      the no-preamble prompt, Qwen3-0.6B greedy-emitted `<think>…</think>` + a clean parseable
+      `<tool_call>{"name": "get_weather", …}</tool_call>` on the 4070 Ti SUPER.*
 - [x] **Model registry / manifest** — a declarative `ModelSpec` (repo, architecture, weight format, dtype,
       tokenizer, chat template, size tier) + a small built-in catalog of known-good models (Qwen2.5, LFM2.5,
       MiniLM, …); adding a model = a manifest entry. *(2026-07-10) `mummu::registry`: `ModelSpec`
@@ -754,6 +869,15 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       substrates to evaluate before hand-rolling: `llguidance` (the guidance-ai engine, token-level
       masks), GBNF-port crates. Gate: greedy path byte-unchanged when no grammar is armed; masked decode
       re-passes the FC real-GPU tests with the parser's error leg now unreachable. *(2026-07-30 research)*
+      *(2026-07-30, same run)* `llguidance` evaluated concretely: **1.7.6** (June 2026), MIT, pure Rust —
+      JSON Schema + Lark-variant CFGs, ~50 µs/token masks on a 128k vocab (Earley + derivative-based lazy
+      lexer + a tokenizer trie), the engine OpenAI credited for Structured Outputs. Integration shape for
+      our driver: build a `TokenParser`/`Constraint` from the grammar + vocabulary (the sibling
+      `toktrie_hf_tokenizers` crate bridges HF `tokenizers`, which we already load), then in
+      `generate_loop`: `compute_mask()` → mask the logits before `sample_id`/argmax → `commit_token()`.
+      Weigh the dep tree (toktrie, derivre, rayon) against a hand-rolled JSON-schema automaton; 2026
+      benchmarks note XGrammar edges it on repeated-schema caching, but llguidance's Rust-native API is
+      the fit here — https://lib.rs/crates/llguidance · https://github.com/guidance-ai/llguidance
 
 ### P6 — Hardware planner: precision, placement & full utilization
 The "use all the hardware" phase — inventory the machine, then pick the precision and the device placement
@@ -797,7 +921,7 @@ that fits the model AND uses every device to the fullest.
       under the 150 ms ceiling); VRAM peak unchanged (11.5 GiB whole-card). Parity gate byte-identical
       (max |Δlogit| 2.670e-5, Ollama greedy exact); f16 island + CPU budget gates re-passed
       (108.4 ms / 11.7 tok/s GPU gate, 13.2 tok/s CPU). `bench/BASELINE.md` re-baselined.*
-- [ ] **Per-device default-dtype policy when mixing precisions in one process** — Burn 0.21 resolves
+- [x] **Per-device default-dtype policy when mixing precisions in one process** — Burn 0.21 resolves
       unspecified-dtype tensor creation against a per-DEVICE settings policy (`get_device_settings` /
       `set_default_dtypes`), not the backend type alias: a `GpuF16` client and a `Gpu` client sharing the
       same device inside one process flip each other's ambient float dtype. *(2026-07-23, found live)*: with
@@ -811,6 +935,24 @@ that fits the model AND uses every device to the fullest.
       decide the policy explicitly — call `set_default_dtypes` per device at model-load/planner level (or pin
       every runtime tensor creation site's dtype) so in-process mixed-precision is defined behavior, and add a
       two-alias regression test once it is.
+      *(2026-07-30)* **Decided and shipped: pin every runtime creation site; the policy registry is not the
+      tool.** Reading burn-backend 0.21 source settled it — `set_default_dtypes` is ONE-SHOT per device
+      (`OnceLock` semantics: first tensor touch permanently locks the defaults, later calls error
+      `AlreadyInitialized`), and the registry key is the *device* type, which `Gpu`/`GpuF16` share — so a
+      runtime per-model policy flip is impossible by design, and pinning is the only correct shape. New
+      `backend::{float_dtype, int_dtype}::<B>()` expose the TYPE-level dtypes; all 7 policy-dependent
+      runtime creation sites now pass an explicit dtype (`from_data(…, (device, dtype))`): rope cos/sin
+      tables, the causal mask, MiniLM's ids+mask, and the three decoders' token-id tensors (the f32-softmax
+      island was already input-derived via `q.dtype()`; load paths were type-pinned 2026-07-23). Proof:
+      new `tests/real_mixed_dtype.rs` (own binary — its policy pollution is the experiment) runs the
+      historically poisonous order on the real GPU: an f16 Qwen3-0.6B forward locks the shared device
+      policy to F16, then the f32 model in the SAME process loads, forwards with `logits.dtype() == F32`,
+      survives the exact strict-f32 readback that died `TypeMismatch` on 2026-07-23, agrees with the f16
+      leg on the greedy top token (151667, spreads 49.4), and greedy-decodes "2 + 2 = 4." coherently.
+      Parity unchanged by construction AND by measurement: the Qwen3 GGUF-vs-llama.cpp strict leg re-passed
+      bit-identically (top-5 exact in order, max |Δlogprob| 4.015608155114805e-1 unchanged, 24-token greedy
+      byte-identical). The one-alias-per-process test convention stays for the OTHER suites (defense in
+      depth), but is no longer load-bearing for pinned code paths.
 - [ ] **Placement plan** — given model size + KV-cache + display headroom and the device set, choose a
       **fit-and-fill** plan: single GPU when it fits; **shard layers across multiple GPUs** (pipeline/
       layer-parallel over Burn's multi-device tensors — Burn gives the multi-device *primitives*, not automatic

@@ -25,6 +25,28 @@ pub type GpuF16 = burn::backend::Wgpu<half::f16, i32>;
 /// CPU backend (burn-flex: pure-Rust SIMD + gemm; burn-ndarray's successor).
 pub type Cpu = burn_flex::Flex<f32, i32>;
 
+/// The backend's TYPE-level float dtype (`B::FloatElem`).
+///
+/// Runtime tensor-creation sites pass this explicitly so a tensor's dtype
+/// never rides Burn 0.21's per-DEVICE default policy: unspecified-dtype
+/// creation resolves against a global registry that locks to whichever
+/// backend touches the device first — and [`Gpu`] / [`GpuF16`] share the
+/// same device type, so the other alias's float width would silently apply
+/// (the 2026-07-23 `TypeMismatch` hazard). Pinning every creation site makes
+/// running f32 and f16 models in one process defined behavior
+/// (`tests/real_mixed_dtype.rs`).
+#[must_use]
+pub fn float_dtype<B: burn::tensor::backend::Backend>() -> burn::tensor::DType {
+    <B::FloatElem as burn::tensor::Element>::dtype()
+}
+
+/// The backend's TYPE-level int dtype (`B::IntElem`) — same rationale as
+/// [`float_dtype`].
+#[must_use]
+pub fn int_dtype<B: burn::tensor::backend::Backend>() -> burn::tensor::DType {
+    <B::IntElem as burn::tensor::Element>::dtype()
+}
+
 /// One enumerated GPU adapter, as reported by wgpu.
 #[derive(Debug, Clone)]
 pub struct GpuAdapter {

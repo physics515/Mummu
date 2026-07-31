@@ -85,18 +85,22 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
   LFM2.5 (bare tool JSON on a `List of tools:` system line, Pythonic calls in
   `<|tool_call_start|>` tokens, results as real `tool` turns, past-turn `</think>` stripping); both
   parsers are bounded with a loud error taxonomy. Proven end-to-end on the real GPU: Qwen2.5-1.5B
-  emitted a parseable Hermes call and LFM2.5-1.2B emitted exactly
-  `<|tool_call_start|>[get_weather(city="Paris")]<|tool_call_end|>` (`tests/real_toolcall.rs`,
-  `tests/real_toolcall_lfm.rs`).
+  emitted a parseable Hermes call, LFM2.5-1.2B emitted exactly
+  `<|tool_call_start|>[get_weather(city="Paris")]<|tool_call_end|>`, and Qwen3-0.6B — from a
+  `ChatMl::qwen3()` prompt selected by its own imported template's convention — emitted a
+  `<think>` block plus a parseable Hermes call (`tests/real_toolcall.rs`,
+  `tests/real_toolcall_lfm.rs`, `tests/real_toolcall_qwen3.rs`).
 - **Template byte gate** — the hardcoded renderers are proven **byte-identical to
   `transformers.apply_chat_template`** rendering the checkpoint's own imported `chat_template`
   (via the `hf-chat-template` dev-dependency): plain, multi-turn, the full Hermes `# Tools` block,
   and function-call history match byte-for-byte on **Qwen3-0.6B, Qwen2.5-1.5B, and LFM2.5-1.2B**
   (LFM's legs cover both tool conventions, its `tool` role turns, its history think-stripping, and
-  the standalone `chat_template.jinja` import path), `tests/template_gate.rs`. The known family
-  divergences are pinned to their exact deltas so any other drift fails loudly: Qwen2.5's no-system
-  branding preamble vs our neutral one, Qwen3's no-system no-preamble, and Qwen3's history
-  think-stripping (ours re-renders history verbatim — a `ChatMl::qwen3()` is a roadmap item).
+  the standalone `chat_template.jinja` import path), `tests/template_gate.rs`. **`ChatMl::qwen3()`**
+  carries Qwen3's two template deltas exactly — `<think>` reasoning stripped from assistant turns
+  at/before the last user query (kept and re-normalized for later turns mid tool loop), and no default
+  system preamble with tools — all three byte-equal against the imported template. The one remaining
+  family divergence is pinned to its exact delta so any other drift fails loudly: Qwen2.5's no-system
+  branding preamble vs `qwen2()`'s neutral one.
   Prompt JSON deliberately serializes with Python `json.dumps` spacing and insertion-order keys
   (serde_json `preserve_order`) — the exact bytes the reference stack renders and models emit back.
 - **f16 inference, validated** — Qwen2.5-1.5B runs coherently on `GpuF16` (weights + KV in f16, the
@@ -104,6 +108,12 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
   VRAM vs ~7.9 GiB f32, at identical speed**; the parity gate re-passes unchanged on f32, where the
   island casts are no-ops ([bench/BASELINE.md](bench/BASELINE.md)). The same island covers the Qwen3
   arch — Qwen3-0.6B decodes coherently in f16 (its qk-norm + decoupled head_dim ride the same f32 scores).
+- **In-process mixed precision is defined behavior** — every runtime tensor-creation site pins its
+  dtype to the backend type (`backend::{float_dtype, int_dtype}`), so an f32 (`Gpu`) and an f16
+  (`GpuF16`) model can share one process and one device regardless of Burn's first-touch-locked
+  per-device dtype policy — proven on the real GPU in the historically failing order
+  (`tests/real_mixed_dtype.rs`: f16 locks the policy first, the f32 model still forwards f32 logits,
+  agrees on the greedy top token, and decodes coherently).
 - **SPIR-V kernels on Vulkan** — CubeCL compiles direct SPIR-V (burn's `vulkan` feature) instead of
   WGSL/naga on Vulkan adapters, worth **+30% decode throughput** on the reference GPU with parity
   byte-identical; other APIs (DX12/Metal) transparently keep WGSL in the same binary.
@@ -128,6 +138,16 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
   kv-head array, conv kernels un-squeezed bit-exactly): the official LiquidAI Q4_K_M greedy-decodes
   "2 + 2 equals 4." with top-1 identical to bf16 (logit cosine 0.991). Next: keep-quantized VRAM
   (tracked in P9).
+- **SentencePiece `tokenizer.model` import, both proto types** — `tokenizer_from_spm` builds the HF
+  pipeline straight from the SPM proto the Llama/Gemma/T5 families ship (a bounded hand-rolled
+  protobuf reader, zero new dependencies). **Unigram** protos (T5/ALBERT/Gemma) get the `Precompiled`
+  charsmap + whitespace-collapse normalizers, Metaspace, and a Unigram model; **BPE** protos (Llama-2
+  family) get their merge list reconstructed from vocab + scores (HF's `SentencePieceExtractor`
+  algorithm) plus the `Prepend`/`Replace` normalizers and `ByteFallback`/`Fuse`/`Strip` decode chain.
+  The proto's specials are re-added and id-verified in both. Proven **byte-identical** to the same
+  checkpoints' shipped `tokenizer.json` — ids and decode round-trips — on flan-t5-small (Unigram) and
+  TinyLlama-1.1B (BPE, 61k reconstructed merges, byte-fallback cases included) across a
+  unicode/whitespace/CJK/emoji battery (`tests/real_spm.rs`).
 - **Hub downloads** — streaming HuggingFace fetches into the model cache: resumable (`.part` + HTTP
   Range, proven byte-identical after an interrupted transfer), length-verified, shard-index aware, with
   a per-chunk progress callback; verified end-to-end by downloading all-MiniLM and embedding with it.

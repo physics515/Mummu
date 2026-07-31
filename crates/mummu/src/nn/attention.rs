@@ -31,7 +31,11 @@ pub fn causal_mask<B: Backend>(t: usize, past: usize, device: &B::Device) -> Ten
             m[i * kcols + j] = -1e4;
         }
     }
-    Tensor::<B, 2>::from_data(TensorData::new(m, [t, kcols]), device).reshape([1, 1, t, kcols])
+    // Dtype pinned to the backend TYPE: unspecified-dtype creation follows
+    // the per-DEVICE policy another alias sharing the device may have locked.
+    let dtype = crate::backend::float_dtype::<B>();
+    Tensor::<B, 2>::from_data(TensorData::new(m, [t, kcols]), (device, dtype))
+        .reshape([1, 1, t, kcols])
 }
 
 /// GQA expand: `[b, nkv, s, hd]` → `[b, nkv*group, s, hd]`, each KV head

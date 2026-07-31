@@ -9,7 +9,11 @@
 //!
 //! - **Hermes** (Qwen2.5/Qwen3): tool signatures in a `<tools>` block of the
 //!   system turn, calls emitted as `<tool_call>{json}</tool_call>`, results
-//!   returned inside `<tool_response>` blocks of a user turn.
+//!   returned inside `<tool_response>` blocks of a user turn. Qwen3's
+//!   template additionally strips `<think>` reasoning from assistant turns
+//!   at/before the last user query and injects no default system preamble —
+//!   [`ChatMl::qwen3`] carries those deltas; [`ChatMl::qwen2`] re-renders
+//!   history verbatim.
 //! - **LFM** (LFM2.5, per its `chat_template.jinja` + model card): tool
 //!   signatures as bare JSON in a `List of tools: […]` line of the system
 //!   turn, calls emitted as a *Pythonic call list* between the
@@ -35,6 +39,22 @@ pub enum Role {
 enum ToolCallStyle {
     Hermes,
     Lfm,
+}
+
+/// How a template treats `</think>`-prefixed reasoning when re-rendering
+/// assistant history turns (each variant byte-verified against its family's
+/// imported `chat_template` by `tests/template_gate.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThinkStrip {
+    /// Re-render history verbatim — Qwen2.5's template has no think path.
+    Keep,
+    /// Strip from every assistant turn but the last: LFM2.5's
+    /// `keep_past_thinking=false` default.
+    PastAssistant,
+    /// Qwen3: strip from assistant turns at/before the last real user query;
+    /// later turns (mid tool loop) keep their reasoning, re-emitted in the
+    /// template's normalized `<think>\n…\n</think>\n\n` shape.
+    BeforeLastUserQuery,
 }
 
 impl Role {
@@ -672,6 +692,56 @@ impl<'a> PythonicParser<'a> {
 /// still catches an unbounded history being passed by mistake.
 const MAX_TURNS: usize = 1024;
 
+/// The index Qwen3's template calls `last_query_index`: the last USER turn
+/// whose content is not a pre-wrapped `<tool_response>` block (the legacy
+/// convention for returning tool results inside a user turn). When no such
+/// turn exists the template's fallback makes every turn "at/before" it.
+fn last_user_query(turns: &[Turn]) -> usize {
+    debug_assert!(!turns.is_empty(), "render asserts a non-empty history");
+    debug_assert!(turns.len() <= MAX_TURNS, "render asserts the bound");
+    turns
+        .iter()
+        .rposition(|t| {
+            t.role == Role::User
+                && !(t.content.starts_with("<tool_response>")
+                    && t.content.ends_with("</tool_response>"))
+        })
+        .unwrap_or(turns.len().saturating_sub(1))
+}
+
+/// Qwen3's assistant-history reasoning rule, byte-for-byte from its
+/// `chat_template` (pinned by `tests/template_gate.rs`): a turn at/before
+/// the last user query renders only the text after its final `</think>`
+/// (leading newlines dropped — Python `lstrip('\n')`, NOT a full trim); a
+/// later turn (mid tool loop) keeps its reasoning, re-emitted in the
+/// template's normalized `<think>\n…\n</think>\n\n` shape.
+fn qwen3_think_content(
+    content: &str,
+    index: usize,
+    last_user_query: usize,
+) -> std::borrow::Cow<'_, str> {
+    let Some(last_close) = content.rfind("</think>") else {
+        return std::borrow::Cow::Borrowed(content);
+    };
+    let body = content[last_close + "</think>".len()..].trim_start_matches('\n');
+    debug_assert!(!body.starts_with('\n'), "leading newlines are stripped");
+    if index <= last_user_query {
+        return std::borrow::Cow::Borrowed(body);
+    }
+    // The template's Python chain, literally: reasoning =
+    // split('</think>')[0].rstrip('\n').split('<think>')[-1], emitted
+    // through a final .strip('\n').
+    let first_close = content.find("</think>").unwrap_or(last_close);
+    debug_assert!(first_close <= last_close, "find precedes rfind");
+    let before = content[..first_close].trim_end_matches('\n');
+    let reasoning = match before.rfind("<think>") {
+        Some(open) => &before[open + "<think>".len()..],
+        None => before,
+    };
+    let reasoning = reasoning.trim_matches('\n');
+    std::borrow::Cow::Owned(format!("<think>\n{reasoning}\n</think>\n\n{body}"))
+}
+
 /// The ChatML template family: `<|im_start|>role\ncontent<|im_end|>\n` per
 /// turn, then an open assistant turn for the model to complete. `bos` is
 /// prepended once when a model requires a start-of-text token; `tool_style`
@@ -680,6 +750,11 @@ const MAX_TURNS: usize = 1024;
 pub struct ChatMl {
     bos: Option<&'static str>,
     tool_style: ToolCallStyle,
+    think_strip: ThinkStrip,
+    /// The system preamble `render_with_tools` synthesizes when the
+    /// conversation opens without a system turn — `None` for templates
+    /// (Qwen3, LFM) that inject nothing of their own.
+    tools_default_system: Option<&'static str>,
 }
 
 impl ChatMl {
@@ -689,6 +764,22 @@ impl ChatMl {
         Self {
             bos: None,
             tool_style: ToolCallStyle::Hermes,
+            think_strip: ThinkStrip::Keep,
+            tools_default_system: Some("You are a helpful assistant."),
+        }
+    }
+
+    /// Qwen3 / Qwen3.5: Qwen2's ChatML + Hermes wire format, plus the two
+    /// behavioral deltas its template adds — `<think>` reasoning stripped
+    /// from assistant turns at/before the last user query, and NO default
+    /// system preamble when tools are supplied without a system turn.
+    #[must_use]
+    pub fn qwen3() -> Self {
+        Self {
+            bos: None,
+            tool_style: ToolCallStyle::Hermes,
+            think_strip: ThinkStrip::BeforeLastUserQuery,
+            tools_default_system: None,
         }
     }
 
@@ -699,6 +790,8 @@ impl ChatMl {
         Self {
             bos: Some("<|startoftext|>"),
             tool_style: ToolCallStyle::Lfm,
+            think_strip: ThinkStrip::PastAssistant,
+            tools_default_system: None,
         }
     }
 
@@ -719,6 +812,7 @@ impl ChatMl {
              a trailing assistant turn would double it"
         );
         let last_assistant = turns.iter().rposition(|t| t.role == Role::Assistant);
+        let last_user_query = last_user_query(turns);
         let mut out = String::from(self.bos.unwrap_or(""));
         let mut i = 0;
         while i < turns.len() {
@@ -737,7 +831,7 @@ impl ChatMl {
                 out.push_str("<|im_start|>");
                 out.push_str(turns[i].role.tag(self.tool_style));
                 out.push('\n');
-                out.push_str(self.turn_content(&turns[i], i, last_assistant));
+                out.push_str(&self.turn_content(&turns[i], i, last_assistant, last_user_query));
                 out.push_str("<|im_end|>\n");
                 i += 1;
             }
@@ -747,30 +841,38 @@ impl ChatMl {
         out
     }
 
-    /// What a turn's body renders as. LFM templates strip `</think>`-prefixed
-    /// reasoning from every assistant history turn but the last (the
-    /// `keep_past_thinking=false` default of LFM2.5's `chat_template.jinja`);
-    /// everything else passes through.
+    /// What a turn's body renders as — the per-family [`ThinkStrip`] policy
+    /// applied to assistant history turns; everything else passes through.
     fn turn_content<'a>(
         &self,
         turn: &'a Turn,
         index: usize,
         last_assistant: Option<usize>,
-    ) -> &'a str {
+        last_user_query: usize,
+    ) -> std::borrow::Cow<'a, str> {
         debug_assert!(index <= MAX_TURNS, "index bounded by the render assert");
         debug_assert!(
             turn.role != Role::Assistant || last_assistant.is_some(),
             "an assistant turn implies a last-assistant index"
         );
-        let is_past_assistant =
-            turn.role == Role::Assistant && last_assistant.is_some_and(|l| index != l);
-        if self.tool_style == ToolCallStyle::Lfm
-            && is_past_assistant
-            && let Some(end) = turn.content.rfind("</think>")
-        {
-            return turn.content[end + "</think>".len()..].trim();
+        if turn.role != Role::Assistant {
+            return std::borrow::Cow::Borrowed(&turn.content);
         }
-        &turn.content
+        match self.think_strip {
+            ThinkStrip::Keep => std::borrow::Cow::Borrowed(&turn.content),
+            ThinkStrip::PastAssistant => {
+                let is_past = last_assistant.is_some_and(|l| index != l);
+                match turn.content.rfind("</think>") {
+                    Some(end) if is_past => {
+                        std::borrow::Cow::Borrowed(turn.content[end + "</think>".len()..].trim())
+                    }
+                    _ => std::borrow::Cow::Borrowed(turn.content.as_str()),
+                }
+            }
+            ThinkStrip::BeforeLastUserQuery => {
+                qwen3_think_content(&turn.content, index, last_user_query)
+            }
+        }
     }
 
     /// [`render`](Self::render) with function calling in this template's
@@ -780,6 +882,8 @@ impl ChatMl {
     ///   `# Tools` section of the system turn — the exact wording and tag
     ///   structure those models ship in their chat template. A conversation
     ///   without a system turn gets a neutral "You are a helpful assistant."
+    ///   preamble under [`ChatMl::qwen2`]; [`ChatMl::qwen3`] injects none,
+    ///   matching its template.
     /// - **LFM** (LFM2.5): bare tool JSON on a `List of tools: […]` line
     ///   appended to the system turn — the exact shape of LFM2.5's
     ///   `chat_template.jinja` + model card, which injects *no* default
@@ -809,12 +913,17 @@ impl ChatMl {
         debug_assert!(!tools.is_empty(), "checked by render_with_tools");
         debug_assert!(self.tool_style == ToolCallStyle::Hermes, "hermes only");
         let (preamble, rest) = match turns.first() {
-            Some(t) if t.role == Role::System => (t.content.as_str(), &turns[1..]),
-            _ => ("You are a helpful assistant.", turns),
+            Some(t) if t.role == Role::System => (Some(t.content.as_str()), &turns[1..]),
+            // Qwen2.5 synthesizes a preamble; Qwen3's template injects none.
+            _ => (self.tools_default_system, turns),
         };
-        let mut system = String::from(preamble);
+        let mut system = String::new();
+        if let Some(preamble) = preamble {
+            system.push_str(preamble);
+            system.push_str("\n\n");
+        }
         system.push_str(
-            "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n\
+            "# Tools\n\nYou may call one or more functions to assist with the user query.\n\n\
              You are provided with function signatures within <tools></tools> XML tags:\n<tools>",
         );
         for tool in tools {
@@ -1149,6 +1258,74 @@ mod tests {
             Turn::user("b?"),
         ]);
         assert!(raw.contains("<think>hmm</think>Alpha."));
+    }
+
+    /// Qwen3 strips `<think>` reasoning from assistant turns at/before the
+    /// last user query — and its strip is Python `lstrip('\n')`, newlines
+    /// only, NOT LFM's full trim (a leading space survives).
+    #[test]
+    fn qwen3_strips_thinking_at_or_before_the_last_user_query() {
+        let raw = ChatMl::qwen3().render(&[
+            Turn::user("a?"),
+            Turn::assistant("<think>hmm</think>\n\n Alpha."),
+            Turn::user("b?"),
+        ]);
+        assert!(raw.contains("<|im_start|>assistant\n Alpha.<|im_end|>"));
+        assert!(!raw.contains("<think>"));
+    }
+
+    /// An assistant turn AFTER the last user query (mid tool loop) keeps its
+    /// reasoning, re-emitted in the template's normalized
+    /// `<think>\n…\n</think>\n\n` shape.
+    #[test]
+    fn qwen3_normalizes_thinking_after_the_last_user_query() {
+        let raw = ChatMl::qwen3().render(&[
+            Turn::user("Weather in Paris?"),
+            Turn::assistant("<think>need the tool</think>call below"),
+            Turn::tool_response("{\"temp_c\": 21}"),
+        ]);
+        assert!(raw.contains(
+            "<|im_start|>assistant\n<think>\nneed the tool\n</think>\n\ncall below<|im_end|>"
+        ));
+    }
+
+    /// A pre-wrapped `<tool_response>` user turn is NOT a user query: the
+    /// last real query stays earlier, so a later assistant turn keeps its
+    /// reasoning (the template's multi_step_tool rule).
+    #[test]
+    fn qwen3_ignores_tool_response_user_turns_when_finding_the_last_query() {
+        let raw = ChatMl::qwen3().render(&[
+            Turn::user("a?"),
+            Turn::assistant("<think>hmm</think>reply"),
+            Turn::user("<tool_response>\nr\n</tool_response>"),
+        ]);
+        assert!(raw.contains("<think>\nhmm\n</think>\n\nreply"));
+    }
+
+    /// Assistant turns without reasoning render verbatim under Qwen3 —
+    /// wherever they sit relative to the last user query.
+    #[test]
+    fn qwen3_renders_thoughtless_assistant_turns_verbatim() {
+        let raw = ChatMl::qwen3().render(&[
+            Turn::user("a?"),
+            Turn::assistant("Alpha."),
+            Turn::user("b?"),
+        ]);
+        assert!(raw.contains("<|im_start|>assistant\nAlpha.<|im_end|>"));
+    }
+
+    /// Qwen3 with tools and no system turn injects NO preamble — the system
+    /// turn opens directly with `# Tools` (Qwen2 keeps the neutral default).
+    #[test]
+    fn qwen3_tools_without_system_turn_has_no_preamble() {
+        let raw = ChatMl::qwen3().render_with_tools(&[weather_tool()], &[Turn::user("hi")]);
+        assert!(raw.starts_with("<|im_start|>system\n# Tools\n\n"));
+        assert!(!raw.contains("You are a helpful assistant."));
+
+        let qwen2 = ChatMl::qwen2().render_with_tools(&[weather_tool()], &[Turn::user("hi")]);
+        assert!(
+            qwen2.starts_with("<|im_start|>system\nYou are a helpful assistant.\n\n# Tools\n\n")
+        );
     }
 
     #[test]
