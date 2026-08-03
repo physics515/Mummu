@@ -217,6 +217,7 @@ fn build<B: Backend>(cfg: &Qwen2Config, device: &B::Device) -> Qwen2<B> {
         head_dim: cfg.head_dim,
         bias: true,        // Qwen2 has q/k/v projection bias
         qk_norm_eps: None, // and no per-head q/k norm
+        qk_norm_projection: false,
     };
     let mlp_cfg = SwiGluMlpConfig {
         hidden_size: cfg.hidden_size,

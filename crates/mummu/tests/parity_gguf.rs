@@ -21,10 +21,10 @@ mod llama_ref;
 use std::path::PathBuf;
 
 use llama_ref::{LlamaServer, logprobs_at};
-use mummu::backend::Gpu;
+use mummu::backend::{Cpu, Gpu};
 use mummu::gguf::GgufFile;
 use mummu::models::CausalLm;
-use mummu::models::{lfm2, qwen2, qwen3};
+use mummu::models::{lfm2, olmoe, qwen2, qwen3};
 
 const PROMPT: &str = "List the first five prime numbers.";
 const MAX_TOKENS: usize = 24;
@@ -63,15 +63,17 @@ fn next_port() -> u16 {
 }
 
 /// One quantized-reference comparison: `load` builds our model from the GGUF,
-/// `render` wraps the prompt in the model's chat template. Panics (test
-/// style) on any divergence.
-fn compare_against_llama_cpp<M, C>(
+/// `render` wraps the prompt in the model's chat template. Generic over the
+/// backend — the dense tiers compare on `Gpu`; OLMoE's ~28 GB f32 build only
+/// fits the CPU backend. Panics (test style) on any divergence.
+fn compare_against_llama_cpp<B, M, C>(
     tag: &str,
     gguf: &std::path::Path,
-    load: impl FnOnce(&std::path::Path, &burn::tensor::Device<Gpu>) -> M,
+    load: impl FnOnce(&std::path::Path, &burn::tensor::Device<B>) -> M,
     render: impl FnOnce(&str) -> String,
 ) where
-    M: CausalLm<Gpu, Cache = C>,
+    B: burn::tensor::backend::Backend,
+    M: CausalLm<B, Cache = C>,
 {
     let exe =
         llama_ref::server_exe().expect("set MUMMU_LLAMA_SERVER to a llama.cpp llama-server binary");
@@ -104,7 +106,7 @@ fn compare_against_llama_cpp<M, C>(
         "reference returned fewer than top-{TOP_K}"
     );
 
-    let device = burn::tensor::Device::<Gpu>::default();
+    let device = burn::tensor::Device::<B>::default();
     let loaded = load(gguf, &device);
     let mut cache = loaded.new_cache();
     let logits = loaded
@@ -214,5 +216,41 @@ fn lfm2_q4_gguf_matches_llama_cpp_on_the_same_file() {
         &gguf,
         |p, d| lfm2::load_from_gguf::<Gpu>(p, d).expect("gguf load checked"),
         |user| mummu::chat::ChatMl::lfm2().render(&[mummu::chat::Turn::user(user)]),
+    );
+}
+
+#[test]
+#[ignore = "needs the OLMoE Q4_K_M GGUF (MUMMU_OLMOE_GGUF_PATH), llama-server \
+            (MUMMU_LLAMA_SERVER), and ~60 GB free RAM (28 GB f32 build, CPU backend)"]
+fn olmoe_q4_gguf_matches_llama_cpp_on_the_same_file() {
+    // The zoo's first MoE leg. Our side runs on the CPU backend — the ~28 GB
+    // f32 resident-everything build does not fit a 16 GB card; parity is
+    // backend-independent by construction (same weights, same math).
+    let gguf = env_path(
+        "MUMMU_OLMOE_GGUF_PATH",
+        "the OLMoE-1B-7B-0125-Instruct q4_k_m gguf",
+    );
+    // OLMoE has no hardcoded ChatMl renderer yet: render its zephyr-style
+    // template (from the GGUF's own chat_template metadata) by hand, BOS
+    // first — both sides get the identical id array, so no template stack is
+    // in the loop on either side.
+    let f = GgufFile::open(&gguf).expect("gguf header parses");
+    let bos = f
+        .get("tokenizer.ggml.bos_token_id")
+        .and_then(mummu::gguf::GgufValue::as_u64)
+        .and_then(|v| {
+            f.get("tokenizer.ggml.tokens")
+                .and_then(mummu::gguf::GgufValue::as_array)
+                .and_then(|t| t.get(usize::try_from(v).ok()?))
+                .and_then(mummu::gguf::GgufValue::as_str)
+                .map(String::from)
+        })
+        .unwrap_or_default();
+    drop(f);
+    compare_against_llama_cpp(
+        "olmoe",
+        &gguf,
+        |p, d| olmoe::load_from_gguf::<Cpu>(p, d).expect("gguf load checked"),
+        move |user| format!("{bos}<|user|>\n{user}\n<|assistant|>\n"),
     );
 }

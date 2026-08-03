@@ -8,6 +8,7 @@ use crate::decode::{SamplerOptions, generate_loop, top_k_ids};
 
 pub mod lfm2;
 pub mod minilm;
+pub mod olmoe;
 pub mod qwen2;
 pub mod qwen3;
 

@@ -61,6 +61,13 @@ fn pre_spec(pre: &str) -> Option<PreSpec> {
             regex: r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
             nfc: false,
         }),
+        // OLMo/OLMoE (GPT-NeoX lineage): the stock GPT-2 regex, contractions
+        // case-SENSITIVE — the family's tokenizer.json is ByteLevel with
+        // `use_regex: true` (exactly this pattern) behind an NFC normalizer.
+        "olmo" => Some(PreSpec {
+            regex: r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+",
+            nfc: true,
+        }),
         _ => None,
     }
 }

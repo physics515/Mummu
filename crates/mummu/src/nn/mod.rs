@@ -8,11 +8,13 @@
 mod attention;
 mod conv;
 mod mlp;
+mod moe;
 mod rope;
 
 pub use attention::{GqaAttention, GqaAttentionConfig, LayerKv, causal_mask, repeat_kv};
 pub use conv::{ConvState, ShortConv, ShortConvConfig};
 pub use mlp::{SwiGluMlp, SwiGluMlpConfig};
+pub use moe::{MoeExperts, SparseMoe, SparseMoeConfig};
 pub use rope::{apply_rope, rope_tables, rotate_half};
 
 /// Hard ceiling on `past + t` everywhere a sequence position is materialized.
