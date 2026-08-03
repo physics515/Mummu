@@ -9,7 +9,7 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
 ## What it is
 
 - **One binary, every device** — compile both `Wgpu` (Vulkan/DX12/Metal, no CUDA toolchain) and `burn-flex` (CPU); a runtime probe enumerates **all** adapters + the CPU and places the model across them — a single GPU, **several GPUs together**, or GPU + CPU hybrid. No feature-split builds, no per-vendor path.
-- **Models from scratch, generic over `B: Backend`** — a growing zoo (Qwen2/2.5, Qwen3 dense with per-head q/k norm + decoupled head_dim, LFM2/2.5 hybrid conv+attention, all-MiniLM embedder) built on shared blocks (RmsNorm · GQA · RoPE · SwiGLU · tied lm-head · depthwise causal conv), with a clean trait to add more.
+- **Models from scratch, generic over `B: Backend`** — a growing zoo (Qwen2/2.5, Qwen3 dense with per-head q/k norm + decoupled head_dim, LFM2/2.5 hybrid conv+attention, **OLMoE sparse mixture-of-experts**, all-MiniLM embedder) built on shared blocks (RmsNorm · GQA · RoPE · SwiGLU · **top-k-routed expert bank** · tied lm-head · depthwise causal conv), with a clean trait to add more.
 - **Trustworthy reimplementations** — every port must pass a **parity gate**: single-forward top-k logits *and* a short greedy sequence match a reference (Candle, or a local Ollama of the same model) exactly.
 - **Fast** — per-layer KV cache (+ conv-state cache for hybrids), on-GPU argmax (sync only the winning index), sampling, **token streaming**, cooperative cancellation; kernel `fusion` + `autotune`; an **f16** path (f32 attention-score island for numeric safety) that halves VRAM at full speed.
 - **A full model-import suite** — pull a model from HuggingFace (by repo id) or from disk and load it: **safetensors**, **PyTorch** state dicts, and **GGUF** (llama.cpp, dequantized) weights; `config.json`-driven hyperparameters; tokenizer + chat-template import (HF `tokenizers` / SentencePiece / BPE); per-architecture weight-name remapping with a **checked load** (fail loudly on a key mismatch, never silently zero-init); resumable, shard-aware downloads into a per-user cache; and a declarative **model registry** so adding a model is a manifest entry, not new code.
@@ -56,12 +56,21 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
   runtime liveness a checked load can't see — NaN/Inf logits, a vocab-width mismatch, or a
   degenerate/dead forward. `CausalLm::sanity_check` is the post-`install` gate an app calls to catch a
   silently-broken import before trusting the model.
-- **Four architectures ported and running on real weights** — Qwen2/2.5, Qwen3 dense, the LFM2/2.5
-  hybrid, and the all-MiniLM sentence embedder; Qwen2.5-1.5B, Qwen3-0.6B, and LFM2.5-1.2B/230M load and
-  greedy-decode correctly on the reference GPU (wgpu/Vulkan), and Qwen2.5-0.5B / LFM2.5-230M do the same
-  on the CPU backend. Qwen3 reuses the shared blocks whole (its per-head q/k RMSNorm, absent qkv bias,
-  and decoupled `head_dim` were all already supported), loads from safetensors **and** a single Q4_K_M
-  GGUF, and handles Qwen3's `<think>` reasoning mode.
+- **Five architectures ported and running on real weights** — Qwen2/2.5, Qwen3 dense, the LFM2/2.5
+  hybrid, **OLMoE** (sparse MoE), and the all-MiniLM sentence embedder; Qwen2.5-1.5B, Qwen3-0.6B, and
+  LFM2.5-1.2B/230M load and greedy-decode correctly on the reference GPU (wgpu/Vulkan), and
+  Qwen2.5-0.5B / LFM2.5-230M / OLMoE-1B-7B do the same on the CPU backend. Qwen3 reuses the shared
+  blocks whole (its per-head q/k RMSNorm, absent qkv bias, and decoupled `head_dim` were all already
+  supported), loads from safetensors **and** a single Q4_K_M GGUF, and handles Qwen3's `<think>`
+  reasoning mode.
+- **Mixture-of-experts** — `nn::SparseMoe` is a softmax top-k router over a **fused expert bank**
+  (`[experts, out, in]` — the row-major twin of GGUF's `ffn_*_exps`, so 64 experts load as three
+  tensors per layer, not 192); `models::olmoe` drives it config-first off `olmoe.*` GGUF metadata.
+  **OLMoE-1B-7B** (64 experts, top-8 routing, 1B active / 7B total) runs from the one official
+  4.21 GB Q4_K_M file — 16 layers × 64 experts loaded and "2 + 2 equals 4." greedy-decoded at
+  1.15 s/token on the CPU backend (~28 GB f32 resident; a 16 GB card waits on keep-quantized VRAM,
+  tracked in P9). Attention learned OLMoE's whole-projection q/k RMSNorm placement, inferred from the
+  loaded norm's own width, so every existing checkpoint loads byte-unchanged.
 - **All three models are parity-verified** — the two-leg P7 gate passes for Qwen2.5-1.5B on the
   reference GPU: single-forward top-5 logits match a Candle f32 reference (max |Δlogit| 2.7e-5,
   `tests/parity_qwen2.rs` + the committed `tools/candle-probe` fixture) and a 24-token greedy sequence
@@ -74,8 +83,10 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
   both tiers. **Qwen3** is parity-verified through the same llama.cpp harness (`tests/parity_gguf.rs`,
   `qwen3` leg): on Qwen3-0.6B Q4_K_M, top-5 first-forward ids match exactly in order and a 24-token
   greedy sequence — `<think>` reasoning tokens included — is byte-identical to `llama-server` on the
-  same file. The MiniLM embedder matches its Candle reference at cosine 0.99999994
-  (max |Δcomponent| 1.2e-7, `tests/real_minilm.rs`).
+  same file. **OLMoE-1B-7B** passes the same llama.cpp gate on its own Q4_K_M (`olmoe` leg): top-5 ids
+  exact in order, 24-token greedy byte-identical, max |Δlogprob| 3.7e-1 — so the MoE router and expert
+  bank are verified against a reference, not just plausible. The MiniLM embedder matches its Candle
+  reference at cosine 0.99999994 (max |Δcomponent| 1.2e-7, `tests/real_minilm.rs`).
 - **Sampling, streaming, cancellation** — temperature / top-k / top-p sampling (deterministic per seed),
   per-token streaming through a `ControlFlow` callback, and cooperative between-token cancellation;
   greedy decoding keeps the argmax on-device.

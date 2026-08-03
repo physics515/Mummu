@@ -274,21 +274,25 @@ mod tests {
     fn forward_matches_the_hand_rolled_sparse_reference() {
         let device = Dev::default();
         let m = moe(&device);
-        for norm in [false, true] {
-            let x = input(5, 2.0, &device);
-            let xv = x.clone().into_data().to_vec::<f32>().unwrap();
-            let got = m
-                .forward(x, TOP_K, norm)
-                .into_data()
-                .to_vec::<f32>()
-                .unwrap();
-            let want = reference(&m, &xv, 5, norm);
-            assert_eq!(got.len(), want.len());
-            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
-                assert!(
-                    (g - w).abs() < 1e-5,
-                    "norm={norm} elem {i}: got {g} vs reference {w}"
-                );
+        // Both shapes the decoder actually runs: a multi-token prefill and
+        // the single-token decode step.
+        for t in [5, 1] {
+            for norm in [false, true] {
+                let x = input(t, 2.0, &device);
+                let xv = x.clone().into_data().to_vec::<f32>().unwrap();
+                let got = m
+                    .forward(x, TOP_K, norm)
+                    .into_data()
+                    .to_vec::<f32>()
+                    .unwrap();
+                let want = reference(&m, &xv, t, norm);
+                assert_eq!(got.len(), want.len());
+                for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert!(
+                        (g - w).abs() < 1e-5,
+                        "t={t} norm={norm} elem {i}: got {g} vs reference {w}"
+                    );
+                }
             }
         }
     }
