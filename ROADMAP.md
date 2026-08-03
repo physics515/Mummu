@@ -400,11 +400,12 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       legs, template gate 10/10, budgets 104.4 ms / 13.2 tok/s GPU + 15.3 tok/s CPU). Run the legs with
       `MUMMU_OLMOE_GGUF_PATH` / `MUMMU_HUB_DEST` / `MUMMU_OLMOE_TOK_JSON`.*
 - [ ] **MoE decode: make routed-expert compute actually pay** — the dense-mask forward computes all 64
-      experts per token when only 8 are routed, so decode touches ~7B params instead of ~1B. The obvious
-      fix was tried and **measured a regression, so it was reverted, not shipped**: gathering the k routed
+      experts per token when only 8 are routed, so decode touches ~7B params instead of ~1B (baseline:
+      **0.76 s/token** warm, `mummu-bench/tests/budget_moe.rs` — the number to beat). The obvious fix was
+      tried and **measured a regression, so it was reverted, not shipped**: gathering the k routed
       expert slices with a device-side `select` off the router's own index tensor (no host sync, exact
       same math to summation-order rounding — a unit test confirmed the two paths agree to 1e-6) made real
-      OLMoE decode **1.58 s/token vs the dense path's 1.15 s** on burn-flex. The gather copies ~200 MB of
+      OLMoE decode **1.58 s/token vs the dense path's 1.15 s** end to end on burn-flex. The gather copies ~200 MB of
       expert weights per layer per token, and that copy costs more than the dense matmul it removes —
       i.e. `select` materializes where the dense path streams. Routes worth trying next, each gated on
       `bench/BASELINE.md` like this one was: (a) a fused dequant/gather matmul kernel that never
