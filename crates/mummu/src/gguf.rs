@@ -137,6 +137,15 @@ impl GgufValue {
         }
     }
 
+    /// The value as a bool, if it is one.
+    #[must_use]
+    pub fn as_bool(&self) -> Option<bool> {
+        match *self {
+            Self::Bool(v) => Some(v),
+            _ => None,
+        }
+    }
+
     /// The value as an array slice, if it is one.
     #[must_use]
     pub fn as_array(&self) -> Option<&[GgufValue]> {

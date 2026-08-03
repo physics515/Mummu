@@ -20,6 +20,9 @@ pub enum Architecture {
     Lfm2,
     /// `models::minilm` — all-MiniLM BERT sentence embedder.
     MiniLm,
+    /// `models::olmoe` — OLMoE sparse mixture-of-experts decoder (the zoo's
+    /// first MoE; GGUF import only — HF ships the experts unfused).
+    Olmoe,
 }
 
 /// How the checkpoint's weights are stored — which fetch + load path a spec
@@ -231,6 +234,19 @@ pub fn catalog() -> Vec<ModelSpec> {
                 file: "Qwen3-4B-Q4_K_M.gguf".into(),
             },
             disk_bytes_estimate: 2_500_000_000,
+        },
+        // The zoo's first MoE: 64 experts, 8 active per token (1B active /
+        // 7B total). Resident-everything first cut — ~28 GB dequantized to
+        // f32, sized for the CPU backend (128 GB reference machine).
+        ModelSpec {
+            name: "olmoe-1b-7b-0125-instruct-q4km".into(),
+            repo: "allenai/OLMoE-1B-7B-0125-Instruct-GGUF".into(),
+            revision: "main".into(),
+            architecture: Architecture::Olmoe,
+            format: WeightFormat::Gguf {
+                file: "OLMoE-1B-7B-0125-Instruct-Q4_K_M.gguf".into(),
+            },
+            disk_bytes_estimate: 4_210_000_000,
         },
     ];
     debug_assert!(

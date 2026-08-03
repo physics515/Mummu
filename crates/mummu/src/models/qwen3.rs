@@ -182,6 +182,7 @@ fn build<B: Backend>(cfg: &Qwen3Config, device: &B::Device) -> Qwen3<B> {
         head_dim: cfg.head_dim,
         bias: false,                         // Qwen3 dropped the q/k/v bias
         qk_norm_eps: Some(cfg.rms_norm_eps), // and added per-head q/k RMSNorm
+        qk_norm_projection: false,
     };
     let mlp_cfg = SwiGluMlpConfig {
         hidden_size: cfg.hidden_size,

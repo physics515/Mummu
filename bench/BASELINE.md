@@ -34,6 +34,23 @@ weights at only ~114 GB/s vs the card's ~672 GB/s, so kernel/dispatch overhead i
 | --- | --- | --- |
 | Decode (8 greedy tokens, warm KV cache; `mummu-bench/tests/budget_cpu.rs`) | **11.7 tok/s** | ≥ 6 tok/s |
 
+## OLMoE-1B-7B-0125-Instruct · CPU (burn-flex) · f32 from Q4_K_M GGUF
+
+The MoE tier (64 experts, top-8 routing; 1B active / 7B total). Budgeted in **seconds per token**, not
+tok/s: the dense-mask expert forward computes every expert for every token, so decode touches all 7B
+params rather than the 1B the routing implies — this row is the number the routed-compute work in
+ROADMAP P2 has to beat. GPU is out of reach until keep-quantized VRAM (P9): ~28 GB resident in f32.
+
+| Metric | Recorded (2026-08-03) | Budget |
+| --- | --- | --- |
+| Load (dequantize ~7B params to f32; `mummu-bench/tests/budget_moe.rs`) | **81.9 s** | ≤ 300 s |
+| Decode (4 greedy tokens, warm KV cache) | **0.76 s/token** | ≤ 2.0 s/token |
+
+End-to-end (`tests/real_olmoe.rs`, prefill included and amortized over a 6-token answer) reads
+1.15 s/token — the same path, measured the way a caller experiences it rather than warm-cache steady
+state. Use the 0.76 s/token row for regression comparisons; both are recorded so the gap is not
+mistaken for drift.
+
 Notes
 - 2026-07-11: the f32 attention-score island (NaN fix for f16) coincided with an f32 *improvement*
   (TTFT 100.5 → 88.4 ms, decode 13.3 → 14.1 tok/s) — softmax now always runs in f32 with fusion
@@ -42,4 +59,9 @@ Notes
 - Effective weight-streaming bandwidth at ~71 ms/token over ~6.2 GB of f32 weights is ~88 GB/s vs the
   card's ~672 GB/s — the decode path is kernel/dispatch-bound, not bandwidth-bound. The CubeCL SPIR-V
   compiler feature (ROADMAP P6) is the identified lever.
+- 2026-08-03: a routed-expert **gather** for the single-token decode step (device-side `select` of the
+  8 routed slices — numerically the dense path minus its exactly-zero terms) measured **1.58 s/token vs
+  the dense path's 1.15** on the end-to-end harness, so it was rejected under this file's rule and
+  reverted: the ~200 MB per-layer gather copy costs more than the dense matmul it removes. Routes left
+  open are in the ROADMAP P2 item.
 - `harness_smoke` (sub-ns) exists only to keep `cargo bench` green without the multi-GB weights.

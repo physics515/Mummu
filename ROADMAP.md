@@ -37,7 +37,11 @@ device defaults — the exact `B::FloatElem` seam Mummu's dtype pinning and `Gpu
 upstream: a `FloatCastAdapter` in burn-store (our `CastFloatAdapter`'s role), burnpack split into
 `burn-pack`, BitNet `Calibration::AbsMean` ternary quant, quant fallbacks for slice/gather/select/expand,
 and a remote multi-device backend (iroh). tokenizers 0.23.1 remains current —
-https://github.com/Tracel-AI/burn/releases*
+https://github.com/Tracel-AI/burn/releases* *(2026-08-03) Pin watch: burn 0.22 is **still pre-release**
+(0.22.0-pre.1 remains the newest tag; 0.21.0 the latest stable) — the P0 migration item stays gated.
+CubeCL tagged **0.11.0-pre.1** the same day (2026-07-29): a frontend mega-refactor (references), a
+**Metal backend**, a new CPU runtime, tiled layouts, and CUDA stream priority hints — all of which
+arrive with the burn bump, not before — https://github.com/tracel-ai/cubecl/releases*
 
 ## North Star
 
@@ -347,7 +351,7 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       less of the reference's own per-dot bf16 activation rounding; it sits inside the existing 5e-2
       tolerance with ~1.5x headroom (tolerance unchanged, and the strict-order id match remains the
       real assert). Run legs with `MUMMU_LFM2_230M_DIR` + `MUMMU_LFM2_230M_BF16_GGUF`.*
-- [ ] **First MoE architecture** *(colibri parity)* — the zoo is dense-only and has so far deferred MoE
+- [x] **First MoE architecture** *(colibri parity)* — the zoo is dense-only and has so far deferred MoE
       ("Qwen3.6 35B-A3B … well past the single-card tier"), but colibri demonstrates the counter-thesis
       on our exact hardware class: frontier MoE (GLM-5.2 744B-A40B, Kimi K3 2.8T-A104B) on consumer
       boxes, because only the ~40B *active* params compute per token — dense parts (~10 GB at int4) stay
@@ -369,6 +373,53 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       the textbook offload candidates since only 8/64 fire per token) —
       https://huggingface.co/allenai/OLMoE-1B-7B-0125-Instruct-GGUF ·
       https://huggingface.co/blog/Doctor-Shotgun/llamacpp-moe-offload-guide
+      *(2026-08-03) **SHIPPED and parity-verified on the first run — the zoo is no longer dense-only.**
+      New shared block `nn::SparseMoe`: a softmax top-k router (f32 island, HF `OlmoeSparseMoeBlock`
+      math) over a **fused 3-D expert bank** `[experts, out, in]` — the exact row-major twin of ggml's
+      `ffn_{gate,up,down}_exps`, so the 64 experts load as three tensors per layer rather than 192.
+      Compute is **dense-mask**: every expert processes every token and the router's weight row (exactly
+      zero off the top-k) scales the rest away — numerically identical to the sparse formulation, and it
+      keeps the whole forward on-device with no data-dependent gather (see the measured follow-up below).
+      `GqaAttention` gained OLMoE's q/k-norm placement — RMSNorm over the **whole projection** before the
+      head split — inferred from the loaded gamma's width (`head_dim` = per-head, `n·head_dim` =
+      projection), so the module shape is unchanged and every existing checkpoint loads identically.
+      `models::olmoe` is config-driven off `olmoe.*` GGUF metadata (expert counts, either
+      `feed_forward_length` spelling, `expert_weights_norm`), GGUF-only by design (HF ships the experts
+      **unfused** as `mlp.experts.{i}.*` — a 64-way concat-on-import is the split item below); the
+      tokenizer registry gained the `olmo` pre (stock GPT-2 regex + NFC). **Parity gate PASSED**
+      (`parity_gguf.rs`, new `olmoe` leg — the harness is now generic over the backend): llama.cpp on the
+      SAME allenai Q4_K_M file, top-5 first-forward ids match **exactly in order**
+      (1992, 17833, 11202, 4943, 1394), the 24-token greedy sequence is **byte-identical**, max
+      |Δlogprob| **3.687691131310693e-1** (inside the shared 7.5e-1 tolerance, right beside Qwen3's
+      4.02e-1). Real-model proof (`real_olmoe.rs`): the registry spec fetched the 4.21 GB GGUF, the ONE
+      file loaded 16 layers × 64 experts in 92 s and greedy-decoded "2 + 2 equals 4." at **1.15 s/token**
+      on the CPU backend (~28 GB f32 resident — a 16 GB card is out of reach until the P9 keep-quantized
+      leg), sanity spread 36.9; its GGUF-built tokenizer is **byte-identical** to the checkpoint's
+      `tokenizer.json` across an 8-prompt battery. 202 unit tests; every prior gate re-passed unchanged
+      after the attention refactor (Qwen3 GGUF parity bit-identical at 4.015608155114805e-1, Qwen2 both
+      legs, template gate 10/10, budgets 104.4 ms / 13.2 tok/s GPU + 15.3 tok/s CPU). Run the legs with
+      `MUMMU_OLMOE_GGUF_PATH` / `MUMMU_HUB_DEST` / `MUMMU_OLMOE_TOK_JSON`.*
+- [ ] **MoE decode: make routed-expert compute actually pay** — the dense-mask forward computes all 64
+      experts per token when only 8 are routed, so decode touches ~7B params instead of ~1B (baseline:
+      **0.76 s/token** warm, `mummu-bench/tests/budget_moe.rs` — the number to beat). The obvious fix was
+      tried and **measured a regression, so it was reverted, not shipped**: gathering the k routed
+      expert slices with a device-side `select` off the router's own index tensor (no host sync, exact
+      same math to summation-order rounding — a unit test confirmed the two paths agree to 1e-6) made real
+      OLMoE decode **1.58 s/token vs the dense path's 1.15 s** end to end on burn-flex. The gather copies ~200 MB of
+      expert weights per layer per token, and that copy costs more than the dense matmul it removes —
+      i.e. `select` materializes where the dense path streams. Routes worth trying next, each gated on
+      `bench/BASELINE.md` like this one was: (a) a fused dequant/gather matmul kernel that never
+      materializes the gathered bank (the P9 keep-quantized kernel work is the natural host); (b) measure
+      on the **GPU** backend, where the copy is far cheaper relative to compute — blocked until a MoE fits
+      VRAM (P9 keep-quantized, or expert offload); (c) llama.cpp's own answer, `--n-cpu-moe`-style
+      placement, which sidesteps the gather entirely by moving whole expert banks rather than slicing
+      them. *(2026-08-03, measured this run.)*
+- [ ] **OLMoE from HF safetensors** — the port loads GGUF only because HF stores each expert separately
+      (`model.layers.N.mlp.experts.{0..63}.{gate,up,down}_proj.weight`) while `MoeExperts` holds one fused
+      `[experts, out, in]` tensor per projection. Needs a concat-on-import step (64 slices → one tensor,
+      in expert order) in the safetensors path — mechanical, but it wants its own fixture (the bf16
+      checkpoint is ~14 GB) and a byte-equality check against the GGUF-loaded weights. *(2026-08-03, split
+      from the MoE item.)*
 - [ ] **Qwen3.5 hybrid (`qwen35`) architecture port** — split from the Qwen3.5-tier item when the
       2026-07-30 header probe showed Qwen3.5-4B/9B are a hybrid **linear-attention/SSM + periodic
       full-attention** arch (`qwen35.ssm.*` metadata: conv_kernel/state_size/group_count/time_step_rank/
@@ -1001,6 +1052,15 @@ that fits the model AND uses every device to the fullest.
       affects speed, never precision"), and a bench proving the streamed model beats the
       largest-fitting resident one on task throughput. *(2026-07-30 research)* —
       https://github.com/JustVugg/colibri
+      *(2026-08-03 research)* Prior art to mine when this is picked up: llama.cpp's **`--n-cpu-moe N`**
+      flag (core algorithm in its PR #15077) keeps attention on-GPU and moves the first N layers'
+      expert FFN weights to CPU RAM — community numbers show 12–24 GB cards running 35B-class MoE at
+      50–60 tok/s, which calibrates what expert-CPU-offload alone (no NVMe tier) buys; and an open
+      llama.cpp feature request (#20757) sketches the **two-tier GPU+RAM expert cache with pluggable
+      eviction** — the same LRU-residency design colibri proved, upstreamed. Mummu's OLMoE port
+      (2026-08-03) makes both concrete here: expert banks are single fused 3-D tensors per layer, the
+      natural offload/eviction unit — https://github.com/ggml-org/llama.cpp/issues/20757 ·
+      https://openclawdc.com/blog/llama-cpp-moe-offload-flags-explained/
 - [ ] **Planner introspection (`plan` / `doctor`)** *(colibri parity)* — colibri ships `coli plan`
       (print the placement decision without running) and `coli doctor` (readiness checks). Mummu's
       planner should expose the same as *API*, consumer UIs render it: a `Plan` report (per-device
@@ -1133,7 +1193,9 @@ Mummu (a 128 GB box with one consumer GPU), opposite bet: Mummu shrinks the mode
 gap, each gated by the usual parity + budget discipline:
 
 - **P2 — first MoE architecture** (OLMoE-7B-A1B / Qwen3-30B-A3B): router + expert blocks + GGUF expert
-  tensors; the prerequisite for everything expert-shaped.
+  tensors; the prerequisite for everything expert-shaped. **Closed 2026-08-03** — OLMoE-1B-7B ported and
+  parity-verified vs llama.cpp; the expert-streaming and routed-compute items below now have their
+  architecture.
 - **P5 — speculative decoding** (MTP heads / small-model drafts, byte-identical by construction) and
   **grammar-constrained decoding** (guaranteed-parseable tool calls — worth more to the apps than tok/s).
 - **P6 — NVMe as a third placement tier** (expert streaming; the headline feature) and **planner

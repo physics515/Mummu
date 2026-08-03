@@ -295,6 +295,7 @@ fn build<B: Backend>(cfg: &Lfm2Config, device: &B::Device) -> Lfm2<B> {
         head_dim: cfg.head_dim(),
         bias: false,                     // LFM2 projections are bias-free
         qk_norm_eps: Some(cfg.norm_eps), // per-head q/k RMSNorm
+        qk_norm_projection: false,
     };
     let conv_cfg = ShortConvConfig {
         hidden_size: cfg.hidden_size,
