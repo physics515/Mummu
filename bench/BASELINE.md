@@ -24,23 +24,51 @@ recorded numbers (and this file's date) only on a legitimate improvement.
 | Decode latency (32 greedy tokens, warm KV cache) | 0.656 s → **20.5 ms/token ≈ 48.8 tok/s** | ≥ 10 tok/s |
 | Peak GPU memory during decode (whole card, 3.1 GiB ambient → **~3.6 GiB runner**, 2026-07-11 measure) | 6.75 GiB | ≤ 8 GiB whole-card |
 
-**2026-08-06 re-measure — the f16 path is 2.7× faster than 2026-07-12 recorded, f32 10% slower.**
-Both tables above were re-run on an idle card (criterion, three runs each, unchanged shipping code)
-because the flash-attention evaluation below needed an honest control. f16 decode moved
-54.5 → 20.5 ms/token and f16 TTFT 97.2 → 20.4 ms — an improvement nothing in this repo claimed, so
-it came from underneath (driver, or a dependency in the CubeCL/wgpu stack, or the 2026-07-30 dtype
-pinning removing a per-call policy lookup). f32 decode moved the other way, 54.3 → 60.0 ms/token;
-the gate never tripped because its ceiling is 10 tok/s, four ms/token of slack away. Both drifts are
-pre-existing at HEAD, not caused by anything this run shipped — bisecting the f32 one is a ROADMAP
-item.
+Gated by `mummu-bench/tests/budget_f16.rs`, which lives in its **own test binary** — one dtype alias
+per process is what makes the row above real, and the gate asserts `logits.dtype() == F16` so a
+policy-poisoned run fails loudly instead of quietly reporting f32 numbers. Its budgets are set
+against what *it* measures, not the criterion row: **21 ms TTFT / 16.9 tok/s** (budgets 60 ms /
+12 tok/s). The ~3× decode gap against criterion's 48.8 tok/s is warm-up, not contradiction — a single
+32-step burst never leaves f16 autotune, so the gate number is roughly what the first 32 tokens of a
+cold f16 session cost and criterion's is steady state. Two honest numbers for the same path, recorded
+together so the gap is not mistaken for drift (the OLMoE rows below do the same).
+
+**2026-08-06 re-measure, then bisected — and the old f16 rows were never f16.**
+Both tables were re-run on an idle card (criterion, three runs each, unchanged shipping code) because
+the flash-attention evaluation below needed an honest control, and they came back far from the
+2026-07-12 record: f16 decode 54.5 → **20.5 ms/token**, f16 TTFT 97.2 → **20.4 ms**, while f32 decode
+went the *other* way, 54.3 → 60.0. Neither move was a mystery for long — the 2026-07-12 tree
+(`e44debf`) and the pre-2026-07-30 tree (`c1826e7`) were checked out and benched on the same idle
+machine the same day:
+
+| tree | f32 decode | f16 decode |
+| --- | --- | --- |
+| `e44debf` (2026-07-12, recorded 54.3 / 54.5) | 60.1 ms/token | 60.2 ms/token |
+| `c1826e7` (just before the 2026-07-30 dtype pinning) | 60.0 ms/token | **panics `DTypeMismatch`** |
+| HEAD (2026-08-06) | 60.0 ms/token | **20.5 ms/token** |
+
+Two conclusions, and the second one retires a standing belief:
+
+1. **f32 never regressed.** The same 2026-07-12 code reads 60.1 ms/token today. The 54.3 recorded then
+   is not reproducible from that tree now, so it was machine state (driver, OS, background load),
+   never a Mummu change. f32 decode has been ~60 ms/token on this card the whole time.
+2. **The old f16 bench rows were f32 runs wearing an f16 label.** This bench instantiates `Gpu` and
+   then `GpuF16` in one process; before the dtype pinning, the f32 leg locked the per-device default
+   dtype policy and the "f16" model ran in f32 — which is exactly why 2026-07-11 and 2026-07-12
+   recorded f16 as *matching f32 to a tenth of a millisecond* (70.9 vs 70.7, then 54.5 vs 54.3). Once
+   the loaders started taking `target_float` from the TYPE (2026-07-23) the mismatch became loud
+   instead of silent — hence the `DTypeMismatch` panic at `c1826e7` — and the 2026-07-30 pinning of
+   every runtime creation site fixed it. **Real f16 decode is 2.9× faster than f32**, and always was;
+   the bench simply could not see it. (The f16 VRAM figures below are unaffected: they were measured
+   by `real_f16.rs`, which runs one alias per process and so was always genuinely f16.)
 
 The SPIR-V compiler (burn `vulkan` feature) cut decode latency **23%** on both dtypes
 (70.7 → 54.3 ms/token) at the cost of ~9 ms TTFT (88.4 → 96.7 ms, still ⅔ under its ceiling); parity
 held byte-identically (max |Δlogit| 2.670e-5, Ollama greedy leg exact). **The "f16 buys VRAM, not
-speed" reading from that run no longer holds**: as of the 2026-08-06 re-measure f16 decodes at
-20.5 ms/token against f32's 60.0 — 2.9× — so f16 is now the fast path as well as the small one, and
-the f32 path is the one that looks dispatch-bound (60 ms/token streams ~6.2 GB of f32 weights at
-~103 GB/s against the card's ~672 GB/s).
+speed" reading from that run was wrong, and the bisect above says why** — the f16 row it rested on
+was an f32 run. f16 decodes at 20.5 ms/token against f32's 60.0, so f16 is the fast path as well as
+the small one. What survives is the *f32* reading: 60 ms/token streams ~6.2 GB of f32 weights at
+~103 GB/s against the card's ~672 GB/s, so that path is dispatch-bound, not bandwidth-bound.
 
 ## Qwen2.5-0.5B-Instruct · CPU (burn-flex) · f32
 

@@ -89,11 +89,15 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       on an otherwise-idle GPU (5% util). Decode throughput tracking CPU availability is what a
       dispatch-bound path looks like. Operationally: **run the budget gates on a quiet machine** or
       they report contention as a regression.*
-      *(2026-08-06)* Two updates. **(1) The premise is now f32-only.** This run's re-measure has f16
-      decoding at 20.5 ms/token against f32's 60.0 — f16 is no longer "same speed, half the VRAM", it is
-      2.9× faster, so the dispatch-bound reading applies to the f32 path and the f16 path has evidently
-      found an accelerated one. Any further work here should target f32 or, better, ask whether f32 is
-      still the right default at all. **(2) The next lever is named: graph capture.** The industry
+      *(2026-08-06)* Two updates. **(1) The 2026-07-11 f16 leg of this argument is RETRACTED — it was
+      never an f16 measurement.** "f16 (half the weight traffic) decodes at exactly f32's speed" came
+      from a bench that builds `Gpu` then `GpuF16` in one process; the f32 leg locked the per-device
+      default dtype policy, so the f16 model ran in f32 and of course matched to a tenth of a
+      millisecond. Bisected this run (see the closed item above): real f16 decodes at **20.5 ms/token
+      against f32's 60.0**. So the dispatch-bound reading holds for the **f32** path — which the
+      independent evidence still supports (the ~30 % swing from *host CPU* load on an idle GPU; SPIR-V's
+      +30 %) — and the open question becomes whether f32 is the right default at all rather than why f16
+      is not faster. **(2) The next lever is named: graph capture.** The industry
       framing matches our numbers exactly — a kernel launch costs ~5–10 µs of CPU time, an LLM forward
       dispatches hundreds of them, and on batch-1 decode that CPU-side sequencing is 20–40 % of total
       inference time; the standard fix is to capture the decode step's whole launch sequence once and
@@ -175,18 +179,41 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       for one token) and the honest shape is llama.cpp at f16 on the `llama_ref` harness; (b) accept a
       dtype- **and** length-conditional branch in `GqaAttention::forward`, or find a formulation that
       isn't conditional. Re-measure first: the numbers are burn-0.21/wgpu-29-specific.
-- [ ] **Bisect the f32 decode drift: 54.3 → 60.0 ms/token since 2026-07-12** — the 2026-08-06
-      re-measure found the f32 decode row 10 % slower than recorded while f16 got **2.7× faster**
-      (54.5 → 20.5 ms/token) over the same period. Neither move was caused by a Mummu change that
-      claimed them, and the budget gate never noticed because its ceiling (10 tok/s) sits four
-      ms/token below the recorded number — a ceiling that loose cannot catch drift, only collapse.
-      Suspects, cheapest first: the 2026-07-30 dtype pinning (explicit `(device, dtype)` at every
-      creation site may have moved f32 off a fast path while putting f16 on one), a dependency bump in
-      the CubeCL/wgpu stack, an autotune cache re-tuned against a different machine state, or the
-      GPU driver. Route: check out the 2026-07-12 tree and re-bench it on today's machine — if it
-      also reads 60 ms/token the cause is under the repo, if it reads 54 the cause is in it, and
-      `git bisect` over the bench closes it either way. Worth doing before any further f32 perf work
-      builds on a number that moved.
+- [x] **Bisect the f32 decode drift: 54.3 → 60.0 ms/token since 2026-07-12** — the 2026-08-06
+      re-measure found the f32 decode row 10 % slower than recorded while f16 read **2.7× faster**.
+      *(2026-08-06, closed the same run — and it turned up something bigger than the drift.)* The
+      2026-07-12 tree (`e44debf`) and the pre-dtype-pinning tree (`c1826e7`) were checked out and
+      benched on the same idle machine: f32 reads **60.1 / 60.0 / 60.0 ms/token** across all three
+      trees, so **f32 never regressed** — the 54.3 recorded on 2026-07-12 is not reproducible from
+      that same code today, i.e. it was machine state (driver/OS/background), never a Mummu change.
+      The f16 finding is the real one: `c1826e7` **panics `DTypeMismatch`** on the f16 bench leg, and
+      `e44debf` reports f16 at 60.2 ms/token — a tenth of a millisecond from its own f32 row. That is
+      the one-alias-per-process hazard (root-caused 2026-07-23, fixed 2026-07-30): this bench builds
+      `Gpu` then `GpuF16` in ONE process, the f32 leg locked the per-device default dtype policy, and
+      **the "f16" rows recorded on 2026-07-11 and 2026-07-12 were f32 runs wearing an f16 label** —
+      which is exactly why they matched f32 so implausibly closely (70.9 vs 70.7, then 54.5 vs 54.3).
+      Real f16 decode is **20.5 ms/token, 2.9× faster than f32**, and always was; the harness could
+      not see it. Consequences folded above: the dispatch-bound item's f16 leg is retracted, and
+      `bench/BASELINE.md` carries the three-tree table. The f16 *VRAM* figures are unaffected — they
+      come from `real_f16.rs`, one alias per process, always genuinely f16. Standing lesson for the
+      perf suite: **a measurement that agrees with its control to a tenth of a percent is evidence of
+      a wiring bug, not of a null result.**
+      *(2026-08-06, same run)* Guard added so this class of bug cannot recur silently:
+      **`mummu-bench/tests/budget_f16.rs`**, an f16 budget gate in its OWN test binary (one dtype alias
+      per process) that asserts `logits.dtype() == F16` before it believes a single number. Recorded
+      21 ms TTFT / 16.9 tok/s, budgets 60 ms / 12 tok/s.
+- [ ] **Close the f16 autotune warm-up gap: 16.9 tok/s cold vs 48.8 steady** — building the f16 gate
+      surfaced it. The gate prefills twice, then times 32 decode steps once, and gets 16.9 tok/s
+      (~59 ms/token); criterion, which runs the same 32 steps across many samples, gets 48.8 (20.5
+      ms/token). So an f16 session's **first ~32 tokens run at roughly f32 speed** and only then does the
+      2.9× appear — the f16 path has many more autotune variants to try than f32 (whose same-harness gap
+      is only 13.2 vs 16.7 tok/s). That is a real user-facing cost for a runner whose consumers open
+      short-lived agent turns, and it is not a perf mystery so much as a caching question: CubeCL's
+      autotune cache is configurable (`[cubecl.autotune] cache = "local"|"target"|"global"|{file=…}`,
+      already in the repo-root `burn.toml`'s vocabulary) and a persisted, per-machine cache should let a
+      cold process start warm. Route: measure whether a `global`/file-backed autotune cache carries the
+      tuning across processes, and if so ship it as the default for consumers; if not, consider a
+      warm-up prefill at model install. Gate on the budget rows like everything else.
 
 ## Phases
 
@@ -1071,6 +1098,12 @@ that fits the model AND uses every device to the fullest.
       gate re-passed both legs (max |Δlogit| 2.670e-5, unchanged; Ollama greedy byte-identical), and f32
       perf *improved* (TTFT 100.5 → 88.4 ms, decode 13.3 → 14.1 tok/s). f16 benches recorded in
       `bench/BASELINE.md`: 88.0 ms TTFT, 14.1 tok/s — speed parity with f32, VRAM halved.*
+      *(2026-08-06 correction)* The islands themselves are unaffected — they were validated by
+      `real_f16.rs`, one dtype alias per process, genuinely f16 (no NaN, 6.75 GiB, coherent output). But
+      the **"speed parity with f32" bench line above is withdrawn**: that row came from the two-alias
+      bench process and was an f32 run mislabelled f16 (bisected this run — see the closed drift item in
+      the perf section). Real f16 decode is 20.5 ms/token vs f32's 60.0. The same withdrawal applies to
+      the SPIR-V item's "+30 % on BOTH dtypes" — only its f32 half was ever measured.
 - [x] Evaluate burn-wgpu's **`spirv` compiler feature** on Vulkan (CubeCL SPIR-V backend instead of
       WGSL/naga): claims significantly faster matmul incl. TensorCores at f16 — could be the cheapest
       decode-tok/s lever on the dev GPU; gate on the parity harness + `bench/BASELINE.md` —
