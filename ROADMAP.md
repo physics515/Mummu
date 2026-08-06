@@ -89,6 +89,18 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       on an otherwise-idle GPU (5% util). Decode throughput tracking CPU availability is what a
       dispatch-bound path looks like. Operationally: **run the budget gates on a quiet machine** or
       they report contention as a regression.*
+      *(2026-08-06)* Two updates. **(1) The premise is now f32-only.** This run's re-measure has f16
+      decoding at 20.5 ms/token against f32's 60.0 — f16 is no longer "same speed, half the VRAM", it is
+      2.9× faster, so the dispatch-bound reading applies to the f32 path and the f16 path has evidently
+      found an accelerated one. Any further work here should target f32 or, better, ask whether f32 is
+      still the right default at all. **(2) The next lever is named: graph capture.** The industry
+      framing matches our numbers exactly — a kernel launch costs ~5–10 µs of CPU time, an LLM forward
+      dispatches hundreds of them, and on batch-1 decode that CPU-side sequencing is 20–40 % of total
+      inference time; the standard fix is to capture the decode step's whole launch sequence once and
+      replay it, which keeps per-token overhead flat instead of paying it per kernel. burn **0.22 ships
+      graph capture** for this purpose (P0 item), which is a far better bet than shaving kernels one at a
+      time — this run's flash-attention A/B is the evidence that per-kernel substitution does not move
+      this number. — https://gigagpu.com/cuda-graph-optimization-inference/
 - [x] Evaluate Burn 0.21's `burn.toml` project config — per-subsystem tuning + a CubeCL kernel-validation
       layer without recompiling; useful as a debug switch for kernel-level parity hunts —
       https://burn.dev/blog/release-0.21.0/ *(2026-07-17 research)* Concretely, a `burn.toml` dropped at
@@ -191,6 +203,18 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       Do NOT adopt a pre-release; when 0.22.0 stabilizes: migrate on a branch, re-run every parity gate +
       budget, and expect the backend aliases + dtype helpers + all loaders' `target_float` derivation to
       change shape. *(2026-07-30 research)* — https://github.com/Tracel-AI/burn/releases
+      *(2026-08-06 research)* Still pre-release (0.22.0-pre.1 is the newest tag; 0.21.0 the latest stable),
+      so this stays gated — but reading the pre-release notes properly turns it from a migration *cost*
+      into the run's most valuable pending item, because **0.22 ships graph capture, explicitly to cut
+      CPU-side launch overhead**. That is the exact bottleneck the dispatch-bound decode item has been
+      chasing since 2026-07-11 (an f16-matches-f32 measurement, then SPIR-V, then this run's flash-attention
+      A/B all pointing at per-dispatch cost rather than bandwidth), and it is the one lever that attacks it
+      *generically* rather than one kernel at a time. Three more items arrive with it: **LoRA/QLoRA** land
+      in-framework (P10 becomes wiring, not implementation), the **remote backend** gains multi-device +
+      client-side operation-graph caching + async reads (P6 multi-GPU), and quantization gains
+      dequant→op→quant fallbacks for slice/gather/select/expand plus BitNet b1.58 calibration (P9). Plan the
+      migration around measuring graph capture on the decode loop first — if it lands the dispatch win, it
+      reorders everything below it in the perf section.
 - [x] Silence the pre-existing `LNK4098` (LIBCMT defaultlib conflict) the 2026-07 nightly toolchain's
       new `linker_messages` lint now surfaces when linking the `mummu` lib-test binary — find which
       native dep object embeds the static-CRT directive (tokenizers' C++ deps are the suspects) and
@@ -979,6 +1003,23 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       greedy; (b) a small same-tokenizer zoo model as drafter (0.5B drafts for 9B). Needs: batched-verify
       forward through the existing KV cache (rollback on reject), driver support in `generate_loop`.
       *(2026-07-30 research)* — https://github.com/JustVugg/colibri
+      *(2026-08-06 research)* **Calibration that changes this item's expected value: on consumer GPUs a
+      small-draft-model speculation is frequently a net LOSS, not a 1.5–2× win.** The 2026 measurements to
+      plan against: a 7B target + 0.5B draft on an RTX 5060 Ti ran at **0.27×** (i.e. ~4× slower) and only
+      flipped to 1.4× when the target grew to 14B — the draft's cost only amortizes when the target is
+      expensive enough per token; and a public 19-configuration llama.cpp study on Qwen3.6-35B-A3B with a
+      vocab-matched Qwen3.5-0.8B drafter found **no variant achieving a net speedup** on a single RTX 3090
+      (ngram-cache, ngram-mod and classic draft all lost), while vLLM on the same hardware got +27.5 % —
+      i.e. the engine's verify-batching quality, not the idea, decides it. Consequences for Mummu: (a)
+      route (a) **native MTP heads** is the one to build — no second model to pay for; (b) route (b) small-
+      model drafting must be gated on an end-to-end measurement per (target, draft, hardware) triple, never
+      shipped on the literature's headline; (c) the batched-verify forward has to be genuinely batched
+      through the KV cache, since that is where the engines that win differ from the ones that lose. Our
+      own dispatch-bound decode makes (c) harder and the win smaller: a k-token verify is one forward
+      either way, so speculation trades dispatches for compute — which is the right direction here, and
+      worth re-checking after graph capture (P0) moves the dispatch baseline. —
+      https://github.com/thc1006/qwen3.6-speculative-decoding-rtx3090 ·
+      https://inventivehq.com/blog/llama-cpp-speculative-decoding-consumer-gpu
 - [ ] **Grammar-constrained decoding** *(colibri parity)* — colibri forces structured output via `.gbnf`
       grammars (llama.cpp's GBNF convention) and even uses grammar-forced *drafts* to speed structured
       generation. Mummu's tool-calling currently *trusts* the model to emit parseable `<tool_call>` JSON
@@ -1207,6 +1248,18 @@ The VRAM lever the P6 planner pulls to make the largest useful model fit the use
       here may be VRAM-only for us until the dispatch gap closes; (b) their gains lean on subgroup
       matrix ops where available, with portable fallbacks. — https://arxiv.org/html/2605.20706v1
       *(2026-07-16 research)*
+      *(2026-08-06 research)* Corroborated from the CUDA side, which matters because it means the design is
+      the *general* answer and not a WebGPU workaround: production int4 kernels (Marlin and descendants)
+      fuse dequantization into the matmul so the int4 values unpack to f16 **in the register file**, never
+      materializing a full-size intermediate — the same "straight into registers" split LlamaWeb measured
+      for the decode matvec. Also worth copying from LlamaWeb is its *interface*: a new quantization scheme
+      is an **unpacker + a dequant routine**, and every downstream kernel (matmul, attention) stays
+      format-agnostic — the shape that let one representation carry 21 formats, and the natural fit for our
+      GGUF reader, which already parses every K-quant block layout structurally. One caveat sharpens with
+      this run's numbers: LlamaWeb's headline decode win came from being bandwidth-bound, and our f32 path
+      is not — but our **f16** path now decodes 2.9× faster than f32, so measure the keep-quantized win
+      against f16, not f32, or it will look better than it is. —
+      https://www.tensortonic.com/llm-internals/quantization
 - [ ] Evaluate **CubeCL's quantization primitives** for the keep-quantized matmul: recent CubeCL ships
       block-scaled MMA, global quantization for matmul, quantized tensor views, and FP4/FP2 formats —
       the kernel substrate a Q4-weights × f16-activations decode path would ride (vs hand-writing a
