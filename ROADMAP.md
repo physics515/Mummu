@@ -830,11 +830,35 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       the local cache). Known family divergences are PINNED to their exact deltas so any other drift still
       fails: Qwen2.5's no-system branding preamble ("You are Qwen, …") vs our neutral one (with tools AND
       the plain injected default turn), Qwen3's no-system no-preamble, Qwen3's history think-stripping.
-- [ ] **General fallback chat renderer via `hf-chat-template`** — payoff (2) of the evaluation above: for a
+- [x] **General fallback chat renderer via `hf-chat-template`** — payoff (2) of the evaluation above: for a
       checkpoint whose family has no hardcoded `chat` renderer, render prompts from its own imported
       `chat_template` (the byte gate proved fidelity on Qwen3). Weigh promoting the dep from dev to optional
       runtime feature vs the from-scratch ethos; needs the P8/consumer-facing API decision of when to prefer
       the imported template over a family renderer. *(2026-07-23, split from the evaluation.)*
+      *(2026-08-06) **Shipped as `mummu::template`, behind the non-default feature `jinja-template`.** Both
+      open questions decided: **(a) the dep** is promoted from dev-only to an *optional* runtime dependency
+      — same crate, same 0.2.1 the byte gate already trusts as the transformers-equivalent reference — so a
+      default build still carries no Jinja engine and the from-scratch ethos holds for the zoo, while a
+      consumer that must run an un-ported checkpoint opts in. **(b) the selection rule** is a value, not a
+      convention: `Renderer::for_checkpoint(family: Option<ChatMl>, dir)` takes the family renderer when the
+      caller has one and falls back to `ImportedTemplate` otherwise, and it deliberately does **not**
+      second-guess a family renderer by reading the template (the gate pins those bytes; a checkpoint
+      repackaged with a foreign template is caught at *load* by the `tokenizer.rs` consistency gate, not
+      silently obeyed at render). API mirrors `ChatMl`: `render` / `render_with_tools`, plus
+      `render_with_tools_json` because the `tools` shape is genuinely open — the mainstream templates unpack
+      the `transformers` `{"type":"function","function":{…}}` wrapper, LFM2.5's wants the signature bare.
+      Bounded + fail-loud throughout (`Absent` / `Jinja` / `TooLarge` at 8 MiB / `BadTool`; a runaway
+      template trips the byte bound rather than returning an untokenizable prompt — unit-tested with a
+      render bomb). The one model change: `chat::Turn` gained an additive `tool_calls: Vec<ToolCall>` field
+      that `assistant_tool_calls{,_lfm}` now populate **beside** the rendered content — the family renderers
+      never read it (prompt bytes unchanged by construction *and* by the gate), but the imported path passes
+      calls as data so the template writes its own markers instead of inheriting Hermes' `<tool_call>`
+      wrapping. Proof: 7 unit tests over a toy Jinja template (no fixture needed) + `tests/imported_render.rs`
+      on real checkpoints — byte-identical to `ChatMl::qwen3()` on plain 142 B / tools 748 B / FC history
+      324 B and to `ChatMl::lfm2()` on plain 157 B / tools 379 B (that leg also exercising the standalone
+      `chat_template.jinja` fallback and `bos_token` injection, which the gate had to hand-inject); all 10
+      template-gate legs re-passed unchanged, 209 unit tests with the feature (202 without), clippy clean in
+      both configurations, and Qwen3-0.6B still greedy-emits a parseable `<tool_call>` on the 4070 Ti SUPER.*
 - [x] **`ChatMl::qwen3()` with history think-stripping** — the byte gate documented that Qwen3's template
       strips `<think>…</think>` reasoning from assistant turns at/before the last user query while our
       shared `ChatMl::qwen2()` renderer re-renders history verbatim (fine for fresh prompts + tool loops,

@@ -51,6 +51,20 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
   neither → no behavior change). On a successful safetensors load the parsed `TokenizerConfig` is surfaced
   on the returned `Loaded{Qwen2,Qwen3,Lfm2}` struct (`tokenizer_config`), so a consumer reads config-driven
   EOS/BOS/PAD ids straight off the model; a GGUF load surfaces `None` (self-contained).
+- **Fallback chat renderer for un-ported models** (optional feature `jinja-template`) —
+  `mummu::template::ImportedTemplate` renders a checkpoint's **own** imported `chat_template` Jinja, so a
+  model whose family has no hardcoded renderer is still promptable from the authority on its prompt
+  format: its own template. The selection rule ships as a value — `Renderer::for_checkpoint(family, dir)`
+  takes a byte-verified family renderer when one exists and falls back to the template otherwise, never
+  second-guessing the family renderer. Bounded and fail-loud (no template → `Absent`, bad Jinja →
+  `Jinja`, a runaway render → `TooLarge` at 8 MiB), with the config's BOS/EOS/PAD/UNK reaching the render
+  context and assistant tool calls passed **structurally** so the template writes its own call markers
+  instead of inheriting Hermes'. Verified against the from-scratch path on real checkpoints
+  (`tests/imported_render.rs`): byte-identical to `ChatMl::qwen3()` on plain (142 B), tools (748 B) and
+  full FC history (324 B), and to `ChatMl::lfm2()` on plain (157 B) and tools (379 B) — the LFM leg also
+  proving the standalone `chat_template.jinja` fallback and the `bos_token` injection. The feature is
+  **off by default**: the zoo's from-scratch renderers cover it byte-for-byte, and a default build carries
+  no Jinja engine.
 - **Import validation** — a two-stage error taxonomy: `ImportError` for the file→module stage (missing
   file, parse, load, and an `Incomplete` per-tensor missing/errored diff) and `SanityError` for the
   runtime liveness a checked load can't see — NaN/Inf logits, a vocab-width mismatch, or a

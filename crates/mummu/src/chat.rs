@@ -75,6 +75,15 @@ impl Role {
 pub struct Turn {
     pub role: Role,
     pub content: String,
+    /// The tool calls an assistant turn makes, kept **structurally** beside
+    /// the rendered `content`. The family renderers here never read it —
+    /// they re-emit `content`, which the `assistant_tool_calls*`
+    /// constructors already wrote in the family's own wire format. It exists
+    /// for renderers that need the calls unwrapped: a checkpoint's imported
+    /// Jinja template (see [`crate::template`]) receives `tool_calls` as data
+    /// and writes the markers *itself*, in whatever convention that template
+    /// speaks. Empty for every other role and for a plain assistant turn.
+    pub tool_calls: Vec<ToolCall>,
 }
 
 impl Turn {
@@ -83,6 +92,7 @@ impl Turn {
         Self {
             role: Role::System,
             content: content.into(),
+            tool_calls: Vec::new(),
         }
     }
 
@@ -91,6 +101,7 @@ impl Turn {
         Self {
             role: Role::User,
             content: content.into(),
+            tool_calls: Vec::new(),
         }
     }
 
@@ -99,6 +110,7 @@ impl Turn {
         Self {
             role: Role::Assistant,
             content: content.into(),
+            tool_calls: Vec::new(),
         }
     }
 
@@ -124,6 +136,7 @@ impl Turn {
         Self {
             role: Role::Assistant,
             content: blocks.join("\n"),
+            tool_calls: calls.to_vec(),
         }
     }
 
@@ -145,6 +158,7 @@ impl Turn {
                 "<|tool_call_start|>{}<|tool_call_end|>",
                 pythonic_calls(calls)
             ),
+            tool_calls: calls.to_vec(),
         }
     }
 
@@ -156,6 +170,7 @@ impl Turn {
         Self {
             role: Role::Tool,
             content: content.into(),
+            tool_calls: Vec::new(),
         }
     }
 }
@@ -337,7 +352,7 @@ pub struct ToolCall {
 pub const MAX_TOOL_CALLS: usize = 64;
 
 /// Most tools one render will advertise.
-const MAX_TOOLS: usize = 128;
+pub(crate) const MAX_TOOLS: usize = 128;
 
 /// What went wrong extracting tool calls from a model response.
 #[derive(Debug, thiserror::Error)]
@@ -690,7 +705,7 @@ impl<'a> PythonicParser<'a> {
 
 /// Longest conversation a single render will wrap — a generous bound that
 /// still catches an unbounded history being passed by mistake.
-const MAX_TURNS: usize = 1024;
+pub(crate) const MAX_TURNS: usize = 1024;
 
 /// The index Qwen3's template calls `last_query_index`: the last USER turn
 /// whose content is not a pre-wrapped `<tool_response>` block (the legacy
