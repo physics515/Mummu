@@ -6,8 +6,19 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+# Render a checkpoint's OWN imported `chat_template` Jinja (crate::template),
+# for models whose family has no hardcoded `chat` renderer. Off by default:
+# the from-scratch renderers cover the zoo byte-for-byte and a default build
+# should not carry a Jinja engine to wrap a prompt. Turning it on pulls
+# hf-chat-template (minijinja) — the same crate, same version, that the
+# template BYTE gate already trusts as the transformers-equivalent reference.
+jinja-template = ["dep:hf-chat-template"]
+
 [dependencies]
 burn = { workspace = true }
+hf-chat-template = { workspace = true, optional = true }
 wgpu = { workspace = true }
 pollster = { workspace = true }
 half = { workspace = true }
@@ -28,7 +39,9 @@ burn-store = { workspace = true }
 # wrapping stays the hardcoded, byte-verified `chat` renderers.
 # Default features stay ON: they carry minijinja's Python-compat layer
 # (str.startswith etc.), which real HF templates (Qwen3's included) call.
-hf-chat-template = "0.2.1"
+# Also the dependency behind the optional `jinja-template` feature above;
+# listing it here too keeps the gate running in a plain `cargo test`.
+hf-chat-template = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 # One syscall (GlobalMemoryStatusEx) for the device inventory's total-RAM

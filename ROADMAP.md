@@ -89,6 +89,22 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       on an otherwise-idle GPU (5% util). Decode throughput tracking CPU availability is what a
       dispatch-bound path looks like. Operationally: **run the budget gates on a quiet machine** or
       they report contention as a regression.*
+      *(2026-08-06)* Two updates. **(1) The 2026-07-11 f16 leg of this argument is RETRACTED — it was
+      never an f16 measurement.** "f16 (half the weight traffic) decodes at exactly f32's speed" came
+      from a bench that builds `Gpu` then `GpuF16` in one process; the f32 leg locked the per-device
+      default dtype policy, so the f16 model ran in f32 and of course matched to a tenth of a
+      millisecond. Bisected this run (see the closed item above): real f16 decodes at **20.5 ms/token
+      against f32's 60.0**. So the dispatch-bound reading holds for the **f32** path — which the
+      independent evidence still supports (the ~30 % swing from *host CPU* load on an idle GPU; SPIR-V's
+      +30 %) — and the open question becomes whether f32 is the right default at all rather than why f16
+      is not faster. **(2) The next lever is named: graph capture.** The industry
+      framing matches our numbers exactly — a kernel launch costs ~5–10 µs of CPU time, an LLM forward
+      dispatches hundreds of them, and on batch-1 decode that CPU-side sequencing is 20–40 % of total
+      inference time; the standard fix is to capture the decode step's whole launch sequence once and
+      replay it, which keeps per-token overhead flat instead of paying it per kernel. burn **0.22 ships
+      graph capture** for this purpose (P0 item), which is a far better bet than shaving kernels one at a
+      time — this run's flash-attention A/B is the evidence that per-kernel substitution does not move
+      this number. — https://gigagpu.com/cuda-graph-optimization-inference/
 - [x] Evaluate Burn 0.21's `burn.toml` project config — per-subsystem tuning + a CubeCL kernel-validation
       layer without recompiling; useful as a debug switch for kernel-level parity hunts —
       https://burn.dev/blog/release-0.21.0/ *(2026-07-17 research)* Concretely, a `burn.toml` dropped at
@@ -123,7 +139,7 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       with validation armed (no OOB found — clean bill), and the budget gates hold their numbers from
       the opted-out bench crate (12.4 tok/s with the files ≈ 12.1 without; first run after a config
       change can read ~30% low while autotune re-tunes — re-run before believing a regression).
-- [ ] Evaluate **CubeCL's now-complete flash-attention kernel** for the decode/prefill attention step —
+- [x] Evaluate **CubeCL's now-complete flash-attention kernel** for the decode/prefill attention step —
       the releases page reports a full implementation (causal **masking**, partitions, row-wise
       reductions, multi-plane ops). Mummu currently materializes attention explicitly (q·kᵀ → f32 softmax
       island → ·v); a fused flash-attention kernel collapses those into one dispatch, which is squarely
@@ -131,6 +147,73 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       the O(t²) scores tensor at prefill). Gate strictly: the f32-softmax island is the whole reason the
       f16 parity holds, so any flash path must re-pass the parity harness (both legs) AND hold/beat
       `bench/BASELINE.md` before adoption. — https://github.com/tracel-ai/cubecl/releases *(2026-07-17 research)*
+      *(2026-08-06) **Evaluated end to end, and rejected on measurement — the numbers are in
+      `bench/BASELINE.md`.** It reaches Mummu as burn 0.21's `tensor::module::attention`, which the
+      wgpu backend routes to `cubek`'s flash kernel through an autotune set (flash-blackbox-accelerated
+      variants vs an unfused fallback). It is a genuine drop-in: `scale: None` asks for the op's own
+      `1/sqrt(head_dim)` default — the same factor, and passing it explicitly would silently
+      *disqualify* the flash kernel (burn-cubecl routes any custom scale to the fallback) — `is_causal:
+      true` reproduces our mask exactly (its causal boundary aligns bottom-right, `col > row + (seq_k −
+      seq_q)`, which IS the KV cache's rule at every `past`), and **the f32 island survives inside the
+      kernel** (`AccumulatorPrecision::Strict(F32)`), so the whole reason f16 attention doesn't NaN is
+      preserved rather than discarded. Implemented, proven equivalent by a new unit test against the
+      explicit formulation written out longhand, then A/B'd (criterion, idle card, two runs per arm) —
+      and reverted: f16 prefill @2048 −22 % and f16 TTFT −18 % (real wins, the accelerated plane
+      matmuls have tiles to fill), but f16 decode **+11 %**, f32 decode +1.8 %, f32 prefill @2048
+      **+6.0 %**. Decode is `seq_q = 1`, a matvec with no tile reuse where flash is pure overhead and
+      (leading hypothesis) an opaque node the Fusion backend can't absorb the way it absorbs the
+      explicit chain's scale/mask/softmax/cast. Adopting only the winning quadrant means a
+      dtype-conditional fork in the hottest leaf function on a path **no strict parity gate covers**
+      (the gates run f32 and GGUF-dequant-to-f32) — see the split item below. Kept from the work: a
+      permanent **`ttft_prefill_2048` row** in the criterion bench and the budget gate (593 ms f32 /
+      210 ms f16 recorded, ≤ 900 ms budget), the row where the attention formulation is visible at all —
+      the ~36-token bench prompt makes a 62 KiB scores tensor, 2048 tokens makes 201 MiB.*
+- [ ] **Adopt flash attention for f16 prefill only, once f16 has parity coverage** — the winning
+      quadrant of the 2026-08-06 evaluation above: `t > 1` (prefill) on an f16 ambient dtype is
+      −22 % prefill @2048 and −18 % TTFT, and it drops the O(t²) scores tensor (201 MiB at 2048 × 12
+      heads today, and it is the term that ends long-context prefill on a 16 GB card — a P6 fit lever,
+      not only a latency one). Two prerequisites, both deliberate: (a) an **f16 parity leg** — every
+      strict gate today runs f32 or GGUF-dequant-to-f32, so an f16-only numeric fork would ship
+      unverified; the cheap shape is an in-process f16-vs-f32 first-forward agreement assert (the
+      dtype-pinning work makes both aliases coexist — `real_mixed_dtype.rs` already does exactly this
+      for one token) and the honest shape is llama.cpp at f16 on the `llama_ref` harness; (b) accept a
+      dtype- **and** length-conditional branch in `GqaAttention::forward`, or find a formulation that
+      isn't conditional. Re-measure first: the numbers are burn-0.21/wgpu-29-specific.
+- [x] **Bisect the f32 decode drift: 54.3 → 60.0 ms/token since 2026-07-12** — the 2026-08-06
+      re-measure found the f32 decode row 10 % slower than recorded while f16 read **2.7× faster**.
+      *(2026-08-06, closed the same run — and it turned up something bigger than the drift.)* The
+      2026-07-12 tree (`e44debf`) and the pre-dtype-pinning tree (`c1826e7`) were checked out and
+      benched on the same idle machine: f32 reads **60.1 / 60.0 / 60.0 ms/token** across all three
+      trees, so **f32 never regressed** — the 54.3 recorded on 2026-07-12 is not reproducible from
+      that same code today, i.e. it was machine state (driver/OS/background), never a Mummu change.
+      The f16 finding is the real one: `c1826e7` **panics `DTypeMismatch`** on the f16 bench leg, and
+      `e44debf` reports f16 at 60.2 ms/token — a tenth of a millisecond from its own f32 row. That is
+      the one-alias-per-process hazard (root-caused 2026-07-23, fixed 2026-07-30): this bench builds
+      `Gpu` then `GpuF16` in ONE process, the f32 leg locked the per-device default dtype policy, and
+      **the "f16" rows recorded on 2026-07-11 and 2026-07-12 were f32 runs wearing an f16 label** —
+      which is exactly why they matched f32 so implausibly closely (70.9 vs 70.7, then 54.5 vs 54.3).
+      Real f16 decode is **20.5 ms/token, 2.9× faster than f32**, and always was; the harness could
+      not see it. Consequences folded above: the dispatch-bound item's f16 leg is retracted, and
+      `bench/BASELINE.md` carries the three-tree table. The f16 *VRAM* figures are unaffected — they
+      come from `real_f16.rs`, one alias per process, always genuinely f16. Standing lesson for the
+      perf suite: **a measurement that agrees with its control to a tenth of a percent is evidence of
+      a wiring bug, not of a null result.**
+      *(2026-08-06, same run)* Guard added so this class of bug cannot recur silently:
+      **`mummu-bench/tests/budget_f16.rs`**, an f16 budget gate in its OWN test binary (one dtype alias
+      per process) that asserts `logits.dtype() == F16` before it believes a single number. Recorded
+      21 ms TTFT / 16.9 tok/s, budgets 60 ms / 12 tok/s.
+- [ ] **Close the f16 autotune warm-up gap: 16.9 tok/s cold vs 48.8 steady** — building the f16 gate
+      surfaced it. The gate prefills twice, then times 32 decode steps once, and gets 16.9 tok/s
+      (~59 ms/token); criterion, which runs the same 32 steps across many samples, gets 48.8 (20.5
+      ms/token). So an f16 session's **first ~32 tokens run at roughly f32 speed** and only then does the
+      2.9× appear — the f16 path has many more autotune variants to try than f32 (whose same-harness gap
+      is only 13.2 vs 16.7 tok/s). That is a real user-facing cost for a runner whose consumers open
+      short-lived agent turns, and it is not a perf mystery so much as a caching question: CubeCL's
+      autotune cache is configurable (`[cubecl.autotune] cache = "local"|"target"|"global"|{file=…}`,
+      already in the repo-root `burn.toml`'s vocabulary) and a persisted, per-machine cache should let a
+      cold process start warm. Route: measure whether a `global`/file-backed autotune cache carries the
+      tuning across processes, and if so ship it as the default for consumers; if not, consider a
+      warm-up prefill at model install. Gate on the budget rows like everything else.
 
 ## Phases
 
@@ -147,6 +230,18 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       Do NOT adopt a pre-release; when 0.22.0 stabilizes: migrate on a branch, re-run every parity gate +
       budget, and expect the backend aliases + dtype helpers + all loaders' `target_float` derivation to
       change shape. *(2026-07-30 research)* — https://github.com/Tracel-AI/burn/releases
+      *(2026-08-06 research)* Still pre-release (0.22.0-pre.1 is the newest tag; 0.21.0 the latest stable),
+      so this stays gated — but reading the pre-release notes properly turns it from a migration *cost*
+      into the run's most valuable pending item, because **0.22 ships graph capture, explicitly to cut
+      CPU-side launch overhead**. That is the exact bottleneck the dispatch-bound decode item has been
+      chasing since 2026-07-11 (an f16-matches-f32 measurement, then SPIR-V, then this run's flash-attention
+      A/B all pointing at per-dispatch cost rather than bandwidth), and it is the one lever that attacks it
+      *generically* rather than one kernel at a time. Three more items arrive with it: **LoRA/QLoRA** land
+      in-framework (P10 becomes wiring, not implementation), the **remote backend** gains multi-device +
+      client-side operation-graph caching + async reads (P6 multi-GPU), and quantization gains
+      dequant→op→quant fallbacks for slice/gather/select/expand plus BitNet b1.58 calibration (P9). Plan the
+      migration around measuring graph capture on the decode loop first — if it lands the dispatch win, it
+      reorders everything below it in the perf section.
 - [x] Silence the pre-existing `LNK4098` (LIBCMT defaultlib conflict) the 2026-07 nightly toolchain's
       new `linker_messages` lint now surfaces when linking the `mummu` lib-test binary — find which
       native dep object embeds the static-CRT directive (tokenizers' C++ deps are the suspects) and
@@ -786,11 +881,35 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       the local cache). Known family divergences are PINNED to their exact deltas so any other drift still
       fails: Qwen2.5's no-system branding preamble ("You are Qwen, …") vs our neutral one (with tools AND
       the plain injected default turn), Qwen3's no-system no-preamble, Qwen3's history think-stripping.
-- [ ] **General fallback chat renderer via `hf-chat-template`** — payoff (2) of the evaluation above: for a
+- [x] **General fallback chat renderer via `hf-chat-template`** — payoff (2) of the evaluation above: for a
       checkpoint whose family has no hardcoded `chat` renderer, render prompts from its own imported
       `chat_template` (the byte gate proved fidelity on Qwen3). Weigh promoting the dep from dev to optional
       runtime feature vs the from-scratch ethos; needs the P8/consumer-facing API decision of when to prefer
       the imported template over a family renderer. *(2026-07-23, split from the evaluation.)*
+      *(2026-08-06) **Shipped as `mummu::template`, behind the non-default feature `jinja-template`.** Both
+      open questions decided: **(a) the dep** is promoted from dev-only to an *optional* runtime dependency
+      — same crate, same 0.2.1 the byte gate already trusts as the transformers-equivalent reference — so a
+      default build still carries no Jinja engine and the from-scratch ethos holds for the zoo, while a
+      consumer that must run an un-ported checkpoint opts in. **(b) the selection rule** is a value, not a
+      convention: `Renderer::for_checkpoint(family: Option<ChatMl>, dir)` takes the family renderer when the
+      caller has one and falls back to `ImportedTemplate` otherwise, and it deliberately does **not**
+      second-guess a family renderer by reading the template (the gate pins those bytes; a checkpoint
+      repackaged with a foreign template is caught at *load* by the `tokenizer.rs` consistency gate, not
+      silently obeyed at render). API mirrors `ChatMl`: `render` / `render_with_tools`, plus
+      `render_with_tools_json` because the `tools` shape is genuinely open — the mainstream templates unpack
+      the `transformers` `{"type":"function","function":{…}}` wrapper, LFM2.5's wants the signature bare.
+      Bounded + fail-loud throughout (`Absent` / `Jinja` / `TooLarge` at 8 MiB / `BadTool`; a runaway
+      template trips the byte bound rather than returning an untokenizable prompt — unit-tested with a
+      render bomb). The one model change: `chat::Turn` gained an additive `tool_calls: Vec<ToolCall>` field
+      that `assistant_tool_calls{,_lfm}` now populate **beside** the rendered content — the family renderers
+      never read it (prompt bytes unchanged by construction *and* by the gate), but the imported path passes
+      calls as data so the template writes its own markers instead of inheriting Hermes' `<tool_call>`
+      wrapping. Proof: 7 unit tests over a toy Jinja template (no fixture needed) + `tests/imported_render.rs`
+      on real checkpoints — byte-identical to `ChatMl::qwen3()` on plain 142 B / tools 748 B / FC history
+      324 B and to `ChatMl::lfm2()` on plain 157 B / tools 379 B (that leg also exercising the standalone
+      `chat_template.jinja` fallback and `bos_token` injection, which the gate had to hand-inject); all 10
+      template-gate legs re-passed unchanged, 209 unit tests with the feature (202 without), clippy clean in
+      both configurations, and Qwen3-0.6B still greedy-emits a parseable `<tool_call>` on the 4070 Ti SUPER.*
 - [x] **`ChatMl::qwen3()` with history think-stripping** — the byte gate documented that Qwen3's template
       strips `<think>…</think>` reasoning from assistant turns at/before the last user query while our
       shared `ChatMl::qwen2()` renderer re-renders history verbatim (fine for fresh prompts + tool loops,
@@ -911,6 +1030,23 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       greedy; (b) a small same-tokenizer zoo model as drafter (0.5B drafts for 9B). Needs: batched-verify
       forward through the existing KV cache (rollback on reject), driver support in `generate_loop`.
       *(2026-07-30 research)* — https://github.com/JustVugg/colibri
+      *(2026-08-06 research)* **Calibration that changes this item's expected value: on consumer GPUs a
+      small-draft-model speculation is frequently a net LOSS, not a 1.5–2× win.** The 2026 measurements to
+      plan against: a 7B target + 0.5B draft on an RTX 5060 Ti ran at **0.27×** (i.e. ~4× slower) and only
+      flipped to 1.4× when the target grew to 14B — the draft's cost only amortizes when the target is
+      expensive enough per token; and a public 19-configuration llama.cpp study on Qwen3.6-35B-A3B with a
+      vocab-matched Qwen3.5-0.8B drafter found **no variant achieving a net speedup** on a single RTX 3090
+      (ngram-cache, ngram-mod and classic draft all lost), while vLLM on the same hardware got +27.5 % —
+      i.e. the engine's verify-batching quality, not the idea, decides it. Consequences for Mummu: (a)
+      route (a) **native MTP heads** is the one to build — no second model to pay for; (b) route (b) small-
+      model drafting must be gated on an end-to-end measurement per (target, draft, hardware) triple, never
+      shipped on the literature's headline; (c) the batched-verify forward has to be genuinely batched
+      through the KV cache, since that is where the engines that win differ from the ones that lose. Our
+      own dispatch-bound decode makes (c) harder and the win smaller: a k-token verify is one forward
+      either way, so speculation trades dispatches for compute — which is the right direction here, and
+      worth re-checking after graph capture (P0) moves the dispatch baseline. —
+      https://github.com/thc1006/qwen3.6-speculative-decoding-rtx3090 ·
+      https://inventivehq.com/blog/llama-cpp-speculative-decoding-consumer-gpu
 - [ ] **Grammar-constrained decoding** *(colibri parity)* — colibri forces structured output via `.gbnf`
       grammars (llama.cpp's GBNF convention) and even uses grammar-forced *drafts* to speed structured
       generation. Mummu's tool-calling currently *trusts* the model to emit parseable `<tool_call>` JSON
@@ -962,6 +1098,12 @@ that fits the model AND uses every device to the fullest.
       gate re-passed both legs (max |Δlogit| 2.670e-5, unchanged; Ollama greedy byte-identical), and f32
       perf *improved* (TTFT 100.5 → 88.4 ms, decode 13.3 → 14.1 tok/s). f16 benches recorded in
       `bench/BASELINE.md`: 88.0 ms TTFT, 14.1 tok/s — speed parity with f32, VRAM halved.*
+      *(2026-08-06 correction)* The islands themselves are unaffected — they were validated by
+      `real_f16.rs`, one dtype alias per process, genuinely f16 (no NaN, 6.75 GiB, coherent output). But
+      the **"speed parity with f32" bench line above is withdrawn**: that row came from the two-alias
+      bench process and was an f32 run mislabelled f16 (bisected this run — see the closed drift item in
+      the perf section). Real f16 decode is 20.5 ms/token vs f32's 60.0. The same withdrawal applies to
+      the SPIR-V item's "+30 % on BOTH dtypes" — only its f32 half was ever measured.
 - [x] Evaluate burn-wgpu's **`spirv` compiler feature** on Vulkan (CubeCL SPIR-V backend instead of
       WGSL/naga): claims significantly faster matmul incl. TensorCores at f16 — could be the cheapest
       decode-tok/s lever on the dev GPU; gate on the parity harness + `bench/BASELINE.md` —
@@ -1139,6 +1281,18 @@ The VRAM lever the P6 planner pulls to make the largest useful model fit the use
       here may be VRAM-only for us until the dispatch gap closes; (b) their gains lean on subgroup
       matrix ops where available, with portable fallbacks. — https://arxiv.org/html/2605.20706v1
       *(2026-07-16 research)*
+      *(2026-08-06 research)* Corroborated from the CUDA side, which matters because it means the design is
+      the *general* answer and not a WebGPU workaround: production int4 kernels (Marlin and descendants)
+      fuse dequantization into the matmul so the int4 values unpack to f16 **in the register file**, never
+      materializing a full-size intermediate — the same "straight into registers" split LlamaWeb measured
+      for the decode matvec. Also worth copying from LlamaWeb is its *interface*: a new quantization scheme
+      is an **unpacker + a dequant routine**, and every downstream kernel (matmul, attention) stays
+      format-agnostic — the shape that let one representation carry 21 formats, and the natural fit for our
+      GGUF reader, which already parses every K-quant block layout structurally. One caveat sharpens with
+      this run's numbers: LlamaWeb's headline decode win came from being bandwidth-bound, and our f32 path
+      is not — but our **f16** path now decodes 2.9× faster than f32, so measure the keep-quantized win
+      against f16, not f32, or it will look better than it is. —
+      https://www.tensortonic.com/llm-internals/quantization
 - [ ] Evaluate **CubeCL's quantization primitives** for the keep-quantized matmul: recent CubeCL ships
       block-scaled MMA, global quantization for matmul, quantized tensor views, and FP4/FP2 formats —
       the kernel substrate a Q4-weights × f16-activations decode path would ride (vs hand-writing a
