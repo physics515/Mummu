@@ -25,6 +25,12 @@ use tokenizers::Tokenizer;
 /// jitter, short enough that the KV cache stays near its steady-state length.
 const DECODE_STEPS_PER_SAMPLE: usize = 32;
 
+/// Prefill length for the long-context TTFT row. Chosen so the explicit
+/// attention path's `[1, heads, t, t]` scores tensor is hundreds of MiB —
+/// large enough that avoiding it is a measurable effect, small enough that
+/// the 16 GB reference card still holds the f32 model beside it.
+const LONG_PREFILL_TOKENS: usize = 2048;
+
 fn qwen2_dir() -> Option<PathBuf> {
     let dir = PathBuf::from(std::env::var_os("MUMMU_QWEN2_DIR")?);
     dir.is_dir().then_some(dir)
@@ -63,6 +69,26 @@ where
         b.iter(|| {
             let mut cache = loaded.new_cache();
             let logits = loaded.forward(&ids, 0, &mut cache, &device);
+            black_box(argmax_id(logits).expect("argmax"))
+        });
+    });
+
+    // Long-context prefill: the same work, but at a sequence length where the
+    // attention formulation actually matters. Explicit attention materializes
+    // a `[1, heads, t, t]` scores tensor — 201 MiB of f32 at t = 2048 for this
+    // model's 12 heads, versus 62 KiB at the 36-token prompt above — so this
+    // is the row that moves when the attention step changes shape.
+    let long_ids: Vec<u32> = ids
+        .iter()
+        .cycle()
+        .take(LONG_PREFILL_TOKENS)
+        .copied()
+        .collect();
+    assert_eq!(long_ids.len(), LONG_PREFILL_TOKENS);
+    group.bench_function("ttft_prefill_2048", |b| {
+        b.iter(|| {
+            let mut cache = loaded.new_cache();
+            let logits = loaded.forward(&long_ids, 0, &mut cache, &device);
             black_box(argmax_id(logits).expect("argmax"))
         });
     });

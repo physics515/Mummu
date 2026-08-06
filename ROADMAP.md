@@ -123,7 +123,7 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       with validation armed (no OOB found — clean bill), and the budget gates hold their numbers from
       the opted-out bench crate (12.4 tok/s with the files ≈ 12.1 without; first run after a config
       change can read ~30% low while autotune re-tunes — re-run before believing a regression).
-- [ ] Evaluate **CubeCL's now-complete flash-attention kernel** for the decode/prefill attention step —
+- [x] Evaluate **CubeCL's now-complete flash-attention kernel** for the decode/prefill attention step —
       the releases page reports a full implementation (causal **masking**, partitions, row-wise
       reductions, multi-plane ops). Mummu currently materializes attention explicitly (q·kᵀ → f32 softmax
       island → ·v); a fused flash-attention kernel collapses those into one dispatch, which is squarely
@@ -131,6 +131,50 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       the O(t²) scores tensor at prefill). Gate strictly: the f32-softmax island is the whole reason the
       f16 parity holds, so any flash path must re-pass the parity harness (both legs) AND hold/beat
       `bench/BASELINE.md` before adoption. — https://github.com/tracel-ai/cubecl/releases *(2026-07-17 research)*
+      *(2026-08-06) **Evaluated end to end, and rejected on measurement — the numbers are in
+      `bench/BASELINE.md`.** It reaches Mummu as burn 0.21's `tensor::module::attention`, which the
+      wgpu backend routes to `cubek`'s flash kernel through an autotune set (flash-blackbox-accelerated
+      variants vs an unfused fallback). It is a genuine drop-in: `scale: None` asks for the op's own
+      `1/sqrt(head_dim)` default — the same factor, and passing it explicitly would silently
+      *disqualify* the flash kernel (burn-cubecl routes any custom scale to the fallback) — `is_causal:
+      true` reproduces our mask exactly (its causal boundary aligns bottom-right, `col > row + (seq_k −
+      seq_q)`, which IS the KV cache's rule at every `past`), and **the f32 island survives inside the
+      kernel** (`AccumulatorPrecision::Strict(F32)`), so the whole reason f16 attention doesn't NaN is
+      preserved rather than discarded. Implemented, proven equivalent by a new unit test against the
+      explicit formulation written out longhand, then A/B'd (criterion, idle card, two runs per arm) —
+      and reverted: f16 prefill @2048 −22 % and f16 TTFT −18 % (real wins, the accelerated plane
+      matmuls have tiles to fill), but f16 decode **+11 %**, f32 decode +1.8 %, f32 prefill @2048
+      **+6.0 %**. Decode is `seq_q = 1`, a matvec with no tile reuse where flash is pure overhead and
+      (leading hypothesis) an opaque node the Fusion backend can't absorb the way it absorbs the
+      explicit chain's scale/mask/softmax/cast. Adopting only the winning quadrant means a
+      dtype-conditional fork in the hottest leaf function on a path **no strict parity gate covers**
+      (the gates run f32 and GGUF-dequant-to-f32) — see the split item below. Kept from the work: a
+      permanent **`ttft_prefill_2048` row** in the criterion bench and the budget gate (593 ms f32 /
+      210 ms f16 recorded, ≤ 900 ms budget), the row where the attention formulation is visible at all —
+      the ~36-token bench prompt makes a 62 KiB scores tensor, 2048 tokens makes 201 MiB.*
+- [ ] **Adopt flash attention for f16 prefill only, once f16 has parity coverage** — the winning
+      quadrant of the 2026-08-06 evaluation above: `t > 1` (prefill) on an f16 ambient dtype is
+      −22 % prefill @2048 and −18 % TTFT, and it drops the O(t²) scores tensor (201 MiB at 2048 × 12
+      heads today, and it is the term that ends long-context prefill on a 16 GB card — a P6 fit lever,
+      not only a latency one). Two prerequisites, both deliberate: (a) an **f16 parity leg** — every
+      strict gate today runs f32 or GGUF-dequant-to-f32, so an f16-only numeric fork would ship
+      unverified; the cheap shape is an in-process f16-vs-f32 first-forward agreement assert (the
+      dtype-pinning work makes both aliases coexist — `real_mixed_dtype.rs` already does exactly this
+      for one token) and the honest shape is llama.cpp at f16 on the `llama_ref` harness; (b) accept a
+      dtype- **and** length-conditional branch in `GqaAttention::forward`, or find a formulation that
+      isn't conditional. Re-measure first: the numbers are burn-0.21/wgpu-29-specific.
+- [ ] **Bisect the f32 decode drift: 54.3 → 60.0 ms/token since 2026-07-12** — the 2026-08-06
+      re-measure found the f32 decode row 10 % slower than recorded while f16 got **2.7× faster**
+      (54.5 → 20.5 ms/token) over the same period. Neither move was caused by a Mummu change that
+      claimed them, and the budget gate never noticed because its ceiling (10 tok/s) sits four
+      ms/token below the recorded number — a ceiling that loose cannot catch drift, only collapse.
+      Suspects, cheapest first: the 2026-07-30 dtype pinning (explicit `(device, dtype)` at every
+      creation site may have moved f32 off a fast path while putting f16 on one), a dependency bump in
+      the CubeCL/wgpu stack, an autotune cache re-tuned against a different machine state, or the
+      GPU driver. Route: check out the 2026-07-12 tree and re-bench it on today's machine — if it
+      also reads 60 ms/token the cause is under the repo, if it reads 54 the cause is in it, and
+      `git bisect` over the bench closes it either way. Worth doing before any further f32 perf work
+      builds on a number that moved.
 
 ## Phases
 
