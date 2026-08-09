@@ -101,6 +101,11 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
   exact in order, 24-token greedy byte-identical, max |Δlogprob| 3.7e-1 — so the MoE router and expert
   bank are verified against a reference, not just plausible. The MiniLM embedder matches its Candle
   reference at cosine 0.99999994 (max |Δcomponent| 1.2e-7, `tests/real_minilm.rs`).
+  **The f16 path is parity-verified too** (`tests/parity_f16.rs`, its own binary because `GpuF16`
+  locks Burn's per-device dtype policy): the same llama.cpp comparison with our side loaded onto
+  `GpuF16` passes for Qwen2.5-1.5B and Qwen3-0.6B — top-5 ids exact in order, 24-token greedy
+  byte-identical, max |Δlogprob| 2.5e-1 / 3.9e-1, *below* the f32 legs' own 2.7e-1 / 4.0e-1. So half
+  precision is a verified path, not merely a live one.
 - **Sampling, streaming, cancellation** — temperature / top-k / top-p sampling (deterministic per seed),
   per-token streaming through a `ControlFlow` callback, and cooperative between-token cancellation;
   greedy decoding keeps the argmax on-device.

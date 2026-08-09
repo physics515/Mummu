@@ -179,6 +179,20 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       for one token) and the honest shape is llama.cpp at f16 on the `llama_ref` harness; (b) accept a
       dtype- **and** length-conditional branch in `GqaAttention::forward`, or find a formulation that
       isn't conditional. Re-measure first: the numbers are burn-0.21/wgpu-29-specific.
+      *(2026-08-09)* **Prerequisite (a) is DONE — the honest shape, and it passed first run on both
+      architectures.** New `tests/parity_f16.rs` (own binary: `GpuF16` locks the per-device dtype
+      policy) runs the SAME strict comparison every other port passes, with our side loaded onto
+      `GpuF16`: **Qwen2.5-1.5B Q4_K_M** — top-5 ids match llama.cpp **exactly in order**
+      (785, 32, 16, 1249, 8420), 24-token greedy **byte-identical**, max |Δlogprob|
+      **2.5284926197284596e-1**; **Qwen3-0.6B Q4_K_M** — top-5 exact in order
+      (151667, 151644, 151645, 99966, 131545), greedy byte-identical incl. the `<think>` tokens, max
+      |Δlogprob| **3.938617118639698e-1**. Both f16 numbers are *below* their f32 twins (2.66e-1 /
+      4.02e-1), i.e. f16 adds nothing measurable on top of the reference's own Q8_K activation-quant
+      noise — the f32-softmax island is doing its job. Enabling this cost only a refactor: the
+      comparator moved out of `parity_gguf.rs` into a shared `tests/gguf_compare/` module (beside
+      `llama_ref`, which `parity_lfm2.rs` still uses for transport only) and gained explicit `port` +
+      `tolerance` parameters; the f32 legs re-passed unchanged (qwen3 bit-identical at
+      4.015608155114805e-1). What remains for this item is (b) plus a re-measure of the A/B.
 - [x] **Bisect the f32 decode drift: 54.3 → 60.0 ms/token since 2026-07-12** — the 2026-08-06
       re-measure found the f32 decode row 10 % slower than recorded while f16 read **2.7× faster**.
       *(2026-08-06, closed the same run — and it turned up something bigger than the drift.)* The
