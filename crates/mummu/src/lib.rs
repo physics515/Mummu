@@ -25,3 +25,4 @@ pub mod registry;
 pub mod template;
 pub mod tok_config;
 pub mod tokenizer;
+pub mod tune;

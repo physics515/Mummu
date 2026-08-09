@@ -43,6 +43,13 @@ burn-store = { version = "0.21", default-features = false, features = [
 	"pytorch",
 ] }
 
+# Direct handle on cubecl-runtime (the same version burn 0.21 resolves through
+# burn-cubecl) to read the autotune-cache location out of the very config
+# CubeCL itself discovers — `crate::tune` reports and clears it. Feature-
+# unified, so this adds no compile time; hardcoding the discovery rule instead
+# would drift from cubecl's the first time it changes.
+cubecl-runtime = "0.10"
+
 # Direct handle on wgpu (the same version Burn resolves) for the cheap startup
 # adapter probe: enumerate GPUs to decide GPU vs CPU before building a backend.
 wgpu = "29"

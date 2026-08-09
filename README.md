@@ -161,6 +161,15 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
   decode 36.8 tok/s, prefill@2048 241 ms** (~3.6 GiB runner) — recorded with budgets in
   [bench/BASELINE.md](bench/BASELINE.md), enforced by opt-in regression gates
   (`mummu-bench/tests/budget{,_f16,_cpu,_moe}.rs`, one dtype alias per process).
+- **Autotune-cache control** — CubeCL benchmarks each kernel once and persists the winner to disk, so
+  later processes start warm; but the cache has no invalidation, so a pick made while the machine was
+  busy is believed forever (measured 2026-08-09: a tune taken during a contended moment cost 21–27% of
+  f16 decode in every subsequent process, silently). `mummu::tune` is the repair a settings UI needs:
+  `autotune_cache_dir()` reports where the picks live — read out of the very config CubeCL discovers,
+  not a hardcoded copy of the rule — `autotune_cache_report()` measures it, and
+  `clear_autotune_cache()` removes it so the next launch re-tunes. Bounded and fail-loud (an
+  implausibly deep or wide tree is an error, never a wide delete). Proven on the real GPU
+  (`tests/real_autotune_cache.rs`).
 - **Model management** — `ModelManager` gives settings UIs the whole lifecycle over a declarative model
   catalog (`registry::ModelSpec`): install with per-chunk download progress, `is_installed`, per-model
   disk usage, and traversal-safe removal; model switching rides `ModelSlot`.

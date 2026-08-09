@@ -3634,6 +3634,7 @@ dependencies = [
  "burn",
  "burn-flex",
  "burn-store",
+ "cubecl-runtime",
  "half",
  "hf-chat-template",
  "once_cell",

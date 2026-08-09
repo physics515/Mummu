@@ -294,6 +294,26 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       validate on load — time one warm-up burst against a recorded expectation and clear the cache when
       it reads far low, which the `warm_up` API already has the shape for. Gate any of them on
       `bench/BASELINE.md` like everything else. *(2026-08-09, measured this run.)*
+      *(2026-08-09, same run) **Route (a) shipped: `mummu::tune`.*** `autotune_cache_dir()` reports
+      where CubeCL will persist picks — read out of the very config CubeCL discovers
+      (`CubeClRuntimeConfig::get().autotune.cache.root()` joined with the `autotune` segment
+      `CacheOption::name` adds), so the path is right by construction rather than by a hardcoded copy
+      of the discovery rule; `autotune_cache_report()` measures it (files + bytes, absent = empty, not
+      an error); `clear_autotune_cache()` removes it and returns what it removed, which is the
+      "re-tune GPU kernels" action a consumer's settings UI needs. Bounded and fail-loud throughout —
+      a tree deeper than 8 levels or wider than 65 536 files is `TuneError::Implausible` rather than a
+      long walk or a wide delete, and every path this module touches ends in the `autotune` segment by
+      construction (asserted), so a misconfigured root cannot widen the delete. Documented honestly:
+      it takes effect on the **next** process (a running one has already loaded the cache into memory).
+      One new direct dep, `cubecl-runtime 0.10`, the same version burn 0.21 already resolves through
+      burn-cubecl — feature-unified, zero compile-time cost, the `burn-store`/`wgpu` precedent.
+      5 unit tests + a REAL-GPU proof (`tests/real_autotune_cache.rs`): it clears the cache, runs four
+      512² matmuls with readbacks, and finds **3 files / 8 303 bytes** written to exactly the reported
+      directory, then clears them again and confirms empty. That test deliberately touches
+      `crates/mummu/target/autotune` and never the bench crate's — CubeCL's root is the walk-up from
+      the process CWD, so the recorded benchmark numbers keep their own tuning. Still open here:
+      (b) pinning the cache to a Mummu-owned location via `RuntimeConfig::set`, and (c) detecting a
+      bad tune automatically rather than exposing the repair.
 
 ## Phases
 
