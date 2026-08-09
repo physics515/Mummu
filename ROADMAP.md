@@ -202,7 +202,7 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       **`mummu-bench/tests/budget_f16.rs`**, an f16 budget gate in its OWN test binary (one dtype alias
       per process) that asserts `logits.dtype() == F16` before it believes a single number. Recorded
       21 ms TTFT / 16.9 tok/s, budgets 60 ms / 12 tok/s.
-- [ ] **Close the f16 autotune warm-up gap: 16.9 tok/s cold vs 48.8 steady** — building the f16 gate
+- [x] **Close the f16 autotune warm-up gap: 16.9 tok/s cold vs 48.8 steady** — building the f16 gate
       surfaced it. The gate prefills twice, then times 32 decode steps once, and gets 16.9 tok/s
       (~59 ms/token); criterion, which runs the same 32 steps across many samples, gets 48.8 (20.5
       ms/token). So an f16 session's **first ~32 tokens run at roughly f32 speed** and only then does the
@@ -214,6 +214,48 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       cold process start warm. Route: measure whether a `global`/file-backed autotune cache carries the
       tuning across processes, and if so ship it as the default for consumers; if not, consider a
       warm-up prefill at model install. Gate on the budget rows like everything else.
+      *(2026-08-09) **Measured, and the caching premise was wrong — shipped the warm-up instead.** The
+      route's first branch is a non-question: CubeCL **already** persists autotune across processes by
+      default (`[cubecl.autotune] cache` defaults to `target`; this repo's live cache is
+      `crates/mummu-bench/target/autotune/`, written and re-loaded on every run), so a `global`/file
+      location changes *where* the cache lives, never *whether* tuning carries. What the cold process
+      still pays is **kernel compilation + pipeline creation**, which the wgpu runtime caches nowhere —
+      cubecl 0.10 wires `CompilationCache` for the CUDA and HIP runtimes only, so the
+      `[cubecl.compilation] cache` knob is inert on our path. No configuration can carry it; only
+      spending it earlier can. New harness `mummu-bench/tests/warmup_f16.rs` measures the whole curve in
+      one process (8 bursts × 32 decode steps, each burst a fresh cache + untimed prefill so KV length
+      stays constant): **the first 32 tokens run at 12.5–16.3 tok/s, burst 2 onward is flat at
+      37–41**, i.e. the cold tax is 2.5–3.0× and exactly ONE burst deep — nothing beyond it is
+      recoverable in-process. So `budget_f16.rs`'s 16.9 tok/s is not a mystery, it IS the first burst.
+      Shipped: **`CausalLm::warm_up(probe_ids, steps, device)`** — one prefill plus `steps` greedy decode
+      steps on a throwaway cache, every step's argmax read back (an unsynchronized warm-up returns before
+      the GPU runs anything), bounded by `MAX_WARM_UP_STEPS = 256`, default-implemented so every zoo model
+      inherits it beside `sanity_check`. REAL-GPU proof (`mummu-bench/tests/warmup_api_f16.rs`, own binary
+      because warm-up is a once-per-process effect): after a 4.21 s `warm_up(&ids, 32)`, a cold process's
+      FIRST 32-token burst runs at **41.9 tok/s** vs the next burst's 41.0 — ratio 1.02× where un-warmed
+      it is 0.33×. Warms the decode step (shape-stable at `t == 1`); prefill kernels key on prompt length,
+      documented on the fn. The other half of the gap's premise — "48.8 steady" — did not survive:
+      criterion measures 36.8 tok/s today and the same numbers come back on the pre-`cargo update`
+      lockfile, so it is machine state, not a regression (see `bench/BASELINE.md`, incl. the measured
+      f16-vs-f32 host-CPU sensitivity, +9.8 % vs +3.2 % for the same added load).*
+- [ ] **A stale autotune cache is permanent, silent, and cost 21–27 % of f16 decode** — found while
+      closing the item above, and it is the reason "just persist the autotune cache" is not a free win
+      for consumers. This run's FIRST budget run happened on a contended machine (9.1 tok/s f32, failing
+      its own gate before recovering to 13.1); autotune tuned under that contention, wrote its picks to
+      `crates/mummu-bench/target/autotune/`, and **every later process loaded them and never re-tuned**.
+      Deleting the directory and re-running the same code on the same machine: f16
+      `decode_32_tokens` 1.0279 s → 0.8109 / 0.8371 s, while f32 was unmoved (1.9646 → 1.9797 s). CubeCL
+      offers no invalidation, no re-tune trigger, and no confidence signal — the cache is keyed by
+      (device, kernel, checksum), and a pick made under load is indistinguishable from a good one. That
+      is a real hazard for a runner whose consumers ship a persisted cache to end users' machines, where
+      the tune may happen during install (busy) and be believed forever. Routes: (a) re-tune on demand —
+      an API to clear the cache root (Mummu knows where it is; `CacheConfig::root()` is public) plus a
+      documented "re-tune" action in the consumer's settings; (b) pin the cache to a Mummu-owned location
+      via `RuntimeConfig::set` (cubecl exposes a one-shot programmatic setter that must run before the
+      first `get()`) so the runner controls invalidation rather than inheriting the CWD walk-up; (c)
+      validate on load — time one warm-up burst against a recorded expectation and clear the cache when
+      it reads far low, which the `warm_up` API already has the shape for. Gate any of them on
+      `bench/BASELINE.md` like everything else. *(2026-08-09, measured this run.)*
 
 ## Phases
 

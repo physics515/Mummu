@@ -4,13 +4,20 @@
 
 use burn::tensor::{Tensor, backend::Backend};
 
-use crate::decode::{SamplerOptions, generate_loop, top_k_ids};
+use crate::decode::{SamplerOptions, argmax_id, generate_loop, top_k_ids};
 
 pub mod lfm2;
 pub mod minilm;
 pub mod olmoe;
 pub mod qwen2;
 pub mod qwen3;
+
+/// Upper bound on one [`CausalLm::warm_up`] call. A warm-up is a fixed,
+/// bounded cost paid off the user's critical path — not a place to spend
+/// unbounded GPU time — and the measured curve flattens after ~32 steps
+/// (`mummu-bench/tests/warmup_f16.rs`), so this ceiling is 8x the useful
+/// depth, not a tuning knob.
+pub const MAX_WARM_UP_STEPS: usize = 256;
 
 /// The contract every causal LM in the zoo implements. A new architecture
 /// (Hermes-class function-caller, Gemma, Qwen3, …) provides its cache type,
@@ -121,5 +128,59 @@ pub trait CausalLm<B: Backend> {
             .to_vec::<f32>()
             .map_err(|e| format!("logits readback: {e:?}"))?;
         crate::import::logit_sanity(&v, expected_vocab).map_err(|e| e.to_string())
+    }
+
+    /// Pay the **cold-start tax off the user's critical path**: one prefill
+    /// plus `steps` greedy decode steps on a throwaway cache, discarded.
+    ///
+    /// A freshly-started process decodes its first tokens far slower than its
+    /// steady state — measured on Qwen2.5-1.5B at f16, the first 32 tokens run
+    /// at 12.5 tok/s against a steady 37.6, and the curve is *flat* from token
+    /// 33 on (`mummu-bench/tests/warmup_f16.rs`). CubeCL already persists its
+    /// **autotune** choices to disk across processes, so what is left is
+    /// per-process kernel compilation and pipeline creation, which the wgpu
+    /// runtime does not cache anywhere (`CompilationCache` is wired for CUDA
+    /// and HIP only in cubecl 0.10) — no configuration can carry it, only
+    /// spending it earlier can. A consumer that opens short agent turns should
+    /// call this once after `install`/load, beside
+    /// [`Self::sanity_check`].
+    ///
+    /// Warms the **decode** step, whose kernels are shape-stable (`t == 1`).
+    /// Prefill kernels are keyed by prompt length, so a caller who cares about
+    /// TTFT should pass a `probe_ids` of its own typical prompt length rather
+    /// than a token or two.
+    ///
+    /// Returns the number of forwards executed (`steps + 1`). Every step reads
+    /// its argmax back, exactly as real decoding does — an unsynchronized
+    /// warm-up would queue work and return before the GPU had run any of it.
+    fn warm_up(
+        &self,
+        probe_ids: &[u32],
+        steps: usize,
+        device: &B::Device,
+    ) -> Result<usize, String> {
+        assert!(!probe_ids.is_empty(), "warm_up: empty probe prompt");
+        assert!(steps >= 1, "warm_up: steps must be >= 1");
+        assert!(
+            steps <= MAX_WARM_UP_STEPS,
+            "warm_up: {steps} steps exceeds the {MAX_WARM_UP_STEPS} bound"
+        );
+
+        let mut cache = self.new_cache();
+        let logits = self.forward(probe_ids, 0, &mut cache, device);
+        let mut next = argmax_id(logits)?;
+        let mut forwards = 1usize;
+        for past in (probe_ids.len()..).take(steps) {
+            let logits = self.forward(&[next], past, &mut cache, device);
+            next = argmax_id(logits)?;
+            forwards += 1;
+        }
+
+        debug_assert_eq!(
+            forwards,
+            steps + 1,
+            "warm_up must run exactly one prefill plus `steps` decode forwards"
+        );
+        Ok(forwards)
     }
 }

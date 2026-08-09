@@ -130,9 +130,18 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
   (serde_json `preserve_order`) — the exact bytes the reference stack renders and models emit back.
 - **f16 inference, validated** — Qwen2.5-1.5B runs coherently on `GpuF16` (weights + KV in f16, the
   q·kᵀ attention scores + softmax computed in an f32 island to stop f16 overflow): **~3.6 GiB runner
-  VRAM vs ~7.9 GiB f32, at identical speed**; the parity gate re-passes unchanged on f32, where the
-  island casts are no-ops ([bench/BASELINE.md](bench/BASELINE.md)). The same island covers the Qwen3
+  VRAM vs ~7.9 GiB f32, and ~2.3× the decode throughput** (27.1 vs 61.8 ms/token, measured
+  2026-08-09); the parity gate re-passes unchanged on f32, where the island casts are no-ops
+  ([bench/BASELINE.md](bench/BASELINE.md)). The same island covers the Qwen3
   arch — Qwen3-0.6B decodes coherently in f16 (its qk-norm + decoupled head_dim ride the same f32 scores).
+- **Warm-up API** — a freshly-started process decodes its first ~32 tokens at roughly a third of its
+  steady rate (per-process kernel compilation + pipeline creation; CubeCL persists *autotune* across
+  processes but the wgpu runtime caches no compiled kernels). `CausalLm::warm_up(probe_ids, steps,
+  device)` pays that cost off the user's critical path — one prefill plus `steps` greedy decode steps on
+  a throwaway cache, bounded and synchronized. Measured on the reference GPU: after a 4.2 s warm-up a
+  cold process's first 32-token burst runs at **41.9 tok/s vs the next burst's 41.0** (un-warmed, that
+  ratio is 0.33×) — `mummu-bench/tests/warmup_api_f16.rs`, curve in
+  [bench/BASELINE.md](bench/BASELINE.md).
 - **In-process mixed precision is defined behavior** — every runtime tensor-creation site pins its
   dtype to the backend type (`backend::{float_dtype, int_dtype}`), so an f32 (`Gpu`) and an f16
   (`GpuF16`) model can share one process and one device regardless of Burn's first-touch-locked
@@ -142,10 +151,11 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
 - **SPIR-V kernels on Vulkan** — CubeCL compiles direct SPIR-V (burn's `vulkan` feature) instead of
   WGSL/naga on Vulkan adapters, worth **+30% decode throughput** on the reference GPU with parity
   byte-identical; other APIs (DX12/Metal) transparently keep WGSL in the same binary.
-- **Benchmarked** — Qwen2.5-1.5B on the reference GPU: **TTFT 96.7 ms, decode 18.4 tok/s** (f32,
-  11.5 GiB whole-card peak ≈ 8.0 GiB runner; f16: 97.2 ms, 18.4 tok/s, ~3.6 GiB runner) — recorded with
-  budgets in [bench/BASELINE.md](bench/BASELINE.md), enforced by an opt-in regression gate
-  (`mummu-bench/tests/budget.rs`).
+- **Benchmarked** — Qwen2.5-1.5B on the reference GPU, criterion: **f32 TTFT 98.2 ms, decode
+  16.2 tok/s, prefill@2048 597 ms** (11.5 GiB whole-card peak ≈ 8.0 GiB runner); **f16 TTFT 24.9 ms,
+  decode 36.8 tok/s, prefill@2048 241 ms** (~3.6 GiB runner) — recorded with budgets in
+  [bench/BASELINE.md](bench/BASELINE.md), enforced by opt-in regression gates
+  (`mummu-bench/tests/budget{,_f16,_cpu,_moe}.rs`, one dtype alias per process).
 - **Model management** — `ModelManager` gives settings UIs the whole lifecycle over a declarative model
   catalog (`registry::ModelSpec`): install with per-chunk download progress, `is_installed`, per-model
   disk usage, and traversal-safe removal; model switching rides `ModelSlot`.
