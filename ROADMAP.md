@@ -42,6 +42,15 @@ https://github.com/Tracel-AI/burn/releases* *(2026-08-03) Pin watch: burn 0.22 i
 CubeCL tagged **0.11.0-pre.1** the same day (2026-07-29): a frontend mega-refactor (references), a
 **Metal backend**, a new CPU runtime, tiled layouts, and CUDA stream priority hints — all of which
 arrive with the burn bump, not before — https://github.com/tracel-ai/cubecl/releases*
+*(2026-08-09) Pin watch: **burn 0.22 is still pre-release** (0.22.0-pre.1 remains the newest tag,
+0.21.0 the latest stable) and cubecl still 0.11.0-pre.1, so the P0 migration stays gated; tokenizers
+0.23.1 and every other direct dep are already current, and `cargo upgrade --incompatible` offers only
+the standing wgpu 29→30 pin. Two cubecl-0.11 changelog entries matter to this run's autotune work and
+are folded into the items below: **#1423 "Disable persistent tune cache option"** (a
+`CUBECL_AUTOTUNE_CACHE` env var that bypasses persistent cache read/write and keeps tuning
+in-memory-per-process) and **#1422 "Feat/autotune throughput"** (throughput-based autotuning, beside
+#1408 "Peak device throughput") — https://github.com/tracel-ai/cubecl/releases ·
+https://github.com/tracel-ai/cubecl/pull/1423*
 
 ## North Star
 
@@ -168,7 +177,7 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       permanent **`ttft_prefill_2048` row** in the criterion bench and the budget gate (593 ms f32 /
       210 ms f16 recorded, ≤ 900 ms budget), the row where the attention formulation is visible at all —
       the ~36-token bench prompt makes a 62 KiB scores tensor, 2048 tokens makes 201 MiB.*
-- [ ] **Adopt flash attention for f16 prefill only, once f16 has parity coverage** — the winning
+- [x] **Adopt flash attention for f16 prefill only, once f16 has parity coverage** — the winning
       quadrant of the 2026-08-06 evaluation above: `t > 1` (prefill) on an f16 ambient dtype is
       −22 % prefill @2048 and −18 % TTFT, and it drops the O(t²) scores tensor (201 MiB at 2048 × 12
       heads today, and it is the term that ends long-context prefill on a 16 GB card — a P6 fit lever,
@@ -179,6 +188,44 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       for one token) and the honest shape is llama.cpp at f16 on the `llama_ref` harness; (b) accept a
       dtype- **and** length-conditional branch in `GqaAttention::forward`, or find a formulation that
       isn't conditional. Re-measure first: the numbers are burn-0.21/wgpu-29-specific.
+      *(2026-08-09)* **Prerequisite (a) is DONE — the honest shape, and it passed first run on both
+      architectures.** New `tests/parity_f16.rs` (own binary: `GpuF16` locks the per-device dtype
+      policy) runs the SAME strict comparison every other port passes, with our side loaded onto
+      `GpuF16`: **Qwen2.5-1.5B Q4_K_M** — top-5 ids match llama.cpp **exactly in order**
+      (785, 32, 16, 1249, 8420), 24-token greedy **byte-identical**, max |Δlogprob|
+      **2.5284926197284596e-1**; **Qwen3-0.6B Q4_K_M** — top-5 exact in order
+      (151667, 151644, 151645, 99966, 131545), greedy byte-identical incl. the `<think>` tokens, max
+      |Δlogprob| **3.938617118639698e-1**. Both f16 numbers are *below* their f32 twins (2.66e-1 /
+      4.02e-1), i.e. f16 adds nothing measurable on top of the reference's own Q8_K activation-quant
+      noise — the f32-softmax island is doing its job. Enabling this cost only a refactor: the
+      comparator moved out of `parity_gguf.rs` into a shared `tests/gguf_compare/` module (beside
+      `llama_ref`, which `parity_lfm2.rs` still uses for transport only) and gained explicit `port` +
+      `tolerance` parameters; the f32 legs re-passed unchanged (qwen3 bit-identical at
+      4.015608155114805e-1).
+      *(2026-08-09, same run) **Item CLOSED — rejected on correctness, and the parity leg built two
+      hours earlier is what caught it.** With (a) in hand, (b) was implemented exactly as scoped: a
+      `use_fused_attention(t, ambient, masked)` gate (`t > 1 && f16 && masked` — the measured
+      quadrant, nothing wider) picking between a new `attend_fused` and the existing chain, extracted
+      as `attend_explicit`; plus a CPU-backend unit test holding the two formulations to each other at
+      four `(past, t)` pairs (they agree to 1e-5, so the bottom-right causal alignment and the implicit
+      `1/sqrt(head_dim)` scale are right) and a gate test pinning the quadrant. **The A/B reproduced
+      the win** — two runs per arm, same session, idle-ish card, f32 rows as an untouched control:
+      f16 TTFT 24.9/24.6 → **21.0/20.8 ms (−15.6 %)**, f16 prefill@2048 240.6/239.5 → **224.2/221.3 ms
+      (−7.2 %)**, f16 decode unchanged within noise (830.8 → 806.7 ms, and it cannot take the path by
+      construction), f32 TTFT 98.2 → 98.0 ms / prefill 597.3 → 598.5 ms. **Then the f16 parity gate
+      failed: Qwen2.5-1.5B Q4_K_M on `GpuF16` returns NON-FINITE logits through the fused kernel**
+      (`logprobs_at`'s finiteness assert), while the same weights through the explicit chain are fine
+      and llama.cpp-identical. So the 2026-08-06 reading that "the f32 island survives inside the
+      kernel (`AccumulatorPrecision::Strict(F32)`)" does **not** hold in practice for the very model
+      whose q·kᵀ overflow motivated the island — the fused path reproduces the pre-island 2026-07-11
+      NaN. It is also model-dependent: **Qwen3-0.6B passed** through the same fused path (top-3 exact,
+      greedy byte-identical, max |Δlogprob| 3.9386004209988457e-1 vs the explicit 3.938617118639698e-1
+      — only the 5th tail id reshuffled), which is exactly what makes it unshippable as a rule in a
+      shared leaf function: it would be correct for narrow models and silently NaN for wide ones.
+      Reverted; the tree keeps the explicit chain. What would reopen this: burn 0.22 / wgpu 30 (the P0
+      item — wgpu 30 lifts `SHADER_F16` to WGSL, changing which kernels are candidates at all), or an
+      upstream fix that makes the kernel's score accumulation genuinely f32 for f16 inputs. Re-run
+      `tests/parity_f16.rs` FIRST next time; the measurement was never the hard part.*
 - [x] **Bisect the f32 decode drift: 54.3 → 60.0 ms/token since 2026-07-12** — the 2026-08-06
       re-measure found the f32 decode row 10 % slower than recorded while f16 read **2.7× faster**.
       *(2026-08-06, closed the same run — and it turned up something bigger than the drift.)* The
@@ -202,7 +249,7 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       **`mummu-bench/tests/budget_f16.rs`**, an f16 budget gate in its OWN test binary (one dtype alias
       per process) that asserts `logits.dtype() == F16` before it believes a single number. Recorded
       21 ms TTFT / 16.9 tok/s, budgets 60 ms / 12 tok/s.
-- [ ] **Close the f16 autotune warm-up gap: 16.9 tok/s cold vs 48.8 steady** — building the f16 gate
+- [x] **Close the f16 autotune warm-up gap: 16.9 tok/s cold vs 48.8 steady** — building the f16 gate
       surfaced it. The gate prefills twice, then times 32 decode steps once, and gets 16.9 tok/s
       (~59 ms/token); criterion, which runs the same 32 steps across many samples, gets 48.8 (20.5
       ms/token). So an f16 session's **first ~32 tokens run at roughly f32 speed** and only then does the
@@ -214,6 +261,98 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       cold process start warm. Route: measure whether a `global`/file-backed autotune cache carries the
       tuning across processes, and if so ship it as the default for consumers; if not, consider a
       warm-up prefill at model install. Gate on the budget rows like everything else.
+      *(2026-08-09) **Measured, and the caching premise was wrong — shipped the warm-up instead.** The
+      route's first branch is a non-question: CubeCL **already** persists autotune across processes by
+      default (`[cubecl.autotune] cache` defaults to `target`; this repo's live cache is
+      `crates/mummu-bench/target/autotune/`, written and re-loaded on every run), so a `global`/file
+      location changes *where* the cache lives, never *whether* tuning carries. What the cold process
+      still pays is **kernel compilation + pipeline creation**, which the wgpu runtime caches nowhere —
+      cubecl 0.10 wires `CompilationCache` for the CUDA and HIP runtimes only, so the
+      `[cubecl.compilation] cache` knob is inert on our path. No configuration can carry it; only
+      spending it earlier can. New harness `mummu-bench/tests/warmup_f16.rs` measures the whole curve in
+      one process (8 bursts × 32 decode steps, each burst a fresh cache + untimed prefill so KV length
+      stays constant): **the first 32 tokens run at 12.5–16.3 tok/s, burst 2 onward is flat at
+      37–41**, i.e. the cold tax is 2.5–3.0× and exactly ONE burst deep — nothing beyond it is
+      recoverable in-process. So `budget_f16.rs`'s 16.9 tok/s is not a mystery, it IS the first burst.
+      Shipped: **`CausalLm::warm_up(probe_ids, steps, device)`** — one prefill plus `steps` greedy decode
+      steps on a throwaway cache, every step's argmax read back (an unsynchronized warm-up returns before
+      the GPU runs anything), bounded by `MAX_WARM_UP_STEPS = 256`, default-implemented so every zoo model
+      inherits it beside `sanity_check`. REAL-GPU proof (`mummu-bench/tests/warmup_api_f16.rs`, own binary
+      because warm-up is a once-per-process effect): after a 4.21 s `warm_up(&ids, 32)`, a cold process's
+      FIRST 32-token burst runs at **41.9 tok/s** vs the next burst's 41.0 — ratio 1.02× where un-warmed
+      it is 0.33×. Warms the decode step (shape-stable at `t == 1`); prefill kernels key on prompt length,
+      documented on the fn. The other half of the gap's premise — "48.8 steady" — did not survive:
+      criterion measures 36.8 tok/s today and the same numbers come back on the pre-`cargo update`
+      lockfile, so it is machine state, not a regression (see `bench/BASELINE.md`, incl. the measured
+      f16-vs-f32 host-CPU sensitivity, +9.8 % vs +3.2 % for the same added load).*
+      *(2026-08-09 research, to re-check when burn 0.22 lands)* The "no configuration can carry it"
+      finding is a **cubecl-0.10-on-wgpu** statement, not a permanent one, and there are two routes to
+      removing the residual cost rather than paying it earlier. (1) wgpu itself ships
+      `Device::create_pipeline_cache` / `PipelineCacheDescriptor` (gfx-rs/wgpu #5293) — a driver-blob
+      pipeline cache explicitly for "reducing program startup time" — so a cubecl-wgpu compilation
+      cache is buildable upstream and is the thing to look for on the 0.22 / wgpu-30 bump. (2) CubeCL's
+      documentation already describes **shipping a warm compilation + autotune cache with the binary**
+      for a known deployment target, which for a consumer like Nanna (fixed Tauri build, known GPU
+      classes) converts the cold start into a build-time cost. Verify the wiring before believing
+      either: at cubecl 0.10 `CompilationCache` is constructed in the **cuda and hip** runtimes only
+      (read from source this run), which is exactly why `[cubecl.compilation] cache` is inert on our
+      path. — https://github.com/gfx-rs/wgpu/issues/5293 ·
+      https://docs.rs/wgpu/latest/wgpu/struct.PipelineCache.html
+- [ ] **A stale autotune cache is permanent, silent, and cost 21–27 % of f16 decode** — found while
+      closing the item above, and it is the reason "just persist the autotune cache" is not a free win
+      for consumers. This run's FIRST budget run happened on a contended machine (9.1 tok/s f32, failing
+      its own gate before recovering to 13.1); autotune tuned under that contention, wrote its picks to
+      `crates/mummu-bench/target/autotune/`, and **every later process loaded them and never re-tuned**.
+      Deleting the directory and re-running the same code on the same machine: f16
+      `decode_32_tokens` 1.0279 s → 0.8109 / 0.8371 s, while f32 was unmoved (1.9646 → 1.9797 s). CubeCL
+      offers no invalidation, no re-tune trigger, and no confidence signal — the cache is keyed by
+      (device, kernel, checksum), and a pick made under load is indistinguishable from a good one. That
+      is a real hazard for a runner whose consumers ship a persisted cache to end users' machines, where
+      the tune may happen during install (busy) and be believed forever. Routes: (a) re-tune on demand —
+      an API to clear the cache root (Mummu knows where it is; `CacheConfig::root()` is public) plus a
+      documented "re-tune" action in the consumer's settings; (b) pin the cache to a Mummu-owned location
+      via `RuntimeConfig::set` (cubecl exposes a one-shot programmatic setter that must run before the
+      first `get()`) so the runner controls invalidation rather than inheriting the CWD walk-up; (c)
+      validate on load — time one warm-up burst against a recorded expectation and clear the cache when
+      it reads far low, which the `warm_up` API already has the shape for. Gate any of them on
+      `bench/BASELINE.md` like everything else. *(2026-08-09, measured this run.)*
+      *(2026-08-09, same run) **Route (a) shipped: `mummu::tune`.*** `autotune_cache_dir()` reports
+      where CubeCL will persist picks — read out of the very config CubeCL discovers
+      (`CubeClRuntimeConfig::get().autotune.cache.root()` joined with the `autotune` segment
+      `CacheOption::name` adds), so the path is right by construction rather than by a hardcoded copy
+      of the discovery rule; `autotune_cache_report()` measures it (files + bytes, absent = empty, not
+      an error); `clear_autotune_cache()` removes it and returns what it removed, which is the
+      "re-tune GPU kernels" action a consumer's settings UI needs. Bounded and fail-loud throughout —
+      a tree deeper than 8 levels or wider than 65 536 files is `TuneError::Implausible` rather than a
+      long walk or a wide delete, and every path this module touches ends in the `autotune` segment by
+      construction (asserted), so a misconfigured root cannot widen the delete. Documented honestly:
+      it takes effect on the **next** process (a running one has already loaded the cache into memory).
+      One new direct dep, `cubecl-runtime 0.10`, the same version burn 0.21 already resolves through
+      burn-cubecl — feature-unified, zero compile-time cost, the `burn-store`/`wgpu` precedent.
+      5 unit tests + a REAL-GPU proof (`tests/real_autotune_cache.rs`): it clears the cache, runs four
+      512² matmuls with readbacks, and finds **3 files / 8 303 bytes** written to exactly the reported
+      directory, then clears them again and confirms empty. That test deliberately touches
+      `crates/mummu/target/autotune` and never the bench crate's — CubeCL's root is the walk-up from
+      the process CWD, so the recorded benchmark numbers keep their own tuning. Still open here:
+      (b) pinning the cache to a Mummu-owned location via `RuntimeConfig::set`, and (c) detecting a
+      bad tune automatically rather than exposing the repair.
+      *(2026-08-09 research)* **Upstream is moving on both halves, and it arrives with the burn 0.22
+      bump — re-scope (b)/(c) then, don't hand-roll them now.** cubecl 0.11 adds
+      **`CUBECL_AUTOTUNE_CACHE`** (PR #1423, "Disable persistent tune cache option"): an env var that
+      bypasses persistent read *and* write and keeps tuning `in_memory_cache` per process. That is a
+      cleaner (c) than anything we would build — a consumer that suspects a bad tune can run once with
+      persistence off and compare, and a *test* harness can opt out entirely so a benchmark never
+      inherits another run's picks (worth adopting for `mummu-bench` the moment it lands: this run's
+      21–27 % f16 swing came from exactly that inheritance). Also in 0.11: **#1422 "Feat/autotune
+      throughput"** + **#1408 "Peak device throughput"**, i.e. autotune scoring moves from latency to
+      throughput against a measured device peak — plausibly *more* noise-robust, so re-measure the
+      hazard's magnitude after the bump rather than assuming it persists. And CubeCL's own
+      documentation frames the persisted caches as a **shipping** artifact — "ship a warm cache with
+      your binary when you know the deployment target, so the cold-start cost is paid once at build
+      time" — which is the mirror image of this item and worth evaluating for consumers with a fixed
+      target (Nanna's Tauri build): a *good* tune shipped deliberately, rather than whatever the user's
+      first busy minute produced. — https://github.com/tracel-ai/cubecl/pull/1423 ·
+      https://github.com/tracel-ai/cubecl
 
 ## Phases
 
@@ -1086,6 +1225,26 @@ that fits the model AND uses every device to the fullest.
       `Wgpu<half::f16, i32>`; drop to int8/int4 (P9) when f16 still won't fit. *(2026-07-11) The f16
       backend itself is now **fully validated** (all 3 claims — see the islands item below); what remains
       here is the *picking* logic, which rides the placement-plan item + P9.*
+      *(2026-08-09) **The float half of the picking logic shipped: `mummu::plan`.***
+      `pick_precision(&ModelShape, &DeviceBudget) -> Option<Fit>` returns the **highest** precision that
+      fits one adapter, or `None` — which is the honest answer "no float tier fits; this needs
+      quantization or a multi-device plan", never a silently-worse tier. `ModelShape::from_decoder`
+      takes the `config.json` numbers (params, layers, kv heads, head_dim, context) and derives the KV
+      geometry itself; `DeviceBudget::from_adapter` reads straight off `backend::inventory()` and
+      returns `None` when `vram_bytes` is unknown (every non-Windows adapter today) rather than
+      guessing; `Fit` carries the projected and usable byte counts plus `headroom_bytes()`, which is
+      already the shape the `plan`/`doctor` introspection item will render. Two constants carry the
+      judgement and are calibrated against `bench/BASELINE.md` rather than first principles:
+      `OVERHEAD_BYTES` (1 GiB for activations/workspaces/CubeCL pools — the residual between measured
+      runner VRAM and weights+KV, ~0.5–1.8 GiB depending on dtype) and `USABLE_VRAM_FRACTION` (0.75,
+      because the reference box runs 3.5–6.5 GiB of desktop ambient on the same card and a plan that
+      ignores it fails at load). 7 unit tests pin the decisions against real hardware and real models:
+      Qwen2.5-1.5B projects 7.0 GiB f32 / 3.9 GiB f16 against the measured 8.0 / 3.6; the 15.7 GiB
+      reference card gets f32 and an 8 GiB card gets f16; the dev box's own **DX12 rows (no
+      `SHADER_F16`) never get an f16 plan**; a 64k context pushes a 12 GiB card from f32 down to f16;
+      and OLMoE-1B-7B on a 16 GiB card returns `None`, matching what `bench/BASELINE.md` records as
+      "GPU is out of reach until keep-quantized VRAM (P9)". Item stays `[ ]` for the int8/int4 tiers,
+      which extend `Precision` downward once P9 lands.
 - [x] **f16 mixed-precision islands** — Qwen2.5-1.5B in pure f16 NaNs out (overflow in the
       softmax/RmsNorm/logit reductions; f16 max is 65 504). Keep weights + matmuls f16 but compute the
       numerically hot reductions (attention softmax, RmsNorm accumulation, final logits) in f32, then
@@ -1293,6 +1452,16 @@ The VRAM lever the P6 planner pulls to make the largest useful model fit the use
       is not — but our **f16** path now decodes 2.9× faster than f32, so measure the keep-quantized win
       against f16, not f32, or it will look better than it is. —
       https://www.tensortonic.com/llm-internals/quantization
+      *(2026-08-09 research)* Third independent corroboration, this time from a shipped WebGPU product
+      rather than a paper: PrismML's 1-bit 27B WebGPU runner describes the same split — hand-written
+      WGSL matmul kernels with **fused dequantization in shared memory, weights never materialized as
+      fp16 in VRAM**. Three sources (LlamaWeb on WebGPU, Marlin-class CUDA int4 kernels, this) now
+      agree on the same shape, so the design question for our P9 kernel is settled and only the
+      *substrate* choice is open (hand-written CubeCL kernel vs the CubeCL quantization primitives in
+      the item below). Also worth watching for the KV half above: llama.cpp's TurboQuant discussion
+      (#20969) is the current state of extreme KV-cache quantization —
+      https://essamamdani.com/blog/prismml-bonsai-27b-1-bit-27b-model-runs-phone-webgpu-july-2026 ·
+      https://github.com/ggml-org/llama.cpp/discussions/20969
 - [ ] Evaluate **CubeCL's quantization primitives** for the keep-quantized matmul: recent CubeCL ships
       block-scaled MMA, global quantization for matmul, quantized tensor views, and FP4/FP2 formats —
       the kernel substrate a Q4-weights × f16-activations decode path would ride (vs hand-writing a

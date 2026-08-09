@@ -33,6 +33,59 @@ against what *it* measures, not the criterion row: **21 ms TTFT / 16.9 tok/s** (
 cold f16 session cost and criterion's is steady state. Two honest numbers for the same path, recorded
 together so the gap is not mistaken for drift (the OLMoE rows below do the same).
 
+**2026-08-09: the warm-up gap is now a curve, not an inference — and it is exactly one burst deep.**
+`mummu-bench/tests/warmup_f16.rs` measures what the two rows above could only bracket: a cold f16
+process, no warm-up pass, then 8 bursts of 32 decode steps, each burst a fresh cache + untimed
+prefill (criterion's `decode_32_tokens` sample, replicated so KV length is constant across bursts —
+decoding 256 *consecutive* tokens instead confounds warm-up with attention length and reads ~20 %
+low by the last burst). Two runs, same session:
+
+| cumulative tokens | 32 | 64 | 96 | 128 | 160 | 192 | 224 | 256 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| run A, tok/s | 12.5 | 37.4 | 38.8 | 36.7 | 38.1 | 37.4 | 36.8 | 37.6 |
+| run B, tok/s | 16.3 | 41.1 | 39.7 | 39.3 | 40.3 | 40.6 | 41.3 | 40.3 |
+
+The first 32 tokens cost **2.5–3.0×** steady state and the curve is flat from token 33 on. That
+settles the shape of the gap: `budget_f16.rs`'s number IS the first burst (15.5–16.3 tok/s measured
+the same session), and nothing beyond one burst is recoverable in-process. It also names what the
+cost is *not*: CubeCL already persists **autotune** choices across processes by default
+(`[cubecl.autotune] cache` defaults to `target` — this repo's live cache is
+`crates/mummu-bench/target/autotune/`), so what is left is per-process kernel compilation and
+pipeline creation, which the wgpu runtime caches nowhere — `CompilationCache` is wired for the CUDA
+and HIP runtimes only in cubecl 0.10, and `[cubecl.compilation] cache` is inert on our path. No
+configuration carries it; only spending it earlier does, which is what `CausalLm::warm_up` is for.
+Proof it works (`mummu-bench/tests/warmup_api_f16.rs`): after one `warm_up(&ids, 32, …)` costing
+**4.21 s**, a cold process's FIRST burst runs at **41.9 tok/s** against the next burst's 41.0 —
+a ratio of 1.02× where the un-warmed ratio is 0.33×.
+
+**2026-08-09: a stale autotune cache silently cost 21–27 % of f16 decode.** Found while measuring the
+above, and it is the reason a persisted cache is not a free win. The day's first budget run happened
+on a contended machine (it measured 9.1 tok/s f32 and failed its own gate before recovering to 13.1
+on a re-run); autotune tuned under that contention, wrote its picks to
+`crates/mummu-bench/target/autotune/`, and **every later process loaded those picks and never
+re-tuned**. Deleting the directory and re-running the same code on the same machine:
+
+| criterion `decode_32_tokens` | stale cache | after deleting the cache |
+| --- | --- | --- |
+| f32 | 1.9646 s | 1.9797 s (unchanged) |
+| f16 | 1.0279 s | **0.8109 s / 0.8371 s** (two runs) |
+
+f32's picks were unaffected; f16's were not. The operational rule: **delete the autotune cache before
+believing an f16 regression**, the same way the 2026-07-24 note says to re-run after a config change.
+The general lesson for the runner — a persistent autotune cache makes a bad tune permanent and
+silent, with no invalidation and no re-tune trigger — is a ROADMAP item, not something a benchmark
+file can fix.
+
+**2026-08-09 re-measure (context for the rows above, budgets unchanged).** Full criterion run on the
+same idle-ish machine (~15 % ambient host CPU from other work), fresh autotune cache: f32 TTFT
+98.2 ms / prefill@2048 597 ms / decode 61.8 ms/token, and f16 TTFT 24.9 ms / prefill@2048 241 ms /
+decode 27.1 ms/token. The f32 rows reproduce the 2026-08-06 record within 3–8 %; the f16 rows read
+15–32 % slower. That asymmetry is the dispatch-bound thesis showing up as *sensitivity*, and it was
+measured directly rather than assumed: adding 8 spinning threads (host CPU 15 % → 37 %) costs f32
+**+3.2 %** and f16 **+9.8 %** — f16 does ~3× less GPU work per dispatch, so the same host-side
+sequencing is ~3× more of its per-token time. The recorded columns are left at 2026-08-06 because
+today's machine was not quieter, not because today's numbers are wrong.
+
 **2026-08-06 re-measure, then bisected — and the old f16 rows were never f16.**
 Both tables were re-run on an idle card (criterion, three runs each, unchanged shipping code) because
 the flash-attention evaluation below needed an honest control, and they came back far from the
@@ -120,6 +173,28 @@ Notes
   gates run f32 and GGUF-dequant-to-f32), so it waits for a deliberate decision with f16 parity
   coverage behind it. Re-measure after the burn 0.22 / wgpu 30 bump: wgpu 30 lifts `SHADER_F16` to
   WGSL, which changes which kernels are even candidates here.
+- 2026-08-09: **the f16-prefill quadrant was implemented, re-measured, and rejected — this time on
+  CORRECTNESS.** With the f16 parity legs in place (`tests/parity_f16.rs`, shipped the same run), the
+  conditional was built exactly as scoped (`t > 1 && f16 && masked` picks the fused kernel; every
+  other call keeps the explicit chain) and **the win reproduced**, two runs per arm, f32 as an
+  untouched control:
+
+  | metric | explicit (control) | fused f16 prefill | delta |
+  | --- | --- | --- | --- |
+  | f16 TTFT (36 tok) | 24.9 / 24.6 ms | 21.0 / 20.8 ms | **−15.6 %** |
+  | f16 prefill @ 2048 | 240.6 / 239.5 ms | 224.2 / 221.3 ms | **−7.2 %** |
+  | f16 decode | 868.7 / 792.8 ms | 822.3 / 791.1 ms | noise (path not taken) |
+  | f32 TTFT / prefill@2048 / decode | 98.2 ms / 597.3 ms / 1.9787 s | 98.0 ms / 598.5 ms / 1.9877 s | control, unmoved |
+
+  Then the parity gate killed it: **Qwen2.5-1.5B Q4_K_M on `GpuF16` returns non-finite logits through
+  the fused kernel**, while the identical weights through the explicit chain are llama.cpp-identical.
+  The 2026-08-06 note above assumed the f32 score island survives inside the kernel
+  (`AccumulatorPrecision::Strict(F32)`); it does not, for the very model whose q·kᵀ overflow motivated
+  that island — the fused path reproduces the pre-island 2026-07-11 NaN. And it is model-dependent:
+  **Qwen3-0.6B passed** the same fused path (top-3 exact, greedy byte-identical, max |Δlogprob|
+  3.9386e-1 vs the explicit 3.9386e-1), which is precisely what makes it unshippable in a shared leaf —
+  correct for narrow models, silently NaN for wide ones. Reverted. The standing lesson: **run
+  `tests/parity_f16.rs` before the A/B, not after** — the measurement was never the hard part.
 - 2026-07-11: the f32 attention-score island (NaN fix for f16) coincided with an f32 *improvement*
   (TTFT 100.5 → 88.4 ms, decode 13.3 → 14.1 tok/s) — softmax now always runs in f32 with fusion
   re-tuning around it; both budget gates re-passed (`budget.rs` 96.8 ms / 10.2 tok/s, `budget_cpu.rs`

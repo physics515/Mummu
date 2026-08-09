@@ -31,6 +31,7 @@ sha2 = { workspace = true }
 once_cell = { workspace = true }
 burn-flex = { workspace = true }
 burn-store = { workspace = true }
+cubecl-runtime = { workspace = true }
 
 [dev-dependencies]
 # Test-only reference renderer for the imported `chat_template` Jinja: claims

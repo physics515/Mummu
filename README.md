@@ -101,6 +101,11 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
   exact in order, 24-token greedy byte-identical, max |Δlogprob| 3.7e-1 — so the MoE router and expert
   bank are verified against a reference, not just plausible. The MiniLM embedder matches its Candle
   reference at cosine 0.99999994 (max |Δcomponent| 1.2e-7, `tests/real_minilm.rs`).
+  **The f16 path is parity-verified too** (`tests/parity_f16.rs`, its own binary because `GpuF16`
+  locks Burn's per-device dtype policy): the same llama.cpp comparison with our side loaded onto
+  `GpuF16` passes for Qwen2.5-1.5B and Qwen3-0.6B — top-5 ids exact in order, 24-token greedy
+  byte-identical, max |Δlogprob| 2.5e-1 / 3.9e-1, *below* the f32 legs' own 2.7e-1 / 4.0e-1. So half
+  precision is a verified path, not merely a live one.
 - **Sampling, streaming, cancellation** — temperature / top-k / top-p sampling (deterministic per seed),
   per-token streaming through a `ControlFlow` callback, and cooperative between-token cancellation;
   greedy decoding keeps the argmax on-device.
@@ -130,9 +135,18 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
   (serde_json `preserve_order`) — the exact bytes the reference stack renders and models emit back.
 - **f16 inference, validated** — Qwen2.5-1.5B runs coherently on `GpuF16` (weights + KV in f16, the
   q·kᵀ attention scores + softmax computed in an f32 island to stop f16 overflow): **~3.6 GiB runner
-  VRAM vs ~7.9 GiB f32, at identical speed**; the parity gate re-passes unchanged on f32, where the
-  island casts are no-ops ([bench/BASELINE.md](bench/BASELINE.md)). The same island covers the Qwen3
+  VRAM vs ~7.9 GiB f32, and ~2.3× the decode throughput** (27.1 vs 61.8 ms/token, measured
+  2026-08-09); the parity gate re-passes unchanged on f32, where the island casts are no-ops
+  ([bench/BASELINE.md](bench/BASELINE.md)). The same island covers the Qwen3
   arch — Qwen3-0.6B decodes coherently in f16 (its qk-norm + decoupled head_dim ride the same f32 scores).
+- **Warm-up API** — a freshly-started process decodes its first ~32 tokens at roughly a third of its
+  steady rate (per-process kernel compilation + pipeline creation; CubeCL persists *autotune* across
+  processes but the wgpu runtime caches no compiled kernels). `CausalLm::warm_up(probe_ids, steps,
+  device)` pays that cost off the user's critical path — one prefill plus `steps` greedy decode steps on
+  a throwaway cache, bounded and synchronized. Measured on the reference GPU: after a 4.2 s warm-up a
+  cold process's first 32-token burst runs at **41.9 tok/s vs the next burst's 41.0** (un-warmed, that
+  ratio is 0.33×) — `mummu-bench/tests/warmup_api_f16.rs`, curve in
+  [bench/BASELINE.md](bench/BASELINE.md).
 - **In-process mixed precision is defined behavior** — every runtime tensor-creation site pins its
   dtype to the backend type (`backend::{float_dtype, int_dtype}`), so an f32 (`Gpu`) and an f16
   (`GpuF16`) model can share one process and one device regardless of Burn's first-touch-locked
@@ -142,10 +156,29 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
 - **SPIR-V kernels on Vulkan** — CubeCL compiles direct SPIR-V (burn's `vulkan` feature) instead of
   WGSL/naga on Vulkan adapters, worth **+30% decode throughput** on the reference GPU with parity
   byte-identical; other APIs (DX12/Metal) transparently keep WGSL in the same binary.
-- **Benchmarked** — Qwen2.5-1.5B on the reference GPU: **TTFT 96.7 ms, decode 18.4 tok/s** (f32,
-  11.5 GiB whole-card peak ≈ 8.0 GiB runner; f16: 97.2 ms, 18.4 tok/s, ~3.6 GiB runner) — recorded with
-  budgets in [bench/BASELINE.md](bench/BASELINE.md), enforced by an opt-in regression gate
-  (`mummu-bench/tests/budget.rs`).
+- **Benchmarked** — Qwen2.5-1.5B on the reference GPU, criterion: **f32 TTFT 98.2 ms, decode
+  16.2 tok/s, prefill@2048 597 ms** (11.5 GiB whole-card peak ≈ 8.0 GiB runner); **f16 TTFT 24.9 ms,
+  decode 36.8 tok/s, prefill@2048 241 ms** (~3.6 GiB runner) — recorded with budgets in
+  [bench/BASELINE.md](bench/BASELINE.md), enforced by opt-in regression gates
+  (`mummu-bench/tests/budget{,_f16,_cpu,_moe}.rs`, one dtype alias per process).
+- **Precision selection** — `mummu::plan::pick_precision` answers "which dtype fits this card?" from
+  numbers the crate already has: a model's `config.json` shape on one side, `backend::inventory()`'s
+  per-adapter VRAM and `SHADER_F16` on the other. It returns the **highest** precision that fits
+  (f32 before f16) with the projected and usable byte counts behind the decision, `None` when no float
+  tier fits — the honest "this needs quantization or several devices", never a silently-worse tier —
+  and never plans f16 on an adapter that doesn't advertise it. Its overhead and headroom constants are
+  calibrated against [bench/BASELINE.md](bench/BASELINE.md), and its tests pin the decisions to real
+  hardware: the 15.7 GiB reference card takes Qwen2.5-1.5B in f32, an 8 GiB card in f16, a 64k context
+  forces a 12 GiB card down to f16, and OLMoE-1B-7B on 16 GiB reports no fit.
+- **Autotune-cache control** — CubeCL benchmarks each kernel once and persists the winner to disk, so
+  later processes start warm; but the cache has no invalidation, so a pick made while the machine was
+  busy is believed forever (measured 2026-08-09: a tune taken during a contended moment cost 21–27% of
+  f16 decode in every subsequent process, silently). `mummu::tune` is the repair a settings UI needs:
+  `autotune_cache_dir()` reports where the picks live — read out of the very config CubeCL discovers,
+  not a hardcoded copy of the rule — `autotune_cache_report()` measures it, and
+  `clear_autotune_cache()` removes it so the next launch re-tunes. Bounded and fail-loud (an
+  implausibly deep or wide tree is an error, never a wide delete). Proven on the real GPU
+  (`tests/real_autotune_cache.rs`).
 - **Model management** — `ModelManager` gives settings UIs the whole lifecycle over a declarative model
   catalog (`registry::ModelSpec`): install with per-chunk download progress, `is_installed`, per-model
   disk usage, and traversal-safe removal; model switching rides `ModelSlot`.
