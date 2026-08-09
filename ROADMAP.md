@@ -1225,6 +1225,26 @@ that fits the model AND uses every device to the fullest.
       `Wgpu<half::f16, i32>`; drop to int8/int4 (P9) when f16 still won't fit. *(2026-07-11) The f16
       backend itself is now **fully validated** (all 3 claims — see the islands item below); what remains
       here is the *picking* logic, which rides the placement-plan item + P9.*
+      *(2026-08-09) **The float half of the picking logic shipped: `mummu::plan`.***
+      `pick_precision(&ModelShape, &DeviceBudget) -> Option<Fit>` returns the **highest** precision that
+      fits one adapter, or `None` — which is the honest answer "no float tier fits; this needs
+      quantization or a multi-device plan", never a silently-worse tier. `ModelShape::from_decoder`
+      takes the `config.json` numbers (params, layers, kv heads, head_dim, context) and derives the KV
+      geometry itself; `DeviceBudget::from_adapter` reads straight off `backend::inventory()` and
+      returns `None` when `vram_bytes` is unknown (every non-Windows adapter today) rather than
+      guessing; `Fit` carries the projected and usable byte counts plus `headroom_bytes()`, which is
+      already the shape the `plan`/`doctor` introspection item will render. Two constants carry the
+      judgement and are calibrated against `bench/BASELINE.md` rather than first principles:
+      `OVERHEAD_BYTES` (1 GiB for activations/workspaces/CubeCL pools — the residual between measured
+      runner VRAM and weights+KV, ~0.5–1.8 GiB depending on dtype) and `USABLE_VRAM_FRACTION` (0.75,
+      because the reference box runs 3.5–6.5 GiB of desktop ambient on the same card and a plan that
+      ignores it fails at load). 7 unit tests pin the decisions against real hardware and real models:
+      Qwen2.5-1.5B projects 7.0 GiB f32 / 3.9 GiB f16 against the measured 8.0 / 3.6; the 15.7 GiB
+      reference card gets f32 and an 8 GiB card gets f16; the dev box's own **DX12 rows (no
+      `SHADER_F16`) never get an f16 plan**; a 64k context pushes a 12 GiB card from f32 down to f16;
+      and OLMoE-1B-7B on a 16 GiB card returns `None`, matching what `bench/BASELINE.md` records as
+      "GPU is out of reach until keep-quantized VRAM (P9)". Item stays `[ ]` for the int8/int4 tiers,
+      which extend `Precision` downward once P9 lands.
 - [x] **f16 mixed-precision islands** — Qwen2.5-1.5B in pure f16 NaNs out (overflow in the
       softmax/RmsNorm/logit reductions; f16 max is 65 504). Keep weights + matmuls f16 but compute the
       numerically hot reductions (attention softmax, RmsNorm accumulation, final logits) in f32, then

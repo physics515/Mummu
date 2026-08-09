@@ -161,6 +161,15 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
   decode 36.8 tok/s, prefill@2048 241 ms** (~3.6 GiB runner) — recorded with budgets in
   [bench/BASELINE.md](bench/BASELINE.md), enforced by opt-in regression gates
   (`mummu-bench/tests/budget{,_f16,_cpu,_moe}.rs`, one dtype alias per process).
+- **Precision selection** — `mummu::plan::pick_precision` answers "which dtype fits this card?" from
+  numbers the crate already has: a model's `config.json` shape on one side, `backend::inventory()`'s
+  per-adapter VRAM and `SHADER_F16` on the other. It returns the **highest** precision that fits
+  (f32 before f16) with the projected and usable byte counts behind the decision, `None` when no float
+  tier fits — the honest "this needs quantization or several devices", never a silently-worse tier —
+  and never plans f16 on an adapter that doesn't advertise it. Its overhead and headroom constants are
+  calibrated against [bench/BASELINE.md](bench/BASELINE.md), and its tests pin the decisions to real
+  hardware: the 15.7 GiB reference card takes Qwen2.5-1.5B in f32, an 8 GiB card in f16, a 64k context
+  forces a 12 GiB card down to f16, and OLMoE-1B-7B on 16 GiB reports no fit.
 - **Autotune-cache control** — CubeCL benchmarks each kernel once and persists the winner to disk, so
   later processes start warm; but the cache has no invalidation, so a pick made while the machine was
   busy is believed forever (measured 2026-08-09: a tune taken during a contended moment cost 21–27% of
