@@ -173,6 +173,28 @@ Notes
   gates run f32 and GGUF-dequant-to-f32), so it waits for a deliberate decision with f16 parity
   coverage behind it. Re-measure after the burn 0.22 / wgpu 30 bump: wgpu 30 lifts `SHADER_F16` to
   WGSL, which changes which kernels are even candidates here.
+- 2026-08-09: **the f16-prefill quadrant was implemented, re-measured, and rejected — this time on
+  CORRECTNESS.** With the f16 parity legs in place (`tests/parity_f16.rs`, shipped the same run), the
+  conditional was built exactly as scoped (`t > 1 && f16 && masked` picks the fused kernel; every
+  other call keeps the explicit chain) and **the win reproduced**, two runs per arm, f32 as an
+  untouched control:
+
+  | metric | explicit (control) | fused f16 prefill | delta |
+  | --- | --- | --- | --- |
+  | f16 TTFT (36 tok) | 24.9 / 24.6 ms | 21.0 / 20.8 ms | **−15.6 %** |
+  | f16 prefill @ 2048 | 240.6 / 239.5 ms | 224.2 / 221.3 ms | **−7.2 %** |
+  | f16 decode | 868.7 / 792.8 ms | 822.3 / 791.1 ms | noise (path not taken) |
+  | f32 TTFT / prefill@2048 / decode | 98.2 ms / 597.3 ms / 1.9787 s | 98.0 ms / 598.5 ms / 1.9877 s | control, unmoved |
+
+  Then the parity gate killed it: **Qwen2.5-1.5B Q4_K_M on `GpuF16` returns non-finite logits through
+  the fused kernel**, while the identical weights through the explicit chain are llama.cpp-identical.
+  The 2026-08-06 note above assumed the f32 score island survives inside the kernel
+  (`AccumulatorPrecision::Strict(F32)`); it does not, for the very model whose q·kᵀ overflow motivated
+  that island — the fused path reproduces the pre-island 2026-07-11 NaN. And it is model-dependent:
+  **Qwen3-0.6B passed** the same fused path (top-3 exact, greedy byte-identical, max |Δlogprob|
+  3.9386e-1 vs the explicit 3.9386e-1), which is precisely what makes it unshippable in a shared leaf —
+  correct for narrow models, silently NaN for wide ones. Reverted. The standing lesson: **run
+  `tests/parity_f16.rs` before the A/B, not after** — the measurement was never the hard part.
 - 2026-07-11: the f32 attention-score island (NaN fix for f16) coincided with an f32 *improvement*
   (TTFT 100.5 → 88.4 ms, decode 13.3 → 14.1 tok/s) — softmax now always runs in f32 with fusion
   re-tuning around it; both budget gates re-passed (`budget.rs` 96.8 ms / 10.2 tok/s, `budget_cpu.rs`

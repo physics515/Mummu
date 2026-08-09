@@ -168,7 +168,7 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       permanent **`ttft_prefill_2048` row** in the criterion bench and the budget gate (593 ms f32 /
       210 ms f16 recorded, ≤ 900 ms budget), the row where the attention formulation is visible at all —
       the ~36-token bench prompt makes a 62 KiB scores tensor, 2048 tokens makes 201 MiB.*
-- [ ] **Adopt flash attention for f16 prefill only, once f16 has parity coverage** — the winning
+- [x] **Adopt flash attention for f16 prefill only, once f16 has parity coverage** — the winning
       quadrant of the 2026-08-06 evaluation above: `t > 1` (prefill) on an f16 ambient dtype is
       −22 % prefill @2048 and −18 % TTFT, and it drops the O(t²) scores tensor (201 MiB at 2048 × 12
       heads today, and it is the term that ends long-context prefill on a 16 GB card — a P6 fit lever,
@@ -192,7 +192,31 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       comparator moved out of `parity_gguf.rs` into a shared `tests/gguf_compare/` module (beside
       `llama_ref`, which `parity_lfm2.rs` still uses for transport only) and gained explicit `port` +
       `tolerance` parameters; the f32 legs re-passed unchanged (qwen3 bit-identical at
-      4.015608155114805e-1). What remains for this item is (b) plus a re-measure of the A/B.
+      4.015608155114805e-1).
+      *(2026-08-09, same run) **Item CLOSED — rejected on correctness, and the parity leg built two
+      hours earlier is what caught it.** With (a) in hand, (b) was implemented exactly as scoped: a
+      `use_fused_attention(t, ambient, masked)` gate (`t > 1 && f16 && masked` — the measured
+      quadrant, nothing wider) picking between a new `attend_fused` and the existing chain, extracted
+      as `attend_explicit`; plus a CPU-backend unit test holding the two formulations to each other at
+      four `(past, t)` pairs (they agree to 1e-5, so the bottom-right causal alignment and the implicit
+      `1/sqrt(head_dim)` scale are right) and a gate test pinning the quadrant. **The A/B reproduced
+      the win** — two runs per arm, same session, idle-ish card, f32 rows as an untouched control:
+      f16 TTFT 24.9/24.6 → **21.0/20.8 ms (−15.6 %)**, f16 prefill@2048 240.6/239.5 → **224.2/221.3 ms
+      (−7.2 %)**, f16 decode unchanged within noise (830.8 → 806.7 ms, and it cannot take the path by
+      construction), f32 TTFT 98.2 → 98.0 ms / prefill 597.3 → 598.5 ms. **Then the f16 parity gate
+      failed: Qwen2.5-1.5B Q4_K_M on `GpuF16` returns NON-FINITE logits through the fused kernel**
+      (`logprobs_at`'s finiteness assert), while the same weights through the explicit chain are fine
+      and llama.cpp-identical. So the 2026-08-06 reading that "the f32 island survives inside the
+      kernel (`AccumulatorPrecision::Strict(F32)`)" does **not** hold in practice for the very model
+      whose q·kᵀ overflow motivated the island — the fused path reproduces the pre-island 2026-07-11
+      NaN. It is also model-dependent: **Qwen3-0.6B passed** through the same fused path (top-3 exact,
+      greedy byte-identical, max |Δlogprob| 3.9386004209988457e-1 vs the explicit 3.938617118639698e-1
+      — only the 5th tail id reshuffled), which is exactly what makes it unshippable as a rule in a
+      shared leaf function: it would be correct for narrow models and silently NaN for wide ones.
+      Reverted; the tree keeps the explicit chain. What would reopen this: burn 0.22 / wgpu 30 (the P0
+      item — wgpu 30 lifts `SHADER_F16` to WGSL, changing which kernels are candidates at all), or an
+      upstream fix that makes the kernel's score accumulation genuinely f32 for f16 inputs. Re-run
+      `tests/parity_f16.rs` FIRST next time; the measurement was never the hard part.*
 - [x] **Bisect the f32 decode drift: 54.3 → 60.0 ms/token since 2026-07-12** — the 2026-08-06
       re-measure found the f32 decode row 10 % slower than recorded while f16 read **2.7× faster**.
       *(2026-08-06, closed the same run — and it turned up something bigger than the drift.)* The
