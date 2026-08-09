@@ -42,6 +42,15 @@ https://github.com/Tracel-AI/burn/releases* *(2026-08-03) Pin watch: burn 0.22 i
 CubeCL tagged **0.11.0-pre.1** the same day (2026-07-29): a frontend mega-refactor (references), a
 **Metal backend**, a new CPU runtime, tiled layouts, and CUDA stream priority hints — all of which
 arrive with the burn bump, not before — https://github.com/tracel-ai/cubecl/releases*
+*(2026-08-09) Pin watch: **burn 0.22 is still pre-release** (0.22.0-pre.1 remains the newest tag,
+0.21.0 the latest stable) and cubecl still 0.11.0-pre.1, so the P0 migration stays gated; tokenizers
+0.23.1 and every other direct dep are already current, and `cargo upgrade --incompatible` offers only
+the standing wgpu 29→30 pin. Two cubecl-0.11 changelog entries matter to this run's autotune work and
+are folded into the items below: **#1423 "Disable persistent tune cache option"** (a
+`CUBECL_AUTOTUNE_CACHE` env var that bypasses persistent cache read/write and keeps tuning
+in-memory-per-process) and **#1422 "Feat/autotune throughput"** (throughput-based autotuning, beside
+#1408 "Peak device throughput") — https://github.com/tracel-ai/cubecl/releases ·
+https://github.com/tracel-ai/cubecl/pull/1423*
 
 ## North Star
 
@@ -276,6 +285,19 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       criterion measures 36.8 tok/s today and the same numbers come back on the pre-`cargo update`
       lockfile, so it is machine state, not a regression (see `bench/BASELINE.md`, incl. the measured
       f16-vs-f32 host-CPU sensitivity, +9.8 % vs +3.2 % for the same added load).*
+      *(2026-08-09 research, to re-check when burn 0.22 lands)* The "no configuration can carry it"
+      finding is a **cubecl-0.10-on-wgpu** statement, not a permanent one, and there are two routes to
+      removing the residual cost rather than paying it earlier. (1) wgpu itself ships
+      `Device::create_pipeline_cache` / `PipelineCacheDescriptor` (gfx-rs/wgpu #5293) — a driver-blob
+      pipeline cache explicitly for "reducing program startup time" — so a cubecl-wgpu compilation
+      cache is buildable upstream and is the thing to look for on the 0.22 / wgpu-30 bump. (2) CubeCL's
+      documentation already describes **shipping a warm compilation + autotune cache with the binary**
+      for a known deployment target, which for a consumer like Nanna (fixed Tauri build, known GPU
+      classes) converts the cold start into a build-time cost. Verify the wiring before believing
+      either: at cubecl 0.10 `CompilationCache` is constructed in the **cuda and hip** runtimes only
+      (read from source this run), which is exactly why `[cubecl.compilation] cache` is inert on our
+      path. — https://github.com/gfx-rs/wgpu/issues/5293 ·
+      https://docs.rs/wgpu/latest/wgpu/struct.PipelineCache.html
 - [ ] **A stale autotune cache is permanent, silent, and cost 21–27 % of f16 decode** — found while
       closing the item above, and it is the reason "just persist the autotune cache" is not a free win
       for consumers. This run's FIRST budget run happened on a contended machine (9.1 tok/s f32, failing
@@ -314,6 +336,23 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       the process CWD, so the recorded benchmark numbers keep their own tuning. Still open here:
       (b) pinning the cache to a Mummu-owned location via `RuntimeConfig::set`, and (c) detecting a
       bad tune automatically rather than exposing the repair.
+      *(2026-08-09 research)* **Upstream is moving on both halves, and it arrives with the burn 0.22
+      bump — re-scope (b)/(c) then, don't hand-roll them now.** cubecl 0.11 adds
+      **`CUBECL_AUTOTUNE_CACHE`** (PR #1423, "Disable persistent tune cache option"): an env var that
+      bypasses persistent read *and* write and keeps tuning `in_memory_cache` per process. That is a
+      cleaner (c) than anything we would build — a consumer that suspects a bad tune can run once with
+      persistence off and compare, and a *test* harness can opt out entirely so a benchmark never
+      inherits another run's picks (worth adopting for `mummu-bench` the moment it lands: this run's
+      21–27 % f16 swing came from exactly that inheritance). Also in 0.11: **#1422 "Feat/autotune
+      throughput"** + **#1408 "Peak device throughput"**, i.e. autotune scoring moves from latency to
+      throughput against a measured device peak — plausibly *more* noise-robust, so re-measure the
+      hazard's magnitude after the bump rather than assuming it persists. And CubeCL's own
+      documentation frames the persisted caches as a **shipping** artifact — "ship a warm cache with
+      your binary when you know the deployment target, so the cold-start cost is paid once at build
+      time" — which is the mirror image of this item and worth evaluating for consumers with a fixed
+      target (Nanna's Tauri build): a *good* tune shipped deliberately, rather than whatever the user's
+      first busy minute produced. — https://github.com/tracel-ai/cubecl/pull/1423 ·
+      https://github.com/tracel-ai/cubecl
 
 ## Phases
 
@@ -1393,6 +1432,16 @@ The VRAM lever the P6 planner pulls to make the largest useful model fit the use
       is not — but our **f16** path now decodes 2.9× faster than f32, so measure the keep-quantized win
       against f16, not f32, or it will look better than it is. —
       https://www.tensortonic.com/llm-internals/quantization
+      *(2026-08-09 research)* Third independent corroboration, this time from a shipped WebGPU product
+      rather than a paper: PrismML's 1-bit 27B WebGPU runner describes the same split — hand-written
+      WGSL matmul kernels with **fused dequantization in shared memory, weights never materialized as
+      fp16 in VRAM**. Three sources (LlamaWeb on WebGPU, Marlin-class CUDA int4 kernels, this) now
+      agree on the same shape, so the design question for our P9 kernel is settled and only the
+      *substrate* choice is open (hand-written CubeCL kernel vs the CubeCL quantization primitives in
+      the item below). Also worth watching for the KV half above: llama.cpp's TurboQuant discussion
+      (#20969) is the current state of extreme KV-cache quantization —
+      https://essamamdani.com/blog/prismml-bonsai-27b-1-bit-27b-model-runs-phone-webgpu-july-2026 ·
+      https://github.com/ggml-org/llama.cpp/discussions/20969
 - [ ] Evaluate **CubeCL's quantization primitives** for the keep-quantized matmul: recent CubeCL ships
       block-scaled MMA, global quantization for matmul, quantized tensor views, and FP4/FP2 formats —
       the kernel substrate a Q4-weights × f16-activations decode path would ride (vs hand-writing a
