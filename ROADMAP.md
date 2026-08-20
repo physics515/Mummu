@@ -381,6 +381,21 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       dequant→op→quant fallbacks for slice/gather/select/expand plus BitNet b1.58 calibration (P9). Plan the
       migration around measuring graph capture on the decode loop first — if it lands the dispatch win, it
       reorders everything below it in the perf section.
+      *(2026-08-20)* Still gated: crates.io now serves **0.22.0-pre.2**, so 0.21.0 remains the newest
+      stable and the do-not-adopt-a-pre-release rule holds for another run. Checked as part of the
+      dependency sweep, which is also why **wgpu 30 stays held**: `cargo upgrade --incompatible`
+      offers it, but `cargo tree -i wgpu` shows exactly one wgpu in the graph (29.0.4, reached via
+      `cubecl-wgpu 0.10`), so bumping our direct handle alone would put a second, non-Burn wgpu in
+      the tree and the startup adapter probe would stop describing the device Burn actually runs on.
+      wgpu 30 unblocks with the burn bump, exactly as the Stack note says — not before.
+      *(2026-08-20 research)* One refinement to the migration shape: the associated element types are
+      not simply deleted — they move off `Backend` onto a new **`BackendTypes`** trait, and the release
+      notes steer callers to the **type aliases** (`Device<B>`, `FloatTensor<B>`) instead of naming
+      associated types directly, specifically to dodge resolution problems. That is actionable now, at
+      zero migration risk: every place we write `B::FloatElem` / `B::IntElem` by hand (`backend::
+      {float_dtype,int_dtype}` and each loader's `target_float` derivation) is a place the 0.22 diff will
+      land, so preferring the alias form where one already exists shrinks that diff before the bump.
+      — https://github.com/tracel-ai/burn/releases
 - [x] Silence the pre-existing `LNK4098` (LIBCMT defaultlib conflict) the 2026-07 nightly toolchain's
       new `linker_messages` lint now surfaces when linking the `mummu` lib-test binary — find which
       native dep object embeds the static-CRT directive (tokenizers' C++ deps are the suspects) and
@@ -648,12 +663,76 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       VRAM (P9 keep-quantized, or expert offload); (c) llama.cpp's own answer, `--n-cpu-moe`-style
       placement, which sidesteps the gather entirely by moving whole expert banks rather than slicing
       them. *(2026-08-03, measured this run.)*
-- [ ] **OLMoE from HF safetensors** — the port loads GGUF only because HF stores each expert separately
+      *(2026-08-20 research)* Two findings that sharpen the three routes above. (1) **Route (c) now has
+      a measured implementation to copy rather than a slogan**: llama.cpp PR #25294 streams routed
+      experts from disk behind a bounded per-layer device-side cache of expert *slabs* — top-k ids are
+      remapped to cache slots on the CPU, a miss demand-loads asynchronously through an io thread pool,
+      eviction is **decaying route hotness with an LRU tiebreak**, and reads use `O_DIRECT` so the page
+      cache cannot thrash against a model far larger than RAM. Reported on GB10 for a ~254 GB model at a
+      90-slot cache: **5.3x prefill / 2.4x decode vs `mmap`+`--n-cpu-moe`, at a 79 % cache hit rate**.
+      That hit rate is the number that matters to us — it says a *small* resident expert set covers most
+      tokens, which is exactly the premise the gather route needs to become cheap. It also ships
+      **wave-partitioned prefill** (when a batch needs more experts than slots, run experts in waves of
+      `(n_slots - n_expert_used)/2` and sum the masked outputs) — the trick that keeps a bounded cache
+      from capping prompt length. (2) **Our gather regression is a batch-size regime, not a dead end**:
+      llama.cpp only switches to the copy-experts-to-GPU path above a batch threshold, and ik_llama.cpp
+      sets that threshold at `32 * total_experts / active_experts` — **256 tokens for OLMoE's 64/8**.
+      Batch-1 decode is the worst possible point for a materializing gather, and prefill is the regime
+      where it should win; the 2026-08-03 A/B measured only decode, so re-run it at prefill batch sizes
+      before treating the gather as refuted. Both are gated on `bench/BASELINE.md` like the rest —
+      https://github.com/ggml-org/llama.cpp/pull/25294 ·
+      https://huggingface.co/blog/Doctor-Shotgun/llamacpp-moe-offload-guide
+- [x] **OLMoE from HF safetensors** — the port loads GGUF only because HF stores each expert separately
       (`model.layers.N.mlp.experts.{0..63}.{gate,up,down}_proj.weight`) while `MoeExperts` holds one fused
       `[experts, out, in]` tensor per projection. Needs a concat-on-import step (64 slices → one tensor,
       in expert order) in the safetensors path — mechanical, but it wants its own fixture (the bf16
       checkpoint is ~14 GB) and a byte-equality check against the GGUF-loaded weights. *(2026-08-03, split
       from the MoE item.)*
+      *(2026-08-20) Shipped.* `crates/mummu/src/safetensors.rs` is a sharded-safetensors reader plus an
+      **N:1 fusing rewriter** — the two things `burn-store` cannot do for us (it finds only a single
+      `model.safetensors`, and its remapping is 1:1). It plans the whole output before reading one payload
+      byte, so a group that is not exactly `count` members `0..count` is a loud `BadGroup` rather than a
+      short bank that loads clean and computes wrong; members are ordered **numerically, not
+      lexicographically** (`experts.10` sorts before `experts.2` as text — the trap this whole item exists
+      to avoid). `olmoe::load_from_dir` maps `model.layers.N.mlp.experts.{0..63}.{gate,up,down}_proj.weight`
+      onto the same fused `[experts, out, in]` banks the GGUF path lands on, then rides the ordinary
+      `SafetensorsStore` + adapter-chain + `load_checked` pipeline.
+      **REAL-WEIGHTS proof** (`tests/real_olmoe_safetensors.rs`, the 3-shard 13.84 GB bf16 checkpoint):
+      the fuse builds `[64, 1024, 2048]` banks over 16 layers, checked-loads in **136.1 s** on the CPU
+      backend, and emits a live distribution (sanity top 194, spread 20.6) that greedy-decodes 8 tokens.
+      The check a mis-ordering could not survive: layer 5 / expert 37's `gate_proj`, read independently out
+      of the raw shard bytes, is **bit-identical to slot 37 of the fused bank — 0 mismatches over 2 097 152
+      values** (bf16 -> f32 is an exact 16-bit widening, so this is bit-equality, not a tolerance). Note the
+      decode leg uses an arbitrary token probe, not a prompt, so it is a liveness check; the *weight*
+      correctness evidence is the bit-exact one. 16 `safetensors` unit tests, incl. one pinning the
+      safetensors fuse targets to the SAME module names the GGUF path renames to — both import paths must
+      land on the same params or one of them is loading a different model.
+      Two things the gate caught that the code did not survive first contact with:
+      (a) `checkpoint_shards` planned straight off the index without checking the shards were **on disk**,
+      so an interrupted download reported as a complete checkpoint, skipped the resume, and died later with
+      a bare `os error 2` from inside the load — it now fails at planning time naming the missing shard, and
+      says so explicitly when a `.part` sibling shows the download was interrupted;
+      (b) the fuse materialized the payload in RAM **twice** (a `data` buffer, then a `blob` copy), and the
+      second 13.8 GB allocation genuinely failed on this 128 GB box —
+      `memory allocation of 13838346237 bytes failed`. `fuse_checkpoint_to_file` now streams header +
+      payload straight to a temp file through one reusable per-part buffer (~4 MiB, one expert projection),
+      so peak drops from ~42 GB (13.8 blob + ~28 model) to the model alone; a `FusedTemp` guard deletes the
+      scratch file on every exit path, verified empty after the run. A unit test pins the two fuse paths as
+      **byte-identical**, so the big-model path and the small-model path stay one importer.
+- [ ] **Give the GGUF dequant path the same streaming sink the safetensors fuse just got** — found while
+      fixing the OLMoE safetensors OOM (2026-08-20). `gguf::dequant_to_safetensors` has the identical
+      double-buffer: it fills a `data` Vec of `total_f32_bytes`, then copies it into a second `blob` Vec of
+      `8 + header + data`, so peak is **2x the dequantized f32 payload** before the model is even built.
+      For OLMoE-1B-7B that is ~28 GB f32 → ~56 GB peak, which is most of why that model reads as
+      "CPU-only, and only on a big box". `safetensors::fuse_into` is the template: plan, then stream header
+      + payload into an `impl Write` through one bounded per-tensor buffer, with a `*_to_file` variant for
+      `SafetensorsStore::from_file`. Prove it the same way — a unit test pinning the in-memory and
+      to-file outputs as byte-identical, then re-run the `real_gguf` + `parity_gguf` legs unchanged.
+- [ ] **`gguf.rs` still has `.expect()` on production paths** — `dequant_to_safetensors` and the metadata
+      readers carry `usize::try_from(..).expect("bounded above")` (4 sites), the same pattern removed from
+      `safetensors.rs` on 2026-08-20 in favour of a fallible `to_usize` that returns `OverBound`. Mechanical,
+      and it keeps the no-panic-on-production-paths rule true across the whole import suite rather than in
+      the newest module only.
 - [ ] **Qwen3.5 hybrid (`qwen35`) architecture port** — split from the Qwen3.5-tier item when the
       2026-07-30 header probe showed Qwen3.5-4B/9B are a hybrid **linear-attention/SSM + periodic
       full-attention** arch (`qwen35.ssm.*` metadata: conv_kernel/state_size/group_count/time_step_rank/
@@ -664,6 +743,16 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       the 4B/9B are 2026's local-FC sweet spot (BFCL 9B 66.1%) and the 4B ships an `mmproj` vision
       projector (P11 candidate). *(2026-07-30 research)* —
       https://huggingface.co/unsloth/Qwen3.5-4B-GGUF
+      *(2026-08-20 research)* The mechanism has a name and a ratio, which makes the port scopeable:
+      the linear-attention half is **Gated DeltaNet**, interleaved with periodic full-attention at
+      roughly **75 % linear / 25 % full** — so `full_attention_interval` is expected to read 4, and the
+      recurrent-state cache (the LFM2 conv-state machinery generalizes) carries three quarters of the
+      layers. Two adjacent facts: the family ships **MTP** variants as their own GGUF repos
+      (`unsloth/Qwen3.5-{2B,9B,35B-A3B}-MTP-GGUF`), which is the concrete draft-model artifact the P5
+      speculative-decoding item needs rather than a hypothetical; and llama.cpp renamed the flag
+      `--spec-type mtp` to `--spec-type draft-mtp` (2026-05-13), worth knowing before wiring a
+      reference leg against it. —
+      https://huggingface.co/unsloth/Qwen3.5-9B-MTP-GGUF · https://sebastianraschka.com/llm-architecture-gallery/hybrid-attention/
 - [x] A `Model` trait so new architectures (Hermes-class function-callers, Gemma, Qwen3, …) slot in.
       *(2026-07-10) `models::CausalLm<B>` — associated `Cache` type; a port supplies `new_cache` /
       `forward` / `is_eos` and inherits `generate` / `greedy_generate` / `first_token` from the shared
@@ -786,6 +875,23 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       BOTH Qwen2.5-1.5B and LFM2.5-1.2B; top-3 first-forward ids exact in order, top-5 overlap ≥ 4/5,
       max |Δlogprob| 2.7e-1 (the reference's own Q8_K *activation* quantization in its integer Q4_K
       kernels — an order above the BF16 leg's 1.5e-2; our f32 path doesn't quantize activations).*
+- [x] **`fetch_model` fetches the sibling files the import gates read** — found while installing the OLMoE
+      safetensors checkpoint through the registry (2026-08-20). `hub::fetch_model_with` fetched exactly
+      `config.json`, `tokenizer.json`, and the weights, so a checkpoint installed through Mummu's OWN
+      registry arrived with no `tokenizer_config.json` — and the 2026-07-19/20/21 gates all fail **open**:
+      `validate_checkpoint_dir` returns `Ok(None)`, the EOS-agreement + added-token-id + tool-call-convention
+      checks silently no-op, and the `tokenizer_config` the loaders surface is always `None`. The gates
+      appeared to work only because every locally-cached fixture had been populated by hand. Fixed: both
+      `tokenizer_config.json` and `chat_template.jinja` (the standalone-template checkpoints of the
+      2026-07-20 item) are now fetched as **optional** files — one HEAD each, and only a 404 counts as
+      absent, so a 403 on a gated repo or a 5xx still reaches the real fetch and is reported rather than
+      swallowed as "the repo just doesn't ship it". `config.json` / `tokenizer.json` stay required. They are
+      fetched BEFORE the weights because the single-file branch returns early — placing them after it would
+      have fetched them for sharded checkpoints only, which is exactly the kind of half-fix this item exists
+      to avoid. Proof (`tests/real_hub.rs::a_registry_install_arrives_with_the_files_the_import_gates_read`):
+      a catalog model installed into a **clean** dir — no hand-populated fixture can satisfy it — now has
+      `tokenizer_config.json` on disk AND `validate_checkpoint_dir` returns `Some`, i.e. the gate has
+      something to check instead of quietly passing. *(2026-08-20)*
 - [ ] **GPTQ / AWQ** (HF safetensors) — import the calibration-quantized int4/int8 layouts most "quantized on
       the Hub" models ship as (a `.safetensors` payload + a quant config), dequant or keep-quant into Burn.
       *(2026-07-13 research)* Both are quantization *algorithms*, not formats — the artifact is ordinary
@@ -1351,6 +1457,16 @@ that fits the model AND uses every device to the fullest.
       RAM/VRAM pool, residency keyed by routing frequency, prefetch keyed by the router's early output.
       Gate like everything: parity unaffected by placement (colibri's own invariant — "placement only
       affects speed, never precision"), and a bench proving the streamed model beats the
+      *(2026-08-20 research — read with the P2 MoE note, which carries the detail)* The colibri-shaped
+      design above now has an independent implementation to measure against: llama.cpp PR #25294 does
+      per-layer bounded expert-slab caching + async demand-load + hotness/LRU eviction + `O_DIRECT`, and
+      reports 5.3x prefill / 2.4x decode over `mmap`+`--n-cpu-moe` at a 79 % hit rate. Two design points
+      worth stealing outright when the `Disk` placement class is built: eviction on **decaying route
+      hotness with an LRU tiebreak** (not plain LRU — MoE routing is skewed, and plain LRU throws away
+      a hot expert after one cold burst), and **`O_DIRECT`/unbuffered reads**, because the OS page cache
+      actively hurts once the model exceeds RAM. Its stated limitation is also a design constraint for
+      us: single-context only — concurrent decodes sharing one streamed model corrupt each other, so the
+      residency pool has to be owned per-session or locked. — https://github.com/ggml-org/llama.cpp/pull/25294
       largest-fitting resident one on task throughput. *(2026-07-30 research)* —
       https://github.com/JustVugg/colibri
       *(2026-08-03 research)* Prior art to mine when this is picked up: llama.cpp's **`--n-cpu-moe N`**

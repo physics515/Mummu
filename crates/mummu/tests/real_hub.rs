@@ -275,3 +275,45 @@ fn hub_gguf_spec_downloads_and_parses() {
         f.tensors.len()
     );
 }
+
+/// The install path must feed the import-validation gates.
+///
+/// `validate_checkpoint_dir` fails OPEN: with no sibling `tokenizer_config.json`
+/// it returns `Ok(None)` and the EOS-agreement + added-token-id checks quietly
+/// do not run. So a checkpoint installed through Mummu's own registry has to
+/// ARRIVE with that file, or every one of those gates is decorative for exactly
+/// the models Mummu installed itself. This fetches a catalog model into a
+/// **clean** dir (no hand-populated fixtures) and asserts the gate found
+/// something to check.
+#[test]
+#[ignore = "needs network (MUMMU_HUB_DEST names the download dir; ~90 MB)"]
+fn a_registry_install_arrives_with_the_files_the_import_gates_read() {
+    let Some(dest) = std::env::var_os("MUMMU_HUB_DEST").map(PathBuf::from) else {
+        panic!("set MUMMU_HUB_DEST to a scratch dir for the ~90 MB download");
+    };
+    // A dir of our own, so nothing here can be satisfied by a fixture someone
+    // populated by hand — the whole point of the check.
+    let clean = dest.join("gate-feed-probe");
+    if clean.exists() {
+        std::fs::remove_dir_all(&clean).expect("clear the probe dir");
+    }
+    let dir = minilm_spec().fetch(&clean, |_| {}).expect("hub fetch");
+
+    assert!(
+        dir.join("tokenizer_config.json").is_file(),
+        "the install must fetch tokenizer_config.json, or the import gates no-op"
+    );
+
+    // And the gate itself must now have something to validate. MiniLM declares
+    // no eos in config.json, so pass an empty set and assert only that the
+    // config was FOUND — `Ok(None)` here is the silent-no-op this test exists
+    // to forbid.
+    let cfg = mummu::tokenizer::validate_checkpoint_dir(&dir, &[], None)
+        .expect("tokenizer_config.json parses and agrees with tokenizer.json");
+    assert!(
+        cfg.is_some(),
+        "validate_checkpoint_dir returned Ok(None) — the gate silently no-opped"
+    );
+
+    std::fs::remove_dir_all(&clean).ok();
+}

@@ -21,6 +21,7 @@ pub mod models;
 pub mod nn;
 pub mod plan;
 pub mod registry;
+pub mod safetensors;
 /// Render a checkpoint's own imported chat template (feature `jinja-template`).
 #[cfg(feature = "jinja-template")]
 pub mod template;

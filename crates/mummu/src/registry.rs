@@ -21,7 +21,8 @@ pub enum Architecture {
     /// `models::minilm` — all-MiniLM BERT sentence embedder.
     MiniLm,
     /// `models::olmoe` — OLMoE sparse mixture-of-experts decoder (the zoo's
-    /// first MoE; GGUF import only — HF ships the experts unfused).
+    /// first MoE). Imports from GGUF (experts pre-fused) or from HF
+    /// safetensors (experts fused on import).
     Olmoe,
 }
 
@@ -247,6 +248,17 @@ pub fn catalog() -> Vec<ModelSpec> {
                 file: "OLMoE-1B-7B-0125-Instruct-Q4_K_M.gguf".into(),
             },
             disk_bytes_estimate: 4_210_000_000,
+        },
+        // The same MoE from its HF source: 3 bf16 safetensors shards + an
+        // index, with the 64 experts stored separately. `load_from_dir` fuses
+        // them into the `[experts, out, in]` banks the module holds.
+        ModelSpec {
+            name: "olmoe-1b-7b-0125-instruct".into(),
+            repo: "allenai/OLMoE-1B-7B-0125-Instruct".into(),
+            revision: "main".into(),
+            architecture: Architecture::Olmoe,
+            format: WeightFormat::Safetensors,
+            disk_bytes_estimate: 13_800_000_000,
         },
     ];
     debug_assert!(

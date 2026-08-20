@@ -13,12 +13,19 @@
 //! CPU backend on the reference 128 GB machine. Expert streaming / offload is
 //! the P6 placement item; keep-quantized is P9.
 //!
-//! Import is **GGUF-only** for now: the HF safetensors checkpoint stores each
-//! expert as a separate tensor (`mlp.experts.{i}.gate_proj.weight`), which
-//! would need a 64-way concat on import; the GGUF ships the experts already
-//! fused (`ffn_*_exps`) in exactly the layout [`MoeExperts`] holds.
+//! Import covers **both** sources. A GGUF ships the experts already fused
+//! (`ffn_*_exps`) in exactly the layout `MoeExperts` holds; the HF safetensors
+//! checkpoint stores each expert separately
+//! (`mlp.experts.{i}.{gate,up,down}_proj.weight`) and is sharded, so
+//! [`load_from_dir`] runs it through
+//! [`crate::safetensors::fuse_checkpoint_to_file`], which reads every shard and
+//! stacks each 64-member expert group into one `[experts, out, in]` tensor
+//! before the ordinary checked-load pipeline. It fuses to a temp file rather
+//! than to RAM deliberately: the in-memory twin would need the whole payload
+//! resident (13.8 GB for the 1B-7B) on top of the ~28 GB f32 model the load
+//! then builds.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use burn::module::Module;
 use burn::nn::{Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig};
@@ -26,12 +33,13 @@ use burn::store::{ModuleAdapter, PyTorchToBurnAdapter, SafetensorsStore};
 use burn::tensor::{Int, Tensor, TensorData, backend::Backend};
 
 use crate::gguf::{GgufFile, GgufMap, GgufTensorInfo, GgufValue};
-use crate::import::{CastFloatAdapter, ImportError, load_checked};
+use crate::import::{CastFloatAdapter, ImportError, load_checked, required_file};
 use crate::models::CausalLm;
 use crate::models::qwen2::{EosIds, gguf_f32, gguf_usize};
 use crate::nn::{
     GqaAttention, GqaAttentionConfig, LayerKv, SparseMoe, SparseMoeConfig, causal_mask, rope_tables,
 };
+use crate::safetensors::{Fuse, fuse_checkpoint_to_file};
 
 /// OLMoE architecture hyperparameters (HF `config.json` field names).
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -184,6 +192,10 @@ pub struct Olmoe<B: Backend> {
 pub struct LoadedOlmoe<B: Backend> {
     pub model: Olmoe<B>,
     pub config: OlmoeConfig,
+    /// The sibling `tokenizer_config.json`, when the checkpoint dir ships one
+    /// — config-driven EOS/BOS/PAD for a consumer to read. `None` for a GGUF
+    /// load (self-contained: EOS rides the GGUF metadata).
+    pub tokenizer_config: Option<crate::tok_config::TokenizerConfig>,
 }
 
 fn build<B: Backend>(cfg: &OlmoeConfig, device: &B::Device) -> Olmoe<B> {
@@ -310,7 +322,161 @@ pub fn load_from_gguf<B: Backend>(
             .allow_partial(true),
     );
     load_checked(&mut model, &mut store, path)?;
-    Ok(LoadedOlmoe { model, config })
+    Ok(LoadedOlmoe {
+        model,
+        config,
+        tokenizer_config: None,
+    })
+}
+
+/// How a source tensor of an HF OLMoE checkpoint reaches the module.
+///
+/// Everything but the expert bank passes through under its own name (the
+/// `install_remaps` chain does the HF→module renaming downstream, exactly as
+/// on the single-file safetensors path). The per-expert projections are the
+/// N:1 case: `model.layers.3.mlp.experts.7.gate_proj.weight` is member 7 of
+/// the fused `model.layers.3.mlp.experts.gate`.
+///
+/// Deliberately *not* a strict allow-list: unrecognized tensors are kept, and
+/// a checkpoint that renames the expert projections then fails loudly one
+/// stage later in `load_checked` — which names the missing `experts.gate`
+/// param in its report — rather than here with a less specific message.
+fn olmoe_hf_fuse(name: &str, num_experts: usize) -> Fuse {
+    let Some(target) = fused_expert_target(name, num_experts) else {
+        return Fuse::Keep(name.to_string());
+    };
+    target
+}
+
+/// `model.layers.{L}.mlp.experts.{I}.{gate,up,down}_proj.weight` → its slot in
+/// the fused bank, or `None` when the name is not a per-expert projection.
+fn fused_expert_target(name: &str, num_experts: usize) -> Option<Fuse> {
+    let rest = name.strip_prefix("model.layers.")?;
+    let (layer, rest) = rest.split_once('.')?;
+    layer.parse::<usize>().ok()?;
+    let rest = rest.strip_prefix("mlp.experts.")?;
+    let (index, rest) = rest.split_once('.')?;
+    let index: usize = index.parse().ok()?;
+    let projection = match rest {
+        "gate_proj.weight" => "gate",
+        "up_proj.weight" => "up",
+        "down_proj.weight" => "down",
+        _ => return None,
+    };
+    Some(Fuse::Stack {
+        target: format!("model.layers.{layer}.mlp.experts.{projection}"),
+        index,
+        count: num_experts,
+    })
+}
+
+/// Load an OLMoE model from an **HF safetensors checkpoint dir**.
+///
+/// The checkpoint is sharded (`model-0000N-of-0000M.safetensors` +
+/// `model.safetensors.index.json`) and stores every expert separately, so the
+/// shards are read and the expert groups fused into `[experts, out, in]`
+/// tensors first; the fused blob then rides the SAME adapter chain and
+/// `load_checked` as every other import path. Source dtype is preserved by
+/// the fuse (HF ships bf16) and cast to the backend float on load.
+///
+/// Budget note: the fused blob is the checkpoint's own size (~13.8 GB in bf16
+/// for the 1B-7B) and the loaded f32 model is ~28 GB — size the target device.
+/// Owns the fused scratch file for the life of one `load_from_dir`.
+///
+/// The fused blob is as large as the checkpoint (13.8 GB for the 1B-7B), so
+/// leaving one behind on a failed load would quietly fill the disk over a few
+/// retries. `Drop` removes it on every exit path, success or `?`.
+struct FusedTemp {
+    path: PathBuf,
+}
+
+impl FusedTemp {
+    /// Placed beside the checkpoint, so the scratch write lands on the same
+    /// volume as the weights rather than on a small system temp drive.
+    fn new(dir: &Path) -> Result<Self, ImportError> {
+        assert!(!dir.as_os_str().is_empty(), "checkpoint dir must be named");
+        let path = dir.join(format!(
+            "mummu-fused-{}.safetensors.tmp",
+            std::process::id()
+        ));
+        // A leftover from a killed process must never be mistaken for ours.
+        if path.exists() {
+            std::fs::remove_file(&path).map_err(|e| ImportError::Parse {
+                file: path.clone(),
+                reason: format!("could not clear a stale fused scratch file: {e}"),
+            })?;
+        }
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        debug_assert!(!self.path.as_os_str().is_empty(), "scratch path is named");
+        &self.path
+    }
+}
+
+impl Drop for FusedTemp {
+    fn drop(&mut self) {
+        // Best effort by construction: a Drop that can fail has nowhere to
+        // report to, and a stranded scratch file is not worth a panic.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+pub fn load_from_dir<B: Backend>(
+    dir: &Path,
+    device: &B::Device,
+) -> Result<LoadedOlmoe<B>, ImportError> {
+    let cfg_path = required_file(dir, "config.json")?;
+    let cfg_bytes = std::fs::read(&cfg_path).map_err(|e| ImportError::Parse {
+        file: cfg_path.clone(),
+        reason: e.to_string(),
+    })?;
+    let config = OlmoeConfig::from_json_bytes(&cfg_bytes).map_err(|reason| ImportError::Parse {
+        file: cfg_path,
+        reason,
+    })?;
+
+    // Cross-check the sibling metadata before touching weights, same as the
+    // dense loaders. `None` for the expected tool-call convention: Mummu ships
+    // no hardcoded OLMoE `chat` renderer to contradict, so only the EOS and
+    // added-token-id checks apply.
+    let tokenizer_config =
+        crate::tokenizer::validate_checkpoint_dir(dir, &config.eos_token_id.to_vec(), None)?;
+
+    let num_experts = config.num_experts;
+    // Fuse to a TEMP FILE, not to RAM. The in-memory fuse needs the whole
+    // payload resident (13.8 GB for the 1B-7B) on top of the ~28 GB f32 model
+    // the load then builds; streaming it to disk keeps the peak at the model
+    // alone. The file is this process's to delete, and it is deleted whether
+    // the load succeeds or fails.
+    let fused = FusedTemp::new(dir)?;
+    let bytes = fuse_checkpoint_to_file(
+        dir,
+        &|name| Some(olmoe_hf_fuse(name, num_experts)),
+        fused.path(),
+    )
+    .map_err(|e| ImportError::Parse {
+        file: dir.to_path_buf(),
+        reason: e.to_string(),
+    })?;
+    assert!(bytes > 8, "a fused checkpoint yields a non-empty payload");
+
+    let mut model = build::<B>(&config, device);
+    // The backend's float dtype from the TYPE (`B::FloatElem`), never a probe
+    // tensor (the per-device default-dtype policy hazard).
+    let target_float = <B::FloatElem as burn::tensor::Element>::dtype();
+    let mut store = install_remaps(
+        SafetensorsStore::from_file(fused.path().to_path_buf())
+            .with_from_adapter(PyTorchToBurnAdapter.chain(CastFloatAdapter::new(target_float)))
+            .allow_partial(true),
+    );
+    load_checked(&mut model, &mut store, dir)?;
+    Ok(LoadedOlmoe {
+        model,
+        config,
+        tokenizer_config,
+    })
 }
 
 impl<B: Backend> CausalLm<B> for LoadedOlmoe<B> {
@@ -459,6 +625,7 @@ mod tests {
         let loaded = LoadedOlmoe::<Cpu> {
             model: build(&cfg, &device),
             config: cfg,
+            tokenizer_config: None,
         };
 
         let prompt: Vec<u32> = vec![3, 14, 15, 9, 26];
@@ -615,8 +782,78 @@ mod tests {
         let loaded = LoadedOlmoe::<Cpu> {
             model: build(&cfg, &device),
             config: cfg,
+            tokenizer_config: None,
         };
         let out = loaded.greedy_generate(&[1, 2, 3], 4, &device).unwrap();
         assert!(out.len() <= 4);
+    }
+
+    /// The HF per-expert projections fuse onto EXACTLY the module names the
+    /// GGUF path renames its pre-fused banks to. Both import paths must land
+    /// on the same params, or one of them is loading a different model.
+    #[test]
+    fn hf_expert_fusion_targets_match_the_gguf_names() {
+        for (projection, ggml) in [
+            ("gate", "ffn_gate_exps"),
+            ("up", "ffn_up_exps"),
+            ("down", "ffn_down_exps"),
+        ] {
+            let hf = format!("model.layers.3.mlp.experts.7.{projection}_proj.weight");
+            let expected = olmoe_gguf_name(&format!("blk.3.{ggml}.weight")).unwrap();
+            assert_eq!(
+                olmoe_hf_fuse(&hf, 64),
+                Fuse::Stack {
+                    target: expected,
+                    index: 7,
+                    count: 64,
+                },
+                "{projection}: safetensors and GGUF must fuse to the same param"
+            );
+        }
+    }
+
+    /// Non-expert tensors pass through untouched — the `install_remaps` chain
+    /// does the HF→module renaming downstream, same as the dense loaders.
+    #[test]
+    fn non_expert_tensors_pass_through_by_name() {
+        for name in [
+            "model.embed_tokens.weight",
+            "model.norm.weight",
+            "lm_head.weight",
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.q_norm.weight",
+            "model.layers.0.input_layernorm.weight",
+            // The ROUTER is a plain Linear, not part of the expert bank —
+            // fusing it would be a silent disaster.
+            "model.layers.0.mlp.gate.weight",
+        ] {
+            assert_eq!(
+                olmoe_hf_fuse(name, 64),
+                Fuse::Keep(name.to_string()),
+                "{name} must pass through"
+            );
+        }
+    }
+
+    /// The expert index is parsed as a NUMBER, so the fuse plan can order the
+    /// bank numerically; `experts.10` must not be read as expert 1.
+    #[test]
+    fn expert_index_is_parsed_numerically() {
+        let at = |i: usize| match olmoe_hf_fuse(
+            &format!("model.layers.0.mlp.experts.{i}.gate_proj.weight"),
+            64,
+        ) {
+            Fuse::Stack { index, .. } => index,
+            other => panic!("expected a Stack, got {other:?}"),
+        };
+        assert_eq!(at(0), 0);
+        assert_eq!(at(1), 1);
+        assert_eq!(at(10), 10);
+        assert_eq!(at(63), 63);
+        // A non-numeric member is not an expert projection at all.
+        assert_eq!(
+            olmoe_hf_fuse("model.layers.0.mlp.experts.x.gate_proj.weight", 64),
+            Fuse::Keep("model.layers.0.mlp.experts.x.gate_proj.weight".to_string())
+        );
     }
 }
