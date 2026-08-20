@@ -388,6 +388,14 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       `cubecl-wgpu 0.10`), so bumping our direct handle alone would put a second, non-Burn wgpu in
       the tree and the startup adapter probe would stop describing the device Burn actually runs on.
       wgpu 30 unblocks with the burn bump, exactly as the Stack note says — not before.
+      *(2026-08-20 research)* One refinement to the migration shape: the associated element types are
+      not simply deleted — they move off `Backend` onto a new **`BackendTypes`** trait, and the release
+      notes steer callers to the **type aliases** (`Device<B>`, `FloatTensor<B>`) instead of naming
+      associated types directly, specifically to dodge resolution problems. That is actionable now, at
+      zero migration risk: every place we write `B::FloatElem` / `B::IntElem` by hand (`backend::
+      {float_dtype,int_dtype}` and each loader's `target_float` derivation) is a place the 0.22 diff will
+      land, so preferring the alias form where one already exists shrinks that diff before the bump.
+      — https://github.com/tracel-ai/burn/releases
 - [x] Silence the pre-existing `LNK4098` (LIBCMT defaultlib conflict) the 2026-07 nightly toolchain's
       new `linker_messages` lint now surfaces when linking the `mummu` lib-test binary — find which
       native dep object embeds the static-CRT directive (tokenizers' C++ deps are the suspects) and
@@ -655,6 +663,25 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       VRAM (P9 keep-quantized, or expert offload); (c) llama.cpp's own answer, `--n-cpu-moe`-style
       placement, which sidesteps the gather entirely by moving whole expert banks rather than slicing
       them. *(2026-08-03, measured this run.)*
+      *(2026-08-20 research)* Two findings that sharpen the three routes above. (1) **Route (c) now has
+      a measured implementation to copy rather than a slogan**: llama.cpp PR #25294 streams routed
+      experts from disk behind a bounded per-layer device-side cache of expert *slabs* — top-k ids are
+      remapped to cache slots on the CPU, a miss demand-loads asynchronously through an io thread pool,
+      eviction is **decaying route hotness with an LRU tiebreak**, and reads use `O_DIRECT` so the page
+      cache cannot thrash against a model far larger than RAM. Reported on GB10 for a ~254 GB model at a
+      90-slot cache: **5.3x prefill / 2.4x decode vs `mmap`+`--n-cpu-moe`, at a 79 % cache hit rate**.
+      That hit rate is the number that matters to us — it says a *small* resident expert set covers most
+      tokens, which is exactly the premise the gather route needs to become cheap. It also ships
+      **wave-partitioned prefill** (when a batch needs more experts than slots, run experts in waves of
+      `(n_slots - n_expert_used)/2` and sum the masked outputs) — the trick that keeps a bounded cache
+      from capping prompt length. (2) **Our gather regression is a batch-size regime, not a dead end**:
+      llama.cpp only switches to the copy-experts-to-GPU path above a batch threshold, and ik_llama.cpp
+      sets that threshold at `32 * total_experts / active_experts` — **256 tokens for OLMoE's 64/8**.
+      Batch-1 decode is the worst possible point for a materializing gather, and prefill is the regime
+      where it should win; the 2026-08-03 A/B measured only decode, so re-run it at prefill batch sizes
+      before treating the gather as refuted. Both are gated on `bench/BASELINE.md` like the rest —
+      https://github.com/ggml-org/llama.cpp/pull/25294 ·
+      https://huggingface.co/blog/Doctor-Shotgun/llamacpp-moe-offload-guide
 - [ ] **OLMoE from HF safetensors** — the port loads GGUF only because HF stores each expert separately
       (`model.layers.N.mlp.experts.{0..63}.{gate,up,down}_proj.weight`) while `MoeExperts` holds one fused
       `[experts, out, in]` tensor per projection. Needs a concat-on-import step (64 slices → one tensor,
@@ -671,6 +698,16 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       the 4B/9B are 2026's local-FC sweet spot (BFCL 9B 66.1%) and the 4B ships an `mmproj` vision
       projector (P11 candidate). *(2026-07-30 research)* —
       https://huggingface.co/unsloth/Qwen3.5-4B-GGUF
+      *(2026-08-20 research)* The mechanism has a name and a ratio, which makes the port scopeable:
+      the linear-attention half is **Gated DeltaNet**, interleaved with periodic full-attention at
+      roughly **75 % linear / 25 % full** — so `full_attention_interval` is expected to read 4, and the
+      recurrent-state cache (the LFM2 conv-state machinery generalizes) carries three quarters of the
+      layers. Two adjacent facts: the family ships **MTP** variants as their own GGUF repos
+      (`unsloth/Qwen3.5-{2B,9B,35B-A3B}-MTP-GGUF`), which is the concrete draft-model artifact the P5
+      speculative-decoding item needs rather than a hypothetical; and llama.cpp renamed the flag
+      `--spec-type mtp` to `--spec-type draft-mtp` (2026-05-13), worth knowing before wiring a
+      reference leg against it. —
+      https://huggingface.co/unsloth/Qwen3.5-9B-MTP-GGUF · https://sebastianraschka.com/llm-architecture-gallery/hybrid-attention/
 - [x] A `Model` trait so new architectures (Hermes-class function-callers, Gemma, Qwen3, …) slot in.
       *(2026-07-10) `models::CausalLm<B>` — associated `Cache` type; a port supplies `new_cache` /
       `forward` / `is_eos` and inherits `generate` / `greedy_generate` / `first_token` from the shared
@@ -1358,6 +1395,16 @@ that fits the model AND uses every device to the fullest.
       RAM/VRAM pool, residency keyed by routing frequency, prefetch keyed by the router's early output.
       Gate like everything: parity unaffected by placement (colibri's own invariant — "placement only
       affects speed, never precision"), and a bench proving the streamed model beats the
+      *(2026-08-20 research — read with the P2 MoE note, which carries the detail)* The colibri-shaped
+      design above now has an independent implementation to measure against: llama.cpp PR #25294 does
+      per-layer bounded expert-slab caching + async demand-load + hotness/LRU eviction + `O_DIRECT`, and
+      reports 5.3x prefill / 2.4x decode over `mmap`+`--n-cpu-moe` at a 79 % hit rate. Two design points
+      worth stealing outright when the `Disk` placement class is built: eviction on **decaying route
+      hotness with an LRU tiebreak** (not plain LRU — MoE routing is skewed, and plain LRU throws away
+      a hot expert after one cold burst), and **`O_DIRECT`/unbuffered reads**, because the OS page cache
+      actively hurts once the model exceeds RAM. Its stated limitation is also a design constraint for
+      us: single-context only — concurrent decodes sharing one streamed model corrupt each other, so the
+      residency pool has to be owned per-session or locked. — https://github.com/ggml-org/llama.cpp/pull/25294
       largest-fitting resident one on task throughput. *(2026-07-30 research)* —
       https://github.com/JustVugg/colibri
       *(2026-08-03 research)* Prior art to mine when this is picked up: llama.cpp's **`--n-cpu-moe N`**
