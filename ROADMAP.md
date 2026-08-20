@@ -381,6 +381,13 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       dequant→op→quant fallbacks for slice/gather/select/expand plus BitNet b1.58 calibration (P9). Plan the
       migration around measuring graph capture on the decode loop first — if it lands the dispatch win, it
       reorders everything below it in the perf section.
+      *(2026-08-20)* Still gated: crates.io now serves **0.22.0-pre.2**, so 0.21.0 remains the newest
+      stable and the do-not-adopt-a-pre-release rule holds for another run. Checked as part of the
+      dependency sweep, which is also why **wgpu 30 stays held**: `cargo upgrade --incompatible`
+      offers it, but `cargo tree -i wgpu` shows exactly one wgpu in the graph (29.0.4, reached via
+      `cubecl-wgpu 0.10`), so bumping our direct handle alone would put a second, non-Burn wgpu in
+      the tree and the startup adapter probe would stop describing the device Burn actually runs on.
+      wgpu 30 unblocks with the burn bump, exactly as the Stack note says — not before.
 - [x] Silence the pre-existing `LNK4098` (LIBCMT defaultlib conflict) the 2026-07 nightly toolchain's
       new `linker_messages` lint now surfaces when linking the `mummu` lib-test binary — find which
       native dep object embeds the static-CRT directive (tokenizers' C++ deps are the suspects) and

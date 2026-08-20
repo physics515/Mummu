@@ -95,7 +95,7 @@ criterion = "0.8"
 # layer). Two roles, one version: the test-only reference behind the template
 # BYTE gate, and — behind mummu's non-default `jinja-template` feature — the
 # fallback renderer for checkpoints with no hardcoded family renderer.
-hf-chat-template = "0.2.1"
+hf-chat-template = "1.0.0"
 
 [profile.release]
 # Thin LTO: inference is GPU-kernel-bound, so fat LTO's extra minutes per link
