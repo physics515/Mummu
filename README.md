@@ -85,6 +85,14 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
   1.15 s/token on the CPU backend (~28 GB f32 resident; a 16 GB card waits on keep-quantized VRAM,
   tracked in P9). Attention learned OLMoE's whole-projection q/k RMSNorm placement, inferred from the
   loaded norm's own width, so every existing checkpoint loads byte-unchanged.
+  It also loads from the **HF safetensors** release, where the 64 experts are stored as separate
+  tensors across three shards: the importer fuses `experts.{0..63}.{gate,up,down}_proj` into the same
+  `[64, 1024, 2048]` banks, in numeric (not lexicographic) member order, validating group completeness
+  before reading a payload byte. Proven on the real 13.84 GB bf16 checkpoint — 16 layers checked-loaded
+  in 136.1 s, and layer 5 / expert 37's `gate_proj` read straight from the raw shard bytes is
+  **bit-identical to slot 37 of the fused bank across all 2 097 152 values**. The fuse streams to a
+  temp file rather than RAM, so a checkpoint this size costs the model's footprint, not the model plus
+  a second copy of itself.
 - **All three models are parity-verified** — the two-leg P7 gate passes for Qwen2.5-1.5B on the
   reference GPU: single-forward top-5 logits match a Candle f32 reference (max |Δlogit| 2.7e-5,
   `tests/parity_qwen2.rs` + the committed `tools/candle-probe` fixture) and a 24-token greedy sequence

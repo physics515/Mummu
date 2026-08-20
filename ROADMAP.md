@@ -682,12 +682,57 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       before treating the gather as refuted. Both are gated on `bench/BASELINE.md` like the rest —
       https://github.com/ggml-org/llama.cpp/pull/25294 ·
       https://huggingface.co/blog/Doctor-Shotgun/llamacpp-moe-offload-guide
-- [ ] **OLMoE from HF safetensors** — the port loads GGUF only because HF stores each expert separately
+- [x] **OLMoE from HF safetensors** — the port loads GGUF only because HF stores each expert separately
       (`model.layers.N.mlp.experts.{0..63}.{gate,up,down}_proj.weight`) while `MoeExperts` holds one fused
       `[experts, out, in]` tensor per projection. Needs a concat-on-import step (64 slices → one tensor,
       in expert order) in the safetensors path — mechanical, but it wants its own fixture (the bf16
       checkpoint is ~14 GB) and a byte-equality check against the GGUF-loaded weights. *(2026-08-03, split
       from the MoE item.)*
+      *(2026-08-20) Shipped.* `crates/mummu/src/safetensors.rs` is a sharded-safetensors reader plus an
+      **N:1 fusing rewriter** — the two things `burn-store` cannot do for us (it finds only a single
+      `model.safetensors`, and its remapping is 1:1). It plans the whole output before reading one payload
+      byte, so a group that is not exactly `count` members `0..count` is a loud `BadGroup` rather than a
+      short bank that loads clean and computes wrong; members are ordered **numerically, not
+      lexicographically** (`experts.10` sorts before `experts.2` as text — the trap this whole item exists
+      to avoid). `olmoe::load_from_dir` maps `model.layers.N.mlp.experts.{0..63}.{gate,up,down}_proj.weight`
+      onto the same fused `[experts, out, in]` banks the GGUF path lands on, then rides the ordinary
+      `SafetensorsStore` + adapter-chain + `load_checked` pipeline.
+      **REAL-WEIGHTS proof** (`tests/real_olmoe_safetensors.rs`, the 3-shard 13.84 GB bf16 checkpoint):
+      the fuse builds `[64, 1024, 2048]` banks over 16 layers, checked-loads in **136.1 s** on the CPU
+      backend, and emits a live distribution (sanity top 194, spread 20.6) that greedy-decodes 8 tokens.
+      The check a mis-ordering could not survive: layer 5 / expert 37's `gate_proj`, read independently out
+      of the raw shard bytes, is **bit-identical to slot 37 of the fused bank — 0 mismatches over 2 097 152
+      values** (bf16 -> f32 is an exact 16-bit widening, so this is bit-equality, not a tolerance). Note the
+      decode leg uses an arbitrary token probe, not a prompt, so it is a liveness check; the *weight*
+      correctness evidence is the bit-exact one. 16 `safetensors` unit tests, incl. one pinning the
+      safetensors fuse targets to the SAME module names the GGUF path renames to — both import paths must
+      land on the same params or one of them is loading a different model.
+      Two things the gate caught that the code did not survive first contact with:
+      (a) `checkpoint_shards` planned straight off the index without checking the shards were **on disk**,
+      so an interrupted download reported as a complete checkpoint, skipped the resume, and died later with
+      a bare `os error 2` from inside the load — it now fails at planning time naming the missing shard, and
+      says so explicitly when a `.part` sibling shows the download was interrupted;
+      (b) the fuse materialized the payload in RAM **twice** (a `data` buffer, then a `blob` copy), and the
+      second 13.8 GB allocation genuinely failed on this 128 GB box —
+      `memory allocation of 13838346237 bytes failed`. `fuse_checkpoint_to_file` now streams header +
+      payload straight to a temp file through one reusable per-part buffer (~4 MiB, one expert projection),
+      so peak drops from ~42 GB (13.8 blob + ~28 model) to the model alone; a `FusedTemp` guard deletes the
+      scratch file on every exit path, verified empty after the run. A unit test pins the two fuse paths as
+      **byte-identical**, so the big-model path and the small-model path stay one importer.
+- [ ] **Give the GGUF dequant path the same streaming sink the safetensors fuse just got** — found while
+      fixing the OLMoE safetensors OOM (2026-08-20). `gguf::dequant_to_safetensors` has the identical
+      double-buffer: it fills a `data` Vec of `total_f32_bytes`, then copies it into a second `blob` Vec of
+      `8 + header + data`, so peak is **2x the dequantized f32 payload** before the model is even built.
+      For OLMoE-1B-7B that is ~28 GB f32 → ~56 GB peak, which is most of why that model reads as
+      "CPU-only, and only on a big box". `safetensors::fuse_into` is the template: plan, then stream header
+      + payload into an `impl Write` through one bounded per-tensor buffer, with a `*_to_file` variant for
+      `SafetensorsStore::from_file`. Prove it the same way — a unit test pinning the in-memory and
+      to-file outputs as byte-identical, then re-run the `real_gguf` + `parity_gguf` legs unchanged.
+- [ ] **`gguf.rs` still has `.expect()` on production paths** — `dequant_to_safetensors` and the metadata
+      readers carry `usize::try_from(..).expect("bounded above")` (4 sites), the same pattern removed from
+      `safetensors.rs` on 2026-08-20 in favour of a fallible `to_usize` that returns `OverBound`. Mechanical,
+      and it keeps the no-panic-on-production-paths rule true across the whole import suite rather than in
+      the newest module only.
 - [ ] **Qwen3.5 hybrid (`qwen35`) architecture port** — split from the Qwen3.5-tier item when the
       2026-07-30 header probe showed Qwen3.5-4B/9B are a hybrid **linear-attention/SSM + periodic
       full-attention** arch (`qwen35.ssm.*` metadata: conv_kernel/state_size/group_count/time_step_rank/
