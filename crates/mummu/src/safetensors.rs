@@ -14,13 +14,16 @@
 //!    fused `[experts, out, in]` param — exactly the ggml `ffn_*_exps` layout
 //!    a GGUF ships pre-fused.
 //!
-//! [`fuse_checkpoint`] reads every shard's header, plans the output layout,
+//! The fuse reads every shard's header, plans the output layout,
 //! validates it, and only then copies payload bytes — so a checkpoint missing
 //! expert 37 fails before a single weight byte is read, rather than loading
-//! clean and computing wrong. The result is an ordinary in-memory safetensors
-//! blob that goes through the SAME `SafetensorsStore::from_bytes` +
-//! adapter-chain + `load_checked` pipeline as every other import path (the
-//! GGUF path's `dequant_to_safetensors` is the precedent).
+//! clean and computing wrong. The result is an ordinary safetensors blob that
+//! goes through the SAME `SafetensorsStore` + adapter-chain + `load_checked`
+//! pipeline as every other import path (the GGUF path's
+//! `dequant_to_safetensors` is the precedent). Two ways out, byte-identical
+//! and unit-tested as such: [`fuse_checkpoint`] returns the blob in memory,
+//! and [`fuse_checkpoint_to_file`] streams it to disk for checkpoints too big
+//! to hold twice.
 //!
 //! Source dtypes are preserved verbatim — the bf16→backend-float cast stays
 //! where it already lives, in `CastFloatAdapter` on the load pipeline.
@@ -38,9 +41,11 @@ const MAX_HEADER_BYTES: u64 = 64 << 20;
 /// at 16 layers already declares ~3 000; 1M is a runaway index.
 const MAX_TENSORS: usize = 1 << 20;
 
-/// Largest fused payload [`fuse_checkpoint`] will build in RAM. Matches the
-/// GGUF path's ceiling (the reference machine has 128 GB) — note this blob
-/// keeps the SOURCE dtype, so a bf16 checkpoint costs half its f32 footprint.
+/// Largest fused payload either fuse will produce. Matches the GGUF path's
+/// ceiling (the reference machine has 128 GB) — note the payload keeps the
+/// SOURCE dtype, so a bf16 checkpoint costs half its f32 footprint. Only
+/// [`fuse_checkpoint`] holds this much at once; [`fuse_checkpoint_to_file`]
+/// streams it and never buffers more than one tensor.
 const MAX_FUSED_BYTES: u64 = 48 << 30;
 
 /// Largest SINGLE tensor (or fused member) the streaming fuse will buffer.
@@ -538,22 +543,18 @@ fn fuse_into<W: std::io::Write>(
     Ok(written)
 }
 
-/// Plan the output layout and validate it. Nothing here reads payload bytes —
-/// a malformed checkpoint fails before the expensive pass.
-fn plan_output(
+/// First pass: walk every shard and record, in first-seen order, what each
+/// output target is built from.
+///
+/// This is where a checkpoint's *claims* are checked — an unmapped name, a
+/// member index outside `0..count`, two members disagreeing about the group
+/// size, or the same member twice. What it does NOT check is completeness;
+/// that is [`plan_output`]'s job, once every shard has been seen.
+fn collect_groups(
     headers: &[SafetensorsHeader],
     map: &dyn Fn(&str) -> Option<Fuse>,
-) -> Result<Vec<PlannedNamed>, SafetensorsError> {
-    assert!(
-        !headers.is_empty(),
-        "planning needs at least one shard header"
-    );
-    assert!(
-        headers.len() <= MAX_SHARDS,
-        "shard count is bounded before planning"
-    );
-
-    // Collect, in first-seen order, what each target is built from.
+) -> Result<(Vec<String>, HashMap<String, Group>), SafetensorsError> {
+    debug_assert!(!headers.is_empty(), "collecting needs a shard header");
     let mut order: Vec<String> = Vec::new();
     let mut groups: HashMap<String, Group> = HashMap::new();
 
@@ -605,6 +606,35 @@ fn plan_output(
         }
     }
 
+    debug_assert_eq!(
+        order.len(),
+        groups.len(),
+        "every ordered target has exactly one group"
+    );
+    Ok((order, groups))
+}
+
+/// Second pass: lay the collected groups out into the output, and apply THE
+/// completeness check.
+///
+/// Nothing here reads payload bytes — a malformed checkpoint fails before the
+/// expensive pass. Completeness can only be judged after [`collect_groups`]
+/// has seen every shard, because a group's members are free to be split
+/// across shards in any order.
+fn plan_output(
+    headers: &[SafetensorsHeader],
+    map: &dyn Fn(&str) -> Option<Fuse>,
+) -> Result<Vec<PlannedNamed>, SafetensorsError> {
+    assert!(
+        !headers.is_empty(),
+        "planning needs at least one shard header"
+    );
+    assert!(
+        headers.len() <= MAX_SHARDS,
+        "shard count is bounded before planning"
+    );
+
+    let (order, mut groups) = collect_groups(headers, map)?;
     let mut plan = Vec::with_capacity(order.len());
     let mut cursor = 0u64;
     for target in order {

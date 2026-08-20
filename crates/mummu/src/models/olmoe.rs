@@ -17,9 +17,13 @@
 //! (`ffn_*_exps`) in exactly the layout `MoeExperts` holds; the HF safetensors
 //! checkpoint stores each expert separately
 //! (`mlp.experts.{i}.{gate,up,down}_proj.weight`) and is sharded, so
-//! [`load_from_dir`] runs it through [`crate::safetensors::fuse_checkpoint`],
-//! which reads every shard and stacks each 64-member expert group into one
-//! `[experts, out, in]` tensor before the ordinary checked-load pipeline.
+//! [`load_from_dir`] runs it through
+//! [`crate::safetensors::fuse_checkpoint_to_file`], which reads every shard and
+//! stacks each 64-member expert group into one `[experts, out, in]` tensor
+//! before the ordinary checked-load pipeline. It fuses to a temp file rather
+//! than to RAM deliberately: the in-memory twin would need the whole payload
+//! resident (13.8 GB for the 1B-7B) on top of the ~28 GB f32 model the load
+//! then builds.
 
 use std::path::{Path, PathBuf};
 
