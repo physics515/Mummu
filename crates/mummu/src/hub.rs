@@ -160,6 +160,42 @@ fn announced_sha256(url: &str) -> Result<Option<String>, HubError> {
     }))
 }
 
+/// The sibling files that are fetched **only if the repo ships them**.
+///
+/// `tokenizer_config.json` is what the import-validation gates read (EOS
+/// agreement, added-token ids, tool-call convention); `chat_template.jinja` is
+/// how checkpoints that keep their template out of `tokenizer_config.json`
+/// ship it. Neither is universal on the Hub, so a 404 is a legitimate answer —
+/// but not asking for them at all silently disarms those gates for every model
+/// installed through this path.
+const OPTIONAL_FILES: [&str; 2] = ["tokenizer_config.json", "chat_template.jinja"];
+
+/// Does the repo actually ship `url`?
+///
+/// One HEAD, redirects not followed: the Hub answers a `resolve` URL for a
+/// present file with 200 (or a 302 to the CDN) and for an absent one with 404.
+/// ONLY 404 counts as absent — anything else (403 on a gated repo, a 5xx) is
+/// reported as present so the real fetch raises it properly rather than this
+/// probe swallowing it as "the repo just doesn't have it".
+fn repo_has_file(url: &str) -> Result<bool, HubError> {
+    assert!(url.starts_with("https://"), "refusing non-https url: {url}");
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let resp = agent.head(url).call().map_err(|e| HubError::Http {
+        url: url.into(),
+        reason: e.to_string(),
+    })?;
+    let status = resp.status().as_u16();
+    debug_assert!(
+        (100..600).contains(&status),
+        "http status in range: {status}"
+    );
+    Ok(status != 404)
+}
+
 /// Streaming sha256 of a file on disk, as lowercase hex.
 fn sha256_hex_of_file(path: &Path) -> Result<String, HubError> {
     let io_err = |e: std::io::Error| HubError::Io {
@@ -385,9 +421,15 @@ fn download(
 }
 
 /// Fetch a whole model from the Hub into `dest_dir`: `config.json`,
-/// `tokenizer.json`, and the weights — `model.safetensors` when the repo is
-/// single-file, else every shard listed by `model.safetensors.index.json`.
+/// `tokenizer.json`, the weights — `model.safetensors` when the repo is
+/// single-file, else every shard listed by `model.safetensors.index.json` —
+/// and, when the repo ships them, the optional siblings in [`OPTIONAL_FILES`].
 /// Returns `dest_dir` ready for the per-model `load_from_dir`.
+///
+/// `config.json` and `tokenizer.json` are required: a 404 on either is an
+/// error. The optional siblings are best-effort, because a repo that does not
+/// ship them is normal — but they are asked for, so a checkpoint installed
+/// this way arrives with the files the import-validation gates need.
 pub fn fetch_model(
     repo: &str,
     revision: &str,
@@ -419,6 +461,15 @@ pub fn fetch_model_with(
             opts,
             &mut on_progress,
         )?;
+    }
+    // Then the optional siblings. These MUST be fetched before the weights,
+    // because the single-file branch below returns early on success — putting
+    // them after it would fetch them for sharded checkpoints only.
+    for file in OPTIONAL_FILES {
+        let url = hub_file_url(repo, revision, file);
+        if repo_has_file(&url)? {
+            fetch_file_with(&url, &dest_dir.join(file), opts, &mut on_progress)?;
+        }
     }
     // Single-file first (the common case for the small-model tiers we target).
     let single = fetch_file_with(
@@ -475,6 +526,29 @@ mod tests {
     #[should_panic(expected = "owner/name")]
     fn bare_repo_names_are_rejected() {
         let _ = hub_file_url("qwen", "main", "config.json");
+    }
+
+    /// The gates that read these files fail OPEN — `validate_checkpoint_dir`
+    /// returns `Ok(None)` when `tokenizer_config.json` is absent, so the
+    /// EOS-agreement and added-token-id checks simply do not run. That makes
+    /// "did we even ask the Hub for it?" the load-bearing question, and it is
+    /// what this list answers.
+    #[test]
+    fn optional_files_cover_the_siblings_the_import_gates_read() {
+        assert!(OPTIONAL_FILES.contains(&"tokenizer_config.json"));
+        assert!(OPTIONAL_FILES.contains(&"chat_template.jinja"));
+        for file in OPTIONAL_FILES {
+            assert!(
+                !["config.json", "tokenizer.json"].contains(&file),
+                "{file} is required, not optional — a 404 on it must stay an error"
+            );
+            assert_eq!(
+                hub_file_url("allenai/OLMoE-1B-7B-0125-Instruct", "main", file),
+                format!(
+                    "https://huggingface.co/allenai/OLMoE-1B-7B-0125-Instruct/resolve/main/{file}"
+                )
+            );
+        }
     }
 
     #[test]

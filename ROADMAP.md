@@ -830,6 +830,23 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       BOTH Qwen2.5-1.5B and LFM2.5-1.2B; top-3 first-forward ids exact in order, top-5 overlap ≥ 4/5,
       max |Δlogprob| 2.7e-1 (the reference's own Q8_K *activation* quantization in its integer Q4_K
       kernels — an order above the BF16 leg's 1.5e-2; our f32 path doesn't quantize activations).*
+- [x] **`fetch_model` fetches the sibling files the import gates read** — found while installing the OLMoE
+      safetensors checkpoint through the registry (2026-08-20). `hub::fetch_model_with` fetched exactly
+      `config.json`, `tokenizer.json`, and the weights, so a checkpoint installed through Mummu's OWN
+      registry arrived with no `tokenizer_config.json` — and the 2026-07-19/20/21 gates all fail **open**:
+      `validate_checkpoint_dir` returns `Ok(None)`, the EOS-agreement + added-token-id + tool-call-convention
+      checks silently no-op, and the `tokenizer_config` the loaders surface is always `None`. The gates
+      appeared to work only because every locally-cached fixture had been populated by hand. Fixed: both
+      `tokenizer_config.json` and `chat_template.jinja` (the standalone-template checkpoints of the
+      2026-07-20 item) are now fetched as **optional** files — one HEAD each, and only a 404 counts as
+      absent, so a 403 on a gated repo or a 5xx still reaches the real fetch and is reported rather than
+      swallowed as "the repo just doesn't ship it". `config.json` / `tokenizer.json` stay required. They are
+      fetched BEFORE the weights because the single-file branch returns early — placing them after it would
+      have fetched them for sharded checkpoints only, which is exactly the kind of half-fix this item exists
+      to avoid. Proof (`tests/real_hub.rs::a_registry_install_arrives_with_the_files_the_import_gates_read`):
+      a catalog model installed into a **clean** dir — no hand-populated fixture can satisfy it — now has
+      `tokenizer_config.json` on disk AND `validate_checkpoint_dir` returns `Some`, i.e. the gate has
+      something to check instead of quietly passing. *(2026-08-20)*
 - [ ] **GPTQ / AWQ** (HF safetensors) — import the calibration-quantized int4/int8 layouts most "quantized on
       the Hub" models ship as (a `.safetensors` payload + a quant config), dequant or keep-quant into Burn.
       *(2026-07-13 research)* Both are quantization *algorithms*, not formats — the artifact is ordinary
