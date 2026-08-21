@@ -1025,7 +1025,7 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       rope-theta, vocab, tie-word-embeddings, …) so a model is **config-driven**, not hardcoded per checkpoint.
       *(2026-07-09) Per-architecture serde configs with validation (`Qwen2Config`, `Lfm2Config` incl.
       `layer_types` + auto-adjusted ff_dim); both real checkpoints parse and drive the build.*
-- [ ] **Tokenizer + chat-template import** — HF `tokenizer.json` (fast), SentencePiece `tokenizer.model`, BPE
+- [x] **Tokenizer + chat-template import** — HF `tokenizer.json` (fast), SentencePiece `tokenizer.model`, BPE
       merges/vocab; special-tokens map + the chat template from `tokenizer_config.json`. *(2026-07-18)*
       **`tokenizer_config.json` import shipped** (`mummu::tok_config::TokenizerConfig`, no new deps): parses
       the *conventions* HF keeps beside `tokenizer.json` — `add_bos_token`/`add_eos_token`, the BOS/EOS/PAD/UNK
@@ -1053,6 +1053,25 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       qwen3-0.6b: all 26 ids pass `check_ids_against`, and `config.json` eos 151645 agrees with the resolved
       `<|im_end|>`. Remaining on this item: SentencePiece `tokenizer.model` import, and *calling* these
       validators from `load_from_dir` (config-driven EOS + template-vs-renderer consistency) — split below.
+      *(2026-08-21) Closed — every remaining piece it named is `[x]` below, and the whole surface was
+      re-verified on real files this run rather than taken on the sub-items' word:*
+      `real_tokenizer_config` (qwen3-0.6b config↔tokenizer ids agree), `real_spm` **both** legs
+      (Unigram via flan-t5-small and BPE-type via tinyllama, ids byte-matching each checkpoint's own
+      `tokenizer.json`), the **10-case template BYTE gate** (qwen2 / qwen3 / lfm2, plain + history +
+      tools), and `imported_render` under `--features jinja-template` (the fallback renderer's output
+      byte-identical to the family renderer at 142 / 748 / 324 B for qwen3, 157 / 379 B for lfm2, plus
+      the no-family-renderer fallback at 57 B). Anything further on tokenizers is its own item, not
+      this one.
+- [ ] **The real-file gates panic on a missing env var instead of reporting a skip** — already recorded
+      operationally for `parity_gguf` (its lfm2 leg has no local GGUF, so the whole binary reports
+      FAILED even when every other leg passes); `imported_render` did the same thing this run, failing
+      on an unset `MUMMU_LFM2_DIR` while both other legs were byte-identical. The tension is real and
+      the current behaviour is the safer half of it — a gate that silently skips is a gate that does
+      not exist, which is exactly how a parity suite rots. So the fix is NOT "skip quietly": make the
+      missing-fixture case a distinct, *summarized* outcome — collect the unrunnable legs and print
+      one "N legs skipped for missing fixtures: …" line, so the run summary distinguishes "no fixture"
+      from "wrong answer" without ever letting the second hide inside the first. *(2026-08-21,
+      discovered re-verifying the tokenizer gates.)*
 - [x] **SentencePiece `tokenizer.model` import** — the `.model` proto tokenizer (Llama/Gemma/T5 family) that
       HF ships instead of a `tokenizer.json`; build the equivalent HF `tokenizers` pipeline (or convert), and
       byte-verify ids against a `tokenizer.json` of the same checkpoint where one exists. *(2026-07-18, split
