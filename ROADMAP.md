@@ -859,6 +859,35 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       `--spec-type mtp` to `--spec-type draft-mtp` (2026-05-13), worth knowing before wiring a
       reference leg against it. —
       https://huggingface.co/unsloth/Qwen3.5-9B-MTP-GGUF · https://sebastianraschka.com/llm-architecture-gallery/hybrid-attention/
+- [ ] **RoPE scaling + sliding-window attention** *(mistral.rs parity)* — the shared blocks compute plain
+      RoPE and a full causal mask; there is no `rope_scaling` handling (YaRN / linear / dynamic-NTK /
+      `rope_type: llama3`) and no sliding-window mask anywhere in `nn` (grep across `src` is clean).
+      Every current zoo model is fine — their configs ship `rope_scaling: null` and no window inside
+      native context, which is why this never bit — but it is the **silent-wrong-answer** kind of gap:
+      a checkpoint that *does* carry `rope_scaling` (Qwen2.5 past 32k via YaRN) or `sliding_window`
+      (Mistral-family; Gemma 2/3 alternating layers) would load cleanly and degrade numerically far
+      beyond the parity probes' short prompts. Two halves, the cheap one first: (1) **parse the fields
+      and reject unsupported modes loudly** — that alone converts silent degradation into an error
+      naming the mode; (2) implement scaled `rope_tables` + a windowed mask as config-driven variants
+      of the shared blocks, no new module shapes. Gate: a *long-context* parity leg vs llama.cpp on a
+      rope-scaled checkpoint — the short-prompt gates cannot see this by construction. *(2026-08-21,
+      mistral.rs scan.)*
+- [ ] **Llama-family decoder port (`llama`)** *(mistral.rs parity)* — the loader that multiplies
+      checkpoint coverage most per unit of new surface: Llama 2/3.x and the wide Mistral/TinyLlama-style
+      fine-tune space share one architecture shape, and it is strictly a subset of blocks Mummu already
+      has (GQA without q/k-norm + SwiGLU + RoPE + RmsNorm + tied-or-untied head — expected zero new `nn`
+      code; config + key-remap + chat renderer + parity gate). The zoo grows on consumer demand, not
+      breadth-for-breadth — recorded here because when the next port is picked, this one buys the most,
+      and Llama 3.x is the natural `rope_type: llama3` test vector for the scaling item above.
+      *(2026-08-21, mistral.rs scan.)*
+- [ ] **Qwen3-Embedding on the existing qwen3 port** *(mistral.rs parity)* — mistral.rs serves
+      `Qwen/Qwen3-Embedding-0.6B` through its ordinary Qwen3 loader; the checkpoint IS the qwen3 dense
+      arch Mummu already runs and parity-verifies, used as an embedder: last-token (EOS) pooling over
+      the final hidden state instead of MiniLM's masked mean, an instruction-prefixed query format,
+      L2-normalize. A modern 32k-context multilingual embedder for Nanna's memory `embed_fn` at the
+      cost of a pooling fn + a fixture; MiniLM stays as the tiny tier. Gate: cosine parity vs the HF
+      reference, same discipline as `real_minilm`. *(2026-08-21, mistral.rs scan.)* —
+      https://huggingface.co/Qwen/Qwen3-Embedding-0.6B
 - [x] A `Model` trait so new architectures (Hermes-class function-callers, Gemma, Qwen3, …) slot in.
       *(2026-07-10) `models::CausalLm<B>` — associated `Cache` type; a port supplies `new_cache` /
       `forward` / `is_eos` and inherits `generate` / `greedy_generate` / `first_token` from the shared
@@ -1006,6 +1035,17 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       emerging unified on-disk convention to target (one reader covers GPTQ/AWQ/INT8/FP8 exports) —
       https://github.com/vllm-project/compressed-tensors ·
       https://www.digitalapplied.com/blog/gguf-vs-awq-vs-gptq-vs-mlx-llm-quantization-formats-2026
+- [ ] **Architecture auto-detection (any checkpoint by path alone)** *(mistral.rs parity)* — mistral.rs
+      dispatches any checkpoint off `config.json`'s `architectures[0]` (HF) or `general.architecture`
+      (GGUF) with `--arch` as a rarely-needed override; Mummu *parses* both today but only *dispatches*
+      through the curated registry catalog, so a Qwen2/Qwen3/LFM2/OLMoE/MiniLM checkpoint that is not
+      one of the 12 catalog entries needs the caller to know its architecture. The North-Star reading
+      ("one pathway, no config, it just works") makes this the import suite's missing top:
+      `registry::detect(dir_or_gguf) -> Architecture` off the checkpoint's own metadata, so any
+      supported-arch checkpoint loads by path alone, and an unknown architecture is a loud, readable
+      error naming the arch string it found — never a guess. The catalog keeps its job (a curated,
+      parity-verified set with known-good URLs); it just stops being the only door. *(2026-08-21,
+      mistral.rs scan.)*
 - [ ] **ONNX** (optional) — `burn-import` ONNX→Burn for models distributed as ONNX graphs.
 - [x] **Dtype handling** — a `CastFloatAdapter` (bf16→f32/f16); quantized→dequant on import; keep-quantized
       handed to P9. *(2026-07-17)* All three legs are in place and proven across the zoo: `CastFloatAdapter`
@@ -1447,6 +1487,39 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       Weigh the dep tree (toktrie, derivre, rayon) against a hand-rolled JSON-schema automaton; 2026
       benchmarks note XGrammar edges it on repeated-schema caching, but llguidance's Rust-native API is
       the fit here — https://lib.rs/crates/llguidance · https://github.com/guidance-ai/llguidance
+      *(2026-08-21, mistral.rs scan)* Production corroboration for the llguidance pick: mistral.rs ships
+      its structured output (JSON Schema, regex, Lark CFGs) AND grammar-enforced tool calling on
+      llguidance — the exact integration shape sketched above, running in the closest comparable Rust
+      engine. The pick is settled; only the wiring remains. —
+      https://github.com/EricLBuehler/mistral.rs
+- [ ] **Sampling breadth: min-p, repetition/frequency/presence penalties, logit bias** *(mistral.rs
+      parity)* — `SamplerOptions` is temperature/top-k/top-p/seed; the OpenAI-shaped requests the
+      consumers will forward (and every llama.cpp / mistral.rs config in the wild) also speak min-p,
+      the three penalty families, and per-token logit bias. All are host-side transforms over the
+      candidate set that slot between the existing O(vocab) top-k select and `sample_id` — no new
+      device code (penalties need a small recent-token ring the driver already implies). Defaults keep
+      every one of them off; the gate is that an options struct with the new fields at their defaults
+      produces **byte-identical** streams to today (greedy AND seeded-sampled replay), so no existing
+      parity leg moves. *(2026-08-21, mistral.rs scan.)*
+- [ ] **Batched forward (N sequences, one dispatch)** *(mistral.rs parity — the honest subset)* — the
+      decode driver is strictly batch-1. Full continuous batching is a serving-stack feature and stays
+      a non-goal (single-user consumers, no request queue to schedule), but a fixed-N batched forward
+      through the KV cache is the shared prerequisite for two things already wanted: the
+      speculative-decoding **verify** step (item above — "genuinely batched through the KV cache is
+      where the engines that win differ from the ones that lose") and **bulk embedding** (Nanna memory
+      backfills embed texts one forward at a time today). Our dispatch-bound decode profile makes this
+      unusually attractive: N sequences per dispatch amortizes exactly the cost the Performance section
+      measures as dominant. Gate: batch-of-1 byte-identical to the unbatched path; batch-of-N equal to
+      N independent runs. *(2026-08-21, mistral.rs scan.)*
+- [ ] **In-memory prompt-prefix KV reuse** *(mistral.rs parity; the warm sibling of P9's KV-cache
+      persistence)* — agent loops re-send system prompt + growing history every turn and Mummu
+      re-prefills from token zero each time. Keep the last (or LRU-few) prefill's KV in the `ModelSlot`
+      keyed by prompt-token prefix; on the next generate, longest-common-prefix match resumes prefill
+      at the divergence point — the multi-turn case converts each turn's prefill cost from
+      O(whole conversation) to O(new tokens). Same gate as persistence: a resumed decode must be
+      byte-identical to the uninterrupted one (the cache-equivalence proofs already cover the
+      mechanism; this is bookkeeping, not new math). And per the North Star, no knob: it is simply on
+      once proven, like the KV cache itself. *(2026-08-21, mistral.rs scan.)*
 
 ### P6 — Hardware planner: precision, placement & full utilization
 The "use all the hardware" phase — inventory the machine, then pick the precision and the device placement
@@ -1745,8 +1818,22 @@ The VRAM lever the P6 planner pulls to make the largest useful model fit the use
       (f16 → int8 → int4), reports the quality/size trade, and never silently ships a worse tier than asked.
 
 ### P10 — Training & adapters
-- [ ] LoRA adapters; an on-device fine-tune loop (Burn supports training) — learn-by-format /
-      personalization on-device.
+*(2026-08-21, fleshed out by the mistral.rs scan — was one line.)*
+- [ ] **LoRA adapter inference** *(mistral.rs parity)* — load a HF PEFT adapter
+      (`adapter_config.json` + `adapter_model.safetensors`) onto a zoo model. Two application modes,
+      both wanted: **merge-on-load** (W ← W + (α/r)·B·A at import — zero per-token cost; the default
+      "no config" path) and **unmerged** (keep A/B beside the base matmul — a small per-token cost
+      that buys instant swap, and it is the representation the fine-tune loop below trains in). Gate:
+      merged-load logits byte-identical to a reference `peft` `merge_and_unload` export of the same
+      adapter; unmerged ≡ merged to summation-order tolerance.
+- [ ] **Adapter hot-swap** *(mistral.rs parity)* — mistral.rs loads/unloads named adapters at runtime
+      and routes per-request without dropping the base model. The Mummu shape already exists:
+      `ModelSlot`'s drop-then-swap generalizes to swapping only the delta while the base weights stay
+      resident — unmerged adapters swap by tensor replacement, merged ones pay a re-merge. Per the
+      North Star this is a library call (`with_adapter`), not a server route; per-request LoRA
+      *serving* stays consumer glue.
+- [ ] On-device fine-tune loop (Burn supports training) — learn-by-format / personalization
+      on-device, producing exactly the PEFT-shaped artifacts the two items above consume.
 
 ### P11 — Vision & OCR (retire Candle)
 - [ ] Port a vision/OCR model (DeepSeek-OCR — currently Candle in laurelane, `physics515/deepseek-ocr.rs`)
@@ -1788,6 +1875,59 @@ app surface, Mummu stays the library; and no C rewrite — parity here means *ca
 a second runtime. Dual-SSD mirroring, `O_DIRECT`, and NUMA interleave are streaming-tier tuning knobs to
 revisit only if/when the P6 disk tier exists and measures I/O-bound.
 
+## mistral.rs parity scan *(2026-08-21)*
+
+[mistral.rs](https://github.com/EricLBuehler/mistral.rs) (v0.8.2) is the closest Rust analog in ambition —
+"run any HF model, quantized, on whatever hardware" — and the opposite architecture in nearly every
+choice: Candle + per-vendor builds (CUDA/Metal/MKL feature splits, NCCL tensor parallelism) where Mummu is
+Burn/wgpu one-binary; a serving stack (OpenAI **and** Anthropic HTTP APIs, web UI, a server-side agentic
+loop with sandboxed code/shell execution, web search, skills, MCP client + server) where Mummu is a
+library; and a large knob surface (`--arch` overrides, per-layer topology TOML, `tune`/`doctor` CLIs, ISQ
+flags) where Mummu's North Star is **one pathway, no config, auto-optimized for the hardware it lands
+on**. So parity here is *capability* parity, translated: every feature worth having arrives as something
+the importer or the P6 planner decides automatically and the parity harness gates — never as a flag the
+caller must know to pass. mistral.rs's `tune` CLI *recommends* settings; Mummu's planner is the same
+judgement *applied*. The scan spawned one item per gap, each tagged `*(mistral.rs parity)*` in its phase:
+
+- **P2** — **RoPE scaling + sliding-window attention** (the silent-wrong-answer gap: a `rope_scaling` or
+  `sliding_window` checkpoint currently loads clean and degrades quietly past the parity probes' reach);
+  **Llama-family port** (the loader that multiplies checkpoint coverage most per unit of new surface);
+  **Qwen3-Embedding** (a modern 32k embedder that IS the already-ported qwen3 arch + last-token pooling).
+- **P3** — **architecture auto-detection** (dispatch off the checkpoint's own `config.json` /
+  `general.architecture` so any supported-arch checkpoint runs by path alone — the "no config" door
+  mistral.rs opens with auto-detect and Mummu currently gates behind the 12-entry catalog). GPTQ/AWQ
+  import was already open; the compressed-tensors reader plan stands.
+- **P5** — **sampling breadth** (min-p / penalties / logit bias — the request surface consumers will
+  forward); **batched forward** (the honest subset of continuous batching: prerequisite for the
+  spec-decode verify step and bulk embedding, and unusually valuable on a dispatch-bound profile);
+  **in-memory prompt-prefix KV reuse** (their prefix cache — the warm sibling of P9's persistence item);
+  plus a production-corroboration note on the grammar item (mistral.rs ships structured output on
+  llguidance, the substrate already picked here).
+- **P6 / P9** — nothing new to spawn, which is itself a finding: ISQ ≙ **auto-quantize-to-fit** (P9,
+  open), auto device mapping ≙ the **placement plan** (P6, open), FP8 KV cache and keep-quantized
+  weights were already the P9 backbone, PagedAttention-class block KV management only earns its
+  complexity at batch > 1 and so waits on the P5 batching item, and their MTP-only speculative decoding
+  independently confirms the P5 route-(a) conclusion (native heads, never a second model on consumer
+  VRAM).
+- **P10** — fleshed out from one line into **LoRA inference** (merge-on-load + unmerged), **adapter
+  hot-swap**, and the fine-tune loop that produces what those consume.
+
+**Already at or past parity:** chat-template handling (their auto-detect ≙ `tok_config` detection, and
+the byte-gate vs `transformers.apply_chat_template` is a stronger claim than any engine makes);
+tool-call render + parse (Hermes AND LFM Pythonic, auto-detected from the checkpoint); GGUF import
+breadth (F32/F16/BF16, legacy quants, Q2_K–Q6_K superblocks); tokenizer import (`tokenizer.json`, GGUF
+metadata, both SentencePiece proto types); streaming + cooperative cancellation at the library seam;
+resumable sha256-verified hub fetch; warm-up API; true-VRAM device inventory. **Non-goals,
+deliberately** (the consumer contract below already draws this line): the entire serving surface
+(OpenAI/Anthropic HTTP, web UI, interactive CLI, Prometheus metrics) and the entire server-side agentic
+layer (code/shell sandboxes, approval flows, web search, skills, MCP) — that is Nanna's half of the
+split, powered by Mummu primitives (grammar-guaranteed tool calls, prefix reuse, adapters); UQFF-style
+bespoke artifacts (GGUF + safetensors are the ecosystem; a third format is surface without capability);
+X-LoRA / AnyMoE (no consumer demand — revisit if one appears); image generation and speech (FLUX / Dia /
+Voxtral — a different product); multi-node distribution (the North-Star machine is one box); and every
+config knob whose job the planner can do (`--arch`, topology TOML, per-request quant hints — each exists
+as an item above precisely so the answer can be automatic instead).
+
 ## Consumer integration contract
 
 Each app depends on Mummu (path/git dep) and keeps its own glue:
@@ -1812,3 +1952,6 @@ Each app depends on Mummu (path/git dep) and keeps its own glue:
   live on the dev box: Vulkan advertises SHADER_F16 on the 4070 Ti SUPER, DX12 does not (2026-07-09 probe).
 - colibri — pure-C MoE weight-streaming engine (VRAM/RAM/NVMe hierarchy, MTP speculation, GBNF grammars,
   persistent compressed KV); the 2026-07-30 parity scan's source — https://github.com/JustVugg/colibri
+- mistral.rs v0.8.2 — Candle-based Rust serving stack (~50 archs, ISQ/GGUF/GPTQ/AWQ/FP8, PagedAttention,
+  MTP speculation, llguidance structured output, LoRA hot-swap, OpenAI+Anthropic APIs, agentic loop); the
+  2026-08-21 parity scan's source — https://github.com/EricLBuehler/mistral.rs · https://ericlbuehler.github.io/mistral.rs/
