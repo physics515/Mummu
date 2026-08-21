@@ -1373,6 +1373,62 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       https://localaimaster.com/blog/best-ollama-models-for-agents
 
 ### P5 — Decode engine *(ex-laurelane)*
+- [ ] **Async, multithreaded runtime — retire the fully-sync library surface** — Mummu is sync by
+      construction today, deliberately and consistently: `decode::generate_loop` is a blocking driver
+      that hands tokens to an `FnMut(u32) -> ControlFlow<()>` callback, `ureq` is blocking HTTP ("sync
+      like the rest of the library surface", per its own `Cargo.toml` note), `backend.rs` wraps wgpu's
+      async adapter enumeration in `pollster::block_on`, and `ModelSlot::with` serializes every
+      inference behind a `Mutex`. The whole crate contains **zero `async fn`, zero `.await`, and one
+      `thread::spawn` — in a test**. That was the right first cut; it is now the ceiling on three
+      separate things (streaming ergonomics, multi-GPU, concurrent requests), so the transition is
+      worth planning properly rather than bolting a runtime on.
+      **Why it is a real lever here, and where it is not.** Decode on this stack is **dispatch-bound,
+      not bandwidth-bound** — established three independent ways (f16 initially matching f32 exactly;
+      ~114 GB/s effective against the card's ~672; a **~30 % swing from host CPU load alone** on an
+      otherwise-idle GPU). The host thread submitting kernels *is* the bottleneck, so moving
+      tokenization, logits readback, detokenization and the consumer's own per-token work **off the
+      submit thread** attacks the measured bottleneck directly, which is unusual — most async wins are
+      about hiding I/O latency, and this one is not. State the converse in the same breath so nobody
+      expects magic: async makes **no single decode step faster**, and a naive multithreaded executor
+      makes things *worse* by scheduling the submit thread onto whichever core is cold.
+      **What the type system already permits (probed 2026-08-21, burn 0.21).** The naive expectation is
+      backwards. Every model in the zoo — `Qwen2` / `Qwen3` / `Lfm2` / `Olmoe`, on both `Gpu` and `Cpu`
+      — is **`Send` AND `Sync`**, and so is the KV cache (`Vec<LayerKv<Gpu>>`); a compile probe with a
+      deliberate `Rc<u8>` control confirms the check is real and only the control fails. So inference
+      state may cross threads freely, and **one owning worker thread per device** is available today.
+      What is *not*: `burn_store::TensorSnapshot` holds an `Rc<dyn Fn() -> Result<TensorData, _>>`
+      (`burn-store-0.21.0/src/tensor_snapshot.rs:53`), so the **entire import pipeline is `!Send`** and
+      cannot cross a thread boundary or be held across an `.await` on a multithreaded executor. A load
+      must run to completion on one thread; a public `async` load can only mean "hand the work to that
+      thread and await the result". Consequence for P3: this is a constraint upstream owns, so re-check
+      it at the burn 0.22 bump before designing around it.
+      **Correct a stale premise first.** `cache.rs`'s header says "Burn's `Param` is not `Sync`, so the
+      loaded value lives behind a `Mutex`" — the probe above says `Param` **is** `Sync` at 0.21, so the
+      `Mutex` is no longer justified by the type. Serializing work on a single GPU is still a perfectly
+      good *policy*, but the comment must say that instead, or the next person reads a type-level
+      prohibition that does not exist and designs around a phantom.
+      **The app-agnostic constraint is the main design risk.** Mummu is shared by laurelane and Nanna.
+      A library that picks `tokio` and spawns its own tasks **imposes that runtime on both apps** — the
+      exact app-coupling the North Star forbids, and worse than an app concept leaking in because it is
+      unfixable downstream. So: return `impl Future` / `impl Stream` and **never spawn**; keep the sync
+      API as the base rather than a wrapper over an async one (sync-over-async deadlocks; async-over-sync
+      does not); put any runtime dependency behind a non-default feature, the `jinja-template` precedent.
+      Confirm each consumer's runtime before committing to a `Stream` shape (Nanna is Tauri, i.e. tokio;
+      laurelane unverified).
+      **Slices, smallest first, each shippable alone:**
+      (a) fix the stale `cache.rs` premise and land the `Send`/`Sync` facts as compile-time assertions,
+      so a burn bump that revokes them fails the build instead of the design;
+      (b) give `generate_loop` a pull-based streaming shape (an iterator/`Stream` of tokens) beside the
+      `on_token` callback, adopting no runtime — pure API ergonomics, and the piece both apps touch;
+      (c) **move each device onto an owning worker thread with a channel API** — the real change, and
+      the same shape P6's *Multi-GPU execution* item needs, so build it once and share it;
+      (d) async I/O for the P3 downloader, the one genuinely I/O-bound path, where classic async pays;
+      (e) concurrent request serving / continuous batching — the only slice that raises *throughput*
+      rather than moving latency around, and big enough to be its own item when (c) lands.
+      **Gate:** every parity leg byte-identical, `bench/BASELINE.md` held, and specifically that
+      **seeded sampling stays reproducible** — a multithreaded executor is exactly where determinism
+      dies, and `real_inference`'s `qwen2_sampled_streaming_is_seeded_deterministic_and_cancellable`
+      is the test that must not become flaky. *(2026-08-21, requested.)*
 - [x] Per-layer KV cache (+ conv-state cache for hybrids); prompt prefilled once, then one token/step.
       *(2026-07-09) `nn::{LayerKv, ConvState}` + per-model `new_cache`/`forward(past)`; prefill+decode ≡
       full-forward proven by unit tests at block AND whole-model level, then by real GPU decode.*
