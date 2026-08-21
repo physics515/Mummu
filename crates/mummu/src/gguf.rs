@@ -74,6 +74,28 @@ pub enum GgufError {
     },
 }
 
+/// `u64` -> `usize` as an error rather than a panic.
+///
+/// Every caller has already bounded `value` against one of the `MAX_*`
+/// ceilings or a tensor's own declared size, so on a 64-bit target this
+/// cannot fail — but an import path is exactly where "cannot fail" should
+/// still be an `Err` instead of an `.expect()`, so a 32-bit build degrades to
+/// a clean error instead of aborting mid-load. (Same helper, same reasoning,
+/// as `safetensors::to_usize`.)
+fn to_usize(value: u64, path: &str, what: &'static str) -> Result<usize, GgufError> {
+    debug_assert!(
+        value <= usize::MAX as u64,
+        "{what} fits usize on this target"
+    );
+    debug_assert!(!path.is_empty(), "an error needs a file to name");
+    usize::try_from(value).map_err(|_| GgufError::OverBound {
+        path: path.to_string(),
+        what,
+        count: value,
+        bound: usize::MAX as u64,
+    })
+}
+
 /// One typed metadata value. Arrays are homogeneous per the spec; nested
 /// arrays are legal but bounded to one level of nesting in practice.
 #[derive(Debug, Clone, PartialEq)]
@@ -396,8 +418,11 @@ impl GgufFile {
 
         let mut header = String::from("{");
         let mut names = std::collections::HashSet::with_capacity(self.tensors.len());
-        let mut data: Vec<u8> =
-            Vec::with_capacity(usize::try_from(total_f32_bytes).expect("bounded above"));
+        let mut data: Vec<u8> = Vec::with_capacity(to_usize(
+            total_f32_bytes,
+            &self.path.display().to_string(),
+            "dequantized f32 payload bytes",
+        )?);
         for (index, info) in self.tensors.iter().enumerate() {
             let (name, shape) = match map(info) {
                 Some(GgufMap::Rename(name)) => {
@@ -425,7 +450,8 @@ impl GgufFile {
             let start = data.len();
             let values = self.read_tensor_f32(&info.name)?;
             data.extend(values.iter().flat_map(|v| v.to_le_bytes()));
-            let json_name = serde_json::to_string(&name).expect("string serializes");
+            let json_name = serde_json::to_string(&name)
+                .map_err(|e| bad(index, format!("name is not encodable as JSON: {e}")))?;
             if index > 0 {
                 header.push(',');
             }
@@ -504,7 +530,7 @@ impl Reader {
                 bound: MAX_STRING_BYTES,
             });
         }
-        let mut buf = vec![0u8; usize::try_from(len).expect("bounded above")];
+        let mut buf = vec![0u8; to_usize(len, &self.path, what)?];
         self.inner
             .read_exact(&mut buf)
             .map_err(|e| self.io_err(e))?;
@@ -551,7 +577,7 @@ impl Reader {
                         bound: MAX_ARRAY_LEN,
                     });
                 }
-                let mut items = Vec::with_capacity(usize::try_from(len).expect("bounded above"));
+                let mut items = Vec::with_capacity(to_usize(len, &self.path, "metadata array")?);
                 for _ in 0..len {
                     items.push(self.value(key, elem_type, depth + 1)?);
                 }
@@ -597,7 +623,8 @@ impl Reader {
             }
         }
 
-        let mut metadata = Vec::with_capacity(usize::try_from(kv_count).expect("bounded above"));
+        let mut metadata =
+            Vec::with_capacity(to_usize(kv_count, &self.path, "metadata key-values")?);
         for _ in 0..kv_count {
             let key = self.string("metadata key")?;
             let type_id = self.u32()?;
@@ -640,9 +667,9 @@ impl Reader {
     ) -> Result<Vec<GgufTensorInfo>, GgufError> {
         assert!(count <= MAX_TENSORS, "caller bounded the count");
         assert!(alignment.is_power_of_two(), "caller validated alignment");
-        let mut tensors: Vec<GgufTensorInfo> =
-            Vec::with_capacity(usize::try_from(count).expect("bounded above"));
-        for index in 0..usize::try_from(count).expect("bounded above") {
+        let count_usize = to_usize(count, &self.path, "tensor count")?;
+        let mut tensors: Vec<GgufTensorInfo> = Vec::with_capacity(count_usize);
+        for index in 0..count_usize {
             let bad = |reason: String, path: &str| GgufError::BadTensor {
                 path: path.to_string(),
                 index,
@@ -701,7 +728,12 @@ impl Reader {
 /// Dequantize a whole tensor payload to f32. `bytes` must be whole blocks of
 /// `dtype` (guaranteed for payload slices sized by [`GgufTensorInfo::byte_len`]).
 pub fn dequantize(dtype: GgmlType, bytes: &[u8]) -> Result<Vec<f32>, String> {
-    let bpb = usize::try_from(dtype.bytes_per_block()).expect("small");
+    let bpb = usize::try_from(dtype.bytes_per_block()).map_err(|_| {
+        format!(
+            "{dtype:?} block is {} bytes, wider than usize",
+            dtype.bytes_per_block()
+        )
+    })?;
     if bytes.is_empty() || !bytes.len().is_multiple_of(bpb) {
         return Err(format!(
             "{} bytes is not whole {dtype:?} blocks of {bpb}",
@@ -709,11 +741,20 @@ pub fn dequantize(dtype: GgmlType, bytes: &[u8]) -> Result<Vec<f32>, String> {
         ));
     }
     let blocks = bytes.len() / bpb;
-    let block_elems = usize::try_from(dtype.block_size()).expect("small");
+    let block_elems = usize::try_from(dtype.block_size()).map_err(|_| {
+        format!(
+            "{dtype:?} block holds {} elements, more than usize",
+            dtype.block_size()
+        )
+    })?;
     let mut out = Vec::with_capacity(blocks * block_elems);
     for block in bytes.chunks_exact(bpb) {
         match dtype {
-            GgmlType::F32 => out.push(f32::from_le_bytes(block.try_into().expect("4 bytes"))),
+            GgmlType::F32 => {
+                out.push(f32::from_le_bytes(block.try_into().map_err(|_| {
+                    format!("F32 block is {} bytes, not 4", block.len())
+                })?))
+            }
             GgmlType::F16 => out.push(f16_to_f32(u16::from_le_bytes([block[0], block[1]]))),
             GgmlType::BF16 => {
                 out.push(f32::from_bits(
