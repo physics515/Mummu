@@ -797,7 +797,7 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       construction — every replaced site was unreachable on a 64-bit target — proven by the four
       `real_qwen2_gguf_*` legs on the Q4_K_M checkpoint (header parse, dequant-vs-true-weights,
       tokenizer byte identity, GPU load + decode).
-- [ ] **Decide the dequant sink per model, not per code path** — `olmoe::load_from_gguf` takes the new
+- [x] **Decide the dequant sink per model, not per code path** — `olmoe::load_from_gguf` takes the new
       streaming `dequant_to_safetensors_file`; qwen2 / qwen3 / lfm2 still take the in-memory
       `dequant_to_safetensors` (which is now 1x the payload rather than 2x, so they already got half the
       win for free). That split is a guess, not a measurement: the file variant trades a spike in commit
@@ -806,12 +806,33 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       and Qwen3-0.6B, then either pick per-model or — better — pick automatically from
       `total_f32_bytes` against the device inventory's free-RAM figure (P6 already probes it), so a
       consumer never has to know. *(2026-08-20, discovered shipping the streaming sink.)*
-- [ ] **`FusedTemp` is import-suite machinery living in one model file** — `models/olmoe.rs` owns the
+      *(2026-08-21) Measured, and the guess was wrong.* A/B on Qwen2.5-1.5B Q4_K_M (~6 GB of f32),
+      the same `real_qwen2_gguf_loads_and_decodes_on_gpu` load each way: **in-memory 33.90 / 35.93 /
+      42.15 s vs scratch file 36.58 / 37.14 s** — the scratch numbers sit *inside* the in-memory run's
+      own spread, so at any payload of real size the disk round-trip is free and the doubled peak was
+      being paid for nothing. (n=2 on the scratch side: a concurrent routine held the shared cargo
+      target's lock and the third run never started.) `burn-store` is why it is free —
+      `SafetensorsStore::from_file` **mmaps** and materializes tensors lazily
+      (`safetensors_to_snapshots_lazy_file`), so the read-back is page faults during a load that was
+      already reading, not a second pass. So the choice is automatic, not per model:
+      `import::DequantSink` is `Memory` / `Scratch` / `Auto`, `Auto` keeps a payload in RAM only up to
+      `MAX_IN_MEMORY_DEQUANT_BYTES` (512 MiB — a ~1 GiB peak, free anywhere) and streams everything
+      else, and all four ports pass `Auto` so no consumer sees the knob. Proof the new default changed
+      nothing: qwen2 and qwen3 now take the scratch path they did not take before and their parity
+      numbers are **bit-identical** to the recorded ones (2.6614442413586614e-1 / 4.015608155114805e-1),
+      greedy sequences byte-identical, no scratch files left behind. Note the RAM-aware variant this
+      item floated (compare against the device inventory's free-RAM figure) is deliberately NOT built:
+      once streaming is free, a size threshold answers the question and a planner dependency would be
+      complexity bought for nothing.
+- [x] **`FusedTemp` is import-suite machinery living in one model file** — `models/olmoe.rs` owns the
       scratch-file guard (create beside the weights, unique per process + counter, `Drop`-delete on
       every exit path), and it now serves BOTH import paths. Any other model large enough to want a
       streaming sink has to reach into `olmoe` or copy it. Promote it to `import.rs` when a second
       model needs it — not before, since a one-caller abstraction moved early is just churn.
-      *(2026-08-20.)*
+      *(2026-08-20.)* *(2026-08-21) The second caller arrived the same night* — `import::gguf_store`
+      needs the guard for every port, not just OLMoE's — so it is now `import::ScratchFile`, with a
+      unit test pinning the two properties that matter (two live guards never name the same file;
+      `Drop` deletes on every exit path).
 - [ ] **The f32 scratch file is a symptom, not the design** — both streaming sinks exist because
       `SafetensorsStore` is the only checked-load pipeline we have, so every import must first become
       f32 safetensors on disk. A GGUF **keep-quantized** load (P9) would skip the temp file entirely:
