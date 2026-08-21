@@ -9,7 +9,7 @@
 //! loaded here; dequantizing them into Burn tensors is the next slice.
 
 use std::fs::File;
-use std::io::{BufReader, Read, Seek};
+use std::io::{BufReader, Read, Seek, Write};
 use std::path::Path;
 
 /// GGUF file magic, little-endian `"GGUF"`.
@@ -37,9 +37,25 @@ const MAX_ARRAY_LEN: u64 = 1 << 22;
 /// GGML allows at most 4 tensor dimensions.
 const MAX_DIMS: u32 = 4;
 
-/// Largest dequantized-to-f32 payload [`GgufFile::dequant_to_safetensors`]
-/// will build in RAM (a ~12B-param model; the reference machine has 128 GB).
+/// Largest dequantized-to-f32 payload either dequant will produce (a ~12B-param
+/// model; the reference machine has 128 GB). Only
+/// [`GgufFile::dequant_to_safetensors`] holds this much at once;
+/// [`GgufFile::dequant_to_safetensors_file`] streams it and never buffers more
+/// than one tensor.
 const MAX_DEQUANT_BYTES: u64 = 48 << 30;
+
+/// Largest SINGLE dequantized tensor the streaming dequant will hold. The
+/// widest real one is a vocabulary embedding — Qwen2.5-1.5B's is 933 MB at
+/// f32, a 35B's would be ~3.1 GB — so 8 GiB is a corrupt header claiming an
+/// absurd tensor. It is twice `safetensors::MAX_PART_BYTES` on purpose: that
+/// path keeps the source dtype, this one widens everything to f32.
+const MAX_TENSOR_F32_BYTES: u64 = 8 << 30;
+
+/// Bytes staged between the f32 values and the sink. Fixed and small: the
+/// point of the streaming dequant is that peak allocation tracks the widest
+/// TENSOR, never the payload, and this buffer must not reintroduce a second
+/// copy of either.
+const DEQUANT_STAGE_BYTES: usize = 1 << 20;
 
 /// What went wrong reading a GGUF header.
 #[derive(Debug, thiserror::Error)]
@@ -72,6 +88,28 @@ pub enum GgufError {
         index: usize,
         reason: String,
     },
+}
+
+/// `u64` -> `usize` as an error rather than a panic.
+///
+/// Every caller has already bounded `value` against one of the `MAX_*`
+/// ceilings or a tensor's own declared size, so on a 64-bit target this
+/// cannot fail — but an import path is exactly where "cannot fail" should
+/// still be an `Err` instead of an `.expect()`, so a 32-bit build degrades to
+/// a clean error instead of aborting mid-load. (Same helper, same reasoning,
+/// as `safetensors::to_usize`.)
+fn to_usize(value: u64, path: &str, what: &'static str) -> Result<usize, GgufError> {
+    debug_assert!(
+        value <= usize::MAX as u64,
+        "{what} fits usize on this target"
+    );
+    debug_assert!(!path.is_empty(), "an error needs a file to name");
+    usize::try_from(value).map_err(|_| GgufError::OverBound {
+        path: path.to_string(),
+        what,
+        count: value,
+        bound: usize::MAX as u64,
+    })
 }
 
 /// One typed metadata value. Arrays are homogeneous per the spec; nested
@@ -281,6 +319,20 @@ pub enum GgufMap {
     Reshape(String, Vec<u64>),
 }
 
+/// Where one tensor lands in the output blob, decided before any payload
+/// byte is read ([`GgufFile::plan_dequant`]).
+#[derive(Debug)]
+struct PlannedTensor {
+    /// Index into [`GgufFile::tensors`] — the payload to dequantize.
+    source: usize,
+    name: String,
+    shape: Vec<u64>,
+    /// Byte offset within the payload; contiguous and ascending.
+    start: u64,
+    /// Dequantized f32 byte length.
+    len: u64,
+}
+
 /// A parsed GGUF header: typed metadata + the located tensor table.
 #[derive(Debug)]
 pub struct GgufFile {
@@ -375,10 +427,142 @@ impl GgufFile {
     /// [`GgufMap::Reshape`] overrides that for tensors whose checkpoint
     /// shape differs by more than dim order (e.g. llama.cpp squeezes the
     /// middle 1 out of depthwise-conv kernels).
+    ///
+    /// This form needs the whole f32 payload resident. For a model whose
+    /// dequantized size is a meaningful fraction of RAM, use
+    /// [`Self::dequant_to_safetensors_file`] — the two produce byte-identical
+    /// output.
     pub fn dequant_to_safetensors(
         &self,
         map: &dyn Fn(&GgufTensorInfo) -> Option<GgufMap>,
     ) -> Result<Vec<u8>, GgufError> {
+        let mut blob = Vec::new();
+        self.dequant_into(map, &mut blob)?;
+        assert!(blob.len() > 8, "the header length prefix is always written");
+        Ok(blob)
+    }
+
+    /// [`Self::dequant_to_safetensors`] straight to a file, never holding the
+    /// payload in RAM. Returns the payload bytes written (header excluded).
+    ///
+    /// This is the variant a real quantized checkpoint wants. The in-memory
+    /// form needs the whole f32 payload resident — ~28 GB for OLMoE-1B-7B —
+    /// *on top of* the model the load then builds from it, and that sum is
+    /// what a 128 GB box with other tenants actually fails to satisfy.
+    /// Writing to disk trades the spike for temp space and lets
+    /// `SafetensorsStore::from_file` page the weights in as it needs them.
+    /// (`safetensors::fuse_checkpoint_to_file` is the same trade on the
+    /// unquantized path.)
+    pub fn dequant_to_safetensors_file(
+        &self,
+        map: &dyn Fn(&GgufTensorInfo) -> Option<GgufMap>,
+        out: &Path,
+    ) -> Result<u64, GgufError> {
+        assert!(!out.as_os_str().is_empty(), "the sink file must be named");
+        let io = |source: std::io::Error| GgufError::Io {
+            path: out.display().to_string(),
+            source,
+        };
+        let file = File::create(out).map_err(io)?;
+        let mut sink = std::io::BufWriter::with_capacity(DEQUANT_STAGE_BYTES, file);
+        let written = self.dequant_into(map, &mut sink)?;
+        sink.flush().map_err(io)?;
+        sink.into_inner()
+            .map_err(|e| GgufError::Io {
+                path: out.display().to_string(),
+                source: e.into_error(),
+            })?
+            .sync_all()
+            .map_err(io)?;
+        Ok(written)
+    }
+
+    /// The shared dequant: plan, then stream header + payload into `sink` in
+    /// output order, one tensor at a time.
+    ///
+    /// Planning first is not only what makes streaming possible — it moves
+    /// every *claim* check (unmapped name, reshape that changes the element
+    /// count, rename collision) ahead of the first payload byte, so a bad map
+    /// fails in milliseconds instead of after N tensors have been
+    /// dequantized.
+    fn dequant_into<W: std::io::Write>(
+        &self,
+        map: &dyn Fn(&GgufTensorInfo) -> Option<GgufMap>,
+        sink: &mut W,
+    ) -> Result<u64, GgufError> {
+        let path = self.path.display().to_string();
+        let plan = self.plan_dequant(map)?;
+        let total: u64 = plan.iter().map(|p| p.len).sum();
+
+        // Header first: names, dtypes, shapes, and the contiguous offsets the
+        // copy pass will fill.
+        let mut header = String::from("{");
+        for (i, p) in plan.iter().enumerate() {
+            if i > 0 {
+                header.push(',');
+            }
+            let json_name = serde_json::to_string(&p.name).map_err(|e| GgufError::BadTensor {
+                path: path.clone(),
+                index: p.source,
+                reason: format!("name is not encodable as JSON: {e}"),
+            })?;
+            header.push_str(&format!(
+                "{json_name}:{{\"dtype\":\"F32\",\"shape\":{:?},\"data_offsets\":[{},{}]}}",
+                p.shape,
+                p.start,
+                p.start + p.len,
+            ));
+        }
+        header.push('}');
+
+        let io = |source: std::io::Error| GgufError::Io {
+            path: path.clone(),
+            source,
+        };
+        sink.write_all(&(header.len() as u64).to_le_bytes())
+            .map_err(io)?;
+        sink.write_all(header.as_bytes()).map_err(io)?;
+
+        // One small staging buffer, reused for every tensor: peak allocation
+        // is the widest tensor's f32 values (from `read_tensor_f32`) plus this
+        // 1 MiB, never a second copy of the payload.
+        let mut stage: Vec<u8> = Vec::with_capacity(DEQUANT_STAGE_BYTES);
+        let mut written = 0u64;
+        for p in &plan {
+            debug_assert_eq!(written, p.start, "tensors are written in output order");
+            let values = self.read_tensor_f32(&self.tensors[p.source].name)?;
+            debug_assert_eq!(
+                values.len() as u64 * 4,
+                p.len,
+                "the plan sized this tensor from the same element count"
+            );
+            for chunk in values.chunks(DEQUANT_STAGE_BYTES / 4) {
+                stage.clear();
+                stage.extend(chunk.iter().flat_map(|v| v.to_le_bytes()));
+                sink.write_all(&stage).map_err(io)?;
+                written += stage.len() as u64;
+            }
+        }
+        assert_eq!(
+            written, total,
+            "every planned byte was written exactly once"
+        );
+        assert!(
+            stage.capacity() <= DEQUANT_STAGE_BYTES,
+            "the staging buffer never grew past its bound"
+        );
+        Ok(written)
+    }
+
+    /// First pass: decide what every tensor is called, what shape it claims,
+    /// and where its bytes land — reading no payload at all.
+    ///
+    /// Offsets are contiguous and ascending in tensor-table order, which is
+    /// what lets the copy pass be a single forward stream.
+    fn plan_dequant(
+        &self,
+        map: &dyn Fn(&GgufTensorInfo) -> Option<GgufMap>,
+    ) -> Result<Vec<PlannedTensor>, GgufError> {
         let total_f32_bytes: u64 = self.tensors.iter().map(|t| t.element_count() * 4).sum();
         if total_f32_bytes > MAX_DEQUANT_BYTES {
             return Err(GgufError::OverBound {
@@ -394,10 +578,9 @@ impl GgufFile {
             reason,
         };
 
-        let mut header = String::from("{");
+        let mut plan: Vec<PlannedTensor> = Vec::with_capacity(self.tensors.len());
         let mut names = std::collections::HashSet::with_capacity(self.tensors.len());
-        let mut data: Vec<u8> =
-            Vec::with_capacity(usize::try_from(total_f32_bytes).expect("bounded above"));
+        let mut start = 0u64;
         for (index, info) in self.tensors.iter().enumerate() {
             let (name, shape) = match map(info) {
                 Some(GgufMap::Rename(name)) => {
@@ -422,26 +605,27 @@ impl GgufFile {
             if !names.insert(name.clone()) {
                 return Err(bad(index, format!("rename collision on '{name}'")));
             }
-            let start = data.len();
-            let values = self.read_tensor_f32(&info.name)?;
-            data.extend(values.iter().flat_map(|v| v.to_le_bytes()));
-            let json_name = serde_json::to_string(&name).expect("string serializes");
-            if index > 0 {
-                header.push(',');
+            let len = info.element_count() * 4;
+            if len > MAX_TENSOR_F32_BYTES {
+                return Err(GgufError::OverBound {
+                    path: self.path.display().to_string(),
+                    what: "single dequantized tensor bytes",
+                    count: len,
+                    bound: MAX_TENSOR_F32_BYTES,
+                });
             }
-            header.push_str(&format!(
-                "{json_name}:{{\"dtype\":\"F32\",\"shape\":{shape:?},\"data_offsets\":[{start},{end}]}}",
-                end = data.len(),
-            ));
+            plan.push(PlannedTensor {
+                source: index,
+                name,
+                shape,
+                start,
+                len,
+            });
+            start += len;
         }
-        header.push('}');
-
-        assert_eq!(data.len() as u64, total_f32_bytes, "every element written");
-        let mut blob = Vec::with_capacity(8 + header.len() + data.len());
-        blob.extend_from_slice(&(header.len() as u64).to_le_bytes());
-        blob.extend_from_slice(header.as_bytes());
-        blob.extend_from_slice(&data);
-        Ok(blob)
+        assert_eq!(start, total_f32_bytes, "the plan covers the whole payload");
+        assert_eq!(plan.len(), self.tensors.len(), "every tensor is planned");
+        Ok(plan)
     }
 
     /// Look up a metadata value by exact key.
@@ -504,7 +688,7 @@ impl Reader {
                 bound: MAX_STRING_BYTES,
             });
         }
-        let mut buf = vec![0u8; usize::try_from(len).expect("bounded above")];
+        let mut buf = vec![0u8; to_usize(len, &self.path, what)?];
         self.inner
             .read_exact(&mut buf)
             .map_err(|e| self.io_err(e))?;
@@ -551,7 +735,7 @@ impl Reader {
                         bound: MAX_ARRAY_LEN,
                     });
                 }
-                let mut items = Vec::with_capacity(usize::try_from(len).expect("bounded above"));
+                let mut items = Vec::with_capacity(to_usize(len, &self.path, "metadata array")?);
                 for _ in 0..len {
                     items.push(self.value(key, elem_type, depth + 1)?);
                 }
@@ -597,7 +781,8 @@ impl Reader {
             }
         }
 
-        let mut metadata = Vec::with_capacity(usize::try_from(kv_count).expect("bounded above"));
+        let mut metadata =
+            Vec::with_capacity(to_usize(kv_count, &self.path, "metadata key-values")?);
         for _ in 0..kv_count {
             let key = self.string("metadata key")?;
             let type_id = self.u32()?;
@@ -640,9 +825,9 @@ impl Reader {
     ) -> Result<Vec<GgufTensorInfo>, GgufError> {
         assert!(count <= MAX_TENSORS, "caller bounded the count");
         assert!(alignment.is_power_of_two(), "caller validated alignment");
-        let mut tensors: Vec<GgufTensorInfo> =
-            Vec::with_capacity(usize::try_from(count).expect("bounded above"));
-        for index in 0..usize::try_from(count).expect("bounded above") {
+        let count_usize = to_usize(count, &self.path, "tensor count")?;
+        let mut tensors: Vec<GgufTensorInfo> = Vec::with_capacity(count_usize);
+        for index in 0..count_usize {
             let bad = |reason: String, path: &str| GgufError::BadTensor {
                 path: path.to_string(),
                 index,
@@ -701,7 +886,12 @@ impl Reader {
 /// Dequantize a whole tensor payload to f32. `bytes` must be whole blocks of
 /// `dtype` (guaranteed for payload slices sized by [`GgufTensorInfo::byte_len`]).
 pub fn dequantize(dtype: GgmlType, bytes: &[u8]) -> Result<Vec<f32>, String> {
-    let bpb = usize::try_from(dtype.bytes_per_block()).expect("small");
+    let bpb = usize::try_from(dtype.bytes_per_block()).map_err(|_| {
+        format!(
+            "{dtype:?} block is {} bytes, wider than usize",
+            dtype.bytes_per_block()
+        )
+    })?;
     if bytes.is_empty() || !bytes.len().is_multiple_of(bpb) {
         return Err(format!(
             "{} bytes is not whole {dtype:?} blocks of {bpb}",
@@ -709,11 +899,20 @@ pub fn dequantize(dtype: GgmlType, bytes: &[u8]) -> Result<Vec<f32>, String> {
         ));
     }
     let blocks = bytes.len() / bpb;
-    let block_elems = usize::try_from(dtype.block_size()).expect("small");
+    let block_elems = usize::try_from(dtype.block_size()).map_err(|_| {
+        format!(
+            "{dtype:?} block holds {} elements, more than usize",
+            dtype.block_size()
+        )
+    })?;
     let mut out = Vec::with_capacity(blocks * block_elems);
     for block in bytes.chunks_exact(bpb) {
         match dtype {
-            GgmlType::F32 => out.push(f32::from_le_bytes(block.try_into().expect("4 bytes"))),
+            GgmlType::F32 => {
+                out.push(f32::from_le_bytes(block.try_into().map_err(|_| {
+                    format!("F32 block is {} bytes, not 4", block.len())
+                })?))
+            }
             GgmlType::F16 => out.push(f16_to_f32(u16::from_le_bytes([block[0], block[1]]))),
             GgmlType::BF16 => {
                 out.push(f32::from_bits(
@@ -1090,6 +1289,19 @@ mod tests {
         result
     }
 
+    /// A unique scratch path for tests that write their own output file.
+    fn scratch_path(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join("mummu-gguf-tests");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir.join(format!(
+            "{tag}-{}-{}.safetensors",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
     fn open_bytes(bytes: &[u8]) -> Result<GgufFile, GgufError> {
         with_gguf_bytes(bytes, |r| r)
     }
@@ -1426,6 +1638,74 @@ mod tests {
             assert!(matches!(
                 f.dequant_to_safetensors(&|_| Some(GgufMap::Rename("same".into()))),
                 Err(GgufError::BadTensor { .. })
+            ));
+        });
+    }
+
+    #[test]
+    fn dequanting_to_a_file_is_byte_identical_to_dequanting_in_memory() {
+        // Mixed dtypes and widths, so the pin covers the quantized path and
+        // the tensor-to-tensor offset arithmetic, not just one F32 copy.
+        // Q8_0 blocks are 34 B for 32 elements: two blocks = 68 B at offset 0,
+        // then a 6-element F32 tensor at the next 32-aligned offset.
+        let mut payload = vec![0u8; 96];
+        for (i, b) in payload.iter_mut().enumerate().take(68) {
+            *b = u8::try_from(i % 251).expect("bounded by the modulus");
+        }
+        payload.extend((1..=6u8).flat_map(|v| f32::from(v).to_le_bytes()));
+        let bytes = TestGguf::new()
+            .kv_str("general.architecture", "qwen2")
+            .tensor("blk.0.attn_q.weight", &[32, 2], 8, 0) // Q8_0
+            .tensor("token_embd.weight", &[2, 3], 0, 96) // F32
+            .build_with_payload(&payload);
+
+        with_gguf_bytes(&bytes, |f| {
+            let f = f.expect("parses");
+            let map = |i: &GgufTensorInfo| Some(GgufMap::Rename(format!("model.{}", i.name)));
+            let blob = f.dequant_to_safetensors(&map).expect("serializes");
+
+            let out = scratch_path("dequant-pin");
+            let written = f
+                .dequant_to_safetensors_file(&map, &out)
+                .expect("streams to a file");
+            let from_file = std::fs::read(&out).expect("reads back");
+            let _ = std::fs::remove_file(&out);
+
+            assert_eq!(
+                blob, from_file,
+                "the in-memory and to-file dequants must stay ONE importer"
+            );
+            // The returned count is the payload, header excluded — so the
+            // caller can size the model without re-statting the file.
+            let header_len = u64::from_le_bytes(blob[0..8].try_into().expect("8 bytes"));
+            assert_eq!(written, blob.len() as u64 - 8 - header_len);
+            // 64 Q8_0 elements + 6 F32 elements, all at f32.
+            assert_eq!(written, (64 + 6) * 4);
+        });
+    }
+
+    #[test]
+    fn a_bad_map_is_rejected_before_any_payload_is_read() {
+        // The tensor table claims a payload far past the end of the file, so
+        // ANY read of it is an io error. A map error must still surface as the
+        // map error: planning happens first, by construction.
+        let bytes = TestGguf::new()
+            .tensor("a.weight", &[8], 0, 0)
+            .tensor("b.weight", &[1 << 20], 0, 32)
+            .build_with_payload(&[0u8; 64]);
+        with_gguf_bytes(&bytes, |f| {
+            let f = f.expect("parses");
+            assert!(matches!(
+                f.dequant_to_safetensors(
+                    &|i| (i.name != "b.weight").then(|| GgufMap::Rename(i.name.clone()))
+                ),
+                Err(GgufError::BadTensor { index: 1, .. })
+            ));
+            // And the collision check too — it is the second claim planning
+            // makes, on a tensor whose payload is unreadable.
+            assert!(matches!(
+                f.dequant_to_safetensors(&|_| Some(GgufMap::Rename("same".into()))),
+                Err(GgufError::BadTensor { index: 1, .. })
             ));
         });
     }

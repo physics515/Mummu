@@ -87,7 +87,8 @@ fn olmoe_gguf_tokenizer_matches_the_hf_tokenizer() {
 /// mapped) and greedy-decodes a correct answer through the MoE stack on the
 /// CPU backend.
 #[test]
-#[ignore = "needs network (MUMMU_HUB_DEST; ~4.2 GB) and ~60 GB free RAM (CPU backend)"]
+#[ignore = "needs network (MUMMU_HUB_DEST; ~4.2 GB), ~30 GB free COMMIT and ~28 GB \
+            of scratch disk beside the gguf (CPU backend)"]
 fn olmoe_gguf_loads_and_decodes_on_cpu() {
     let path = fetch_olmoe();
     let f = GgufFile::open(&path).expect("valid GGUF");

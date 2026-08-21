@@ -396,6 +396,21 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       {float_dtype,int_dtype}` and each loader's `target_float` derivation) is a place the 0.22 diff will
       land, so preferring the alias form where one already exists shrinks that diff before the bump.
       — https://github.com/tracel-ai/burn/releases
+      *(2026-08-20, second run)* Two corrections and one addition, all from reading what is actually
+      published rather than the migration note's summary. (1) **`burn-store` 0.21 does NOT ship a
+      `FloatCastAdapter`** — its adapter set is `PyTorchToBurnAdapter` / `BurnToPyTorchAdapter` /
+      `HalfPrecisionAdapter` / `ChainAdapter` / `IdentityAdapter`, and `HalfPrecisionAdapter` is
+      f32<->f16 only, not the arbitrary target-dtype cast `CastFloatAdapter` does. So "evaluate
+      replacing our `CastFloatAdapter`" is a 0.22 task, not something already available and skipped.
+      (2) **wgpu 30's f16 story is bigger than "f16 beyond SPIR-V"**: `SHADER_F16` now works in WGSL
+      and GLSL as well as SPIR-V passthrough (add `enable f16;` at the top of the shader), which
+      matters because it means the f16 win stops being Vulkan-only — the `vulkan` feature's SPIR-V
+      path is currently the only way we get f16 kernels, so a DX12/Metal consumer gets f32 today and
+      would not after the bump. (3) wgpu 30 also lands **cooperative matrix load/store** (WGSL in;
+      SPIR-V/Metal/WGSL out), gated on `vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR` and
+      currently **8x8 f32 only** — too narrow to be the decode lever yet, but it is the seam a
+      tensor-core matmul would eventually ride, so watch the supported configurations grow.
+      — https://docs.rs/burn-store/latest/burn_store/ · https://github.com/gfx-rs/wgpu/releases
 - [x] Silence the pre-existing `LNK4098` (LIBCMT defaultlib conflict) the 2026-07 nightly toolchain's
       new `linker_messages` lint now surfaces when linking the `mummu` lib-test binary — find which
       native dep object embeds the static-CRT directive (tokenizers' C++ deps are the suspects) and
@@ -682,6 +697,24 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       before treating the gather as refuted. Both are gated on `bench/BASELINE.md` like the rest —
       https://github.com/ggml-org/llama.cpp/pull/25294 ·
       https://huggingface.co/blog/Doctor-Shotgun/llamacpp-moe-offload-guide
+      *(2026-08-20, second run)* A fourth route, and the one that answers our specific regression:
+      llama.cpp discussion #24528 proposes a **VRAM cache of hot experts with hybrid hit/miss
+      execution** — the `MUL_MAT_ID` stays on the CPU, but thread 0 dispatches ONE batched matvec
+      over the cached (hit) expert rows to the GPU while the remaining threads compute the miss rows
+      exactly as they do today. The property that matters is that **a miss costs nothing extra**:
+      performance degrades gracefully to the vanilla dense-CPU path instead of paying a gather that
+      may not pay for itself, which is precisely how our 2026-08-03 A/B lost (1.58 s vs 1.15 s — the
+      gather was unconditional). Eviction is LRU with an admission threshold, plus a "soft mode" that
+      trades ~5-7 % of prefill to avoid evicting during decode; the cache **engages on decode only**.
+      Reported: +25 % on GLM-5.1 754B, +7 % on Qwen3.5 397B, +28-46 % decode on 2x RTX 3090 — but a
+      GTX 1080 Ti **regressed**, i.e. the win is a function of how much faster the GPU is than the CPU
+      at the cached slice, which is exactly the hardware-dependence our own measurement found.
+      Status: RFC, CUDA-only, unmerged. For us the shape translates directly — a bounded per-layer
+      VRAM slab cache on the `Gpu` backend with the CPU dense path as the miss fallback — and it is
+      the first route that does NOT require the whole MoE to fit VRAM first, so it unblocks route (b)
+      without waiting on P9. Gate it on `bench/BASELINE.md` and the OLMoE 0.76 s/token warm number.
+      — https://github.com/ggml-org/llama.cpp/discussions/24528 ·
+      https://github.com/ggml-org/llama.cpp/issues/20757
 - [x] **OLMoE from HF safetensors** — the port loads GGUF only because HF stores each expert separately
       (`model.layers.N.mlp.experts.{0..63}.{gate,up,down}_proj.weight`) while `MoeExperts` holds one fused
       `[experts, out, in]` tensor per projection. Needs a concat-on-import step (64 slices → one tensor,
@@ -719,7 +752,7 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       so peak drops from ~42 GB (13.8 blob + ~28 model) to the model alone; a `FusedTemp` guard deletes the
       scratch file on every exit path, verified empty after the run. A unit test pins the two fuse paths as
       **byte-identical**, so the big-model path and the small-model path stay one importer.
-- [ ] **Give the GGUF dequant path the same streaming sink the safetensors fuse just got** — found while
+- [x] **Give the GGUF dequant path the same streaming sink the safetensors fuse just got** — found while
       fixing the OLMoE safetensors OOM (2026-08-20). `gguf::dequant_to_safetensors` has the identical
       double-buffer: it fills a `data` Vec of `total_f32_bytes`, then copies it into a second `blob` Vec of
       `8 + header + data`, so peak is **2x the dequantized f32 payload** before the model is even built.
@@ -728,11 +761,84 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       + payload into an `impl Write` through one bounded per-tensor buffer, with a `*_to_file` variant for
       `SafetensorsStore::from_file`. Prove it the same way — a unit test pinning the in-memory and
       to-file outputs as byte-identical, then re-run the `real_gguf` + `parity_gguf` legs unchanged.
-- [ ] **`gguf.rs` still has `.expect()` on production paths** — `dequant_to_safetensors` and the metadata
+      *(2026-08-20, second run) Shipped.* `dequant_to_safetensors` is now a thin wrapper over a shared
+      `dequant_into<W: Write>`, joined by `dequant_to_safetensors_file`. The double-buffer is gone from
+      BOTH forms: the in-memory one writes header-then-payload into a single `Vec` (peak 1x the payload,
+      down from 2x), and the file one holds nothing but the current tensor's f32 values plus a fixed
+      1 MiB staging buffer. What made streaming possible also made the path stricter — a new
+      `plan_dequant` decides every name, shape and offset **before the first payload byte is read**, so
+      an unmapped name, a reshape that changes the element count, or a rename collision now fails in
+      milliseconds instead of after N tensors have been dequantized (a unit test proves this by
+      pointing a tensor's payload past the end of the file and checking the MAP error still surfaces).
+      `olmoe::load_from_gguf` takes the file variant, reusing the same `FusedTemp` guard the HF path
+      uses, so the scratch file is deleted on every exit path.
+      **REAL-WEIGHTS proof**, the OLMoE-1B-7B Q4_K_M leg against llama.cpp on the identical file:
+      top-5 ids exact in order, the 24-token greedy sequence **byte-identical**, max |Δlogprob|
+      3.687691131310693e-1 (tolerance 7.5e-1), 130.5 s. Measured peak while it ran: **26.5 GB private
+      commit** — the model alone — against a 51.7 GB working set, i.e. ~25 GB of the load is now
+      file-backed mmap rather than charged to commit, which is the binding limit on this box. The old
+      shape was ~28 GB blob + ~28 GB model ≈ 56 GB of commit. Nothing else moved: qwen2 GGUF parity
+      2.6614442413586614e-1 and qwen3 **4.015608155114805e-1, bit-identical to the recorded value**,
+      both greedy sequences byte-identical; the four `real_qwen2_gguf_*` legs pass (44.1 s). 234 unit
+      tests (+2). The stale "~60 GB free RAM" gates on the three OLMoE test legs are corrected to
+      ~30 GB free commit + ~28 GB of scratch disk.
+- [x] **`gguf.rs` still has `.expect()` on production paths** — `dequant_to_safetensors` and the metadata
       readers carry `usize::try_from(..).expect("bounded above")` (4 sites), the same pattern removed from
       `safetensors.rs` on 2026-08-20 in favour of a fallible `to_usize` that returns `OverBound`. Mechanical,
       and it keeps the no-panic-on-production-paths rule true across the whole import suite rather than in
       the newest module only.
+      *(2026-08-20, second run) Done — eight sites, not four.* `gguf::to_usize` mirrors
+      `safetensors::to_usize` exactly. The four header readers (`Reader::{string,value,read_file,
+      tensor_table}`) go through it — `tensor_table` now converts its count once instead of twice —
+      and so does `dequant_to_safetensors`' payload capacity. Three more were hiding outside the
+      `try_from` pattern: the tensor-name JSON encode (now reports through `BadTensor`, so it names
+      the offending index), and `dequantize`'s two block-geometry casts plus its F32 4-byte block
+      cast, all mapped into the `String` error that function already returns. No behaviour change by
+      construction — every replaced site was unreachable on a 64-bit target — proven by the four
+      `real_qwen2_gguf_*` legs on the Q4_K_M checkpoint (header parse, dequant-vs-true-weights,
+      tokenizer byte identity, GPU load + decode).
+- [x] **Decide the dequant sink per model, not per code path** — `olmoe::load_from_gguf` takes the new
+      streaming `dequant_to_safetensors_file`; qwen2 / qwen3 / lfm2 still take the in-memory
+      `dequant_to_safetensors` (which is now 1x the payload rather than 2x, so they already got half the
+      win for free). That split is a guess, not a measurement: the file variant trades a spike in commit
+      for an f32 write plus mmap-back, which should LOSE on a 1-2 GB model and win on anything that is a
+      meaningful fraction of RAM. Measure GGUF load wall-clock both ways on Qwen2.5-1.5B (~2.2 GB f32)
+      and Qwen3-0.6B, then either pick per-model or — better — pick automatically from
+      `total_f32_bytes` against the device inventory's free-RAM figure (P6 already probes it), so a
+      consumer never has to know. *(2026-08-20, discovered shipping the streaming sink.)*
+      *(2026-08-21) Measured, and the guess was wrong.* A/B on Qwen2.5-1.5B Q4_K_M (~6 GB of f32),
+      the same `real_qwen2_gguf_loads_and_decodes_on_gpu` load each way: **in-memory 33.90 / 35.93 /
+      42.15 s vs scratch file 36.58 / 37.14 s** — the scratch numbers sit *inside* the in-memory run's
+      own spread, so at any payload of real size the disk round-trip is free and the doubled peak was
+      being paid for nothing. (n=2 on the scratch side: a concurrent routine held the shared cargo
+      target's lock and the third run never started.) `burn-store` is why it is free —
+      `SafetensorsStore::from_file` **mmaps** and materializes tensors lazily
+      (`safetensors_to_snapshots_lazy_file`), so the read-back is page faults during a load that was
+      already reading, not a second pass. So the choice is automatic, not per model:
+      `import::DequantSink` is `Memory` / `Scratch` / `Auto`, `Auto` keeps a payload in RAM only up to
+      `MAX_IN_MEMORY_DEQUANT_BYTES` (512 MiB — a ~1 GiB peak, free anywhere) and streams everything
+      else, and all four ports pass `Auto` so no consumer sees the knob. Proof the new default changed
+      nothing: qwen2 and qwen3 now take the scratch path they did not take before and their parity
+      numbers are **bit-identical** to the recorded ones (2.6614442413586614e-1 / 4.015608155114805e-1),
+      greedy sequences byte-identical, no scratch files left behind. Note the RAM-aware variant this
+      item floated (compare against the device inventory's free-RAM figure) is deliberately NOT built:
+      once streaming is free, a size threshold answers the question and a planner dependency would be
+      complexity bought for nothing.
+- [x] **`FusedTemp` is import-suite machinery living in one model file** — `models/olmoe.rs` owns the
+      scratch-file guard (create beside the weights, unique per process + counter, `Drop`-delete on
+      every exit path), and it now serves BOTH import paths. Any other model large enough to want a
+      streaming sink has to reach into `olmoe` or copy it. Promote it to `import.rs` when a second
+      model needs it — not before, since a one-caller abstraction moved early is just churn.
+      *(2026-08-20.)* *(2026-08-21) The second caller arrived the same night* — `import::gguf_store`
+      needs the guard for every port, not just OLMoE's — so it is now `import::ScratchFile`, with a
+      unit test pinning the two properties that matter (two live guards never name the same file;
+      `Drop` deletes on every exit path).
+- [ ] **The f32 scratch file is a symptom, not the design** — both streaming sinks exist because
+      `SafetensorsStore` is the only checked-load pipeline we have, so every import must first become
+      f32 safetensors on disk. A GGUF **keep-quantized** load (P9) would skip the temp file entirely:
+      no ~28 GB write, no 4x dtype widening, and the 1B-7B would stop being CPU-only. Worth stating
+      here so the scratch-file machinery is understood as a bridge with a known end, not a fixture.
+      *(2026-08-20.)*
 - [ ] **Qwen3.5 hybrid (`qwen35`) architecture port** — split from the Qwen3.5-tier item when the
       2026-07-30 header probe showed Qwen3.5-4B/9B are a hybrid **linear-attention/SSM + periodic
       full-attention** arch (`qwen35.ssm.*` metadata: conv_kernel/state_size/group_count/time_step_rank/
@@ -919,7 +1025,7 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       rope-theta, vocab, tie-word-embeddings, …) so a model is **config-driven**, not hardcoded per checkpoint.
       *(2026-07-09) Per-architecture serde configs with validation (`Qwen2Config`, `Lfm2Config` incl.
       `layer_types` + auto-adjusted ff_dim); both real checkpoints parse and drive the build.*
-- [ ] **Tokenizer + chat-template import** — HF `tokenizer.json` (fast), SentencePiece `tokenizer.model`, BPE
+- [x] **Tokenizer + chat-template import** — HF `tokenizer.json` (fast), SentencePiece `tokenizer.model`, BPE
       merges/vocab; special-tokens map + the chat template from `tokenizer_config.json`. *(2026-07-18)*
       **`tokenizer_config.json` import shipped** (`mummu::tok_config::TokenizerConfig`, no new deps): parses
       the *conventions* HF keeps beside `tokenizer.json` — `add_bos_token`/`add_eos_token`, the BOS/EOS/PAD/UNK
@@ -947,6 +1053,25 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       qwen3-0.6b: all 26 ids pass `check_ids_against`, and `config.json` eos 151645 agrees with the resolved
       `<|im_end|>`. Remaining on this item: SentencePiece `tokenizer.model` import, and *calling* these
       validators from `load_from_dir` (config-driven EOS + template-vs-renderer consistency) — split below.
+      *(2026-08-21) Closed — every remaining piece it named is `[x]` below, and the whole surface was
+      re-verified on real files this run rather than taken on the sub-items' word:*
+      `real_tokenizer_config` (qwen3-0.6b config↔tokenizer ids agree), `real_spm` **both** legs
+      (Unigram via flan-t5-small and BPE-type via tinyllama, ids byte-matching each checkpoint's own
+      `tokenizer.json`), the **10-case template BYTE gate** (qwen2 / qwen3 / lfm2, plain + history +
+      tools), and `imported_render` under `--features jinja-template` (the fallback renderer's output
+      byte-identical to the family renderer at 142 / 748 / 324 B for qwen3, 157 / 379 B for lfm2, plus
+      the no-family-renderer fallback at 57 B). Anything further on tokenizers is its own item, not
+      this one.
+- [ ] **The real-file gates panic on a missing env var instead of reporting a skip** — already recorded
+      operationally for `parity_gguf` (its lfm2 leg has no local GGUF, so the whole binary reports
+      FAILED even when every other leg passes); `imported_render` did the same thing this run, failing
+      on an unset `MUMMU_LFM2_DIR` while both other legs were byte-identical. The tension is real and
+      the current behaviour is the safer half of it — a gate that silently skips is a gate that does
+      not exist, which is exactly how a parity suite rots. So the fix is NOT "skip quietly": make the
+      missing-fixture case a distinct, *summarized* outcome — collect the unrunnable legs and print
+      one "N legs skipped for missing fixtures: …" line, so the run summary distinguishes "no fixture"
+      from "wrong answer" without ever letting the second hide inside the first. *(2026-08-21,
+      discovered re-verifying the tokenizer gates.)*
 - [x] **SentencePiece `tokenizer.model` import** — the `.model` proto tokenizer (Llama/Gemma/T5 family) that
       HF ships instead of a `tokenizer.json`; build the equivalent HF `tokenizers` pipeline (or convert), and
       byte-verify ids against a `tokenizer.json` of the same checkpoint where one exists. *(2026-07-18, split
@@ -1292,6 +1417,18 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       worth re-checking after graph capture (P0) moves the dispatch baseline. —
       https://github.com/thc1006/qwen3.6-speculative-decoding-rtx3090 ·
       https://inventivehq.com/blog/llama-cpp-speculative-decoding-consumer-gpu
+      *(2026-08-20, second run)* Route (a) now has a merged reference implementation to read and a
+      number to aim at: llama.cpp PR **#22673** landed MTP-head support (tested on Qwen3.6-27B and
+      Qwen3.6-35B-A3B, but written for any MTP model), driven by `--spec-type mtp` plus
+      `--spec-draft-n-max <k>`. Reported steady-state **acceptance ~75 % at k=3 for >2x end-to-end**,
+      rising past 80 % on code/math/reasoning, and the community finding that **k=2 often beats k=3**
+      because acceptance falls off as the draft window widens — so `n_draft` is a tunable to measure,
+      not a constant to pick. Two things to carry into our design: MTP needs no second model in VRAM
+      (the heads ride the target checkpoint), which is what makes it the route worth building on a
+      16 GB card; and the flag rename noted above means a reference leg should probe BOTH
+      `--spec-type mtp` and `--spec-type draft-mtp` rather than assume either. —
+      https://github.com/ggml-org/llama.cpp/pull/22673 ·
+      https://github.com/ggml-org/llama.cpp/blob/master/docs/speculative.md
 - [ ] **Grammar-constrained decoding** *(colibri parity)* — colibri forces structured output via `.gbnf`
       grammars (llama.cpp's GBNF convention) and even uses grammar-forced *drafts* to speed structured
       generation. Mummu's tool-calling currently *trusts* the model to emit parseable `<tool_call>` JSON

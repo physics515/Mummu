@@ -92,7 +92,10 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
   in 136.1 s, and layer 5 / expert 37's `gate_proj` read straight from the raw shard bytes is
   **bit-identical to slot 37 of the fused bank across all 2 097 152 values**. The fuse streams to a
   temp file rather than RAM, so a checkpoint this size costs the model's footprint, not the model plus
-  a second copy of itself.
+  a second copy of itself. The **GGUF** path streams the same way: its dequant plans the whole output
+  before reading a payload byte, then writes header + f32 tensors straight to a temp file that
+  `burn-store` mmaps back, so loading the 1B-7B costs **26.5 GB of measured private commit — the model
+  alone** — where the old in-RAM dequant paid for the payload twice on top of it.
 - **All three models are parity-verified** — the two-leg P7 gate passes for Qwen2.5-1.5B on the
   reference GPU: single-forward top-5 logits match a Candle f32 reference (max |Δlogit| 2.7e-5,
   `tests/parity_qwen2.rs` + the committed `tools/candle-probe` fixture) and a 24-token greedy sequence
