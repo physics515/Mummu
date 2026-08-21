@@ -396,6 +396,21 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       {float_dtype,int_dtype}` and each loader's `target_float` derivation) is a place the 0.22 diff will
       land, so preferring the alias form where one already exists shrinks that diff before the bump.
       — https://github.com/tracel-ai/burn/releases
+      *(2026-08-20, second run)* Two corrections and one addition, all from reading what is actually
+      published rather than the migration note's summary. (1) **`burn-store` 0.21 does NOT ship a
+      `FloatCastAdapter`** — its adapter set is `PyTorchToBurnAdapter` / `BurnToPyTorchAdapter` /
+      `HalfPrecisionAdapter` / `ChainAdapter` / `IdentityAdapter`, and `HalfPrecisionAdapter` is
+      f32<->f16 only, not the arbitrary target-dtype cast `CastFloatAdapter` does. So "evaluate
+      replacing our `CastFloatAdapter`" is a 0.22 task, not something already available and skipped.
+      (2) **wgpu 30's f16 story is bigger than "f16 beyond SPIR-V"**: `SHADER_F16` now works in WGSL
+      and GLSL as well as SPIR-V passthrough (add `enable f16;` at the top of the shader), which
+      matters because it means the f16 win stops being Vulkan-only — the `vulkan` feature's SPIR-V
+      path is currently the only way we get f16 kernels, so a DX12/Metal consumer gets f32 today and
+      would not after the bump. (3) wgpu 30 also lands **cooperative matrix load/store** (WGSL in;
+      SPIR-V/Metal/WGSL out), gated on `vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR` and
+      currently **8x8 f32 only** — too narrow to be the decode lever yet, but it is the seam a
+      tensor-core matmul would eventually ride, so watch the supported configurations grow.
+      — https://docs.rs/burn-store/latest/burn_store/ · https://github.com/gfx-rs/wgpu/releases
 - [x] Silence the pre-existing `LNK4098` (LIBCMT defaultlib conflict) the 2026-07 nightly toolchain's
       new `linker_messages` lint now surfaces when linking the `mummu` lib-test binary — find which
       native dep object embeds the static-CRT directive (tokenizers' C++ deps are the suspects) and
@@ -682,6 +697,24 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       before treating the gather as refuted. Both are gated on `bench/BASELINE.md` like the rest —
       https://github.com/ggml-org/llama.cpp/pull/25294 ·
       https://huggingface.co/blog/Doctor-Shotgun/llamacpp-moe-offload-guide
+      *(2026-08-20, second run)* A fourth route, and the one that answers our specific regression:
+      llama.cpp discussion #24528 proposes a **VRAM cache of hot experts with hybrid hit/miss
+      execution** — the `MUL_MAT_ID` stays on the CPU, but thread 0 dispatches ONE batched matvec
+      over the cached (hit) expert rows to the GPU while the remaining threads compute the miss rows
+      exactly as they do today. The property that matters is that **a miss costs nothing extra**:
+      performance degrades gracefully to the vanilla dense-CPU path instead of paying a gather that
+      may not pay for itself, which is precisely how our 2026-08-03 A/B lost (1.58 s vs 1.15 s — the
+      gather was unconditional). Eviction is LRU with an admission threshold, plus a "soft mode" that
+      trades ~5-7 % of prefill to avoid evicting during decode; the cache **engages on decode only**.
+      Reported: +25 % on GLM-5.1 754B, +7 % on Qwen3.5 397B, +28-46 % decode on 2x RTX 3090 — but a
+      GTX 1080 Ti **regressed**, i.e. the win is a function of how much faster the GPU is than the CPU
+      at the cached slice, which is exactly the hardware-dependence our own measurement found.
+      Status: RFC, CUDA-only, unmerged. For us the shape translates directly — a bounded per-layer
+      VRAM slab cache on the `Gpu` backend with the CPU dense path as the miss fallback — and it is
+      the first route that does NOT require the whole MoE to fit VRAM first, so it unblocks route (b)
+      without waiting on P9. Gate it on `bench/BASELINE.md` and the OLMoE 0.76 s/token warm number.
+      — https://github.com/ggml-org/llama.cpp/discussions/24528 ·
+      https://github.com/ggml-org/llama.cpp/issues/20757
 - [x] **OLMoE from HF safetensors** — the port loads GGUF only because HF stores each expert separately
       (`model.layers.N.mlp.experts.{0..63}.{gate,up,down}_proj.weight`) while `MoeExperts` holds one fused
       `[experts, out, in]` tensor per projection. Needs a concat-on-import step (64 slices → one tensor,
@@ -1292,6 +1325,18 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       worth re-checking after graph capture (P0) moves the dispatch baseline. —
       https://github.com/thc1006/qwen3.6-speculative-decoding-rtx3090 ·
       https://inventivehq.com/blog/llama-cpp-speculative-decoding-consumer-gpu
+      *(2026-08-20, second run)* Route (a) now has a merged reference implementation to read and a
+      number to aim at: llama.cpp PR **#22673** landed MTP-head support (tested on Qwen3.6-27B and
+      Qwen3.6-35B-A3B, but written for any MTP model), driven by `--spec-type mtp` plus
+      `--spec-draft-n-max <k>`. Reported steady-state **acceptance ~75 % at k=3 for >2x end-to-end**,
+      rising past 80 % on code/math/reasoning, and the community finding that **k=2 often beats k=3**
+      because acceptance falls off as the draft window widens — so `n_draft` is a tunable to measure,
+      not a constant to pick. Two things to carry into our design: MTP needs no second model in VRAM
+      (the heads ride the target checkpoint), which is what makes it the route worth building on a
+      16 GB card; and the flag rename noted above means a reference leg should probe BOTH
+      `--spec-type mtp` and `--spec-type draft-mtp` rather than assume either. —
+      https://github.com/ggml-org/llama.cpp/pull/22673 ·
+      https://github.com/ggml-org/llama.cpp/blob/master/docs/speculative.md
 - [ ] **Grammar-constrained decoding** *(colibri parity)* — colibri forces structured output via `.gbnf`
       grammars (llama.cpp's GBNF convention) and even uses grammar-forced *drafts* to speed structured
       generation. Mummu's tool-calling currently *trusts* the model to emit parseable `<tool_call>` JSON
