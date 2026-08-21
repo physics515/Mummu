@@ -11,8 +11,13 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use burn::module::Module;
-use burn::store::{ModuleAdapter, ModuleSnapshot, ModuleStore, TensorSnapshot};
+use burn::store::{
+    ModuleAdapter, ModuleSnapshot, ModuleStore, PyTorchToBurnAdapter, SafetensorsStore,
+    TensorSnapshot,
+};
 use burn::tensor::DType;
+
+use crate::gguf::{GgufFile, GgufMap, GgufTensorInfo};
 
 /// Everything that can go wrong turning files on disk into a loaded model.
 #[derive(Debug, thiserror::Error)]
@@ -221,6 +226,163 @@ where
     Ok(())
 }
 
+/// Largest f32 payload [`DequantSink::Auto`] will let a dequant hold in RAM.
+///
+/// The in-memory sink's peak is ~2x the payload (the blob, plus the model
+/// being built from it), so this ceiling is really a ~1 GiB peak — small
+/// enough to be free on any machine that could run the model at all. Above
+/// it, [`DequantSink::Scratch`] costs one f32 write plus an mmap read-back
+/// and halves the peak; measured on Qwen2.5-1.5B (6.2 GB of f32), that trade
+/// is inside the run-to-run noise of the load it is part of, so there is no
+/// reason to keep paying the doubled peak for anything of real size.
+pub const MAX_IN_MEMORY_DEQUANT_BYTES: u64 = 512 << 20;
+
+/// Where a GGUF dequant's f32 payload lands on its way into a
+/// [`SafetensorsStore`].
+///
+/// The two sinks are byte-identical by construction — `gguf::dequant_into` is
+/// ONE function behind both, pinned by a unit test — so this is a resource
+/// trade, never a correctness one. [`Self::Memory`] peaks at ~2x the payload
+/// and needs nothing; [`Self::Scratch`] peaks at ~1x (the payload becomes
+/// file-backed mmap) and needs payload-sized free disk beside the weights.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DequantSink {
+    /// Hold the whole f32 payload in RAM and hand it to the store as bytes.
+    Memory,
+    /// Stream it to a scratch file beside the weights; `burn-store` mmaps
+    /// that back and materializes tensors lazily, so the payload is never
+    /// charged to commit.
+    Scratch,
+    /// Pick by payload size: [`Self::Memory`] only up to
+    /// [`MAX_IN_MEMORY_DEQUANT_BYTES`], [`Self::Scratch`] above it.
+    Auto,
+}
+
+impl DequantSink {
+    /// Resolve [`Self::Auto`] against a payload size; the other two answer
+    /// for themselves. Never returns `Auto`.
+    #[must_use]
+    pub fn resolve(self, total_f32_bytes: u64) -> Self {
+        let picked = match self {
+            Self::Auto if total_f32_bytes > MAX_IN_MEMORY_DEQUANT_BYTES => Self::Scratch,
+            Self::Auto => Self::Memory,
+            explicit => explicit,
+        };
+        debug_assert!(picked != Self::Auto, "resolve must decide");
+        debug_assert!(
+            picked != Self::Memory
+                || total_f32_bytes <= MAX_IN_MEMORY_DEQUANT_BYTES
+                || self == Self::Memory,
+            "Auto never picks Memory above the ceiling"
+        );
+        picked
+    }
+}
+
+/// Owns a scratch file for the life of one load.
+///
+/// The file is as large as the weights it carries (~28 GB dequantizing
+/// OLMoE-1B-7B's Q4_K_M), so leaving one behind on a failed load would
+/// quietly fill the disk over a few retries. `Drop` removes it on every exit
+/// path, success or `?` — and because the store reads it lazily, the guard
+/// must outlive `load_checked`, which holding it as a local does.
+#[derive(Debug)]
+pub struct ScratchFile {
+    path: PathBuf,
+}
+
+impl ScratchFile {
+    /// Placed beside the weights, so the scratch write lands on the same
+    /// volume as the model rather than on a small system temp drive.
+    ///
+    /// The name carries a process-unique counter as well as the pid: two
+    /// concurrent loads in one process must not choose the same file and
+    /// interleave their writes into it.
+    pub fn new(dir: &Path) -> Result<Self, ImportError> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        assert!(!dir.as_os_str().is_empty(), "scratch dir must be named");
+        let path = dir.join(format!(
+            "mummu-scratch-{}-{}.safetensors.tmp",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        // A leftover from a killed process must never be mistaken for ours.
+        if path.exists() {
+            std::fs::remove_file(&path).map_err(|e| ImportError::Parse {
+                file: path.clone(),
+                reason: format!("could not clear a stale scratch file: {e}"),
+            })?;
+        }
+        Ok(Self { path })
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        debug_assert!(!self.path.as_os_str().is_empty(), "scratch path is named");
+        &self.path
+    }
+}
+
+impl Drop for ScratchFile {
+    fn drop(&mut self) {
+        // Best effort by construction: a Drop that can fail has nowhere to
+        // report to, and a stranded scratch file is not worth a panic.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Dequantize `f` to f32 safetensors and return the store every GGUF loader
+/// then adds its own key remaps to, plus the scratch guard (if any) that must
+/// stay alive until the load finishes.
+///
+/// This is the one place the four GGUF ports share: the sink choice, the
+/// adapter chain, and — the part worth centralizing — taking the target float
+/// dtype from the TYPE (`B::FloatElem`) rather than from a probe tensor.
+/// Unspecified-dtype tensor creation follows the per-DEVICE default policy,
+/// which another backend alias sharing the device (`Gpu` vs `GpuF16`) may have
+/// flipped in this process.
+pub fn gguf_store<B: burn::tensor::backend::Backend>(
+    f: &GgufFile,
+    map: &dyn Fn(&GgufTensorInfo) -> Option<GgufMap>,
+    sink: DequantSink,
+) -> Result<(SafetensorsStore, Option<ScratchFile>), ImportError> {
+    let parse = |reason: String| ImportError::Parse {
+        file: f.path.clone(),
+        reason,
+    };
+    let total_f32_bytes: u64 = f.tensors.iter().map(|t| t.element_count() * 4).sum();
+    let target_float = <B::FloatElem as burn::tensor::Element>::dtype();
+    let adapter = PyTorchToBurnAdapter.chain(CastFloatAdapter::new(target_float));
+
+    match sink.resolve(total_f32_bytes) {
+        DequantSink::Memory => {
+            let blob = f
+                .dequant_to_safetensors(map)
+                .map_err(|e| parse(e.to_string()))?;
+            assert!(blob.len() > 8, "a parsed GGUF yields a non-empty blob");
+            let store = SafetensorsStore::from_bytes(Some(blob))
+                .with_from_adapter(adapter)
+                .allow_partial(true);
+            Ok((store, None))
+        }
+        DequantSink::Scratch => {
+            // Beside the gguf, so the scratch write lands on the volume the
+            // weights already live on.
+            let scratch = ScratchFile::new(f.path.parent().unwrap_or(Path::new(".")))?;
+            let bytes = f
+                .dequant_to_safetensors_file(map, scratch.path())
+                .map_err(|e| parse(e.to_string()))?;
+            assert!(bytes > 0, "a parsed GGUF yields a non-empty payload");
+            let store = SafetensorsStore::from_file(scratch.path().to_path_buf())
+                .with_from_adapter(adapter)
+                .allow_partial(true);
+            Ok((store, Some(scratch)))
+        }
+        DequantSink::Auto => unreachable!("resolve never returns Auto"),
+    }
+}
+
 /// `dir/file`, or [`ImportError::MissingFile`] if absent.
 pub fn required_file(dir: &Path, file: &str) -> Result<PathBuf, ImportError> {
     assert!(!file.is_empty(), "required_file: empty file name");
@@ -258,6 +420,54 @@ pub fn weights_file(dir: &Path) -> Result<WeightsFile, ImportError> {
 
 #[cfg(test)]
 mod tests {
+    use super::{DequantSink, MAX_IN_MEMORY_DEQUANT_BYTES, ScratchFile};
+
+    #[test]
+    fn auto_picks_the_scratch_sink_exactly_above_the_ceiling() {
+        // The boundary is the whole point: `Auto` must never leave a payload
+        // in RAM whose 2x peak is what this ceiling exists to cap.
+        assert_eq!(DequantSink::Auto.resolve(0), DequantSink::Memory);
+        assert_eq!(
+            DequantSink::Auto.resolve(MAX_IN_MEMORY_DEQUANT_BYTES),
+            DequantSink::Memory
+        );
+        assert_eq!(
+            DequantSink::Auto.resolve(MAX_IN_MEMORY_DEQUANT_BYTES + 1),
+            DequantSink::Scratch
+        );
+        // An explicit choice is honoured in BOTH directions, including the
+        // one `Auto` would never make — the A/B that set the ceiling needs it.
+        assert_eq!(DequantSink::Memory.resolve(u64::MAX), DequantSink::Memory);
+        assert_eq!(DequantSink::Scratch.resolve(0), DequantSink::Scratch);
+    }
+
+    #[test]
+    fn scratch_files_are_unique_per_instance_and_deleted_on_drop() {
+        let dir = std::env::temp_dir().join("mummu-scratch-tests");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let a = ScratchFile::new(&dir).expect("names a scratch file");
+        let b = ScratchFile::new(&dir).expect("names a second one");
+        assert_ne!(
+            a.path(),
+            b.path(),
+            "two live loads must not share one scratch file"
+        );
+
+        let path = a.path().to_path_buf();
+        std::fs::write(&path, b"payload").expect("writes");
+        assert!(path.is_file());
+        drop(a);
+        assert!(!path.exists(), "Drop removes the scratch file");
+
+        // And a stale file at the same name is cleared, not adopted: write
+        // one at b's path, then re-create a guard for it.
+        let stale = b.path().to_path_buf();
+        std::fs::write(&stale, b"stale").expect("writes");
+        drop(b);
+        assert!(!stale.exists());
+    }
+
     use super::*;
 
     #[test]

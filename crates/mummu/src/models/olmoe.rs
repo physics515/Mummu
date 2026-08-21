@@ -27,7 +27,7 @@
 //! its dequant streams to a temp file (~28 GB of f32) that `burn-store` then
 //! mmaps back, so the payload is file-backed rather than charged to commit.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use burn::module::Module;
 use burn::nn::{Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig};
@@ -35,7 +35,10 @@ use burn::store::{ModuleAdapter, PyTorchToBurnAdapter, SafetensorsStore};
 use burn::tensor::{Int, Tensor, TensorData, backend::Backend};
 
 use crate::gguf::{GgufFile, GgufMap, GgufTensorInfo, GgufValue};
-use crate::import::{CastFloatAdapter, ImportError, load_checked, required_file};
+use crate::import::{
+    CastFloatAdapter, DequantSink, ImportError, ScratchFile, gguf_store, load_checked,
+    required_file,
+};
 use crate::models::CausalLm;
 use crate::models::qwen2::{EosIds, gguf_f32, gguf_usize};
 use crate::nn::{
@@ -315,23 +318,13 @@ pub fn load_from_gguf<B: Backend>(
     };
     let f = GgufFile::open(path).map_err(|e| parse(e.to_string()))?;
     let config = OlmoeConfig::from_gguf(&f).map_err(parse)?;
-    // Beside the GGUF, so the scratch write lands on the volume the weights
-    // already live on.
-    let scratch = FusedTemp::new(path.parent().unwrap_or(Path::new(".")))?;
-    let bytes = f
-        .dequant_to_safetensors_file(&gguf_tensor_to_hf, scratch.path())
-        .map_err(|e| parse(e.to_string()))?;
-    assert!(bytes > 0, "a parsed GGUF yields a non-empty payload");
+    // The scratch guard (Some only when the payload went to disk, which at
+    // OLMoE's size it always does) must outlive `load_checked`: the store
+    // reads that file lazily.
+    let (base, _scratch) = gguf_store::<B>(&f, &gguf_tensor_to_hf, DequantSink::Auto)?;
 
     let mut model = build::<B>(&config, device);
-    // The backend's float dtype, taken from the TYPE (`B::FloatElem`), never
-    // from a probe tensor (per-device default policy hazard).
-    let target_float = <B::FloatElem as burn::tensor::Element>::dtype();
-    let mut store = install_remaps(
-        SafetensorsStore::from_file(scratch.path().to_path_buf())
-            .with_from_adapter(PyTorchToBurnAdapter.chain(CastFloatAdapter::new(target_float)))
-            .allow_partial(true),
-    );
+    let mut store = install_remaps(base);
     load_checked(&mut model, &mut store, path)?;
     Ok(LoadedOlmoe {
         model,
@@ -392,57 +385,6 @@ fn fused_expert_target(name: &str, num_experts: usize) -> Option<Fuse> {
 ///
 /// Budget note: the fused blob is the checkpoint's own size (~13.8 GB in bf16
 /// for the 1B-7B) and the loaded f32 model is ~28 GB — size the target device.
-/// Owns the scratch safetensors file for the life of one load — the fused
-/// checkpoint on the HF path, the dequantized payload on the GGUF path.
-///
-/// It is as large as the weights it carries (13.8 GB fusing the 1B-7B, ~28 GB
-/// dequantizing its Q4_K_M), so leaving one behind on a failed load would
-/// quietly fill the disk over a few retries. `Drop` removes it on every exit
-/// path, success or `?`.
-struct FusedTemp {
-    path: PathBuf,
-}
-
-impl FusedTemp {
-    /// Placed beside the checkpoint, so the scratch write lands on the same
-    /// volume as the weights rather than on a small system temp drive.
-    ///
-    /// The name carries a process-unique counter as well as the pid: two
-    /// concurrent loads in one process must not choose the same scratch file
-    /// and interleave their writes into it.
-    fn new(dir: &Path) -> Result<Self, ImportError> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        assert!(!dir.as_os_str().is_empty(), "checkpoint dir must be named");
-        let path = dir.join(format!(
-            "mummu-fused-{}-{}.safetensors.tmp",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        // A leftover from a killed process must never be mistaken for ours.
-        if path.exists() {
-            std::fs::remove_file(&path).map_err(|e| ImportError::Parse {
-                file: path.clone(),
-                reason: format!("could not clear a stale fused scratch file: {e}"),
-            })?;
-        }
-        Ok(Self { path })
-    }
-
-    fn path(&self) -> &Path {
-        debug_assert!(!self.path.as_os_str().is_empty(), "scratch path is named");
-        &self.path
-    }
-}
-
-impl Drop for FusedTemp {
-    fn drop(&mut self) {
-        // Best effort by construction: a Drop that can fail has nowhere to
-        // report to, and a stranded scratch file is not worth a panic.
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
 pub fn load_from_dir<B: Backend>(
     dir: &Path,
     device: &B::Device,
@@ -470,7 +412,7 @@ pub fn load_from_dir<B: Backend>(
     // the load then builds; streaming it to disk keeps the peak at the model
     // alone. The file is this process's to delete, and it is deleted whether
     // the load succeeds or fails.
-    let fused = FusedTemp::new(dir)?;
+    let fused = ScratchFile::new(dir)?;
     let bytes = fuse_checkpoint_to_file(
         dir,
         &|name| Some(olmoe_hf_fuse(name, num_experts)),

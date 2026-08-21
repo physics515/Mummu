@@ -16,7 +16,9 @@ use burn::store::{ModuleAdapter, PyTorchToBurnAdapter, SafetensorsStore};
 use burn::tensor::{Int, Tensor, TensorData, backend::Backend};
 
 use crate::gguf::{GgufFile, GgufMap, GgufTensorInfo, GgufValue};
-use crate::import::{CastFloatAdapter, ImportError, load_checked, required_file};
+use crate::import::{
+    CastFloatAdapter, DequantSink, ImportError, gguf_store, load_checked, required_file,
+};
 use crate::models::CausalLm;
 use crate::models::qwen2::EosIds;
 use crate::nn::{
@@ -451,19 +453,12 @@ pub fn load_from_gguf<B: Backend>(
     };
     let f = GgufFile::open(path).map_err(|e| parse(e.to_string()))?;
     let config = Lfm2Config::from_gguf(&f).map_err(parse)?;
-    let blob = f
-        .dequant_to_safetensors(&gguf_tensor_to_hf)
-        .map_err(|e| parse(e.to_string()))?;
-    assert!(blob.len() > 8, "a parsed GGUF yields a non-empty blob");
+    // The scratch guard (Some only when the payload went to disk) must
+    // outlive `load_checked`: the store reads that file lazily.
+    let (base, _scratch) = gguf_store::<B>(&f, &gguf_tensor_to_hf, DequantSink::Auto)?;
 
     let mut model = build::<B>(&config, device);
-    // Type-level float dtype (`B::FloatElem`) — a probe tensor would follow
-    // the per-DEVICE default policy, which another backend alias sharing the
-    // device (Gpu vs GpuF16) may have flipped in this process.
-    let target_float = <B::FloatElem as burn::tensor::Element>::dtype();
-    let mut store = SafetensorsStore::from_bytes(Some(blob))
-        .with_from_adapter(PyTorchToBurnAdapter.chain(CastFloatAdapter::new(target_float)))
-        .allow_partial(true)
+    let mut store = base
         .with_key_remapping(r"^model\.", "")
         .with_key_remapping(r"(self_attn)\.out_proj\.", "$1.o_proj.")
         .with_key_remapping(r"(self_attn)\.q_layernorm\.weight$", "$1.q_norm.gamma")
