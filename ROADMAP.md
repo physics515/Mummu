@@ -752,7 +752,7 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       so peak drops from ~42 GB (13.8 blob + ~28 model) to the model alone; a `FusedTemp` guard deletes the
       scratch file on every exit path, verified empty after the run. A unit test pins the two fuse paths as
       **byte-identical**, so the big-model path and the small-model path stay one importer.
-- [ ] **Give the GGUF dequant path the same streaming sink the safetensors fuse just got** — found while
+- [x] **Give the GGUF dequant path the same streaming sink the safetensors fuse just got** — found while
       fixing the OLMoE safetensors OOM (2026-08-20). `gguf::dequant_to_safetensors` has the identical
       double-buffer: it fills a `data` Vec of `total_f32_bytes`, then copies it into a second `blob` Vec of
       `8 + header + data`, so peak is **2x the dequantized f32 payload** before the model is even built.
@@ -761,11 +761,63 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       + payload into an `impl Write` through one bounded per-tensor buffer, with a `*_to_file` variant for
       `SafetensorsStore::from_file`. Prove it the same way — a unit test pinning the in-memory and
       to-file outputs as byte-identical, then re-run the `real_gguf` + `parity_gguf` legs unchanged.
-- [ ] **`gguf.rs` still has `.expect()` on production paths** — `dequant_to_safetensors` and the metadata
+      *(2026-08-20, second run) Shipped.* `dequant_to_safetensors` is now a thin wrapper over a shared
+      `dequant_into<W: Write>`, joined by `dequant_to_safetensors_file`. The double-buffer is gone from
+      BOTH forms: the in-memory one writes header-then-payload into a single `Vec` (peak 1x the payload,
+      down from 2x), and the file one holds nothing but the current tensor's f32 values plus a fixed
+      1 MiB staging buffer. What made streaming possible also made the path stricter — a new
+      `plan_dequant` decides every name, shape and offset **before the first payload byte is read**, so
+      an unmapped name, a reshape that changes the element count, or a rename collision now fails in
+      milliseconds instead of after N tensors have been dequantized (a unit test proves this by
+      pointing a tensor's payload past the end of the file and checking the MAP error still surfaces).
+      `olmoe::load_from_gguf` takes the file variant, reusing the same `FusedTemp` guard the HF path
+      uses, so the scratch file is deleted on every exit path.
+      **REAL-WEIGHTS proof**, the OLMoE-1B-7B Q4_K_M leg against llama.cpp on the identical file:
+      top-5 ids exact in order, the 24-token greedy sequence **byte-identical**, max |Δlogprob|
+      3.687691131310693e-1 (tolerance 7.5e-1), 130.5 s. Measured peak while it ran: **26.5 GB private
+      commit** — the model alone — against a 51.7 GB working set, i.e. ~25 GB of the load is now
+      file-backed mmap rather than charged to commit, which is the binding limit on this box. The old
+      shape was ~28 GB blob + ~28 GB model ≈ 56 GB of commit. Nothing else moved: qwen2 GGUF parity
+      2.6614442413586614e-1 and qwen3 **4.015608155114805e-1, bit-identical to the recorded value**,
+      both greedy sequences byte-identical; the four `real_qwen2_gguf_*` legs pass (44.1 s). 234 unit
+      tests (+2). The stale "~60 GB free RAM" gates on the three OLMoE test legs are corrected to
+      ~30 GB free commit + ~28 GB of scratch disk.
+- [x] **`gguf.rs` still has `.expect()` on production paths** — `dequant_to_safetensors` and the metadata
       readers carry `usize::try_from(..).expect("bounded above")` (4 sites), the same pattern removed from
       `safetensors.rs` on 2026-08-20 in favour of a fallible `to_usize` that returns `OverBound`. Mechanical,
       and it keeps the no-panic-on-production-paths rule true across the whole import suite rather than in
       the newest module only.
+      *(2026-08-20, second run) Done — eight sites, not four.* `gguf::to_usize` mirrors
+      `safetensors::to_usize` exactly. The four header readers (`Reader::{string,value,read_file,
+      tensor_table}`) go through it — `tensor_table` now converts its count once instead of twice —
+      and so does `dequant_to_safetensors`' payload capacity. Three more were hiding outside the
+      `try_from` pattern: the tensor-name JSON encode (now reports through `BadTensor`, so it names
+      the offending index), and `dequantize`'s two block-geometry casts plus its F32 4-byte block
+      cast, all mapped into the `String` error that function already returns. No behaviour change by
+      construction — every replaced site was unreachable on a 64-bit target — proven by the four
+      `real_qwen2_gguf_*` legs on the Q4_K_M checkpoint (header parse, dequant-vs-true-weights,
+      tokenizer byte identity, GPU load + decode).
+- [ ] **Decide the dequant sink per model, not per code path** — `olmoe::load_from_gguf` takes the new
+      streaming `dequant_to_safetensors_file`; qwen2 / qwen3 / lfm2 still take the in-memory
+      `dequant_to_safetensors` (which is now 1x the payload rather than 2x, so they already got half the
+      win for free). That split is a guess, not a measurement: the file variant trades a spike in commit
+      for an f32 write plus mmap-back, which should LOSE on a 1-2 GB model and win on anything that is a
+      meaningful fraction of RAM. Measure GGUF load wall-clock both ways on Qwen2.5-1.5B (~2.2 GB f32)
+      and Qwen3-0.6B, then either pick per-model or — better — pick automatically from
+      `total_f32_bytes` against the device inventory's free-RAM figure (P6 already probes it), so a
+      consumer never has to know. *(2026-08-20, discovered shipping the streaming sink.)*
+- [ ] **`FusedTemp` is import-suite machinery living in one model file** — `models/olmoe.rs` owns the
+      scratch-file guard (create beside the weights, unique per process + counter, `Drop`-delete on
+      every exit path), and it now serves BOTH import paths. Any other model large enough to want a
+      streaming sink has to reach into `olmoe` or copy it. Promote it to `import.rs` when a second
+      model needs it — not before, since a one-caller abstraction moved early is just churn.
+      *(2026-08-20.)*
+- [ ] **The f32 scratch file is a symptom, not the design** — both streaming sinks exist because
+      `SafetensorsStore` is the only checked-load pipeline we have, so every import must first become
+      f32 safetensors on disk. A GGUF **keep-quantized** load (P9) would skip the temp file entirely:
+      no ~28 GB write, no 4x dtype widening, and the 1B-7B would stop being CPU-only. Worth stating
+      here so the scratch-file machinery is understood as a bridge with a known end, not a fixture.
+      *(2026-08-20.)*
 - [ ] **Qwen3.5 hybrid (`qwen35`) architecture port** — split from the Qwen3.5-tier item when the
       2026-07-30 header probe showed Qwen3.5-4B/9B are a hybrid **linear-attention/SSM + periodic
       full-attention** arch (`qwen35.ssm.*` metadata: conv_kernel/state_size/group_count/time_step_rank/

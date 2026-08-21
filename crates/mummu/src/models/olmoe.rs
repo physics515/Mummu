@@ -23,7 +23,9 @@
 //! before the ordinary checked-load pipeline. It fuses to a temp file rather
 //! than to RAM deliberately: the in-memory twin would need the whole payload
 //! resident (13.8 GB for the 1B-7B) on top of the ~28 GB f32 model the load
-//! then builds.
+//! then builds. [`load_from_gguf`] makes the same trade for the same reason:
+//! its dequant streams to a temp file (~28 GB of f32) that `burn-store` then
+//! mmaps back, so the payload is file-backed rather than charged to commit.
 
 use std::path::{Path, PathBuf};
 
@@ -297,6 +299,12 @@ fn olmoe_gguf_name(name: &str) -> Option<String> {
 /// same checked-load pipeline every other port uses. Budget note: the 1B-7B's
 /// ~7B params dequantize to ~28 GB of f32 — size the target device (the
 /// reference machine runs it on the 128 GB CPU backend).
+///
+/// The dequant goes to a TEMP FILE, not to RAM, for the same reason
+/// `load_from_dir`'s fuse does: holding ~28 GB of f32 payload *and* building
+/// the ~28 GB model from it is the sum a 128 GB box with other tenants
+/// actually fails to satisfy. Streaming keeps the peak at the model plus one
+/// tensor. The file is this process's to delete, on success or failure.
 pub fn load_from_gguf<B: Backend>(
     path: &Path,
     device: &B::Device,
@@ -307,17 +315,20 @@ pub fn load_from_gguf<B: Backend>(
     };
     let f = GgufFile::open(path).map_err(|e| parse(e.to_string()))?;
     let config = OlmoeConfig::from_gguf(&f).map_err(parse)?;
-    let blob = f
-        .dequant_to_safetensors(&gguf_tensor_to_hf)
+    // Beside the GGUF, so the scratch write lands on the volume the weights
+    // already live on.
+    let scratch = FusedTemp::new(path.parent().unwrap_or(Path::new(".")))?;
+    let bytes = f
+        .dequant_to_safetensors_file(&gguf_tensor_to_hf, scratch.path())
         .map_err(|e| parse(e.to_string()))?;
-    assert!(blob.len() > 8, "a parsed GGUF yields a non-empty blob");
+    assert!(bytes > 0, "a parsed GGUF yields a non-empty payload");
 
     let mut model = build::<B>(&config, device);
     // The backend's float dtype, taken from the TYPE (`B::FloatElem`), never
     // from a probe tensor (per-device default policy hazard).
     let target_float = <B::FloatElem as burn::tensor::Element>::dtype();
     let mut store = install_remaps(
-        SafetensorsStore::from_bytes(Some(blob))
+        SafetensorsStore::from_file(scratch.path().to_path_buf())
             .with_from_adapter(PyTorchToBurnAdapter.chain(CastFloatAdapter::new(target_float)))
             .allow_partial(true),
     );
@@ -381,11 +392,13 @@ fn fused_expert_target(name: &str, num_experts: usize) -> Option<Fuse> {
 ///
 /// Budget note: the fused blob is the checkpoint's own size (~13.8 GB in bf16
 /// for the 1B-7B) and the loaded f32 model is ~28 GB — size the target device.
-/// Owns the fused scratch file for the life of one `load_from_dir`.
+/// Owns the scratch safetensors file for the life of one load — the fused
+/// checkpoint on the HF path, the dequantized payload on the GGUF path.
 ///
-/// The fused blob is as large as the checkpoint (13.8 GB for the 1B-7B), so
-/// leaving one behind on a failed load would quietly fill the disk over a few
-/// retries. `Drop` removes it on every exit path, success or `?`.
+/// It is as large as the weights it carries (13.8 GB fusing the 1B-7B, ~28 GB
+/// dequantizing its Q4_K_M), so leaving one behind on a failed load would
+/// quietly fill the disk over a few retries. `Drop` removes it on every exit
+/// path, success or `?`.
 struct FusedTemp {
     path: PathBuf,
 }
@@ -393,11 +406,18 @@ struct FusedTemp {
 impl FusedTemp {
     /// Placed beside the checkpoint, so the scratch write lands on the same
     /// volume as the weights rather than on a small system temp drive.
+    ///
+    /// The name carries a process-unique counter as well as the pid: two
+    /// concurrent loads in one process must not choose the same scratch file
+    /// and interleave their writes into it.
     fn new(dir: &Path) -> Result<Self, ImportError> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         assert!(!dir.as_os_str().is_empty(), "checkpoint dir must be named");
         let path = dir.join(format!(
-            "mummu-fused-{}.safetensors.tmp",
-            std::process::id()
+            "mummu-fused-{}-{}.safetensors.tmp",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         // A leftover from a killed process must never be mistaken for ours.
         if path.exists() {

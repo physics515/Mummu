@@ -110,7 +110,8 @@ fn lfm2_q4_gguf_matches_llama_cpp_on_the_same_file() {
 
 #[test]
 #[ignore = "needs the OLMoE Q4_K_M GGUF (MUMMU_OLMOE_GGUF_PATH), llama-server \
-            (MUMMU_LLAMA_SERVER), and ~60 GB free RAM (28 GB f32 build, CPU backend)"]
+            (MUMMU_LLAMA_SERVER), ~30 GB free COMMIT and ~28 GB of scratch disk \
+            beside the gguf (28 GB f32 build, CPU backend)"]
 fn olmoe_q4_gguf_matches_llama_cpp_on_the_same_file() {
     // The zoo's first MoE leg. Our side runs on the CPU backend — the ~28 GB
     // f32 resident-everything build does not fit a 16 GB card; parity is

@@ -34,7 +34,8 @@ const DECODE_STEPS: usize = 4;
 const LOAD_BUDGET_SECS: f64 = 300.0;
 
 #[test]
-#[ignore = "needs the OLMoE Q4_K_M GGUF (MUMMU_OLMOE_GGUF_PATH) and ~40 GB free RAM"]
+#[ignore = "needs the OLMoE Q4_K_M GGUF (MUMMU_OLMOE_GGUF_PATH), ~30 GB free COMMIT \
+            and ~28 GB of scratch disk beside the gguf"]
 fn olmoe_moe_cpu_decode_stays_inside_its_budget() {
     let Some(path) = std::env::var_os("MUMMU_OLMOE_GGUF_PATH").map(PathBuf::from) else {
         panic!("set MUMMU_OLMOE_GGUF_PATH to the OLMoE-1B-7B q4_k_m gguf");
