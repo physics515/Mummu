@@ -10,6 +10,7 @@
 #![recursion_limit = "512"]
 
 pub mod adapt;
+pub mod attn_config;
 pub mod backend;
 pub mod cache;
 pub mod chat;

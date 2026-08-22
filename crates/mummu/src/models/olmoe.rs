@@ -34,6 +34,7 @@ use burn::nn::{Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNor
 use burn::store::{ModuleAdapter, PyTorchToBurnAdapter, SafetensorsStore};
 use burn::tensor::{Device, Int, Tensor, TensorData};
 
+use crate::attn_config::{RopeScaling, check_sliding_window, sliding_window_from_gguf};
 use crate::gguf::{GgufFile, GgufMap, GgufTensorInfo, GgufValue};
 use crate::import::{
     CastFloatAdapter, DequantSink, ImportError, ScratchFile, gguf_store, load_checked,
@@ -64,6 +65,21 @@ pub struct OlmoeConfig {
     pub norm_topk_prob: bool,
     pub rms_norm_eps: f64,
     pub rope_theta: f32,
+    /// Frequency scaling (YaRN / linear / …). `null` on OLMoE-1B-7B; a scaled
+    /// checkpoint is refused at load ([`crate::attn_config`]).
+    /// `rope_parameters` is the same object under the name newer transformers
+    /// writes; reading only `rope_scaling` would let a freshly-serialized
+    /// scaled checkpoint through as unscaled.
+    #[serde(default, alias = "rope_parameters")]
+    pub rope_scaling: Option<RopeScaling>,
+    /// The trained context length, used to tell an inert sliding window from
+    /// a clipping one.
+    #[serde(default)]
+    pub max_position_embeddings: Option<usize>,
+    /// OLMoE has no `use_sliding_window` flag, so a declared window is live —
+    /// which is why `validate` passes `sliding_window.is_some()` as *enabled*.
+    #[serde(default)]
+    pub sliding_window: Option<usize>,
     #[serde(default)]
     pub tie_word_embeddings: bool,
     #[serde(default)]
@@ -74,7 +90,7 @@ impl OlmoeConfig {
     /// Parse `config.json` bytes.
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, String> {
         let cfg: Self = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
-        cfg.validate()?;
+        cfg.validate("olmoe config.json")?;
         Ok(cfg)
     }
 
@@ -130,11 +146,17 @@ impl OlmoeConfig {
             norm_topk_prob,
             rms_norm_eps: f64::from(gguf_f32(f, "olmoe.attention.layer_norm_rms_epsilon")?),
             rope_theta: gguf_f32(f, "olmoe.rope.freq_base")?,
+            rope_scaling: RopeScaling::from_gguf(f, "olmoe"),
+            max_position_embeddings: f
+                .get("olmoe.context_length")
+                .and_then(GgufValue::as_u64)
+                .and_then(|v| usize::try_from(v).ok()),
+            sliding_window: sliding_window_from_gguf(f, "olmoe"),
             // No separate output.weight tensor means the lm-head is tied.
             tie_word_embeddings: f.tensor("output.weight").is_none(),
             eos_token_id,
         };
-        cfg.validate()?;
+        cfg.validate("olmoe GGUF header")?;
         Ok(cfg)
     }
 
@@ -144,7 +166,18 @@ impl OlmoeConfig {
         self.hidden_size / self.num_attention_heads.max(1)
     }
 
-    fn validate(&self) -> Result<(), String> {
+    fn validate(&self, whose: &str) -> Result<(), String> {
+        if let Some(scaling) = &self.rope_scaling {
+            scaling.check(whose)?;
+        }
+        check_sliding_window(
+            self.sliding_window,
+            // No `use_sliding_window` gate in this family: a declared window
+            // is a live one.
+            self.sliding_window.is_some(),
+            self.max_position_embeddings,
+            whose,
+        )?;
         if self.num_key_value_heads == 0
             || !self
                 .num_attention_heads
@@ -533,6 +566,9 @@ mod tests {
             norm_topk_prob: false,
             rms_norm_eps: 1e-5,
             rope_theta: 1e4,
+            rope_scaling: None,
+            max_position_embeddings: Some(512),
+            sliding_window: None,
             tie_word_embeddings: false,
             eos_token_id: EosIds::One(2),
         }
@@ -555,19 +591,35 @@ mod tests {
         assert!(!cfg.norm_topk_prob);
         assert!(!cfg.tie_word_embeddings);
         assert!(cfg.eos_token_id.contains(50_279));
+        assert!(cfg.rope_scaling.is_none() && cfg.sliding_window.is_none());
+    }
+
+    /// OLMoE has no `use_sliding_window` gate, so a declared window is a live
+    /// one — the opposite of Qwen2.5's inert field, and the reason each family
+    /// decides *enabled* for itself rather than sharing one guess.
+    #[test]
+    fn a_declared_window_is_live_in_a_family_without_the_gate() {
+        let json = br#"{
+            "vocab_size": 50304, "hidden_size": 2048, "intermediate_size": 1024,
+            "num_hidden_layers": 16, "num_attention_heads": 16, "num_key_value_heads": 16,
+            "num_experts": 64, "num_experts_per_tok": 8, "rms_norm_eps": 1e-05,
+            "rope_theta": 10000.0, "max_position_embeddings": 4096, "sliding_window": 1024
+        }"#;
+        let err = OlmoeConfig::from_json_bytes(json).expect_err("a live window must refuse");
+        assert!(err.contains("1024"), "{err}");
     }
 
     #[test]
     fn config_rejects_bad_expert_counts() {
         let mut cfg = toy_config();
         cfg.num_experts = 1;
-        assert!(cfg.validate().is_err(), "one expert is not a mixture");
+        assert!(cfg.validate("test").is_err(), "one expert is not a mixture");
         let mut cfg = toy_config();
         cfg.num_experts_per_tok = 5;
-        assert!(cfg.validate().is_err(), "top-k above expert count");
+        assert!(cfg.validate("test").is_err(), "top-k above expert count");
         let mut cfg = toy_config();
         cfg.num_experts_per_tok = 0;
-        assert!(cfg.validate().is_err(), "zero top-k");
+        assert!(cfg.validate("test").is_err(), "zero top-k");
     }
 
     /// The load-bearing invariant: cached prefill+decode == one full forward,

@@ -15,6 +15,7 @@ use burn::nn::{Embedding, EmbeddingConfig, RmsNorm, RmsNormConfig};
 use burn::store::{ModuleAdapter, PyTorchToBurnAdapter, SafetensorsStore};
 use burn::tensor::{Device, Int, Tensor, TensorData};
 
+use crate::attn_config::{RopeScaling, check_sliding_window, sliding_window_from_gguf};
 use crate::gguf::{GgufFile, GgufMap, GgufTensorInfo, GgufValue};
 use crate::import::{
     CastFloatAdapter, DequantSink, ImportError, gguf_store, load_checked, required_file,
@@ -43,6 +44,19 @@ pub struct Lfm2Config {
     /// The newer transformers convention: `{"rope_theta": …, "rope_type": …}`.
     #[serde(default, skip_serializing)]
     rope_parameters: Option<RopeParameters>,
+    /// The third spelling: a top-level `rope_scaling` object, as Qwen and the
+    /// Llama family write it. Refused unless plain ([`crate::attn_config`]).
+    #[serde(default)]
+    pub rope_scaling: Option<RopeScaling>,
+    /// The trained context length (LFM2.5-1.2B: 128 000), used to tell an
+    /// inert sliding window from a clipping one.
+    #[serde(default)]
+    pub max_position_embeddings: Option<usize>,
+    /// LFM2 has no `use_sliding_window` flag: its attention layers are full,
+    /// and its short-conv layers are a different mechanism entirely — so a
+    /// declared window would be live, and is refused.
+    #[serde(default)]
+    pub sliding_window: Option<usize>,
     /// Conv kernel length `K` (the rolling decode state keeps `K-1`).
     #[serde(rename = "conv_L_cache")]
     pub conv_l_cache: usize,
@@ -89,12 +103,14 @@ impl Lfm2Config {
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, String> {
         let mut cfg: Self = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
         if let Some(rp) = cfg.rope_parameters.take() {
-            if rp.rope_type != "default" {
-                return Err(format!(
-                    "rope_parameters.rope_type '{}' is not implemented (only 'default')",
-                    rp.rope_type
-                ));
+            // Same rule, same message as every other family's `rope_scaling`:
+            // only plain rotary is computed, anything else is named and
+            // refused rather than silently approximated.
+            RopeScaling {
+                rope_type: Some(rp.rope_type.clone()),
+                ..RopeScaling::default()
             }
+            .check("lfm2 config.json rope_parameters")?;
             if cfg.rope_theta != 0.0 && cfg.rope_theta != rp.rope_theta {
                 return Err(format!(
                     "rope_theta given twice and disagreeing: {} (top-level) vs {} (rope_parameters)",
@@ -103,7 +119,7 @@ impl Lfm2Config {
             }
             cfg.rope_theta = rp.rope_theta;
         }
-        cfg.validate()?;
+        cfg.validate("lfm2 config.json")?;
         Ok(cfg)
     }
 
@@ -188,6 +204,12 @@ impl Lfm2Config {
             norm_eps: f64::from(eps),
             rope_theta: theta,
             rope_parameters: None,
+            rope_scaling: RopeScaling::from_gguf(f, "lfm2"),
+            max_position_embeddings: f
+                .get("lfm2.context_length")
+                .and_then(GgufValue::as_u64)
+                .and_then(|v| usize::try_from(v).ok()),
+            sliding_window: sliding_window_from_gguf(f, "lfm2"),
             conv_l_cache: meta_usize("lfm2.shortconv.l_cache")?,
             block_ff_dim: meta_usize("lfm2.feed_forward_length")?,
             block_multiple_of: 1,
@@ -199,11 +221,20 @@ impl Lfm2Config {
                 .and_then(|v| u32::try_from(v).ok())
                 .map_or(EosIds::None, EosIds::One),
         };
-        cfg.validate()?;
+        cfg.validate("lfm2 GGUF header")?;
         Ok(cfg)
     }
 
-    fn validate(&self) -> Result<(), String> {
+    fn validate(&self, whose: &str) -> Result<(), String> {
+        if let Some(scaling) = &self.rope_scaling {
+            scaling.check(whose)?;
+        }
+        check_sliding_window(
+            self.sliding_window,
+            self.sliding_window.is_some(),
+            self.max_position_embeddings,
+            whose,
+        )?;
         if self.layer_types.len() != self.num_hidden_layers {
             return Err(format!(
                 "layer_types has {} entries but num_hidden_layers is {}",
@@ -568,6 +599,9 @@ mod tests {
             norm_eps: 1e-5,
             rope_theta: 1e4,
             rope_parameters: None,
+            rope_scaling: None,
+            max_position_embeddings: Some(512),
+            sliding_window: None,
             conv_l_cache: 3,
             block_ff_dim: 48,
             block_multiple_of: 8,
@@ -593,7 +627,7 @@ mod tests {
     fn config_rejects_layer_type_count_mismatch() {
         let mut cfg = toy_config();
         cfg.layer_types.pop();
-        assert!(cfg.validate().is_err());
+        assert!(cfg.validate("test").is_err());
     }
 
     /// Both `rope_theta` spellings parse; anything but plain rotary is loud.

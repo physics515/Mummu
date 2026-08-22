@@ -15,6 +15,7 @@ use burn::nn::{Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNor
 use burn::store::{ModuleAdapter, PyTorchToBurnAdapter, SafetensorsStore};
 use burn::tensor::{Device, Int, Tensor, TensorData};
 
+use crate::attn_config::{RopeScaling, check_sliding_window, sliding_window_from_gguf};
 use crate::gguf::{GgufFile, GgufMap, GgufTensorInfo, GgufValue};
 use crate::import::{
     CastFloatAdapter, DequantSink, ImportError, gguf_store, load_checked, required_file,
@@ -37,6 +38,26 @@ pub struct Qwen2Config {
     pub head_dim: usize,
     pub rms_norm_eps: f64,
     pub rope_theta: f32,
+    /// Frequency scaling (YaRN / linear / …). `null` on every Qwen2.5
+    /// checkpoint at its native context; a scaled one is refused at load
+    /// rather than answered wrong ([`crate::attn_config`]).
+    /// `rope_parameters` is the same object under the name newer transformers
+    /// writes; reading only `rope_scaling` would let a freshly-serialized
+    /// scaled checkpoint through as unscaled.
+    #[serde(default, alias = "rope_parameters")]
+    pub rope_scaling: Option<RopeScaling>,
+    /// The trained context length, used to tell an inert sliding window (one
+    /// that spans the whole context) from a clipping one.
+    #[serde(default)]
+    pub max_position_embeddings: Option<usize>,
+    /// Declared window span. Qwen2.5 ships `32768` on every tier — **inert**,
+    /// because `use_sliding_window` is `false`.
+    #[serde(default)]
+    pub sliding_window: Option<usize>,
+    /// Whether `sliding_window` is live. Qwen2's own gate; `false` everywhere
+    /// in the zoo, which is why the full causal mask is correct for it.
+    #[serde(default)]
+    pub use_sliding_window: bool,
     #[serde(default)]
     pub tie_word_embeddings: bool,
     /// EOS token id(s) — `<|im_end|>` first for the instruct checkpoints.
@@ -99,7 +120,7 @@ impl Qwen2Config {
         if cfg.head_dim == 0 {
             cfg.head_dim = cfg.hidden_size / cfg.num_attention_heads;
         }
-        cfg.validate()?;
+        cfg.validate("qwen2 config.json")?;
         Ok(cfg)
     }
 
@@ -151,15 +172,34 @@ impl Qwen2Config {
             head_dim,
             rms_norm_eps: f64::from(gguf_f32(f, "qwen2.attention.layer_norm_rms_epsilon")?),
             rope_theta: gguf_f32(f, "qwen2.rope.freq_base")?,
+            rope_scaling: RopeScaling::from_gguf(f, "qwen2"),
+            max_position_embeddings: f
+                .get("qwen2.context_length")
+                .and_then(GgufValue::as_u64)
+                .and_then(|v| usize::try_from(v).ok()),
+            sliding_window: sliding_window_from_gguf(f, "qwen2"),
+            // llama.cpp writes the key only for architectures that window, so
+            // its presence IS the enable — there is no `use_sliding_window`
+            // twin in a GGUF header the way `config.json` has one.
+            use_sliding_window: true,
             // No separate output.weight tensor means the lm-head is tied.
             tie_word_embeddings: f.tensor("output.weight").is_none(),
             eos_token_id,
         };
-        cfg.validate()?;
+        cfg.validate("qwen2 GGUF header")?;
         Ok(cfg)
     }
 
-    fn validate(&self) -> Result<(), String> {
+    fn validate(&self, whose: &str) -> Result<(), String> {
+        if let Some(scaling) = &self.rope_scaling {
+            scaling.check(whose)?;
+        }
+        check_sliding_window(
+            self.sliding_window,
+            self.use_sliding_window,
+            self.max_position_embeddings,
+            whose,
+        )?;
         if self.num_key_value_heads == 0
             || !self
                 .num_attention_heads
@@ -466,6 +506,10 @@ mod tests {
             head_dim: 4,
             rms_norm_eps: 1e-6,
             rope_theta: 1e4,
+            rope_scaling: None,
+            max_position_embeddings: Some(512),
+            sliding_window: None,
+            use_sliding_window: false,
             tie_word_embeddings: true,
             eos_token_id: EosIds::One(2),
         }
@@ -483,6 +527,57 @@ mod tests {
         assert_eq!(cfg.head_dim, 128); // derived 1536/12
         assert!(cfg.eos_token_id.contains(151_645));
         assert!(!cfg.eos_token_id.contains(151_644));
+    }
+
+    /// The real Qwen2.5 shape carries `sliding_window: 32768` alongside
+    /// `use_sliding_window: false`. That window is INERT, and refusing on the
+    /// field's presence would reject two checkpoints Mummu has parity-verified
+    /// — so this is the load that must keep working.
+    #[test]
+    fn the_inert_qwen25_sliding_window_still_loads() {
+        let json = br#"{
+            "vocab_size": 151936, "hidden_size": 1536, "intermediate_size": 8960,
+            "num_hidden_layers": 28, "num_attention_heads": 12, "num_key_value_heads": 2,
+            "rms_norm_eps": 1e-6, "rope_theta": 1000000.0, "tie_word_embeddings": true,
+            "max_position_embeddings": 32768, "sliding_window": 32768,
+            "use_sliding_window": false, "max_window_layers": 21, "rope_scaling": null
+        }"#;
+        let cfg = Qwen2Config::from_json_bytes(json).expect("the zoo's own shape must load");
+        assert_eq!(cfg.sliding_window, Some(32768));
+        assert!(!cfg.use_sliding_window);
+        assert!(cfg.rope_scaling.is_none());
+    }
+
+    /// Negative space for the same field: flip the gate and the load must fail
+    /// naming the span, because the full causal mask would silently let the
+    /// model attend past its trained window.
+    #[test]
+    fn an_enabled_sliding_window_is_refused_by_name() {
+        let json = br#"{
+            "vocab_size": 151936, "hidden_size": 1536, "intermediate_size": 8960,
+            "num_hidden_layers": 28, "num_attention_heads": 12, "num_key_value_heads": 2,
+            "rms_norm_eps": 1e-6, "rope_theta": 1000000.0,
+            "max_position_embeddings": 131072, "sliding_window": 4096,
+            "use_sliding_window": true
+        }"#;
+        let err = Qwen2Config::from_json_bytes(json).expect_err("an enabled window must refuse");
+        assert!(err.contains("4096"), "{err}");
+        assert!(err.contains("qwen2 config.json"), "{err}");
+    }
+
+    /// A YaRN-scaled checkpoint would load clean and degrade only far out in
+    /// the context — where no short-prompt gate looks. Refuse at load instead.
+    #[test]
+    fn a_yarn_scaled_checkpoint_is_refused_at_load() {
+        let json = br#"{
+            "vocab_size": 151936, "hidden_size": 1536, "intermediate_size": 8960,
+            "num_hidden_layers": 28, "num_attention_heads": 12, "num_key_value_heads": 2,
+            "rms_norm_eps": 1e-6, "rope_theta": 1000000.0,
+            "rope_scaling": {"rope_type": "yarn", "factor": 4.0,
+                             "original_max_position_embeddings": 32768}
+        }"#;
+        let err = Qwen2Config::from_json_bytes(json).expect_err("yarn must refuse");
+        assert!(err.contains("yarn"), "{err}");
     }
 
     #[test]
