@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/mummu", "crates/mummu-bench", "crates/mummu-serve"]
+members = [
+	"crates/mummu",
+	"crates/mummu-app",
+	"crates/mummu-bench",
+	"crates/mummu-serve",
+]
 
 [workspace.package]
 version = "0.1.0"

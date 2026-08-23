@@ -21,8 +21,12 @@
 //! - `POST /api/chat`    stream a chat completion (SSE deltas)
 //! - `POST /api/unload`  drop the resident model (frees VRAM/RAM)
 //!
-//! Configuration (env): `MUMMU_ADDR` (default `0.0.0.0:8095`),
-//! `MUMMU_MODELS_DIR` (default `./models`), `MUMMU_FORCE_CPU`.
+//! Configuration is the *caller's* job — addresses are arguments here, not
+//! environment reads, so the binary and the desktop shell can default
+//! differently (`0.0.0.0` in a container, loopback on a desktop) without one
+//! silently overriding the other. `MUMMU_MODELS_DIR` and the engine's own
+//! `MUMMU_BACKEND` / `MUMMU_FORCE_CPU` / fit-planner variables stay where
+//! they were, read at the point of use.
 
 mod engine;
 mod shim;
@@ -225,7 +229,6 @@ async fn triggered(mut rx: watch::Receiver<bool>, which: &'static str) {
 }
 
 /// The native API + UI router.
-#[must_use]
 pub fn router() -> Router {
     Router::new()
         .route("/", get(ui))
@@ -247,7 +250,6 @@ pub fn router() -> Router {
 
 /// The ollama-compatibility router, for a caller that wants to mount or
 /// serve that surface itself.
-#[must_use]
 pub fn ollama_router() -> Router {
     shim::router()
 }
