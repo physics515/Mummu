@@ -30,32 +30,12 @@ use tokio::sync::mpsc;
 
 use crate::{
     ChatMessage, DEFAULT_MAX_TOKENS, MAX_BODY_BYTES, MAX_MAX_TOKENS, blocking, engine,
-    json_response, models_root, parse_json, shutdown_signal, to_turns,
+    json_response, models_root, parse_json, to_turns,
 };
 
-/// Bind the shim's listener and serve it as a background task; returns
-/// quietly (with a log line) when the address can't be bound so the native
-/// API keeps serving.
-pub(crate) async fn spawn(addr: &str) {
-    let listener = match tokio::net::TcpListener::bind(addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("[mummu-serve] ollama shim: bind {addr} failed ({e}) — shim disabled");
-            return;
-        }
-    };
-    eprintln!("[mummu-serve] ollama-compatible shim listening on http://{addr}");
-    tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, router())
-            .with_graceful_shutdown(shutdown_signal("ollama shim"))
-            .await
-        {
-            eprintln!("[mummu-serve] ollama shim: serve failed: {e}");
-        }
-    });
-}
-
-fn router() -> Router {
+/// The shim's routes. Binding and serving them (and draining them on
+/// shutdown) belongs to `crate::serve_on`, which owns both listeners.
+pub(crate) fn router() -> Router {
     Router::new()
         // `get` also answers HEAD (axum strips the body), which is what the
         // sync shim spelled out as a separate `HEAD /` arm.

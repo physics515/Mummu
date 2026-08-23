@@ -441,6 +441,122 @@ fn compute_weight(w: &Param<Tensor<2>>) -> Tensor<2> {
     }
 }
 
+/// An expert whose weights live in **host RAM**, staged onto a device only
+/// while it computes (P9 stage 4 — see [`crate::workingset`]).
+///
+/// [`DeviceExpert`] pins its weights to one device for the process's life,
+/// which is what caps how much of a model can ever run on the fast one.
+/// This type inverts that: the host copy is authoritative, the device copy
+/// is a cache entry the scheduler creates and drops. That is what lets a
+/// model larger than VRAM still execute every layer on the GPU.
+///
+/// `resident` is the staged device copy. `None` means "not staged": `run`
+/// then computes on the host, which is the overflow path — never a stall,
+/// because the host already holds the bytes.
+pub struct StagedExpert {
+    /// The authoritative copy, always present, on the host device.
+    host: ExpertWeights,
+    /// The host device the weights live on (where overflow computes).
+    host_device: Device,
+    /// The staged device copy, when the scheduler has brought it in.
+    resident: std::sync::RwLock<Option<(Device, ExpertWeights)>>,
+    tier: crate::tier::Tier,
+    bytes: u64,
+}
+
+impl StagedExpert {
+    /// Hold `weights` in host RAM, unstaged.
+    #[must_use]
+    pub fn new(weights: ExpertWeights, host_device: Device, tier: crate::tier::Tier, bytes: u64) -> Self {
+        Self {
+            host: weights,
+            host_device,
+            resident: std::sync::RwLock::new(None),
+            tier,
+            bytes,
+        }
+    }
+
+    /// Is a device copy currently staged?
+    #[must_use]
+    pub fn is_staged(&self) -> bool {
+        self.resident
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
+    /// Stage onto `device` (the scheduler's prefetch). Idempotent: staging
+    /// onto the device it already sits on does nothing, so a redundant
+    /// prefetch costs a comparison rather than a transfer.
+    pub fn stage(&self, device: &Device) {
+        {
+            let held = self.resident.read().unwrap_or_else(|e| e.into_inner());
+            if held.as_ref().is_some_and(|(d, _)| d == device) {
+                return;
+            }
+        }
+        let staged = ExpertWeights {
+            gate: burn::module::Param::from_tensor(self.host.gate.val().to_device(device)),
+            up: burn::module::Param::from_tensor(self.host.up.val().to_device(device)),
+            down: burn::module::Param::from_tensor(self.host.down.val().to_device(device)),
+        };
+        *self.resident.write().unwrap_or_else(|e| e.into_inner()) = Some((device.clone(), staged));
+    }
+
+    /// Drop the device copy (the scheduler's eviction), freeing its memory.
+    /// The host copy is untouched, so the expert stays runnable.
+    pub fn evict(&self) {
+        *self.resident.write().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+impl ExpertExec for StagedExpert {
+    fn tier(&self) -> crate::tier::Tier {
+        self.tier
+    }
+
+    fn resident_bytes(&self) -> u64 {
+        // Device bytes only: the host copy is the backing store, not part of
+        // the working set the planner budgets.
+        if self.is_staged() { self.bytes } else { 0 }
+    }
+
+    fn run(&self, x: &[f32], rows: usize, hidden: usize) -> Vec<f32> {
+        let device = self
+            .resident
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map_or_else(|| self.host_device.clone(), |(d, _)| d.clone());
+        let xt = Tensor::<2>::from_data(
+            burn::tensor::TensorData::new(x.to_vec(), [rows, hidden]),
+            (&device, crate::backend::float_dtype()),
+        );
+        self.run_tensor(xt)
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .expect("expert output read back")
+    }
+
+    fn run_tensor(&self, x: Tensor<2>) -> Tensor<2> {
+        let caller = x.device();
+        let held = self.resident.read().unwrap_or_else(|e| e.into_inner());
+        let (device, w) = match held.as_ref() {
+            // Staged: compute on the device the scheduler put it on.
+            Some((d, w)) => (d.clone(), w),
+            // Not staged — the overflow path. Compute on the host rather
+            // than stall waiting for a transfer that was never issued.
+            None => (self.host_device.clone(), &self.host),
+        };
+        let xt = x.to_device(&device);
+        let acts = activation::silu(xt.clone().matmul(compute_weight(&w.gate)))
+            .mul(xt.matmul(compute_weight(&w.up)));
+        acts.matmul(compute_weight(&w.down)).to_device(&caller)
+    }
+}
+
 /// The tiered expert bank of one model: `[layer][expert]` executors,
 /// hot-swappable, with routing hit counters. Shared (`Arc`) between the
 /// model that runs it and the planner that re-tiers it.
@@ -836,6 +952,67 @@ mod tests {
                 assert!(
                     (da - db).abs() < 1e-5,
                     "t={t} norm={norm} elem {i}: dense {da} vs routed {db}"
+                );
+            }
+        }
+    }
+
+    /// P9 stage 4: staging must move WHERE an expert computes without
+    /// changing WHAT it computes. Same weights, same input, same answer —
+    /// staged, evicted, and re-staged.
+    #[test]
+    fn staging_and_eviction_never_change_the_result() {
+        use crate::tier::{Precision, Tier};
+        let device = crate::backend::cpu_device();
+        let dense = moe(&device);
+        let split = |e: usize| -> ExpertWeights {
+            let slice = |bank: &Param<Tensor<3>>| -> Tensor<2> {
+                let [_, out, inp] = bank.val().dims();
+                bank.val().narrow(0, e, 1).reshape([out, inp]).swap_dims(0, 1)
+            };
+            ExpertWeights {
+                gate: Param::from_tensor(slice(&dense.experts.gate)),
+                up: Param::from_tensor(slice(&dense.experts.up)),
+                down: Param::from_tensor(slice(&dense.experts.down)),
+            }
+        };
+        let tier = Tier { device: 0, precision: Precision::F32 };
+        let staged = StagedExpert::new(split(0), device.clone(), tier, 0);
+        // A pinned reference on the same device, for comparison.
+        let pinned = DeviceExpert { weights: split(0), device: device.clone(), tier, bytes: 0 };
+
+        let x = Tensor::<2>::from_data(
+            TensorData::new((0..HIDDEN).map(|i| (i as f32) * 0.25 - 0.5).collect::<Vec<f32>>(), [1, HIDDEN]),
+            (&device, crate::backend::float_dtype()),
+        );
+        let want = pinned.run_tensor(x.clone()).into_data().to_vec::<f32>().unwrap();
+
+        // Unstaged (the overflow path: computes on the host).
+        assert!(!staged.is_staged(), "a fresh StagedExpert holds no device copy");
+        assert_eq!(staged.resident_bytes(), 0, "unstaged costs no device memory");
+        let overflow = staged.run_tensor(x.clone()).into_data().to_vec::<f32>().unwrap();
+
+        // Staged, then evicted, then staged again.
+        staged.stage(&device);
+        assert!(staged.is_staged());
+        let hot = staged.run_tensor(x.clone()).into_data().to_vec::<f32>().unwrap();
+        staged.stage(&device); // idempotent: no second transfer, same answer
+        let again = staged.run_tensor(x.clone()).into_data().to_vec::<f32>().unwrap();
+        staged.evict();
+        assert!(!staged.is_staged(), "eviction drops the device copy");
+        let after_evict = staged.run_tensor(x).into_data().to_vec::<f32>().unwrap();
+
+        for (i, w) in want.iter().enumerate() {
+            for (label, got) in [
+                ("overflow", &overflow),
+                ("staged", &hot),
+                ("re-staged", &again),
+                ("after evict", &after_evict),
+            ] {
+                assert!(
+                    (w - got[i]).abs() < 1e-5,
+                    "{label} elem {i}: {} vs pinned {w}",
+                    got[i]
                 );
             }
         }
