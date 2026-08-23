@@ -331,6 +331,22 @@ pub trait ExpertExec: Send + Sync {
     /// data on-device when the caller is already on this expert's device.
     fn run(&self, x: &[f32], rows: usize, hidden: usize) -> Vec<f32>;
 
+    /// Bring this expert's weights onto `device` (the working set's
+    /// prefetch). Default: nothing — an executor pinned to one device is
+    /// already where it will run, so staging it is a no-op rather than an
+    /// error.
+    fn stage(&self, _device: &Device) {}
+
+    /// Release a staged device copy (the working set's eviction). Default:
+    /// nothing, for the same reason.
+    fn evict(&self) {}
+
+    /// Is a device copy currently held? Pinned executors answer `true` —
+    /// they are always "resident" on their own device.
+    fn is_staged(&self) -> bool {
+        true
+    }
+
     /// SwiGLU on `[rows, hidden]` **as a tensor**: burn 0.22 has one tensor
     /// type across devices, so this moves data only when the caller's device
     /// differs from the expert's — and not at all when they match, which is
@@ -477,19 +493,10 @@ impl StagedExpert {
         }
     }
 
-    /// Is a device copy currently staged?
-    #[must_use]
-    pub fn is_staged(&self) -> bool {
-        self.resident
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some()
-    }
-
     /// Stage onto `device` (the scheduler's prefetch). Idempotent: staging
     /// onto the device it already sits on does nothing, so a redundant
     /// prefetch costs a comparison rather than a transfer.
-    pub fn stage(&self, device: &Device) {
+    fn stage_on(&self, device: &Device) {
         {
             let held = self.resident.read().unwrap_or_else(|e| e.into_inner());
             if held.as_ref().is_some_and(|(d, _)| d == device) {
@@ -506,8 +513,15 @@ impl StagedExpert {
 
     /// Drop the device copy (the scheduler's eviction), freeing its memory.
     /// The host copy is untouched, so the expert stays runnable.
-    pub fn evict(&self) {
+    fn evict_copy(&self) {
         *self.resident.write().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    fn staged(&self) -> bool {
+        self.resident
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
     }
 }
 
@@ -519,7 +533,19 @@ impl ExpertExec for StagedExpert {
     fn resident_bytes(&self) -> u64 {
         // Device bytes only: the host copy is the backing store, not part of
         // the working set the planner budgets.
-        if self.is_staged() { self.bytes } else { 0 }
+        if self.staged() { self.bytes } else { 0 }
+    }
+
+    fn stage(&self, device: &Device) {
+        self.stage_on(device);
+    }
+
+    fn evict(&self) {
+        self.evict_copy();
+    }
+
+    fn is_staged(&self) -> bool {
+        self.staged()
     }
 
     fn run(&self, x: &[f32], rows: usize, hidden: usize) -> Vec<f32> {
@@ -635,6 +661,70 @@ impl ExpertPool {
 
     /// Replace one expert's executor (the hot-swap). The old one is
     /// returned so the caller controls when its device memory is freed.
+    /// Apply one layer's working-set decisions: evict what the schedule
+    /// gave up, stage what it prefetched. Both are cheap in-place calls on
+    /// the executors — no slot swap, because a [`StagedExpert`] owns its
+    /// host copy and its device copy at once.
+    ///
+    /// Called for layer `L` *while layer `L` computes*, so the transfers
+    /// overlap compute rather than sitting on the critical path. Nothing
+    /// here blocks: a stage that has not landed by the time its layer runs
+    /// simply computes on the host (see [`StagedExpert::run_tensor`]).
+    pub fn apply_schedule(
+        &self,
+        layer: usize,
+        sched: &crate::workingset::LayerSchedule,
+        device: &Device,
+    ) {
+        for &u in &sched.evict {
+            if let Some(e) = self.unit(layer, u) {
+                e.evict();
+            }
+        }
+        for &u in &sched.prefetch {
+            if let Some(e) = self.unit(layer, u) {
+                e.stage(device);
+            }
+        }
+    }
+
+    /// The executor for a flat unit id, if this pool holds it. Unit ids are
+    /// layer-major (`layer * experts_per_layer + index`), matching the
+    /// scheduler's numbering.
+    #[must_use]
+    pub fn unit(&self, layer: usize, unit: crate::workingset::UnitId) -> Option<std::sync::Arc<dyn ExpertExec>> {
+        let per = self.experts_per_layer();
+        let (l, i) = if per == 0 { (layer, unit) } else { (unit / per, unit % per) };
+        // A unit id addresses its own layer; fall back to the caller's layer
+        // for pools whose rows are ragged (dense FFN groups).
+        let (l, i) = if self.slots.get(l).is_some_and(|r| i < r.len()) {
+            (l, i)
+        } else if self.slots.get(layer).is_some_and(|r| unit < r.len()) {
+            (layer, unit)
+        } else {
+            return None;
+        };
+        Some(
+            self.slots[l][i]
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+        )
+    }
+
+    /// Device bytes the working set currently holds — what the scheduler
+    /// budgets against, counting only staged copies.
+    #[must_use]
+    pub fn staged_bytes(&self) -> u64 {
+        (0..self.num_layers())
+            .flat_map(|l| (0..self.row_len(l)).map(move |e| (l, e)))
+            .map(|(l, e)| {
+                let x = self.get(l, e);
+                if x.is_staged() { x.resident_bytes() } else { 0 }
+            })
+            .sum()
+    }
+
     pub fn swap(
         &self,
         layer: usize,
@@ -954,6 +1044,84 @@ mod tests {
                     "t={t} norm={norm} elem {i}: dense {da} vs routed {db}"
                 );
             }
+        }
+    }
+
+    /// The working set end to end: a scheduler plan drives real staging and
+    /// eviction in the pool, the device budget is respected, and the layer
+    /// still computes the right answer whether its experts were staged or
+    /// overflowed to the host.
+    #[test]
+    fn a_schedule_drives_staging_and_the_answer_is_unchanged() {
+        use crate::tier::{Precision, Tier};
+        use crate::workingset::{Budget, LayerDemand, schedule};
+        use std::sync::Arc;
+        let device = crate::backend::cpu_device();
+        let dense = moe(&device);
+        let split = |e: usize| -> ExpertWeights {
+            let slice = |bank: &Param<Tensor<3>>| -> Tensor<2> {
+                let [_, out, inp] = bank.val().dims();
+                bank.val().narrow(0, e, 1).reshape([out, inp]).swap_dims(0, 1)
+            };
+            ExpertWeights {
+                gate: Param::from_tensor(slice(&dense.experts.gate)),
+                up: Param::from_tensor(slice(&dense.experts.up)),
+                down: Param::from_tensor(slice(&dense.experts.down)),
+            }
+        };
+        let tier = Tier { device: 0, precision: Precision::F32 };
+        const UNIT_BYTES: u64 = 1_000;
+
+        // One layer holding every expert, each staged-capable.
+        let row: Vec<Arc<dyn ExpertExec>> = (0..EXPERTS)
+            .map(|e| {
+                Arc::new(StagedExpert::new(split(e), device.clone(), tier, UNIT_BYTES))
+                    as Arc<dyn ExpertExec>
+            })
+            .collect();
+        let pool = ExpertPool::new(vec![row]);
+
+        // Nothing staged yet: the working set costs no device memory.
+        assert_eq!(pool.staged_bytes(), 0, "an unstaged pool holds no device bytes");
+
+        // A schedule over two passes of this layer, with room for half the
+        // experts — so it must both stage and evict.
+        let demands: Vec<LayerDemand> = (0..2)
+            .map(|l| LayerDemand { layer: l, units: (0..EXPERTS).collect() })
+            .collect();
+        let budget = Budget {
+            device_bytes: UNIT_BYTES * (EXPERTS as u64 / 2),
+            unit_bytes: UNIT_BYTES,
+            stage_bytes_per_sec: (UNIT_BYTES as f64) * 2.0 / 0.010,
+            layer_compute_secs: 0.010,
+        };
+        let plan = schedule(&demands, &budget);
+
+        // Apply the first layer's decisions, as the runtime would.
+        pool.apply_schedule(0, &plan.layers[0], &device);
+        let staged = pool.staged_bytes();
+        assert!(
+            staged <= budget.device_bytes,
+            "the working set must respect the device budget: {staged} > {}",
+            budget.device_bytes
+        );
+        assert!(staged > 0, "a prefetching schedule must stage something");
+
+        // The layer's answer must match the unpooled reference regardless of
+        // which experts happened to be staged.
+        let local = SparseMoePerExpert {
+            gate: dense.gate.clone(),
+            experts: (0..EXPERTS).map(split).collect(),
+        };
+        let x = input(3, 5.0, &device);
+        let want = local.forward(x.clone(), TOP_K, true).into_data().to_vec::<f32>().unwrap();
+        let got = local
+            .forward_pooled(x, TOP_K, true, &pool, 0)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        for (i, (a, b)) in want.iter().zip(&got).enumerate() {
+            assert!((a - b).abs() < 1e-5, "elem {i}: {a} vs {b} (staging changed the answer)");
         }
     }
 
