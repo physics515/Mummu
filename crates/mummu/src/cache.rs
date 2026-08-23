@@ -1,15 +1,24 @@
 //! Process-lifetime model caching. Loading a checkpoint costs seconds and
 //! gigabytes, so consumers keep one [`ModelSlot`] static per (model, backend)
 //! and pay the load once. Burn's `Param` is not `Sync`, so the loaded value
-//! lives behind a `Mutex` and is only reachable inside [`ModelSlot::with`] —
-//! which also serializes inference, the right default for a single GPU.
+//! lives behind a `Mutex` and is only reachable inside [`ModelSlot::with`] /
+//! [`ModelSlot::with_async`] — which also serializes inference, the right
+//! default for a single GPU.
+//!
+//! The mutex is tokio's, because the async accessor holds its guard across
+//! an await (a `std` guard is not `Send`, so it would not survive one). The
+//! sync accessor takes the same lock with `blocking_lock`, which is exactly
+//! what it says: callers outside a runtime — tests, examples, the parity
+//! harness — block as they always did. One lock, not two: a second one would
+//! be a second slot, and the model would load twice.
 //!
 //! Switching to a different checkpoint dir through the same slot drops the
 //! old model (freeing its VRAM/RAM) and loads the new one — this is the
 //! active-model-switch primitive the P8 management API builds on.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+
+use tokio::sync::Mutex;
 
 struct Entry<T> {
     key: PathBuf,
@@ -31,7 +40,9 @@ impl<T> ModelSlot<T> {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            inner: Mutex::new(None),
+            // `const_new`, not `new`: the slot is used as a `static`, so its
+            // constructor must be const (tokio's plain `new` is not).
+            inner: Mutex::const_new(None),
         }
     }
 
@@ -45,7 +56,7 @@ impl<T> ModelSlot<T> {
         f: impl FnOnce(&T) -> R,
     ) -> Result<R, E> {
         assert!(!key.as_os_str().is_empty(), "model cache: empty key");
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.inner.blocking_lock();
         let hit = guard.as_ref().is_some_and(|e| e.key == key);
         if !hit {
             *guard = None; // free the old model before loading the new one
@@ -60,19 +71,69 @@ impl<T> ModelSlot<T> {
         Ok(f(&entry.value))
     }
 
+    /// Async access to the slot: loads if needed and returns a **guard**
+    /// holding the model, so the caller can `.await` across it.
+    ///
+    /// A closure-taking twin of [`Self::with`] cannot express this: the
+    /// future would borrow from the `&T` the closure receives, and
+    /// `FnOnce(&T) -> Fut` has no way to tie `Fut`'s lifetime to that
+    /// borrow. A guard says the same thing without the higher-ranked
+    /// gymnastics — hold it, await through it, drop it to release the slot
+    /// (which is what serializes generations and protects VRAM).
+    pub async fn acquire<E>(
+        &self,
+        key: &Path,
+        load: impl FnOnce(&Path) -> Result<T, E>,
+    ) -> Result<SlotGuard<'_, T>, E> {
+        assert!(!key.as_os_str().is_empty(), "model cache: empty key");
+        let mut guard = self.inner.lock().await;
+        let hit = guard.as_ref().is_some_and(|e| e.key == key);
+        if !hit {
+            *guard = None; // free the old model before loading the new one
+            let value = load(key)?;
+            *guard = Some(Entry {
+                key: key.to_path_buf(),
+                value,
+            });
+        }
+        debug_assert!(
+            guard.as_ref().is_some_and(|e| e.key == key),
+            "slot must hold the requested model"
+        );
+        Ok(SlotGuard { guard })
+    }
+
     /// Drop the cached model (freeing its VRAM/RAM). No-op when empty.
+    ///
+    /// Takes the lock blockingly: callable from sync context (shutdown paths,
+    /// tests). From inside a runtime, prefer doing this where a block is
+    /// acceptable — it waits for any in-flight generation to finish.
     pub fn clear(&self) {
-        *self.inner.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.inner.blocking_lock() = None;
     }
 
     /// The checkpoint dir currently loaded, if any — for settings UIs.
     #[must_use]
     pub fn loaded_key(&self) -> Option<PathBuf> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        self.inner.blocking_lock().as_ref().map(|e| e.key.clone())
+    }
+}
+
+/// A held model slot (see [`ModelSlot::acquire`]). Deref to the model;
+/// dropping it releases the slot for the next generation.
+pub struct SlotGuard<'a, T> {
+    guard: tokio::sync::MutexGuard<'a, Option<Entry<T>>>,
+}
+
+impl<T> std::ops::Deref for SlotGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self
+            .guard
             .as_ref()
-            .map(|e| e.key.clone())
+            .expect("a slot guard always holds a loaded model")
+            .value
     }
 }
 

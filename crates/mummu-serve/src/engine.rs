@@ -36,7 +36,7 @@ pub enum AnyLm {
 }
 
 impl AnyLm {
-    fn generate(
+    async fn generate(
         &self,
         prompt_ids: &[u32],
         max_tokens: usize,
@@ -45,12 +45,12 @@ impl AnyLm {
         on_token: impl FnMut(u32) -> ControlFlow<()>,
     ) -> Result<Vec<u32>, String> {
         match self {
-            Self::Qwen2(m) => m.generate(prompt_ids, max_tokens, opts, device, on_token),
-            Self::Qwen3(m) => m.generate(prompt_ids, max_tokens, opts, device, on_token),
-            Self::Lfm2(m) => m.generate(prompt_ids, max_tokens, opts, device, on_token),
-            Self::Olmoe(m) => m.generate(prompt_ids, max_tokens, opts, device, on_token),
-            Self::OlmoeQ(m) => m.generate(prompt_ids, max_tokens, opts, device, on_token),
-            Self::Qwen35(m) => m.generate(prompt_ids, max_tokens, opts, device, on_token),
+            Self::Qwen2(m) => m.generate(prompt_ids, max_tokens, opts, device, on_token).await,
+            Self::Qwen3(m) => m.generate(prompt_ids, max_tokens, opts, device, on_token).await,
+            Self::Lfm2(m) => m.generate(prompt_ids, max_tokens, opts, device, on_token).await,
+            Self::Olmoe(m) => m.generate(prompt_ids, max_tokens, opts, device, on_token).await,
+            Self::OlmoeQ(m) => m.generate(prompt_ids, max_tokens, opts, device, on_token).await,
+            Self::Qwen35(m) => m.generate(prompt_ids, max_tokens, opts, device, on_token).await,
         }
     }
 }
@@ -323,7 +323,7 @@ pub struct ChatResult {
 /// Run one chat completion, streaming decoded-text deltas through `on_delta`
 /// (return `Break` to cancel cooperatively). Loads the model into the
 /// backend's slot on first use; generations are serialized by the slot mutex.
-pub fn run_chat(
+pub async fn run_chat(
     spec: &ModelSpec,
     models_root: &Path,
     turns: &[Turn],
@@ -342,6 +342,7 @@ pub fn run_chat(
         &SLOT, spec, models_root, &prompt, opts, max_tokens, plan.policy,
         plan.backend, label_of(plan.backend), on_delta,
     )
+    .await
 }
 
 /// The device a backend choice denotes (burn 0.22 selects at runtime).
@@ -1238,7 +1239,7 @@ fn plan_fit(spec: &ModelSpec, models_root: &Path) -> Result<FitPlan, String> {
 }
 
 #[allow(clippy::too_many_arguments)] // one call site, mirrors the plan
-fn drive(
+async fn drive(
     slot: &ModelSlot<Loaded>,
     spec: &ModelSpec,
     models_root: &Path,
@@ -1260,10 +1261,15 @@ fn drive(
         // model, its experts on the *other* devices go with it.
         clear_tiers_if_slot(backend);
     }
-    slot.with(
-        &key,
-        |_| load_any(spec, models_root, &device, policy, backend),
-        |m| -> Result<ChatResult, String> {
+    // The load closure and the async body both want `device`; give the loader
+    // its own handle so the future can capture the original by reference.
+    let load_device = device.clone();
+    let m = slot
+        .acquire(&key, move |_| {
+            load_any(spec, models_root, &load_device, policy, backend)
+        })
+        .await?;
+    {
             // ChatML renderers leave specials to the tokenizer; the Tulu
             // render already embeds its own BOS (the real_olmoe.rs pattern).
             let add_special = spec.architecture != Architecture::Olmoe;
@@ -1295,7 +1301,8 @@ fn drive(
                 let delta = text[emitted.len()..].to_string();
                 emitted = text;
                 on_delta(&delta)
-            })?;
+            })
+            .await?;
 
             let text = m
                 .tokenizer
@@ -1304,14 +1311,13 @@ fn drive(
             if matches!(&m.lm, AnyLm::OlmoeQ(q) if q.pool.is_some()) {
                 rebalance_tiers();
             }
-            Ok(ChatResult {
-                text,
-                tokens: out.len(),
-                device: label,
-                elapsed_ms: start.elapsed().as_millis(),
-            })
-        },
-    )?
+        Ok(ChatResult {
+            text,
+            tokens: out.len(),
+            device: label,
+            elapsed_ms: start.elapsed().as_millis(),
+        })
+    }
 }
 
 /// Is every artifact of `spec` on disk? (`ModelManager::is_installed` only
