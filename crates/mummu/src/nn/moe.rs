@@ -326,7 +326,32 @@ pub trait ExpertExec: Send + Sync {
     /// Bytes it holds on its device.
     fn resident_bytes(&self) -> u64;
     /// SwiGLU on `rows × hidden` f32 (row-major) → `rows × hidden`.
+    ///
+    /// The host-buffer form. Prefer [`Self::run_tensor`], which keeps the
+    /// data on-device when the caller is already on this expert's device.
     fn run(&self, x: &[f32], rows: usize, hidden: usize) -> Vec<f32>;
+
+    /// SwiGLU on `[rows, hidden]` **as a tensor**: burn 0.22 has one tensor
+    /// type across devices, so this moves data only when the caller's device
+    /// differs from the expert's — and not at all when they match, which is
+    /// the difference between a per-layer host round trip and none.
+    ///
+    /// The default keeps the old behavior for executors that only implement
+    /// the host form.
+    fn run_tensor(&self, x: Tensor<2>) -> Tensor<2> {
+        let [rows, hidden] = x.dims();
+        let device = x.device();
+        let host = x
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .expect("expert input read back");
+        let out = self.run(&host, rows, hidden);
+        Tensor::<2>::from_data(
+            burn::tensor::TensorData::new(out, [rows, hidden]),
+            (&device, crate::backend::float_dtype()),
+        )
+    }
     /// Per-row energy of this expert's gate activations, `Σ silu(x·g)²` —
     /// the training-free router signal for skipping (P9 stage 3c). Costs
     /// the gate matmul only. The default never skips.
@@ -372,6 +397,17 @@ where
             .convert::<f32>()
             .to_vec::<f32>()
             .expect("expert output read back")
+    }
+
+    fn run_tensor(&self, x: Tensor<2>) -> Tensor<2> {
+        // `to_device` is a no-op when the tensor is already here, so a
+        // cluster group living on the caller's device costs zero transfers.
+        let caller = x.device();
+        let xt = x.to_device(&self.device);
+        let w = &self.weights;
+        let acts = activation::silu(xt.clone().matmul(compute_weight(&w.gate)))
+            .mul(xt.matmul(compute_weight(&w.up)));
+        acts.matmul(compute_weight(&w.down)).to_device(&caller)
     }
 
     fn gate_energy(&self, x: &[f32], rows: usize, hidden: usize) -> Vec<f32> {
@@ -546,12 +582,32 @@ impl ExpertPool {
         }
         let [bt, h] = xt.dims();
         let device = xt.device();
+        let execs: Vec<std::sync::Arc<dyn ExpertExec>> = (0..n).map(|e| self.get(layer, e)).collect();
+
+        // Exact mode (no skipping): every cluster runs on every row, so there
+        // is nothing to gather — sum the groups as tensors and never touch
+        // the host. This is the path a dense model takes, and it removes the
+        // per-layer round trip that dominated the 27B's decode.
+        if skip.is_none() {
+            let mut out: Option<Tensor<2>> = None;
+            for (e, exec) in execs.iter().enumerate() {
+                let y = exec.run_tensor(xt.clone());
+                out = Some(match out {
+                    Some(acc) => acc.add(y),
+                    None => y,
+                });
+                self.hits[layer][e].fetch_add(bt as u64, std::sync::atomic::Ordering::Relaxed);
+                self.dense_rows[0].fetch_add(bt as u64, std::sync::atomic::Ordering::Relaxed);
+                self.dense_rows[1].fetch_add(bt as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+            return out;
+        }
+
         let host: Vec<f32> = xt
             .into_data()
             .convert::<f32>()
             .to_vec::<f32>()
             .expect("FFN input read back");
-        let execs: Vec<std::sync::Arc<dyn ExpertExec>> = (0..n).map(|e| self.get(layer, e)).collect();
         // Which rows each executor runs: all, or the rows where it matters.
         let rows_per_exec: Vec<Vec<i32>> = match skip {
             None => vec![(0..bt as i32).collect(); n],

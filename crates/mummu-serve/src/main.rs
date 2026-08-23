@@ -1,7 +1,12 @@
 //! mummu-serve — a minimal HTTP server + single-page chat UI over mummu.
 //!
-//! Sync all the way down (tiny_http worker threads, no async runtime),
-//! matching the library it serves. Endpoints:
+//! axum on a multi-threaded tokio runtime. A request that starts long work
+//! answers immediately with a stream and lets the work run as its own task,
+//! feeding a `tokio::sync::mpsc` channel the response body drains: the async
+//! engine (`engine::run_chat`) as a spawned task, the still-synchronous
+//! blocking pieces — the hub downloader, the device probe, dropping a
+//! resident model — on `spawn_blocking`, so a runtime worker is never
+//! parked on minutes of CPU/GPU work. Endpoints:
 //!
 //! - `GET  /`            the embedded chat UI
 //! - `GET  /api/health`  device policy + adapter inventory
@@ -16,18 +21,23 @@
 mod engine;
 mod shim;
 
-use std::io::Read;
+use std::convert::Infallible;
 use std::ops::ControlFlow;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
+use axum::Router;
+use axum::body::Bytes;
+use axum::extract::DefaultBodyLimit;
+use axum::http::header;
+use axum::response::sse::Event;
+use axum::response::{IntoResponse, Response, Sse};
+use axum::routing::{get, post};
 use mummu::chat::{Role, Turn};
 use mummu::decode::SamplerOptions;
 use mummu::manage::ModelManager;
 use serde::Deserialize;
 use serde_json::json;
-use tiny_http::{Header, Method, Request, Response, Server};
+use tokio::sync::mpsc;
 
 /// Hard ceilings so one request can't wedge the process.
 pub(crate) const MAX_BODY_BYTES: usize = 4 << 20;
@@ -39,7 +49,8 @@ pub(crate) fn models_root() -> PathBuf {
     std::env::var_os("MUMMU_MODELS_DIR").map_or_else(|| PathBuf::from("models"), PathBuf::from)
 }
 
-fn main() {
+#[tokio::main(flavor = "multi_thread")]
+async fn main() {
     let addr = std::env::var("MUMMU_ADDR").unwrap_or_else(|_| "0.0.0.0:8095".into());
     let root = models_root();
     std::fs::create_dir_all(&root).expect("models dir must be creatable");
@@ -65,208 +76,189 @@ fn main() {
     let shim_addr =
         std::env::var("MUMMU_OLLAMA_ADDR").unwrap_or_else(|_| "0.0.0.0:11435".into());
     if !matches!(shim_addr.as_str(), "" | "off" | "disabled" | "0") {
-        shim::spawn(&shim_addr);
+        shim::spawn(&shim_addr).await;
     }
 
-    let server = Arc::new(Server::http(&addr).expect("bind"));
+    let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
     eprintln!("[mummu-serve] listening on http://{addr}");
 
-    // A small worker pool: generations serialize on the model-slot mutex
-    // anyway, but health/models/UI requests keep answering while one runs.
-    let workers: Vec<_> = (0..4)
-        .map(|_| {
-            let server = Arc::clone(&server);
-            std::thread::spawn(move || {
-                while let Ok(req) = server.recv() {
-                    handle(req);
-                }
-            })
-        })
-        .collect();
-    for w in workers {
-        let _ = w.join();
+    // One router, many concurrent requests: generations serialize on the
+    // model-slot mutex inside `spawn_blocking`, but health/models/UI
+    // requests keep answering on the async workers while one runs.
+    if let Err(e) = axum::serve(listener, router())
+        .with_graceful_shutdown(shutdown_signal("api"))
+        .await
+    {
+        eprintln!("[mummu-serve] serve failed: {e}");
     }
 }
 
-fn handle(req: Request) {
-    let method = req.method().clone();
-    let url = req.url().to_string();
-    let path = url.split('?').next().unwrap_or("").to_string();
-    let result = match (&method, path.as_str()) {
-        (Method::Get, "/") | (Method::Get, "/index.html") => ui(req),
-        (Method::Get, "/api/health") => health(req),
-        (Method::Get, "/api/models") => models(req),
-        (Method::Post, "/api/pull") => pull(req),
-        (Method::Post, "/api/chat") => chat(req),
-        (Method::Post, "/api/unload") => unload(req),
-        _ => respond_json(req, 404, json!({"error": "not found"})),
+fn router() -> Router {
+    Router::new()
+        .route("/", get(ui))
+        .route("/index.html", get(ui))
+        .route("/api/health", get(health))
+        .route("/api/models", get(models))
+        .route("/api/pull", post(pull))
+        .route("/api/chat", post(chat))
+        .route("/api/unload", post(unload))
+        // The sync server matched on (method, path) and answered anything
+        // else with the same 404 JSON — keep that, rather than axum's bare
+        // 405, so a client sees one error shape.
+        .fallback(not_found)
+        .method_not_allowed_fallback(not_found)
+        // `+ 1` so a body just over the ceiling still reaches the handler
+        // and gets the JSON "body too large" the sync reader produced.
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES + 1))
+}
+
+/// Resolve when the process is asked to stop. Both listeners await this;
+/// tokio's ctrl-c stream fans out to every waiter.
+pub(crate) async fn shutdown_signal(which: &'static str) {
+    match tokio::signal::ctrl_c().await {
+        Ok(()) => eprintln!("[mummu-serve] ctrl-c — draining the {which} listener"),
+        Err(e) => eprintln!("[mummu-serve] {which}: ctrl-c handler unavailable: {e}"),
+    }
+}
+
+/// Run blocking work (device probes, disk scans, the engine) on a blocking
+/// pool thread. A panic inside is re-raised here, exactly as it would have
+/// surfaced on the sync server's worker thread.
+pub(crate) async fn blocking<T, F>(f: F) -> T
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(value) => value,
+        Err(e) => std::panic::resume_unwind(e.into_panic()),
+    }
+}
+
+pub(crate) fn json_response(status: u16, body: serde_json::Value) -> Response {
+    let status = axum::http::StatusCode::from_u16(status)
+        .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    (
+        status,
+        [(header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+/// Parse a JSON body, or hand back the 400 response to return as-is. Keeps
+/// the sync server's error wire format (`{"error": "bad json: …"}`).
+pub(crate) fn parse_json<T: serde::de::DeserializeOwned>(
+    body: &Bytes,
+) -> Result<T, Box<Response>> {
+    let text = match std::str::from_utf8(body) {
+        Ok(t) => t,
+        Err(e) => return Err(Box::new(json_response(400, json!({"error": format!("body read: {e}")})))),
     };
-    if let Err(e) = result {
-        eprintln!("[mummu-serve] {method} {path}: respond failed: {e}");
+    if text.len() > MAX_BODY_BYTES {
+        return Err(Box::new(json_response(400, json!({"error": "body too large"}))));
     }
+    serde_json::from_str::<T>(text)
+        .map_err(|e| Box::new(json_response(400, json!({"error": format!("bad json: {e}")}))))
 }
 
-pub(crate) fn json_header() -> Header {
-    Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).expect("static header")
+async fn not_found() -> Response {
+    json_response(404, json!({"error": "not found"}))
 }
 
-pub(crate) fn respond_json(req: Request, status: u16, body: serde_json::Value) -> std::io::Result<()> {
-    req.respond(
-        Response::from_string(body.to_string())
-            .with_status_code(status)
-            .with_header(json_header()),
+async fn ui() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        include_str!("ui.html"),
     )
+        .into_response()
 }
 
-/// Read + parse a JSON body, or answer the 400 and return `None`.
-pub(crate) fn read_json<T: serde::de::DeserializeOwned>(mut req: Request) -> std::io::Result<Option<(Request, T)>> {
-    let mut body = String::new();
-    let read = req
-        .as_reader()
-        .take(MAX_BODY_BYTES as u64 + 1)
-        .read_to_string(&mut body);
-    if let Err(e) = read {
-        respond_json(req, 400, json!({"error": format!("body read: {e}")}))?;
-        return Ok(None);
-    }
-    if body.len() > MAX_BODY_BYTES {
-        respond_json(req, 400, json!({"error": "body too large"}))?;
-        return Ok(None);
-    }
-    match serde_json::from_str::<T>(&body) {
-        Ok(parsed) => Ok(Some((req, parsed))),
-        Err(e) => {
-            respond_json(req, 400, json!({"error": format!("bad json: {e}")}))?;
-            Ok(None)
-        }
-    }
-}
-
-fn ui(req: Request) -> std::io::Result<()> {
-    req.respond(
-        Response::from_string(include_str!("ui.html")).with_header(
-            Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..])
-                .expect("static header"),
-        ),
-    )
-}
-
-fn health(req: Request) -> std::io::Result<()> {
-    let inv = mummu::backend::inventory();
-    let gpus: Vec<_> = inv
-        .gpus
-        .iter()
-        .map(|g| {
-            json!({
-                "name": g.name,
-                "api": format!("{:?}", g.backend),
-                "kind": format!("{:?}", g.device_type),
-                "shader_f16": g.shader_f16,
+async fn health() -> Response {
+    blocking(|| {
+        let inv = mummu::backend::inventory();
+        let gpus: Vec<_> = inv
+            .gpus
+            .iter()
+            .map(|g| {
+                json!({
+                    "name": g.name,
+                    "api": format!("{:?}", g.backend),
+                    "kind": format!("{:?}", g.device_type),
+                    "shader_f16": g.shader_f16,
+                })
             })
-        })
-        .collect();
-    respond_json(
-        req,
-        200,
-        json!({
-            "status": "ok",
-            "device": engine::device_label(),
-            "gpus": gpus,
-            "cpu_cores": inv.cpu.logical_cores,
-        }),
-    )
-}
-
-fn models(req: Request) -> std::io::Result<()> {
-    let root = models_root();
-    let manager = ModelManager::new(root.clone());
-    let list: Vec<_> = manager
-        .catalog()
-        .iter()
-        .filter(|s| !matches!(s.architecture, mummu::registry::Architecture::MiniLm))
-        .map(|s| {
+            .collect();
+        json_response(
+            200,
             json!({
-                "name": s.name,
-                "repo": s.repo,
-                "architecture": format!("{:?}", s.architecture),
-                "format": match &s.format {
-                    mummu::registry::WeightFormat::Safetensors => "safetensors",
-                    mummu::registry::WeightFormat::Gguf { .. } => "gguf",
-                },
-                "disk_bytes_estimate": s.disk_bytes_estimate,
-                "installed": engine::is_installed(s, &root),
-            })
-        })
-        .collect();
-    respond_json(
-        req,
-        200,
-        json!({"models": list, "device": engine::device_label()}),
-    )
+                "status": "ok",
+                "device": engine::device_label(),
+                "gpus": gpus,
+                "cpu_cores": inv.cpu.logical_cores,
+            }),
+        )
+    })
+    .await
 }
 
-fn unload(req: Request) -> std::io::Result<()> {
-    engine::unload_all();
-    respond_json(req, 200, json!({"status": "unloaded"}))
+async fn models() -> Response {
+    blocking(|| {
+        let root = models_root();
+        let manager = ModelManager::new(root.clone());
+        let list: Vec<_> = manager
+            .catalog()
+            .iter()
+            .filter(|s| !matches!(s.architecture, mummu::registry::Architecture::MiniLm))
+            .map(|s| {
+                json!({
+                    "name": s.name,
+                    "repo": s.repo,
+                    "architecture": format!("{:?}", s.architecture),
+                    "format": match &s.format {
+                        mummu::registry::WeightFormat::Safetensors => "safetensors",
+                        mummu::registry::WeightFormat::Gguf { .. } => "gguf",
+                    },
+                    "disk_bytes_estimate": s.disk_bytes_estimate,
+                    "installed": engine::is_installed(s, &root),
+                })
+            })
+            .collect();
+        json_response(
+            200,
+            json!({"models": list, "device": engine::device_label()}),
+        )
+    })
+    .await
+}
+
+async fn unload() -> Response {
+    // Dropping a resident model frees VRAM/RAM — device work, not async work.
+    blocking(engine::unload_all).await;
+    json_response(200, json!({"status": "unloaded"}))
 }
 
 // ---------------------------------------------------------------------------
-// SSE plumbing: the handler spawns the work on its own thread, which feeds
-// `data: {json}` frames through a bounded channel; the request thread pumps
-// the channel out as a chunked response. A dropped client closes the pump,
-// the next send fails, and the worker breaks off cooperatively.
+// SSE plumbing: the handler hands the worker an mpsc sender and streams what
+// comes back as `data: {json}\n\n` frames. When the client goes away axum
+// drops the stream, dropping the receiver; the worker's next send fails and
+// it breaks off cooperatively — which is what stops a 27B generation from
+// holding the model slot for minutes after the browser tab that asked for it
+// is gone. The channel is unbounded because the producers are *synchronous*
+// callbacks (the engine's delta hook, the downloader's progress hook) that
+// must never park the thread they run on; the backlog is bounded in practice
+// by `MAX_MAX_TOKENS` short strings.
 // ---------------------------------------------------------------------------
 
-pub(crate) struct ChannelReader {
-    pub(crate) rx: Receiver<Vec<u8>>,
-    pub(crate) buf: Vec<u8>,
-    pub(crate) pos: usize,
-}
-
-impl Read for ChannelReader {
-    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-        if self.pos >= self.buf.len() {
-            match self.rx.recv() {
-                Ok(chunk) => {
-                    self.buf = chunk;
-                    self.pos = 0;
-                }
-                Err(_) => return Ok(0), // sender done -> EOF
-            }
+fn sse_response(mut rx: mpsc::UnboundedReceiver<serde_json::Value>) -> Response {
+    let stream = async_stream::stream! {
+        while let Some(frame) = rx.recv().await {
+            yield Ok::<Event, Infallible>(Event::default().data(frame.to_string()));
         }
-        let n = (self.buf.len() - self.pos).min(out.len());
-        out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
-        self.pos += n;
-        Ok(n)
-    }
-}
-
-fn sse_frame(value: &serde_json::Value) -> Vec<u8> {
-    format!("data: {value}\n\n").into_bytes()
-}
-
-fn respond_sse(
-    req: Request,
-    work: impl FnOnce(&SyncSender<Vec<u8>>) + Send + 'static,
-) -> std::io::Result<()> {
-    let (tx, rx) = sync_channel::<Vec<u8>>(64);
-    std::thread::spawn(move || work(&tx));
-    let headers = vec![
-        Header::from_bytes(&b"Content-Type"[..], &b"text/event-stream"[..]).expect("static"),
-        Header::from_bytes(&b"Cache-Control"[..], &b"no-cache"[..]).expect("static"),
-        Header::from_bytes(&b"X-Accel-Buffering"[..], &b"no"[..]).expect("static"),
-    ];
-    req.respond(Response::new(
-        200.into(),
-        headers,
-        ChannelReader {
-            rx,
-            buf: Vec::new(),
-            pos: 0,
-        },
-        None,
-        None,
-    ))
+    };
+    // axum's `Sse` sets `text/event-stream` + `no-cache`; the third header
+    // is the one that keeps nginx from buffering the stream into silence.
+    ([("x-accel-buffering", "no")], Sse::new(stream)).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -278,12 +270,15 @@ struct PullRequest {
     model: String,
 }
 
-fn pull(req: Request) -> std::io::Result<()> {
-    let Some((req, parsed)) = read_json::<PullRequest>(req)? else {
-        return Ok(());
+async fn pull(body: Bytes) -> Response {
+    let parsed: PullRequest = match parse_json(&body) {
+        Ok(p) => p,
+        Err(response) => return *response,
     };
     let root = models_root();
-    respond_sse(req, move |tx| {
+    let (tx, rx) = mpsc::unbounded_channel::<serde_json::Value>();
+    // The hub downloader is still synchronous, so it gets a blocking thread.
+    tokio::task::spawn_blocking(move || {
         let manager = ModelManager::new(root);
         let mut last_pct: i64 = -1;
         let mut cancelled = false;
@@ -301,13 +296,13 @@ fn pull(req: Request) -> std::io::Result<()> {
                 return;
             }
             last_pct = tick;
-            let frame = sse_frame(&json!({
+            let frame = json!({
                 "type": "progress",
                 "file": p.file,
                 "received_bytes": p.received_bytes,
                 "total_bytes": p.total_bytes,
                 "percent": pct,
-            }));
+            });
             if tx.send(frame).is_err() {
                 // The hub downloader has no cancel hook; remember the drop so
                 // we at least stop building frames. The download itself runs
@@ -319,8 +314,9 @@ fn pull(req: Request) -> std::io::Result<()> {
             Ok(dir) => json!({"type": "done", "dir": dir.display().to_string()}),
             Err(e) => json!({"type": "error", "error": e}),
         };
-        let _ = tx.send(sse_frame(&done));
-    })
+        let _ = tx.send(done);
+    });
+    sse_response(rx)
 }
 
 // ---------------------------------------------------------------------------
@@ -400,17 +396,18 @@ fn sampler_options(o: &ChatOptions) -> Result<SamplerOptions, String> {
     })
 }
 
-fn chat(req: Request) -> std::io::Result<()> {
-    let Some((req, parsed)) = read_json::<ChatRequest>(req)? else {
-        return Ok(());
+async fn chat(body: Bytes) -> Response {
+    let parsed: ChatRequest = match parse_json(&body) {
+        Ok(p) => p,
+        Err(response) => return *response,
     };
     let turns = match to_turns(&parsed.messages) {
         Ok(t) => t,
-        Err(e) => return respond_json(req, 400, json!({"error": e})),
+        Err(e) => return json_response(400, json!({"error": e})),
     };
     let opts = match sampler_options(&parsed.options) {
         Ok(o) => o,
-        Err(e) => return respond_json(req, 400, json!({"error": e})),
+        Err(e) => return json_response(400, json!({"error": e})),
     };
     let max_tokens = parsed
         .options
@@ -426,25 +423,27 @@ fn chat(req: Request) -> std::io::Result<()> {
         .find(|s| s.name == parsed.model)
         .cloned()
     else {
-        return respond_json(req, 404, json!({"error": format!("unknown model {:?}", parsed.model)}));
+        return json_response(404, json!({"error": format!("unknown model {:?}", parsed.model)}));
     };
     if !engine::is_installed(&spec, &root) {
-        return respond_json(
-            req,
+        return json_response(
             409,
             json!({"error": format!("{} is not installed — pull it first", spec.name)}),
         );
     }
 
-    respond_sse(req, move |tx| {
+    let (tx, rx) = mpsc::unbounded_channel::<serde_json::Value>();
+    // The generation outlives this handler: it runs as its own task and the
+    // response body below drains what it sends.
+    tokio::spawn(async move {
         let started = std::time::Instant::now();
         let result = engine::run_chat(&spec, &root, &turns, &opts, max_tokens, |delta| {
-            let frame = sse_frame(&json!({"type": "delta", "text": delta}));
-            if tx.send(frame).is_err() {
+            if tx.send(json!({"type": "delta", "text": delta})).is_err() {
                 return ControlFlow::Break(()); // client gone: stop decoding
             }
             ControlFlow::Continue(())
-        });
+        })
+        .await;
         let done = match result {
             Ok(r) => {
                 let secs = (r.elapsed_ms as f64 / 1000.0).max(1e-3);
@@ -466,6 +465,7 @@ fn chat(req: Request) -> std::io::Result<()> {
                 json!({"type": "error", "error": e})
             }
         };
-        let _ = tx.send(sse_frame(&done));
-    })
+        let _ = tx.send(done);
+    });
+    sse_response(rx)
 }
