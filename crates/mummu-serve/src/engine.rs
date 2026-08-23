@@ -565,12 +565,44 @@ fn load_ffn_group_on(
     // burn 0.22: one call against the device this tier names (the 0.21
     // per-backend dispatch collapsed with the backend type parameter).
     let device = device_of(backend);
+    let weights = qwen35::load_ffn_clusters(pack, layer, clusters, tier.precision, &device)?;
+    // P9 stage 4: under `MUMMU_WORKING_SET`, clusters are loaded into HOST
+    // RAM and staged onto the device by the schedule, so the device holds
+    // only the working set rather than a permanent assignment. Off by
+    // default — the tier design stays the tested path until the working set
+    // is measured on this hardware.
+    if working_set_enabled() && backend != BackendChoice::Cpu {
+        let host = mummu::backend::cpu_device();
+        let host_weights = qwen35::load_ffn_clusters(pack, layer, clusters, tier.precision, &host)?;
+        return Ok(std::sync::Arc::new(mummu::nn::StagedExpert::new(
+            host_weights,
+            host,
+            tier,
+            bytes,
+        )));
+    }
     Ok(std::sync::Arc::new(mummu::nn::DeviceExpert {
-        weights: qwen35::load_ffn_clusters(pack, layer, clusters, tier.precision, &device)?,
+        weights,
         device,
         tier,
         bytes,
     }))
+}
+
+/// P9 stage 4: is the working set on? `MUMMU_WORKING_SET=on` loads FFN
+/// clusters into host RAM and lets the schedule stage them onto the device,
+/// instead of assigning each one a permanent home.
+///
+/// Off by default, and deliberately so: for a DENSE model every cluster is
+/// needed every layer, so streaming them all costs the whole model across
+/// the bus per token — which the module header of `mummu::workingset`
+/// shows cannot beat the CPU reading the same bytes from DDR. It earns its
+/// keep on selective (routed MoE) workloads and where staging overlaps
+/// compute. Until that is measured on a given host, the tier design stays
+/// the default.
+fn working_set_enabled() -> bool {
+    std::env::var("MUMMU_WORKING_SET")
+        .is_ok_and(|v| v.eq_ignore_ascii_case("on") || v == "1")
 }
 
 /// The skip threshold for a partitioned dense model: `MUMMU_FFN_SKIP_TAU`

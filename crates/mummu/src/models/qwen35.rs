@@ -504,6 +504,10 @@ pub struct LoadedQwen35 {
     /// row's total energy are not computed (lossy — only from a measured
     /// skip table). `0.0` = exact.
     pub ffn_skip_tau: f32,
+    /// P9 stage 4: the working-set schedule this model runs under, one entry
+    /// per trunk layer. `None` = every cluster is permanently resident (the
+    /// tier design), so there is nothing to stage.
+    pub ffn_plan: Option<std::sync::Arc<crate::workingset::Plan>>,
 }
 
 fn build(cfg: &Qwen35Config, device: &Device, untied_head: bool) -> Qwen35 {
@@ -718,6 +722,7 @@ pub fn load_from_gguf_quantized(
         tokenizer_config: None,
         ffn_pool: None,
         ffn_skip_tau: 0.0,
+        ffn_plan: None,
     })
 }
 
@@ -1093,6 +1098,16 @@ impl LoadedQwen35 {
         self.ffn_skip_tau = tau.max(0.0);
         self
     }
+
+    /// Run the FFN clusters as a **working set** under `plan`: each layer
+    /// stages what the next needs while it computes, and evicts behind
+    /// itself (P9 stage 4). Without a plan every cluster stays permanently
+    /// resident, which is the tier design.
+    #[must_use]
+    pub fn with_ffn_plan(mut self, plan: std::sync::Arc<crate::workingset::Plan>) -> Self {
+        self.ffn_plan = Some(plan);
+        self
+    }
 }
 
 fn load_from_pack_inner(
@@ -1198,6 +1213,7 @@ fn load_from_pack_inner(
         tokenizer_config: None,
         ffn_pool: None,
         ffn_skip_tau: 0.0,
+        ffn_plan: None,
     })
 }
 
@@ -1268,6 +1284,16 @@ impl CausalLm for LoadedQwen35 {
             let up = qlinear(&layer.mlp.up_proj, h2.clone());
             let mut ffn = qlinear(&layer.mlp.down_proj, gate.clone().mul(up));
             if let Some(pool) = &self.ffn_pool {
+                // Working set: issue THIS layer's staging decisions before
+                // its FFN runs, so the transfers for the next layer overlap
+                // this layer's compute instead of stalling in front of it.
+                // Nothing here blocks — a cluster that has not landed by the
+                // time its layer runs simply computes on the host.
+                if let Some(plan) = &self.ffn_plan
+                    && let Some(sched) = plan.layers.get(li)
+                {
+                    pool.apply_schedule(li, sched, device);
+                }
                 // Remote clusters of a partitioned FFN (exact sum; skip only
                 // when a measured tau was chosen).
                 let [b, tt, hd] = ffn.dims();
@@ -1341,6 +1367,7 @@ mod tests {
             tokenizer_config: None,
             ffn_pool: None,
             ffn_skip_tau: 0.0,
+            ffn_plan: None,
         }
     }
 

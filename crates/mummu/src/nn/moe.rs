@@ -694,7 +694,9 @@ impl ExpertPool {
     #[must_use]
     pub fn unit(&self, layer: usize, unit: crate::workingset::UnitId) -> Option<std::sync::Arc<dyn ExpertExec>> {
         let per = self.experts_per_layer();
-        let (l, i) = if per == 0 { (layer, unit) } else { (unit / per, unit % per) };
+        let (l, i) = unit
+            .checked_div(per)
+            .map_or((layer, unit), |l| (l, unit % per));
         // A unit id addresses its own layer; fall back to the caller's layer
         // for pools whose rows are ragged (dense FFN groups).
         let (l, i) = if self.slots.get(l).is_some_and(|r| i < r.len()) {
