@@ -7,8 +7,7 @@ use std::ops::ControlFlow;
 use std::path::Path;
 use std::time::Instant;
 
-use burn::tensor::backend::Backend;
-use mummu::backend::{Cpu, Gpu};
+use burn::tensor::Device;
 use mummu::cache::ModelSlot;
 use mummu::chat::{ChatMl, Role, Turn};
 use mummu::decode::SamplerOptions;
@@ -19,30 +18,30 @@ use mummu::registry::{Architecture, ModelSpec, WeightFormat};
 use tokenizers::Tokenizer;
 
 /// One chat-servable model: the architecture-erased LM plus its tokenizer.
-pub struct Loaded<B: Backend> {
-    pub lm: AnyLm<B>,
+pub struct Loaded {
+    pub lm: AnyLm,
     pub tokenizer: Tokenizer,
 }
 
 /// Architecture-erased causal LM. `CausalLm` itself can't be a trait object
 /// (associated `Cache` type, generic `on_token`), so erase by enum instead —
 /// the zoo is closed and small.
-pub enum AnyLm<B: Backend> {
-    Qwen2(qwen2::LoadedQwen2<B>),
-    Qwen3(qwen3::LoadedQwen3<B>),
-    Lfm2(lfm2::LoadedLfm2<B>),
-    Olmoe(olmoe::LoadedOlmoe<B>),
-    OlmoeQ(olmoe::LoadedOlmoeQ<B>),
-    Qwen35(qwen35::LoadedQwen35<B>),
+pub enum AnyLm {
+    Qwen2(qwen2::LoadedQwen2),
+    Qwen3(qwen3::LoadedQwen3),
+    Lfm2(lfm2::LoadedLfm2),
+    Olmoe(olmoe::LoadedOlmoe),
+    OlmoeQ(olmoe::LoadedOlmoeQ),
+    Qwen35(qwen35::LoadedQwen35),
 }
 
-impl<B: Backend> AnyLm<B> {
+impl AnyLm {
     fn generate(
         &self,
         prompt_ids: &[u32],
         max_tokens: usize,
         opts: &SamplerOptions,
-        device: &B::Device,
+        device: &Device,
         on_token: impl FnMut(u32) -> ControlFlow<()>,
     ) -> Result<Vec<u32>, String> {
         match self {
@@ -115,12 +114,11 @@ pub fn device_label() -> &'static str {
     }
 }
 
-/// One process-wide slot per backend: at most one model resident per backend,
-/// and the slot's mutex serializes generations (protects VRAM).
-static GPU_SLOT: ModelSlot<Loaded<Gpu>> = ModelSlot::new();
-static CPU_SLOT: ModelSlot<Loaded<Cpu>> = ModelSlot::new();
-#[cfg(feature = "cuda")]
-static CUDA_SLOT: ModelSlot<Loaded<mummu::backend::Cuda>> = ModelSlot::new();
+/// One process-wide model slot. Under burn 0.22 every backend is the same
+/// Rust type (the device is a runtime value), so the per-backend slots of
+/// the 0.21 design collapse into this one; its mutex still serializes
+/// generations, which is what protects VRAM.
+static SLOT: ModelSlot<Loaded> = ModelSlot::new();
 
 /// What each backend slot currently holds, as the planner sees it: the
 /// model dir and the resident bytes its plan estimated. Lets `plan_fit`
@@ -146,10 +144,7 @@ fn resident_in(backend: BackendChoice) -> Option<(std::path::PathBuf, u64)> {
 /// Drop any resident model (frees VRAM/RAM).
 pub fn unload_all() {
     clear_tiers();
-    GPU_SLOT.clear();
-    CPU_SLOT.clear();
-    #[cfg(feature = "cuda")]
-    CUDA_SLOT.clear();
+    SLOT.clear();
     RESIDENT
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -159,21 +154,16 @@ pub fn unload_all() {
 /// The model dirs currently resident in any backend slot (the ollama shim's
 /// `/api/ps` answer). At most one per backend.
 pub fn resident_dirs() -> Vec<std::path::PathBuf> {
-    let mut dirs = Vec::new();
-    dirs.extend(GPU_SLOT.loaded_key());
-    dirs.extend(CPU_SLOT.loaded_key());
-    #[cfg(feature = "cuda")]
-    dirs.extend(CUDA_SLOT.loaded_key());
-    dirs
+    SLOT.loaded_key().into_iter().collect()
 }
 
-fn load_any<B: Backend>(
+fn load_any(
     spec: &ModelSpec,
     models_root: &Path,
-    device: &B::Device,
+    device: &Device,
     policy: mummu::quant::QuantPolicy,
     backend: BackendChoice,
-) -> Result<Loaded<B>, String> {
+) -> Result<Loaded, String> {
     let dir = spec.dir(models_root);
     match &spec.format {
         WeightFormat::Safetensors => {
@@ -181,16 +171,16 @@ fn load_any<B: Backend>(
                 .map_err(|e| format!("tokenizer.json: {e}"))?;
             let lm = match spec.architecture {
                 Architecture::Qwen2 => AnyLm::Qwen2(
-                    qwen2::load_from_dir::<B>(&dir, device).map_err(|e| e.to_string())?,
+                    qwen2::load_from_dir(&dir, device).map_err(|e| e.to_string())?,
                 ),
                 Architecture::Qwen3 => AnyLm::Qwen3(
-                    qwen3::load_from_dir::<B>(&dir, device).map_err(|e| e.to_string())?,
+                    qwen3::load_from_dir(&dir, device).map_err(|e| e.to_string())?,
                 ),
                 Architecture::Lfm2 => AnyLm::Lfm2(
-                    lfm2::load_from_dir::<B>(&dir, device).map_err(|e| e.to_string())?,
+                    lfm2::load_from_dir(&dir, device).map_err(|e| e.to_string())?,
                 ),
                 Architecture::Olmoe => AnyLm::Olmoe(
-                    olmoe::load_from_dir::<B>(&dir, device).map_err(|e| e.to_string())?,
+                    olmoe::load_from_dir(&dir, device).map_err(|e| e.to_string())?,
                 ),
                 Architecture::MiniLm => {
                     return Err("all-MiniLM is an embedding model — not chat-servable".into());
@@ -210,13 +200,13 @@ fn load_any<B: Backend>(
             drop(f);
             let lm = match spec.architecture {
                 Architecture::Qwen2 => AnyLm::Qwen2(
-                    qwen2::load_from_gguf::<B>(&path, device).map_err(|e| e.to_string())?,
+                    qwen2::load_from_gguf(&path, device).map_err(|e| e.to_string())?,
                 ),
                 Architecture::Qwen3 => AnyLm::Qwen3(
-                    qwen3::load_from_gguf::<B>(&path, device).map_err(|e| e.to_string())?,
+                    qwen3::load_from_gguf(&path, device).map_err(|e| e.to_string())?,
                 ),
                 Architecture::Lfm2 => AnyLm::Lfm2(
-                    lfm2::load_from_gguf::<B>(&path, device).map_err(|e| e.to_string())?,
+                    lfm2::load_from_gguf(&path, device).map_err(|e| e.to_string())?,
                 ),
                 Architecture::Olmoe => {
                     if let Some(pack_dir) = ensure_pack(&dir, &path, spec)? {
@@ -226,7 +216,7 @@ fn load_any<B: Backend>(
                             clear_tiers();
                             let pool = build_tiered_experts(&pack_dir, backend, cpu_only)?;
                             AnyLm::OlmoeQ(
-                                olmoe::load_trunk_from_pack::<B>(&pack_dir, device)
+                                olmoe::load_trunk_from_pack(&pack_dir, device)
                                     .map_err(|e| e.to_string())?
                                     .with_pool(pool),
                             )
@@ -235,18 +225,18 @@ fn load_any<B: Backend>(
                             // on this backend at the planned level.
                             let level = precision_for(policy);
                             AnyLm::OlmoeQ(
-                                olmoe::load_from_pack::<B>(&pack_dir, device, &|_| level)
+                                olmoe::load_from_pack(&pack_dir, device, &|_| level)
                                     .map_err(|e| e.to_string())?,
                             )
                         }
                     } else if policy == mummu::quant::QuantPolicy::Off {
                         AnyLm::Olmoe(
-                            olmoe::load_from_gguf::<B>(&path, device).map_err(|e| e.to_string())?,
+                            olmoe::load_from_gguf(&path, device).map_err(|e| e.to_string())?,
                         )
                     } else {
                         // P9 MoE: per-expert quantized experts, routed compute.
                         AnyLm::OlmoeQ(
-                            olmoe::load_from_gguf_quantized::<B>(&path, device, policy)
+                            olmoe::load_from_gguf_quantized(&path, device, policy)
                                 .map_err(|e| e.to_string())?,
                         )
                     }
@@ -262,19 +252,19 @@ fn load_any<B: Backend>(
                                 // P9 stage 3c: trunk + local FFN clusters here,
                                 // the other clusters tiered across devices.
                                 clear_tiers();
-                                AnyLm::Qwen35(build_partitioned_qwen35::<B>(
+                                AnyLm::Qwen35(build_partitioned_qwen35(
                                     &pack_dir, device, backend, cpu_only, policy,
                                 )?)
                             }
                             _ => AnyLm::Qwen35(
-                                qwen35::load_from_pack::<B>(&pack_dir, device, &|_| level)
+                                qwen35::load_from_pack(&pack_dir, device, &|_| level)
                                     .map_err(|e| e.to_string())?,
                             ),
                         }
                     } else {
                         // Streaming importer with the fit-planned policy.
                         AnyLm::Qwen35(
-                            qwen35::load_from_gguf_quantized::<B>(&path, device, policy)
+                            qwen35::load_from_gguf_quantized(&path, device, policy)
                                 .map_err(|e| e.to_string())?,
                         )
                     }
@@ -347,20 +337,30 @@ pub fn run_chat(
         "[mummu-serve] fit plan for {}: {:?} @ {:?}",
         spec.name, plan.backend, plan.policy
     );
-    match plan.backend {
+    // One slot, one device value: the plan picks *where*, not *which type*.
+    drive(
+        &SLOT, spec, models_root, &prompt, opts, max_tokens, plan.policy,
+        plan.backend, label_of(plan.backend), on_delta,
+    )
+}
+
+/// The device a backend choice denotes (burn 0.22 selects at runtime).
+pub(crate) fn device_of(backend: BackendChoice) -> Device {
+    match backend {
         #[cfg(feature = "cuda")]
-        BackendChoice::Cuda => drive(
-            &CUDA_SLOT, spec, models_root, &prompt, opts, max_tokens, plan.policy,
-            BackendChoice::Cuda, "GPU (cuda)", on_delta,
-        ),
-        BackendChoice::Wgpu => drive(
-            &GPU_SLOT, spec, models_root, &prompt, opts, max_tokens, plan.policy,
-            BackendChoice::Wgpu, "GPU (wgpu)", on_delta,
-        ),
-        BackendChoice::Cpu => drive(
-            &CPU_SLOT, spec, models_root, &prompt, opts, max_tokens, plan.policy,
-            BackendChoice::Cpu, "CPU (flex)", on_delta,
-        ),
+        BackendChoice::Cuda => mummu::backend::cuda_device(),
+        BackendChoice::Wgpu => mummu::backend::gpu_device(),
+        BackendChoice::Cpu => mummu::backend::cpu_device(),
+    }
+}
+
+/// Human label for a backend choice.
+pub(crate) fn label_of(backend: BackendChoice) -> &'static str {
+    match backend {
+        #[cfg(feature = "cuda")]
+        BackendChoice::Cuda => "GPU (cuda)",
+        BackendChoice::Wgpu => "GPU (wgpu)",
+        BackendChoice::Cpu => "CPU (flex)",
     }
 }
 
@@ -504,26 +504,15 @@ fn load_expert_on(
     index: usize,
     tier: mummu::tier::Tier,
 ) -> Result<std::sync::Arc<dyn mummu::nn::ExpertExec>, String> {
-    fn one<B: Backend>(
-        pack: &mummu::pack::Pack,
-        layer: usize,
-        index: usize,
-        tier: mummu::tier::Tier,
-    ) -> Result<std::sync::Arc<dyn mummu::nn::ExpertExec>, String>
-    where
-        mummu::nn::ExpertWeights<B>: Send + Sync,
-        B::Device: Send + Sync,
-    {
-        Ok(std::sync::Arc::new(olmoe::load_expert_from_pack::<B>(
-            pack, layer, index, tier, &B::Device::default(),
-        )?))
-    }
-    match backend {
-        #[cfg(feature = "cuda")]
-        BackendChoice::Cuda => one::<mummu::backend::Cuda>(pack, layer, index, tier),
-        BackendChoice::Wgpu => one::<Gpu>(pack, layer, index, tier),
-        BackendChoice::Cpu => one::<Cpu>(pack, layer, index, tier),
-    }
+    // burn 0.22: the backend IS the device, so the per-backend dispatch of
+    // the 0.21 design is one call against the device this tier names.
+    Ok(std::sync::Arc::new(olmoe::load_expert_from_pack(
+        pack,
+        layer,
+        index,
+        tier,
+        &device_of(backend),
+    )?))
 }
 
 /// All of a layer's FFN clusters for one device as **one** executor
@@ -537,31 +526,15 @@ fn load_ffn_group_on(
     tier: mummu::tier::Tier,
     bytes: u64,
 ) -> Result<std::sync::Arc<dyn mummu::nn::ExpertExec>, String> {
-    fn group<B: Backend>(
-        pack: &mummu::pack::Pack,
-        layer: usize,
-        clusters: &[usize],
-        tier: mummu::tier::Tier,
-        bytes: u64,
-    ) -> Result<std::sync::Arc<dyn mummu::nn::ExpertExec>, String>
-    where
-        mummu::nn::ExpertWeights<B>: Send + Sync,
-        B::Device: Send + Sync,
-    {
-        let device = B::Device::default();
-        Ok(std::sync::Arc::new(mummu::nn::DeviceExpert::<B> {
-            weights: qwen35::load_ffn_clusters::<B>(pack, layer, clusters, tier.precision, &device)?,
-            device,
-            tier,
-            bytes,
-        }))
-    }
-    match backend {
-        #[cfg(feature = "cuda")]
-        BackendChoice::Cuda => group::<mummu::backend::Cuda>(pack, layer, clusters, tier, bytes),
-        BackendChoice::Wgpu => group::<Gpu>(pack, layer, clusters, tier, bytes),
-        BackendChoice::Cpu => group::<Cpu>(pack, layer, clusters, tier, bytes),
-    }
+    // burn 0.22: one call against the device this tier names (the 0.21
+    // per-backend dispatch collapsed with the backend type parameter).
+    let device = device_of(backend);
+    Ok(std::sync::Arc::new(mummu::nn::DeviceExpert {
+        weights: qwen35::load_ffn_clusters(pack, layer, clusters, tier.precision, &device)?,
+        device,
+        tier,
+        bytes,
+    }))
 }
 
 /// The skip threshold for a partitioned dense model: `MUMMU_FFN_SKIP_TAU`
@@ -637,13 +610,13 @@ fn pack_trunk_bytes(pack: &mummu::pack::Pack, level: mummu::pack::Precision) -> 
 /// the other devices (CPU int8/int4, GPU f32/int8). Exact unless a skip
 /// tau is configured. Records the runtime for re-tiering (remote clusters
 /// only — the local slab is pinned).
-fn build_partitioned_qwen35<B: Backend>(
+fn build_partitioned_qwen35(
     pack_dir: &Path,
-    device: &B::Device,
+    device: &Device,
     main: BackendChoice,
     cpu_only: bool,
     policy: mummu::quant::QuantPolicy,
-) -> Result<qwen35::LoadedQwen35<B>, String> {
+) -> Result<qwen35::LoadedQwen35, String> {
     use mummu::pack::Pack;
     let pack = Pack::open(pack_dir)?;
     let part = pack.manifest.ffn_partition.clone().ok_or("pack is not partitioned")?;
@@ -712,7 +685,7 @@ fn build_partitioned_qwen35<B: Backend>(
         .map(|l| (0..epl).filter(|&c| plan.tiers[l * epl + c].device == main_idx).collect())
         .collect();
     let started = Instant::now();
-    let model = qwen35::load_from_pack_partitioned::<B>(pack_dir, device, &|_| level, &|l| local[l].clone())
+    let model = qwen35::load_from_pack_partitioned(pack_dir, device, &|_| level, &|l| local[l].clone())
         .map_err(|e| e.to_string())?;
     // Remote clusters grouped by device: one executor per (layer, device),
     // covering every cluster the plan put there at that device's tier. In
@@ -1116,7 +1089,7 @@ fn ensure_host_room(need: u64, keep: BackendChoice) {
             dir.display(),
             bytes >> 30
         );
-        CPU_SLOT.clear();
+        SLOT.clear();
         RESIDENT
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1265,8 +1238,8 @@ fn plan_fit(spec: &ModelSpec, models_root: &Path) -> Result<FitPlan, String> {
 }
 
 #[allow(clippy::too_many_arguments)] // one call site, mirrors the plan
-fn drive<B: Backend>(
-    slot: &ModelSlot<Loaded<B>>,
+fn drive(
+    slot: &ModelSlot<Loaded>,
     spec: &ModelSpec,
     models_root: &Path,
     prompt: &str,
@@ -1277,7 +1250,10 @@ fn drive<B: Backend>(
     label: &'static str,
     mut on_delta: impl FnMut(&str) -> ControlFlow<()>,
 ) -> Result<ChatResult, String> {
-    let device = burn::tensor::Device::<B>::default();
+    // The device the fit plan chose — NOT `Device::default()`, which would
+    // silently run wherever the process first touched a backend and make the
+    // planner's decision cosmetic.
+    let device = device_of(backend);
     let key = spec.dir(models_root);
     if slot.loaded_key().as_deref() != Some(key.as_path()) && tiers_pack_in(&key).is_none() {
         // This slot is about to evict its occupant; if that was the tiered
@@ -1286,7 +1262,7 @@ fn drive<B: Backend>(
     }
     slot.with(
         &key,
-        |_| load_any::<B>(spec, models_root, &device, policy, backend),
+        |_| load_any(spec, models_root, &device, policy, backend),
         |m| -> Result<ChatResult, String> {
             // ChatML renderers leave specials to the tokenizer; the Tulu
             // render already embeds its own BOS (the real_olmoe.rs pattern).
