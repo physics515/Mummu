@@ -1281,13 +1281,20 @@ impl CausalLm for LoadedQwen35 {
         );
         let cfg = &self.config;
 
+        // The embedding may live on a different device from the rest of the
+        // model (it is a gather, so it is often left on the host to keep VRAM
+        // for weights that compute — see `load_from_pack_partitioned_split`).
+        // A gather needs its indices on the SAME device as the table, so the
+        // indices are built there and only the small `[1, t, hidden]` result
+        // crosses over.
+        let embed_device = self.model.embed_tokens.weight.val().device();
         let ids32: Vec<i32> = new_ids.iter().map(|&i| i as i32).collect();
         let input = Tensor::<1, Int>::from_data(
             TensorData::new(ids32, [t]),
-            (device, crate::backend::int_dtype()),
+            (&embed_device, crate::backend::int_dtype()),
         )
         .reshape([1, t]);
-        let mut x = self.model.embed_tokens.forward(input);
+        let mut x = self.model.embed_tokens.forward(input).to_device(device);
 
         let (cos, sin) = rope_tables(t, past, cfg.rope_dim, cfg.rope_theta, device);
         let mask = (t > 1).then(|| causal_mask(t, past, device));
@@ -1346,9 +1353,17 @@ impl CausalLm for LoadedQwen35 {
         match &self.model.lm_head {
             Some(head) => qlinear2(head, last),
             None => {
-                // Tied head: logits = h · Eᵀ.
+                // Tied head: logits = h · Eᵀ. The embedding may be on another
+                // device (host-resident gather table), and unlike the gather
+                // this IS a matmul — so run it where the big tensor lives and
+                // move only the `[1, vocab]` result, rather than dragging a
+                // multi-GB table across the bus every token.
                 let e = self.model.embed_tokens.weight.val(); // [vocab, hidden]
-                last.matmul(e.swap_dims(0, 1))
+                let out_device = last.device();
+                let e_device = e.device();
+                last.to_device(&e_device)
+                    .matmul(e.swap_dims(0, 1))
+                    .to_device(&out_device)
             }
         }
     }
