@@ -468,12 +468,13 @@ fn tier_devices(
             TierDevice {
                 name: "cuda".into(),
                 class: DeviceClass::DiscreteGpu,
-                // No Q4 on the GPU: burn 0.21's CUDA q_matmul panics in
-                // kernel autotune on the pooled f32-input × Q4-weight matmul
-                // ("Cast element count must match") and returns garbage — the
-                // same class of GPU-Q4 breakage the wgpu path already refuses.
-                // Q4 units live on the CPU (flex's dequant fallback is correct).
-                ladder: vec![Precision::F32, Precision::Q8],
+                // Q4/Q8 on the GPU are safe because pooled experts dequantize
+                // their weight on-device before the matmul (see
+                // `nn::compute_weight`) — burn 0.21's CUDA q_matmul panics on
+                // the mixed f32-input × quantized-weight path, so we never
+                // take it; storage stays compact, so the GPU holds ~4× more
+                // clusters at Q4 than at F32, which is what makes a 27B fit.
+                ladder: vec![Precision::F32, Precision::Q8, Precision::Q4],
                 budget_bytes: budget(BackendChoice::Cuda),
                 speed: 10,
             },

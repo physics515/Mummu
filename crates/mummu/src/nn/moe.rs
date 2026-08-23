@@ -365,8 +365,9 @@ where
             (&self.device, crate::backend::float_dtype::<B>()),
         );
         let w = &self.weights;
-        let acts = activation::silu(xt.clone().matmul(w.gate.val())).mul(xt.matmul(w.up.val()));
-        acts.matmul(w.down.val())
+        let acts = activation::silu(xt.clone().matmul(compute_weight(&w.gate)))
+            .mul(xt.matmul(compute_weight(&w.up)));
+        acts.matmul(compute_weight(&w.down))
             .into_data()
             .convert::<f32>()
             .to_vec::<f32>()
@@ -378,13 +379,29 @@ where
             burn::tensor::TensorData::new(x.to_vec(), [rows, hidden]),
             (&self.device, crate::backend::float_dtype::<B>()),
         );
-        activation::silu(xt.matmul(self.weights.gate.val()))
+        activation::silu(xt.matmul(compute_weight(&self.weights.gate)))
             .powf_scalar(2.0)
             .sum_dim(1)
             .into_data()
             .convert::<f32>()
             .to_vec::<f32>()
             .expect("gate energy read back")
+    }
+}
+
+/// A pooled expert's weight ready for an `f32`-input matmul: a quantized
+/// weight (Q4/Q8, stored compactly) is **dequantized on its own device**
+/// first, so the matmul is always float×float. This keeps the storage
+/// savings while sidestepping the mixed f32-input × quantized-weight
+/// `q_matmul` — which burn 0.21's CUDA backend panics on ("Cast element
+/// count must match") and wgpu computes wrong. The dequantized tensor is
+/// transient (freed after the matmul); the `Param` stays quantized.
+fn compute_weight<B: Backend>(w: &Param<Tensor<B, 2>>) -> Tensor<B, 2> {
+    let t = w.val();
+    if matches!(t.dtype(), DType::QFloat(_)) {
+        t.dequantize()
+    } else {
+        t
     }
 }
 
@@ -539,16 +556,13 @@ impl ExpertPool {
         let rows_per_exec: Vec<Vec<i32>> = match skip {
             None => vec![(0..bt as i32).collect(); n],
             Some((tau, local_energy)) => {
-                let energies: Vec<Vec<f32>> = std::thread::scope(|s| {
-                    let handles: Vec<_> = execs
-                        .iter()
-                        .map(|exec| {
-                            let host = &host;
-                            s.spawn(move || exec.gate_energy(host, bt, h))
-                        })
-                        .collect();
-                    handles.into_iter().map(|hd| hd.join().expect("energy thread")).collect()
-                });
+                // Sequential, not one thread per executor: a fresh OS thread
+                // makes cubecl-cuda open a new CUDA stream, and a 64-layer
+                // forward would exhaust VRAM creating them (CUDA_ERROR_OUT_OF_MEMORY
+                // "Can create a new stream"). The calling thread already owns a
+                // stream; reuse it.
+                let energies: Vec<Vec<f32>> =
+                    execs.iter().map(|exec| exec.gate_energy(&host, bt, h)).collect();
                 let mut total: Vec<f32> = local_energy.to_vec();
                 total.resize(bt, 0.0);
                 for e in &energies {
@@ -567,30 +581,23 @@ impl ExpertPool {
                     .collect()
             }
         };
-        let outputs: Vec<Vec<f32>> = std::thread::scope(|s| {
-            let handles: Vec<_> = execs
-                .iter()
-                .zip(&rows_per_exec)
-                .map(|(exec, rows)| {
-                    let host = &host;
-                    s.spawn(move || {
-                        if rows.is_empty() {
-                            return Vec::new();
-                        }
-                        let mut x = Vec::with_capacity(rows.len() * h);
-                        for &r in rows {
-                            let r = r as usize;
-                            x.extend_from_slice(&host[r * h..(r + 1) * h]);
-                        }
-                        exec.run(&x, rows.len(), h)
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|hd| hd.join().expect("expert thread"))
-                .collect()
-        });
+        // Sequential per executor (see the energy path above): threads here
+        // would each open a CUDA stream and OOM the device over 64 layers.
+        let outputs: Vec<Vec<f32>> = execs
+            .iter()
+            .zip(&rows_per_exec)
+            .map(|(exec, rows)| {
+                if rows.is_empty() {
+                    return Vec::new();
+                }
+                let mut x = Vec::with_capacity(rows.len() * h);
+                for &r in rows {
+                    let r = r as usize;
+                    x.extend_from_slice(&host[r * h..(r + 1) * h]);
+                }
+                exec.run(&x, rows.len(), h)
+            })
+            .collect();
         let mut out = vec![0f32; bt * h];
         for ((e, rows), y) in rows_per_exec.iter().enumerate().zip(&outputs) {
             let mut energy = 0f32;
@@ -850,6 +857,35 @@ mod tests {
             .unwrap();
         for (i, (da, db)) in a.iter().zip(&b).enumerate() {
             assert!((da - db).abs() < 1e-5, "after swap elem {i}: {da} vs {db}");
+        }
+    }
+
+    /// The P9-3c fix: a pooled expert with a **quantized** weight must run
+    /// through `compute_weight`'s on-device dequantize (never burn's mixed
+    /// f32-input × quantized-weight q_matmul, which the CUDA/wgpu backends
+    /// mishandle). Here on CPU we check the dequantize itself: an f32 param
+    /// passes through untouched; a Q8 param comes back float and ≈ the
+    /// original within block-32 quant error.
+    #[test]
+    fn compute_weight_dequantizes_quantized_params() {
+        use crate::quant::{QuantPolicy, quantize_weight};
+        use burn::tensor::TensorData;
+        let device = Dev::default();
+        let vals: Vec<f32> = (0..32 * 64).map(|i| ((i as f32) * 0.05).sin()).collect();
+        let t = Tensor::<Cpu, 2>::from_data(TensorData::new(vals.clone(), [32, 64]), &device);
+
+        // Float param: returned as-is (still float).
+        let out_f32 = compute_weight(&Param::from_tensor(t.clone()));
+        assert!(!matches!(out_f32.dtype(), DType::QFloat(_)), "float weight must stay float");
+
+        // Quantized param: really quantized, and compute_weight floats it back.
+        let q = quantize_weight(QuantPolicy::Q8, t.clone());
+        assert!(matches!(q.dtype(), DType::QFloat(_)), "weight should be quantized");
+        let out_q = compute_weight(&Param::from_tensor(q));
+        assert!(!matches!(out_q.dtype(), DType::QFloat(_)), "compute_weight must dequantize");
+        let back = out_q.into_data().to_vec::<f32>().unwrap();
+        for (i, (x, y)) in vals.iter().zip(&back).enumerate() {
+            assert!((x - y).abs() < 0.05, "Q8 dequant elem {i}: {x} vs {y}");
         }
     }
 
