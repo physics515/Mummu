@@ -1023,7 +1023,7 @@ pub fn load_from_pack(
     device: &Device,
     choose: &dyn Fn(&crate::pack::TensorEntry) -> crate::pack::Precision,
 ) -> Result<LoadedQwen35, ImportError> {
-    load_from_pack_inner(dir, device, choose, None)
+    load_from_pack_inner(dir, device, choose, None, None)
 }
 
 /// Load a **partitioned** pack with only `local(layer)` FFN clusters in each
@@ -1036,7 +1036,25 @@ pub fn load_from_pack_partitioned(
     choose: &dyn Fn(&crate::pack::TensorEntry) -> crate::pack::Precision,
     local: &dyn Fn(usize) -> Vec<usize>,
 ) -> Result<LoadedQwen35, ImportError> {
-    load_from_pack_inner(dir, device, choose, Some(local))
+    load_from_pack_inner(dir, device, choose, Some(local), None)
+}
+
+/// [`load_from_pack_partitioned`], with the **embedding table pinned to
+/// `embed_device`** instead of following the rest of the model.
+///
+/// An embedding is a gather, not a matmul, so it is the one large tensor a
+/// pack never quantizes — on the 27B it is 5.09 GB, a quarter of the model,
+/// and it is read once per token while a layer's weights are read 65 times.
+/// Holding it on the host frees that VRAM for weights that actually compute,
+/// at the cost of one `[1, hidden]` transfer per token.
+pub fn load_from_pack_partitioned_split(
+    dir: &Path,
+    device: &Device,
+    embed_device: &Device,
+    choose: &dyn Fn(&crate::pack::TensorEntry) -> crate::pack::Precision,
+    local: &dyn Fn(usize) -> Vec<usize>,
+) -> Result<LoadedQwen35, ImportError> {
+    load_from_pack_inner(dir, device, choose, Some(local), Some(embed_device))
 }
 
 /// One layer's FFN restricted to `clusters` of a partitioned pack, at
@@ -1115,6 +1133,7 @@ fn load_from_pack_inner(
     device: &Device,
     choose: &dyn Fn(&crate::pack::TensorEntry) -> crate::pack::Precision,
     local: Option<&dyn Fn(usize) -> Vec<usize>>,
+    embed_device: Option<&Device>,
 ) -> Result<LoadedQwen35, ImportError> {
     use crate::pack::{Pack, Role};
     let parse = |reason: String| ImportError::Parse {
@@ -1190,7 +1209,13 @@ fn load_from_pack_inner(
             }
         };
         let src = match entry.role {
-            Role::Linear | Role::Expert { .. } | Role::Embedding => ParamSrc::Ready2(
+            // The embedding may live somewhere else entirely — see
+            // `load_from_pack_partitioned_split`.
+            Role::Embedding => ParamSrc::Ready2(
+                pack.tensor::<2>(entry, precision, embed_device.unwrap_or(device))
+                    .map_err(parse)?,
+            ),
+            Role::Linear | Role::Expert { .. } => ParamSrc::Ready2(
                 pack.tensor::<2>(entry, precision, device).map_err(parse)?,
             ),
             Role::Vector | Role::Conv => ParamSrc::F32 {

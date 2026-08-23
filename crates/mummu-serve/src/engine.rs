@@ -669,6 +669,14 @@ fn pack_trunk_bytes(pack: &mummu::pack::Pack, level: mummu::pack::Precision) -> 
         if matches!(t.role, Role::Expert { .. }) || ffn.contains(t.name.as_str()) {
             continue;
         }
+        // The embedding does not ride with the trunk: it is a gather, never
+        // quantized, and on the 27B it is 5.09 GB — a quarter of the model —
+        // read once per token while a layer's weights are read 65 times.
+        // `build_partitioned_qwen35` pins it to the host, so it must not be
+        // charged against the device budget here either.
+        if matches!(t.role, Role::Embedding) {
+            continue;
+        }
         let numel = t.shape.iter().product::<usize>() as u64;
         bytes += match (&t.role, t.precisions.get(&level)) {
             (Role::Linear, Some(b)) if matches!(level, Precision::Q4 | Precision::Q8) => b.values_len + b.scales_len,
@@ -758,8 +766,18 @@ fn build_partitioned_qwen35(
         .map(|l| (0..epl).filter(|&c| plan.tiers[l * epl + c].device == main_idx).collect())
         .collect();
     let started = Instant::now();
-    let model = qwen35::load_from_pack_partitioned(pack_dir, device, &|_| level, &|l| local[l].clone())
-        .map_err(|e| e.to_string())?;
+    // Trunk on the planned device, embedding on the host (see
+    // `pack_trunk_bytes` — it is a gather, and 5 GB of VRAM spent on it is
+    // 5 GB not spent on weights that run 65 times a token).
+    let host = mummu::backend::cpu_device();
+    let model = qwen35::load_from_pack_partitioned_split(
+        pack_dir,
+        device,
+        &host,
+        &|_| level,
+        &|l| local[l].clone(),
+    )
+    .map_err(|e| e.to_string())?;
     // Remote clusters grouped by device: one executor per (layer, device),
     // covering every cluster the plan put there at that device's tier. In
     // exact mode all clusters run, so this is one matmul per device per
