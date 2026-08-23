@@ -32,5 +32,6 @@ pub mod safetensors;
 pub mod template;
 pub mod tier;
 pub mod tok_config;
+pub mod workingset;
 pub mod tokenizer;
 pub mod tune;
