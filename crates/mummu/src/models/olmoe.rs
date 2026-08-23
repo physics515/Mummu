@@ -819,3 +819,686 @@ mod tests {
         );
     }
 }
+
+// ===========================================================================
+// P9 — the per-expert-quantized OLMoE variant. A separate model struct so
+// the parity-proven fused-bank path above stays byte-for-byte untouched:
+// experts live as independent (quantized) weight triples and compute
+// through `SparseMoePerExpert`'s routed forward — per token only the
+// top-k experts are in service. Attention, router, norms, embedding and
+// head stay float (GqaAttention's Linears would hit burn 0.21's
+// packed-weight reshape bug, and they are a small fraction of the bytes).
+// ===========================================================================
+
+/// One decoder layer of the quantized variant.
+#[derive(Module, Debug)]
+pub struct QDecoderLayer<B: Backend> {
+    pub self_attn: GqaAttention<B>,
+    pub mlp: crate::nn::SparseMoePerExpert<B>,
+    pub input_layernorm: RmsNorm<B>,
+    pub post_attention_layernorm: RmsNorm<B>,
+}
+
+/// The per-expert-quantized OLMoE stack.
+#[derive(Module, Debug)]
+pub struct OlmoeQ<B: Backend> {
+    pub embed_tokens: Embedding<B>,
+    pub layers: Vec<QDecoderLayer<B>>,
+    pub norm: RmsNorm<B>,
+    pub lm_head: Option<Linear<B>>,
+}
+
+/// A weight-loaded quantized OLMoE plus its config. With a `pool`, the
+/// experts in `model` are placeholders and every layer's expert compute
+/// goes through the tiered [`crate::nn::ExpertPool`] (P9 stage 3b); the
+/// router, attention, norms, embedding and head stay on `B`.
+pub struct LoadedOlmoeQ<B: Backend> {
+    pub model: OlmoeQ<B>,
+    pub config: OlmoeConfig,
+    pub pool: Option<std::sync::Arc<crate::nn::ExpertPool>>,
+}
+
+/// **Streaming** GGUF import with per-expert keep-quantized experts: each
+/// fused bank is read once, split into its `num_experts` contiguous
+/// members, and every member is **re-quantized independently** (its own
+/// block scales) per `policy`. Peak memory = the finished model plus one
+/// f32 bank.
+pub fn load_from_gguf_quantized<B: Backend>(
+    path: &Path,
+    device: &B::Device,
+    policy: crate::quant::QuantPolicy,
+) -> Result<LoadedOlmoeQ<B>, ImportError> {
+    use crate::nn::{ExpertWeights, SparseMoePerExpert};
+    use burn::module::Param;
+
+    let parse = |reason: String| ImportError::Parse {
+        file: path.to_path_buf(),
+        reason,
+    };
+    let f = GgufFile::open(path).map_err(|e| parse(e.to_string()))?;
+    let config = OlmoeConfig::from_gguf(&f).map_err(parse)?;
+    let untied = f.tensor("output.weight").is_some();
+
+    let dtype = crate::backend::float_dtype::<B>();
+    let dev_tensor2 = |values: Vec<f32>, shape: [usize; 2]| {
+        Tensor::<B, 2>::from_data(TensorData::new(values, shape), (device, dtype))
+    };
+    let dev_tensor1 = |values: Vec<f32>, n: usize| {
+        Tensor::<B, 1>::from_data(TensorData::new(values, [n]), (device, dtype))
+    };
+    // Tiny placeholders; the completeness count below guarantees every one
+    // is replaced before the model is returned.
+    let placeholder2 = || Param::from_tensor(Tensor::<B, 2>::zeros([1, 1], device));
+
+    let norm = |dev: &B::Device| {
+        RmsNormConfig::new(config.hidden_size)
+            .with_epsilon(config.rms_norm_eps)
+            .init(dev)
+    };
+    let attn_cfg = GqaAttentionConfig {
+        hidden_size: config.hidden_size,
+        num_heads: config.num_attention_heads,
+        num_kv_heads: config.num_key_value_heads,
+        head_dim: config.head_dim(),
+        bias: false,
+        qk_norm_eps: Some(config.rms_norm_eps),
+        qk_norm_projection: true,
+    };
+    let mut model = OlmoeQ {
+        embed_tokens: EmbeddingConfig::new(config.vocab_size, config.hidden_size).init(device),
+        layers: (0..config.num_hidden_layers)
+            .map(|_| QDecoderLayer {
+                self_attn: attn_cfg.init(device),
+                mlp: SparseMoePerExpert {
+                    gate: LinearConfig::new(config.hidden_size, config.num_experts)
+                        .with_bias(false)
+                        .init(device),
+                    experts: (0..config.num_experts)
+                        .map(|_| ExpertWeights {
+                            gate: placeholder2(),
+                            up: placeholder2(),
+                            down: placeholder2(),
+                        })
+                        .collect(),
+                },
+                input_layernorm: norm(device),
+                post_attention_layernorm: norm(device),
+            })
+            .collect(),
+        norm: norm(device),
+        lm_head: untied.then(|| {
+            LinearConfig::new(config.hidden_size, config.vocab_size)
+                .with_bias(false)
+                .init(device)
+        }),
+    };
+
+    // A float linear weight from GGUF's [out, in] into Linear's [in, out].
+    let linear_f32 = |values: Vec<f32>, dims_rev: &[usize]| -> Result<Tensor<B, 2>, String> {
+        let &[out, inp] = dims_rev else {
+            return Err(format!("linear weight must be 2-D, got {dims_rev:?}"));
+        };
+        Ok(dev_tensor2(values, [out, inp]).swap_dims(0, 1))
+    };
+
+    let mut assigned = 0usize;
+    for info in &f.tensors {
+        let dims_rev: Vec<usize> = info.dims.iter().rev().map(|&d| d as usize).collect();
+        let name = &info.name;
+
+        // The fused banks: split into per-expert members, quantize each.
+        let bank_field = name
+            .strip_prefix("blk.")
+            .and_then(|r| r.split_once('.'))
+            .and_then(|(_, field)| match field {
+                "ffn_gate_exps.weight" => Some("gate"),
+                "ffn_up_exps.weight" => Some("up"),
+                "ffn_down_exps.weight" => Some("down"),
+                _ => None,
+            });
+        if let Some(bank_field) = bank_field {
+            let layer: usize = name
+                .strip_prefix("blk.")
+                .and_then(|r| r.split_once('.'))
+                .and_then(|(l, _)| l.parse().ok())
+                .ok_or_else(|| parse(format!("bad bank layer in '{name}'")))?;
+            let &[e, out, inp] = dims_rev.as_slice() else {
+                return Err(parse(format!("expert bank must be 3-D, got {dims_rev:?}")));
+            };
+            if e != config.num_experts {
+                return Err(parse(format!(
+                    "bank '{name}' has {e} experts, config says {}",
+                    config.num_experts
+                )));
+            }
+            let values = f.read_tensor_f32(name).map_err(|e| parse(e.to_string()))?;
+            let stride = out * inp;
+            let mlp = &mut model
+                .layers
+                .get_mut(layer)
+                .ok_or_else(|| parse(format!("layer {layer} out of range")))?
+                .mlp;
+            for expert in 0..e {
+                let member = values[expert * stride..(expert + 1) * stride].to_vec();
+                let w = dev_tensor2(member, [out, inp]).swap_dims(0, 1); // [in, out]
+                let w = if policy.eligible(&[inp, out]) {
+                    crate::quant::quantize_weight(policy, w)
+                } else {
+                    w
+                };
+                let slot = &mut mlp.experts[expert];
+                match bank_field {
+                    "gate" => slot.gate = Param::from_tensor(w),
+                    "up" => slot.up = Param::from_tensor(w),
+                    _ => slot.down = Param::from_tensor(w),
+                }
+            }
+            assigned += 1;
+            continue;
+        }
+
+        // Everything else is float, routed by the proven name table.
+        let mapped = olmoe_gguf_name(name)
+            .ok_or_else(|| parse(format!("unmapped tensor name '{name}'")))?;
+        let values = f.read_tensor_f32(name).map_err(|e| parse(e.to_string()))?;
+        match mapped.as_str() {
+            "model.embed_tokens.weight" => {
+                let &[v, h] = dims_rev.as_slice() else {
+                    return Err(parse("embedding must be 2-D".into()));
+                };
+                model.embed_tokens.weight = Param::from_tensor(dev_tensor2(values, [v, h]));
+            }
+            "model.norm.weight" => {
+                model.norm.gamma = Param::from_tensor(dev_tensor1(values, dims_rev[0]));
+            }
+            "lm_head.weight" => {
+                let head = model
+                    .lm_head
+                    .as_mut()
+                    .ok_or_else(|| parse("output.weight on a tied model".into()))?;
+                head.weight = Param::from_tensor(linear_f32(values, &dims_rev).map_err(parse)?);
+            }
+            other => {
+                let rest = other
+                    .strip_prefix("model.layers.")
+                    .ok_or_else(|| parse(format!("unknown path '{other}'")))?;
+                let (layer, field) = rest
+                    .split_once('.')
+                    .ok_or_else(|| parse(format!("bad layer path '{other}'")))?;
+                let layer: usize = layer
+                    .parse()
+                    .map_err(|_| parse(format!("bad layer '{other}'")))?;
+                let l = model
+                    .layers
+                    .get_mut(layer)
+                    .ok_or_else(|| parse(format!("layer {layer} out of range")))?;
+                match field {
+                    "input_layernorm.weight" => {
+                        l.input_layernorm.gamma =
+                            Param::from_tensor(dev_tensor1(values, dims_rev[0]));
+                    }
+                    "post_attention_layernorm.weight" => {
+                        l.post_attention_layernorm.gamma =
+                            Param::from_tensor(dev_tensor1(values, dims_rev[0]));
+                    }
+                    "self_attn.q_proj.weight" => {
+                        l.self_attn.q_proj.weight =
+                            Param::from_tensor(linear_f32(values, &dims_rev).map_err(parse)?);
+                    }
+                    "self_attn.k_proj.weight" => {
+                        l.self_attn.k_proj.weight =
+                            Param::from_tensor(linear_f32(values, &dims_rev).map_err(parse)?);
+                    }
+                    "self_attn.v_proj.weight" => {
+                        l.self_attn.v_proj.weight =
+                            Param::from_tensor(linear_f32(values, &dims_rev).map_err(parse)?);
+                    }
+                    "self_attn.o_proj.weight" => {
+                        l.self_attn.o_proj.weight =
+                            Param::from_tensor(linear_f32(values, &dims_rev).map_err(parse)?);
+                    }
+                    "self_attn.q_norm.weight" => {
+                        let n = l.self_attn.q_norm.as_mut().expect("qk norm built");
+                        n.gamma = Param::from_tensor(dev_tensor1(values, dims_rev[0]));
+                    }
+                    "self_attn.k_norm.weight" => {
+                        let n = l.self_attn.k_norm.as_mut().expect("qk norm built");
+                        n.gamma = Param::from_tensor(dev_tensor1(values, dims_rev[0]));
+                    }
+                    "mlp.gate.weight" => {
+                        l.mlp.gate.weight =
+                            Param::from_tensor(linear_f32(values, &dims_rev).map_err(parse)?);
+                    }
+                    unknown => {
+                        return Err(parse(format!("unknown layer field '{unknown}'")));
+                    }
+                }
+            }
+        }
+        assigned += 1;
+    }
+
+    // 6 attention + 2 norms + 1 router + 3 banks per layer, plus embedding,
+    // final norm, and the untied head.
+    let expected = config.num_hidden_layers * 12 + 2 + usize::from(untied);
+    if assigned != expected {
+        return Err(parse(format!(
+            "GGUF supplied {assigned} tensors, the architecture needs {expected}"
+        )));
+    }
+    Ok(LoadedOlmoeQ {
+        model,
+        config,
+        pool: None,
+    })
+}
+
+/// How each GGUF tensor enters a `.mummu` pack: expert banks split per
+/// member, attention/router/head as linears, norms as vectors.
+pub fn pack_actions(info: &GgufTensorInfo) -> Option<crate::pack::ImportAction> {
+    use crate::pack::ImportAction as A;
+    match info.name.as_str() {
+        "token_embd.weight" => return Some(A::Embedding),
+        "output_norm.weight" => return Some(A::Vector),
+        "output.weight" => return Some(A::Linear),
+        _ => {}
+    }
+    let rest = info.name.strip_prefix("blk.")?;
+    let (layer, field) = rest.split_once('.')?;
+    let layer: usize = layer.parse().ok()?;
+    Some(match field {
+        "ffn_gate_exps.weight" => A::ExpertBank { layer, proj: "gate".into() },
+        "ffn_up_exps.weight" => A::ExpertBank { layer, proj: "up".into() },
+        "ffn_down_exps.weight" => A::ExpertBank { layer, proj: "down".into() },
+        "attn_norm.weight" | "ffn_norm.weight" | "attn_q_norm.weight" | "attn_k_norm.weight" => {
+            A::Vector
+        }
+        "attn_q.weight" | "attn_k.weight" | "attn_v.weight" | "attn_output.weight"
+        | "ffn_gate_inp.weight" => A::Linear,
+        _ => return None,
+    })
+}
+
+/// Load the per-expert-quantized OLMoE from a `.mummu` pack; `choose` picks
+/// each tensor's precision (experts are separate entries — the tiering hook).
+pub fn load_from_pack<B: Backend>(
+    dir: &Path,
+    device: &B::Device,
+    choose: &dyn Fn(&crate::pack::TensorEntry) -> crate::pack::Precision,
+) -> Result<LoadedOlmoeQ<B>, ImportError> {
+    load_from_pack_inner::<B>(dir, device, choose, true)
+}
+
+fn load_from_pack_inner<B: Backend>(
+    dir: &Path,
+    device: &B::Device,
+    choose: &dyn Fn(&crate::pack::TensorEntry) -> crate::pack::Precision,
+    with_experts: bool,
+) -> Result<LoadedOlmoeQ<B>, ImportError> {
+    use crate::nn::{ExpertWeights, SparseMoePerExpert};
+    use crate::pack::{Pack, Role};
+    use burn::module::Param;
+
+    let parse = |reason: String| ImportError::Parse {
+        file: dir.to_path_buf(),
+        reason,
+    };
+    let pack = Pack::open(dir).map_err(parse)?;
+    let header = pack.header().map_err(parse)?;
+    let config = OlmoeConfig::from_gguf(&header).map_err(parse)?;
+    let untied = pack.entry("output.weight").is_some();
+
+    let dtype = crate::backend::float_dtype::<B>();
+    let placeholder2 = || Param::from_tensor(Tensor::<B, 2>::zeros([1, 1], device));
+    let norm = |dev: &B::Device| {
+        RmsNormConfig::new(config.hidden_size)
+            .with_epsilon(config.rms_norm_eps)
+            .init(dev)
+    };
+    let attn_cfg = GqaAttentionConfig {
+        hidden_size: config.hidden_size,
+        num_heads: config.num_attention_heads,
+        num_kv_heads: config.num_key_value_heads,
+        head_dim: config.head_dim(),
+        bias: false,
+        qk_norm_eps: Some(config.rms_norm_eps),
+        qk_norm_projection: true,
+    };
+    let mut model = OlmoeQ {
+        embed_tokens: EmbeddingConfig::new(config.vocab_size, config.hidden_size).init(device),
+        layers: (0..config.num_hidden_layers)
+            .map(|_| QDecoderLayer {
+                self_attn: attn_cfg.init(device),
+                mlp: SparseMoePerExpert {
+                    gate: LinearConfig::new(config.hidden_size, config.num_experts)
+                        .with_bias(false)
+                        .init(device),
+                    experts: (0..config.num_experts)
+                        .map(|_| ExpertWeights {
+                            gate: placeholder2(),
+                            up: placeholder2(),
+                            down: placeholder2(),
+                        })
+                        .collect(),
+                },
+                input_layernorm: norm(device),
+                post_attention_layernorm: norm(device),
+            })
+            .collect(),
+        norm: norm(device),
+        lm_head: untied.then(|| {
+            LinearConfig::new(config.hidden_size, config.vocab_size)
+                .with_bias(false)
+                .init(device)
+        }),
+    };
+
+    let pick = |entry: &crate::pack::TensorEntry| -> crate::pack::Precision {
+        let p = choose(entry);
+        if entry.precisions.contains_key(&p) {
+            p
+        } else {
+            *entry.precisions.keys().max().expect("pack entries store a level")
+        }
+    };
+    let vec1 = |values: Vec<f32>, n: usize| {
+        Tensor::<B, 1>::from_data(TensorData::new(values, [n]), (device, dtype))
+    };
+
+    let mut assigned = 0usize;
+    for entry in &pack.manifest.tensors {
+        // Experts: addressed by role, not by name.
+        if let Role::Expert { layer, index, proj } = &entry.role {
+            if !with_experts {
+                continue; // a pool serves them
+            }
+            // Experts are float-or-quantized 2-D [in, out] at the chosen level.
+            let t = pack.tensor::<B, 2>(entry, pick(entry), device).map_err(parse)?;
+            let slot = &mut model
+                .layers
+                .get_mut(*layer)
+                .ok_or_else(|| parse(format!("layer {layer} out of range")))?
+                .mlp
+                .experts[*index];
+            match proj.as_str() {
+                "gate" => slot.gate = Param::from_tensor(t),
+                "up" => slot.up = Param::from_tensor(t),
+                "down" => slot.down = Param::from_tensor(t),
+                other => return Err(parse(format!("unknown expert proj '{other}'"))),
+            }
+            assigned += 1;
+            continue;
+        }
+        let mapped = olmoe_gguf_name(&entry.name)
+            .ok_or_else(|| parse(format!("unmapped pack tensor '{}'", entry.name)))?;
+        // Attention/router/head stay float here; linears are already [in, out].
+        let lin = |entry: &crate::pack::TensorEntry| -> Result<Tensor<B, 2>, ImportError> {
+            pack.tensor::<B, 2>(entry, crate::pack::Precision::F32, device)
+                .or_else(|_| pack.tensor::<B, 2>(entry, crate::pack::Precision::F16, device))
+                .map_err(parse)
+        };
+        match mapped.as_str() {
+            "model.embed_tokens.weight" => {
+                model.embed_tokens.weight = Param::from_tensor(lin(entry)?);
+            }
+            "model.norm.weight" => {
+                model.norm.gamma =
+                    Param::from_tensor(vec1(pack.read_f32(entry).map_err(parse)?, entry.shape[0]));
+            }
+            "lm_head.weight" => {
+                let head = model
+                    .lm_head
+                    .as_mut()
+                    .ok_or_else(|| parse("output.weight on a tied model".into()))?;
+                head.weight = Param::from_tensor(lin(entry)?);
+            }
+            other => {
+                let rest = other
+                    .strip_prefix("model.layers.")
+                    .ok_or_else(|| parse(format!("unknown path '{other}'")))?;
+                let (layer, field) = rest
+                    .split_once('.')
+                    .ok_or_else(|| parse(format!("bad layer path '{other}'")))?;
+                let layer: usize = layer
+                    .parse()
+                    .map_err(|_| parse(format!("bad layer '{other}'")))?;
+                let l = model
+                    .layers
+                    .get_mut(layer)
+                    .ok_or_else(|| parse(format!("layer {layer} out of range")))?;
+                let n = entry.shape[0];
+                match field {
+                    "input_layernorm.weight" => {
+                        l.input_layernorm.gamma =
+                            Param::from_tensor(vec1(pack.read_f32(entry).map_err(parse)?, n));
+                    }
+                    "post_attention_layernorm.weight" => {
+                        l.post_attention_layernorm.gamma =
+                            Param::from_tensor(vec1(pack.read_f32(entry).map_err(parse)?, n));
+                    }
+                    "self_attn.q_proj.weight" => l.self_attn.q_proj.weight = Param::from_tensor(lin(entry)?),
+                    "self_attn.k_proj.weight" => l.self_attn.k_proj.weight = Param::from_tensor(lin(entry)?),
+                    "self_attn.v_proj.weight" => l.self_attn.v_proj.weight = Param::from_tensor(lin(entry)?),
+                    "self_attn.o_proj.weight" => l.self_attn.o_proj.weight = Param::from_tensor(lin(entry)?),
+                    "self_attn.q_norm.weight" => {
+                        let qn = l.self_attn.q_norm.as_mut().expect("qk norm built");
+                        qn.gamma = Param::from_tensor(vec1(pack.read_f32(entry).map_err(parse)?, n));
+                    }
+                    "self_attn.k_norm.weight" => {
+                        let kn = l.self_attn.k_norm.as_mut().expect("qk norm built");
+                        kn.gamma = Param::from_tensor(vec1(pack.read_f32(entry).map_err(parse)?, n));
+                    }
+                    "mlp.gate.weight" => l.mlp.gate.weight = Param::from_tensor(lin(entry)?),
+                    unknown => return Err(parse(format!("unknown layer field '{unknown}'"))),
+                }
+            }
+        }
+        assigned += 1;
+    }
+    // 9 non-bank tensors per layer + 3 banks × experts, plus embed, norm, head.
+    let per_layer = if with_experts { 9 + 3 * config.num_experts } else { 9 };
+    let expected = config.num_hidden_layers * per_layer + 2 + usize::from(untied);
+    if assigned != expected {
+        return Err(parse(format!(
+            "pack supplied {assigned} tensors, the architecture needs {expected}"
+        )));
+    }
+    Ok(LoadedOlmoeQ {
+        model,
+        config,
+        pool: None,
+    })
+}
+
+/// The experts of a pack, in the tier planner's flat order
+/// (`layer * num_experts + index`): each entry's three projections and the
+/// resident bytes per stored level (values + scales; float levels as the
+/// f32 a float backend holds).
+pub fn pack_expert_costs(pack: &crate::pack::Pack) -> Result<Vec<crate::tier::ExpertCost>, String> {
+    use crate::pack::{Precision, Role};
+    let header = pack.header()?;
+    let config = OlmoeConfig::from_gguf(&header)?;
+    let n = config.num_hidden_layers * config.num_experts;
+    let mut costs = vec![crate::tier::ExpertCost::default(); n];
+    for entry in &pack.manifest.tensors {
+        let Role::Expert { layer, index, .. } = &entry.role else {
+            continue;
+        };
+        let flat = layer * config.num_experts + index;
+        let numel: u64 = entry.shape.iter().product::<usize>() as u64;
+        let cost = costs
+            .get_mut(flat)
+            .ok_or_else(|| format!("expert ({layer}, {index}) outside the {n} the config declares"))?;
+        for (&p, blob) in &entry.precisions {
+            let bytes = match p {
+                Precision::Q4 | Precision::Q8 => blob.values_len + blob.scales_len,
+                Precision::F16 | Precision::F32 => numel * 4,
+            };
+            *cost.bytes.entry(p).or_insert(0) += bytes;
+        }
+    }
+    Ok(costs)
+}
+
+/// One expert's three projections from a pack at `precision`, on `device`,
+/// as a tier-tagged [`crate::nn::DeviceExpert`]. The planner's hot-swap
+/// path: load the replacement, then swap it into the pool.
+pub fn load_expert_from_pack<B: Backend>(
+    pack: &crate::pack::Pack,
+    layer: usize,
+    index: usize,
+    tier: crate::tier::Tier,
+    device: &B::Device,
+) -> Result<crate::nn::DeviceExpert<B>, String> {
+    use crate::nn::ExpertWeights;
+    use crate::pack::{Precision, Role};
+    use burn::module::Param;
+    let mut gate = None;
+    let mut up = None;
+    let mut down = None;
+    let mut bytes = 0u64;
+    for entry in &pack.manifest.tensors {
+        let Role::Expert { layer: l, index: i, proj } = &entry.role else {
+            continue;
+        };
+        if *l != layer || *i != index {
+            continue;
+        }
+        let precision = if entry.precisions.contains_key(&tier.precision) {
+            tier.precision
+        } else {
+            *entry.precisions.keys().max().expect("pack entries store a level")
+        };
+        let blob = entry.precisions[&precision];
+        bytes += match precision {
+            Precision::Q4 | Precision::Q8 => blob.values_len + blob.scales_len,
+            Precision::F16 | Precision::F32 => entry.shape.iter().product::<usize>() as u64 * 4,
+        };
+        let t = Param::from_tensor(pack.tensor::<B, 2>(entry, precision, device)?);
+        match proj.as_str() {
+            "gate" => gate = Some(t),
+            "up" => up = Some(t),
+            "down" => down = Some(t),
+            other => return Err(format!("unknown expert proj '{other}'")),
+        }
+    }
+    let (Some(gate), Some(up), Some(down)) = (gate, up, down) else {
+        return Err(format!("pack is missing projections of expert ({layer}, {index})"));
+    };
+    Ok(crate::nn::DeviceExpert {
+        weights: ExpertWeights { gate, up, down },
+        device: device.clone(),
+        tier,
+        bytes,
+    })
+}
+
+/// Load everything **but** the experts from a pack (they stay `[1, 1]`
+/// placeholders) — the trunk of a pooled model. Attach the pool with
+/// [`LoadedOlmoeQ::with_pool`].
+pub fn load_trunk_from_pack<B: Backend>(
+    dir: &Path,
+    device: &B::Device,
+) -> Result<LoadedOlmoeQ<B>, ImportError> {
+    load_from_pack_inner::<B>(dir, device, &|_| crate::pack::Precision::F32, false)
+}
+
+impl<B: Backend> LoadedOlmoeQ<B> {
+    /// Route every layer's expert compute through `pool`.
+    #[must_use]
+    pub fn with_pool(mut self, pool: std::sync::Arc<crate::nn::ExpertPool>) -> Self {
+        assert_eq!(
+            pool.num_layers(),
+            self.config.num_hidden_layers,
+            "expert pool layer count must match the model"
+        );
+        assert_eq!(
+            pool.experts_per_layer(),
+            self.config.num_experts,
+            "expert pool width must match the model"
+        );
+        self.pool = Some(pool);
+        self
+    }
+}
+
+impl<B: Backend> CausalLm<B> for LoadedOlmoeQ<B> {
+    type Cache = Vec<LayerKv<B>>;
+
+    fn new_cache(&self) -> Self::Cache {
+        (0..self.config.num_hidden_layers).map(|_| None).collect()
+    }
+
+    fn is_eos(&self, id: u32) -> bool {
+        self.config.eos_token_id.contains(id)
+    }
+
+    fn forward(
+        &self,
+        new_ids: &[u32],
+        past: usize,
+        cache: &mut Self::Cache,
+        device: &B::Device,
+    ) -> Tensor<B, 2> {
+        let t = new_ids.len();
+        assert!(t >= 1, "OLMoE-Q forward: need at least one token");
+        assert!(
+            cache.len() == self.config.num_hidden_layers,
+            "OLMoE-Q forward: cache has {} layers, model has {}",
+            cache.len(),
+            self.config.num_hidden_layers
+        );
+        let cfg = &self.config;
+        let hd = cfg.head_dim();
+
+        let ids32: Vec<i32> = new_ids.iter().map(|&i| i as i32).collect();
+        let input = Tensor::<B, 1, Int>::from_data(
+            TensorData::new(ids32, [t]),
+            (device, crate::backend::int_dtype::<B>()),
+        )
+        .reshape([1, t]);
+        let mut x = self.model.embed_tokens.forward(input);
+
+        let (cos, sin) = rope_tables::<B>(t, past, hd, cfg.rope_theta, device);
+        let mask = (t > 1).then(|| causal_mask::<B>(t, past, device));
+
+        for (li, (layer, kv)) in self.model.layers.iter().zip(cache.iter_mut()).enumerate() {
+            let h = layer.input_layernorm.forward(x.clone());
+            let h = layer.self_attn.forward(
+                h,
+                cfg.num_attention_heads,
+                cfg.num_key_value_heads,
+                hd,
+                &cos,
+                &sin,
+                mask.as_ref(),
+                kv,
+            );
+            x = x.add(h);
+            let h2 = layer.post_attention_layernorm.forward(x.clone());
+            let moe = match &self.pool {
+                Some(pool) => layer.mlp.forward_pooled(
+                    h2,
+                    cfg.num_experts_per_tok,
+                    cfg.norm_topk_prob,
+                    pool,
+                    li,
+                ),
+                None => layer
+                    .mlp
+                    .forward(h2, cfg.num_experts_per_tok, cfg.norm_topk_prob),
+            };
+            x = x.add(moe);
+        }
+        let x = self.model.norm.forward(x);
+
+        let last = x.narrow(1, t - 1, 1).reshape([1, cfg.hidden_size]);
+        match &self.model.lm_head {
+            Some(head) => head.forward(last),
+            None => {
+                let w = self.model.embed_tokens.weight.val();
+                last.matmul(w.swap_dims(0, 1))
+            }
+        }
+    }
+}

@@ -56,6 +56,13 @@ fn pre_spec(pre: &str) -> Option<PreSpec> {
             regex: r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
             nfc: true,
         }),
+        // Qwen3.5/3.8: qwen2's pattern with combining marks (\p{M}) folded
+        // into the letter class (llama.cpp PRE_TYPE_QWEN35, from the
+        // family's tokenizer.json).
+        "qwen35" => Some(PreSpec {
+            regex: r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+            nfc: true,
+        }),
         // LFM2/LFM2.5: digits split in groups of ≤3, no normalizer.
         "lfm2" => Some(PreSpec {
             regex: r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",

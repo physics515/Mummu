@@ -214,6 +214,19 @@ pub enum GgmlType {
     Q5_K,
     Q6_K,
     Q8_K,
+    /// IQ4_XS: 4-bit non-linear (a 16-entry value table) with 6-bit
+    /// sub-scales — the workhorse of unsloth's UD dynamic quants.
+    IQ4_XS,
+    /// IQ4_NL: IQ4_XS's 16-entry table in a simple 32-element block.
+    IQ4_NL,
+    /// IQ2_XS: 2.3125 bpw — 8-value rows from a 512-entry codebook grid.
+    IQ2_XS,
+    /// IQ2_S: 2.5625 bpw — the 1024-entry grid with separate sign bytes.
+    IQ2_S,
+    /// IQ3_XXS: 3.0625 bpw — 4-value rows from a 256-entry grid.
+    IQ3_XXS,
+    /// IQ3_S: 3.4375 bpw — the 512-entry grid, high index bits in `qh`.
+    IQ3_S,
     BF16,
 }
 
@@ -235,6 +248,12 @@ impl GgmlType {
             13 => Self::Q5_K,
             14 => Self::Q6_K,
             15 => Self::Q8_K,
+            17 => Self::IQ2_XS,
+            18 => Self::IQ3_XXS,
+            20 => Self::IQ4_NL,
+            21 => Self::IQ3_S,
+            22 => Self::IQ2_S,
+            23 => Self::IQ4_XS,
             30 => Self::BF16,
             _ => return None,
         };
@@ -246,8 +265,10 @@ impl GgmlType {
     pub fn block_size(self) -> u64 {
         match self {
             Self::F32 | Self::F16 | Self::BF16 => 1,
-            Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::Q8_1 => 32,
-            Self::Q2_K | Self::Q3_K | Self::Q4_K | Self::Q5_K | Self::Q6_K | Self::Q8_K => 256,
+            Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::Q8_1
+            | Self::IQ4_NL => 32,
+            Self::Q2_K | Self::Q3_K | Self::Q4_K | Self::Q5_K | Self::Q6_K | Self::Q8_K
+            | Self::IQ4_XS | Self::IQ2_XS | Self::IQ2_S | Self::IQ3_XXS | Self::IQ3_S => 256,
         }
     }
 
@@ -269,6 +290,12 @@ impl GgmlType {
             Self::Q5_K => 176, // Q4_K + 32 B qh
             Self::Q6_K => 210, // 128 B ql + 64 B qh + 16 i8 scales + f16 d
             Self::Q8_K => 292, // f32 d + 256 i8 + 16 i16 bsums
+            Self::IQ4_XS => 136, // f16 d + u16 scales_h + 4 B scales_l + 128 B qs
+            Self::IQ4_NL => 18,  // f16 d + 16 B qs
+            Self::IQ2_XS => 74,  // f16 d + 32 u16 (grid|signs) + 8 B scales
+            Self::IQ2_S => 82,   // f16 d + 64 B qs(idx lo + signs) + 8 B qh + 8 B scales
+            Self::IQ3_XXS => 98, // f16 d + 64 B idx + 32 B (scale|signs) words
+            Self::IQ3_S => 110,  // f16 d + 64 B qs + 8 B qh + 32 B signs + 4 B scales
         }
     }
 }
@@ -317,6 +344,9 @@ pub enum GgufMap {
     /// bytes — e.g. un-squeezing a depthwise conv kernel back to
     /// `[channels, 1, k]`).
     Reshape(String, Vec<u64>),
+    /// Deliberately drop this tensor (e.g. qwen35's unused NextN/MTP block).
+    /// Distinct from an unmapped name, which stays a loud error.
+    Skip,
 }
 
 /// Where one tensor lands in the output blob, decided before any payload
@@ -558,20 +588,14 @@ impl GgufFile {
     /// and where its bytes land — reading no payload at all.
     ///
     /// Offsets are contiguous and ascending in tensor-table order, which is
-    /// what lets the copy pass be a single forward stream.
+    /// what lets the copy pass be a single forward stream. A
+    /// [`GgufMap::Skip`] tensor (e.g. qwen35's unused NextN block) is dropped
+    /// here: it earns no plan entry and counts toward neither the size bound
+    /// nor the blob.
     fn plan_dequant(
         &self,
         map: &dyn Fn(&GgufTensorInfo) -> Option<GgufMap>,
     ) -> Result<Vec<PlannedTensor>, GgufError> {
-        let total_f32_bytes: u64 = self.tensors.iter().map(|t| t.element_count() * 4).sum();
-        if total_f32_bytes > MAX_DEQUANT_BYTES {
-            return Err(GgufError::OverBound {
-                path: self.path.display().to_string(),
-                what: "dequantized f32 payload bytes",
-                count: total_f32_bytes,
-                bound: MAX_DEQUANT_BYTES,
-            });
-        }
         let bad = |index: usize, reason: String| GgufError::BadTensor {
             path: self.path.display().to_string(),
             index,
@@ -598,6 +622,7 @@ impl GgufFile {
                     }
                     (name, shape)
                 }
+                Some(GgufMap::Skip) => continue,
                 None => {
                     return Err(bad(index, format!("unmapped tensor name '{}'", info.name)));
                 }
@@ -623,8 +648,17 @@ impl GgufFile {
             });
             start += len;
         }
-        assert_eq!(start, total_f32_bytes, "the plan covers the whole payload");
-        assert_eq!(plan.len(), self.tensors.len(), "every tensor is planned");
+        // The bound is on the payload actually planned (skips excluded); this
+        // reads no payload, so checking after the plan loop still fails before
+        // `dequant_into` copies a single byte.
+        if start > MAX_DEQUANT_BYTES {
+            return Err(GgufError::OverBound {
+                path: self.path.display().to_string(),
+                what: "dequantized f32 payload bytes",
+                count: start,
+                bound: MAX_DEQUANT_BYTES,
+            });
+        }
         Ok(plan)
     }
 
@@ -929,6 +963,12 @@ pub fn dequantize(dtype: GgmlType, bytes: &[u8]) -> Result<Vec<f32>, String> {
             GgmlType::Q4_K => dequant_q4_k(block, &mut out),
             GgmlType::Q5_K => dequant_q5_k(block, &mut out),
             GgmlType::Q6_K => dequant_q6_k(block, &mut out),
+            GgmlType::IQ4_XS => dequant_iq4_xs(block, &mut out),
+            GgmlType::IQ4_NL => dequant_iq4_nl(block, &mut out),
+            GgmlType::IQ2_XS => dequant_iq2_xs(block, &mut out),
+            GgmlType::IQ2_S => dequant_iq2_s(block, &mut out),
+            GgmlType::IQ3_XXS => dequant_iq3_xxs(block, &mut out),
+            GgmlType::IQ3_S => dequant_iq3_s(block, &mut out),
             other => return Err(format!("dequant for {other:?} is not implemented yet")),
         }
     }
@@ -1171,6 +1211,164 @@ fn dequant_q6_k(block: &[u8], out: &mut Vec<f32>) {
             y[base + l + 32] = d * s(is + 2) * f32::from(q2);
             y[base + l + 64] = d * s(is + 4) * f32::from(q3);
             y[base + l + 96] = d * s(is + 6) * f32::from(q4);
+        }
+    }
+}
+
+/// IQ4_NL/IQ4_XS's 16-entry non-linear value table (llama.cpp
+/// `kvalues_iq4nl`, frozen with the format).
+const KVALUES_IQ4NL: [f32; 16] = [
+    -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0, 1.0, 13.0, 25.0, 38.0, 53.0, 69.0,
+    89.0, 113.0,
+];
+
+/// IQ4_XS: 256-element superblock — f16 d + 8 six-bit sub-scales (low 4 bits
+/// packed two-per-byte in `scales_l`, high 2 bits packed in `scales_h`) +
+/// 128 B of 4-bit indices into [`KVALUES_IQ4NL`]; per 32-group,
+/// `x = d·(sc − 32)·kvalues[q]` with the 16 low nibbles first
+/// (llama.cpp `dequantize_row_iq4_xs`).
+fn dequant_iq4_xs(block: &[u8], out: &mut Vec<f32>) {
+    assert_eq!(block.len(), 136, "IQ4_XS superblock is 136 bytes");
+    let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+    let scales_h = u16::from_le_bytes([block[2], block[3]]);
+    let scales_l = &block[4..8];
+    let qs = &block[8..136];
+    for ib32 in 0..8usize {
+        let lo = (scales_l[ib32 / 2] >> (4 * (ib32 % 2))) & 0x0F;
+        let hi = ((scales_h >> (2 * ib32)) & 3) as u8;
+        let sc = i16::from(lo | (hi << 4)) - 32;
+        let dl = d * f32::from(sc);
+        let q = &qs[16 * ib32..16 * ib32 + 16];
+        out.extend(q.iter().map(|&b| dl * KVALUES_IQ4NL[usize::from(b & 0x0F)]));
+        out.extend(q.iter().map(|&b| dl * KVALUES_IQ4NL[usize::from(b >> 4)]));
+    }
+}
+
+/// IQ4_NL: 32-element block — f16 d + 16 B of 4-bit indices into
+/// [`KVALUES_IQ4NL`]; low nibbles are elements 0..16, high 16..32
+/// (llama.cpp `dequantize_row_iq4_nl`).
+fn dequant_iq4_nl(block: &[u8], out: &mut Vec<f32>) {
+    assert_eq!(block.len(), 18, "IQ4_NL block is 18 bytes");
+    let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+    let qs = &block[2..18];
+    out.extend(qs.iter().map(|&b| d * KVALUES_IQ4NL[usize::from(b & 0x0F)]));
+    out.extend(qs.iter().map(|&b| d * KVALUES_IQ4NL[usize::from(b >> 4)]));
+}
+
+use crate::gguf_iq_grids::{IQ2S_GRID, IQ2XS_GRID, IQ3S_GRID, IQ3XXS_GRID, KSIGNS_IQ2XS};
+
+/// Unpack a grid word's 8 byte-magnitudes with `signs`' 8 sign bits applied
+/// (ggml's `kmask_iq2xs` is just bit `j`), scaled by `dl`.
+fn push_signed_row8(out: &mut Vec<f32>, dl: f32, grid: u64, signs: u8) {
+    for j in 0..8 {
+        let mag = f32::from((grid >> (8 * j)) as u8);
+        let sign = if signs & (1 << j) != 0 { -1.0 } else { 1.0 };
+        out.push(dl * mag * sign);
+    }
+}
+
+/// IQ2_XS: 256-element superblock — f16 d + 32 u16 words (9-bit grid index +
+/// 7-bit sign index) + 8 packed 4-bit sub-scales;
+/// `x = d·(0.5 + sc)·0.25·grid·±1` (llama.cpp `dequantize_row_iq2_xs`).
+fn dequant_iq2_xs(block: &[u8], out: &mut Vec<f32>) {
+    assert_eq!(block.len(), 74, "IQ2_XS superblock is 74 bytes");
+    let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+    let qs: Vec<u16> = block[2..66]
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
+        .collect();
+    let scales = &block[66..74];
+    for ib32 in 0..8usize {
+        let db = [
+            d * (0.5 + f32::from(scales[ib32] & 0x0F)) * 0.25,
+            d * (0.5 + f32::from(scales[ib32] >> 4)) * 0.25,
+        ];
+        for l in 0..4usize {
+            let word = qs[4 * ib32 + l];
+            let grid = IQ2XS_GRID[usize::from(word & 511)];
+            let signs = KSIGNS_IQ2XS[usize::from(word >> 9)];
+            push_signed_row8(out, db[l / 2], grid, signs);
+        }
+    }
+}
+
+/// IQ2_S: 256-element superblock — f16 d + 64 B `qs` (32 low index bytes,
+/// then 32 sign bytes) + 8 B `qh` (index bits 8..10) + 8 packed sub-scales
+/// (llama.cpp `dequantize_row_iq2_s`).
+fn dequant_iq2_s(block: &[u8], out: &mut Vec<f32>) {
+    assert_eq!(block.len(), 82, "IQ2_S superblock is 82 bytes");
+    let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+    let qs = &block[2..34]; // low 8 bits of grid indices, 4 per 32-group
+    let signs = &block[34..66]; // one sign byte per grid row
+    let qh = &block[66..74];
+    let scales = &block[74..82];
+    for ib32 in 0..8usize {
+        let db = [
+            d * (0.5 + f32::from(scales[ib32] & 0x0F)) * 0.25,
+            d * (0.5 + f32::from(scales[ib32] >> 4)) * 0.25,
+        ];
+        for l in 0..4usize {
+            let hi = (u16::from(qh[ib32]) << (8 - 2 * l)) & 0x300;
+            let grid = IQ2S_GRID[usize::from(u16::from(qs[4 * ib32 + l]) | hi)];
+            push_signed_row8(out, db[l / 2], grid, signs[4 * ib32 + l]);
+        }
+    }
+}
+
+/// Unpack a u32 grid word's 4 byte-magnitudes with 4 sign bits (offset
+/// `bit0` into ggml's 8-bit sign mask), scaled by `dl`.
+fn push_signed_row4(out: &mut Vec<f32>, dl: f32, grid: u32, signs: u8, bit0: u8) {
+    for j in 0..4u8 {
+        let mag = f32::from((grid >> (8 * j)) as u8);
+        let sign = if signs & (1 << (bit0 + j)) != 0 { -1.0 } else { 1.0 };
+        out.push(dl * mag * sign);
+    }
+}
+
+/// IQ3_XXS: 256-element superblock — f16 d + 64 index bytes (into the
+/// 256-entry grid, 4 values each) + 8 u32 words carrying a 4-bit scale and
+/// four 7-bit sign indices (llama.cpp `dequantize_row_iq3_xxs`).
+fn dequant_iq3_xxs(block: &[u8], out: &mut Vec<f32>) {
+    assert_eq!(block.len(), 98, "IQ3_XXS superblock is 98 bytes");
+    let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+    let qs = &block[2..66];
+    let sas = &block[66..98]; // scales-and-signs, one u32 per 32-group
+    for ib32 in 0..8usize {
+        let aux32 = u32::from_le_bytes(sas[4 * ib32..4 * ib32 + 4].try_into().expect("4"));
+        let db = d * (0.5 + (aux32 >> 28) as f32) * 0.5;
+        for l in 0..4usize {
+            let signs = KSIGNS_IQ2XS[usize::try_from((aux32 >> (7 * l)) & 127).expect("7 bits")];
+            let g1 = IQ3XXS_GRID[usize::from(qs[8 * ib32 + 2 * l])];
+            let g2 = IQ3XXS_GRID[usize::from(qs[8 * ib32 + 2 * l + 1])];
+            push_signed_row4(out, db, g1, signs, 0);
+            push_signed_row4(out, db, g2, signs, 4);
+        }
+    }
+}
+
+/// IQ3_S: 256-element superblock — f16 d + 64 index bytes + 8 B `qh` (index
+/// bit 8) + 32 sign bytes + 4 packed 4-bit sub-scales;
+/// `x = d·(1 + 2·sc)·grid·±1` (llama.cpp `dequantize_row_iq3_s`).
+fn dequant_iq3_s(block: &[u8], out: &mut Vec<f32>) {
+    assert_eq!(block.len(), 110, "IQ3_S superblock is 110 bytes");
+    let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+    let qs = &block[2..66];
+    let qh = &block[66..74];
+    let signs = &block[74..106];
+    let scales = &block[106..110];
+    for ib32 in 0..8usize {
+        let db = d
+            * (1.0
+                + 2.0 * f32::from((scales[ib32 / 2] >> (4 * (ib32 % 2))) & 0x0F));
+        for l in 0..4usize {
+            let h = u16::from(qh[ib32]);
+            let i1 = usize::from(u16::from(qs[8 * ib32 + 2 * l]) | ((h << (8 - 2 * l)) & 256));
+            let i2 = usize::from(u16::from(qs[8 * ib32 + 2 * l + 1]) | ((h << (7 - 2 * l)) & 256));
+            let sign_byte = signs[4 * ib32 + l];
+            push_signed_row4(out, db, IQ3S_GRID[i1], sign_byte, 0);
+            push_signed_row4(out, db, IQ3S_GRID[i2], sign_byte, 4);
         }
     }
 }
@@ -1475,6 +1673,105 @@ mod tests {
         assert_eq!(out[32], -32.0);
         // Zero scale zeroes the value even though q3 = −32.
         assert_eq!(out[64], 0.0);
+    }
+
+    #[test]
+    fn iq4_xs_superblock_matches_hand_computation() {
+        let mut block = vec![0u8; 136];
+        block[0..2].copy_from_slice(&f16_bytes(2.0)); // d
+        // Sub-scale 0 = 33 (low 4 bits = 1, high 2 bits = 2 → 1|2<<4 = 33):
+        // scales_l[0] low nibble = 1; scales_h bits 0..2 = 2.
+        block[4] = 0x01;
+        block[2..4].copy_from_slice(&2u16.to_le_bytes());
+        // Sub-scale 1 = 0 → dl = 2·(0−32) = −64 for group 1.
+        // qs[0]: low nibble index 8 (→ +1), high nibble index 15 (→ +113).
+        block[8] = 0xF8; // low nibble = 8, high nibble = 15
+        let out = dequantize(GgmlType::IQ4_XS, &block).unwrap();
+        assert_eq!(out.len(), 256);
+        // Group 0: dl = 2·(33−32) = 2. Element 0 = 2·kvalues[8] = 2·1.
+        assert_eq!(out[0], 2.0);
+        // High nibbles are elements 16..32 of the group: 2·kvalues[15].
+        assert_eq!(out[16], 2.0 * 113.0);
+        // Untouched qs bytes are index 0 → kvalues[0] = −127, scaled.
+        assert_eq!(out[1], 2.0 * -127.0);
+        // Group 1's zero sub-scale gives dl = −64: element 32 = −64·−127.
+        assert_eq!(out[32], -64.0 * -127.0);
+    }
+
+    #[test]
+    fn iq4_nl_block_matches_hand_computation() {
+        let mut b = vec![0u8; 18];
+        b[0..2].copy_from_slice(&f16_bytes(2.0));
+        b[2] = 0xF8; // low nibble 8 → kvalues[8] = 1; high 15 → kvalues[15] = 113
+        let out = dequantize(GgmlType::IQ4_NL, &b).unwrap();
+        assert_eq!(out.len(), 32);
+        assert_eq!(out[0], 2.0);
+        assert_eq!(out[16], 2.0 * 113.0);
+        assert_eq!(out[1], 2.0 * -127.0); // zero nibble hits kvalues[0]
+    }
+
+    #[test]
+    fn iq2_xs_superblock_matches_hand_computation() {
+        let mut b = vec![0u8; 74];
+        b[0..2].copy_from_slice(&f16_bytes(1.0));
+        // qs word 0: grid index 1 (0x…2b in byte 0), sign index 1 (KSIGNS[1]
+        // = 129: bits 0 and 7 negative).
+        b[2..4].copy_from_slice(&0x0201u16.to_le_bytes());
+        b[66] = 0x21; // scales[0]: low nibble 1 → db0 = 0.375, high 2 → db1 = 0.625
+        let out = dequantize(GgmlType::IQ2_XS, &b).unwrap();
+        assert_eq!(out.len(), 256);
+        assert_eq!(out[0], -0.375 * 43.0); // grid byte 0 = 0x2b, sign bit 0
+        assert_eq!(out[1], 0.375 * 8.0);
+        assert_eq!(out[7], -0.375 * 8.0); // sign bit 7
+        // Row l = 2 (elements 16..24) rides db1; untouched words are
+        // grid 0 (all 8s), sign 0.
+        assert_eq!(out[16], 0.625 * 8.0);
+    }
+
+    #[test]
+    fn iq2_s_superblock_matches_hand_computation() {
+        let mut b = vec![0u8; 82];
+        b[0..2].copy_from_slice(&f16_bytes(2.0));
+        b[34] = 129; // signs byte for row 0: bits 0 and 7
+        b[74] = 0x01; // scales[0] low nibble 1 → db0 = 2·1.5·0.25 = 0.75
+        let out = dequantize(GgmlType::IQ2_S, &b).unwrap();
+        assert_eq!(out.len(), 256);
+        assert_eq!(out[0], -0.75 * 8.0); // grid 0 is all 8s
+        assert_eq!(out[1], 0.75 * 8.0);
+        assert_eq!(out[7], -0.75 * 8.0);
+        assert_eq!(out[8], 0.75 * 8.0); // row 1 still rides db0
+        assert_eq!(out[16], 0.5 * 0.25 * 2.0 * 8.0); // rows 2..4: zero high nibble → 0.5·d·0.25
+    }
+
+    #[test]
+    fn iq3_xxs_superblock_matches_hand_computation() {
+        let mut b = vec![0u8; 98];
+        b[0..2].copy_from_slice(&f16_bytes(2.0));
+        b[2] = 1; // grid1 index 1 = 0x04040414: byte 0 = 20, rest 4
+        // aux32 for group 0: scale bits 1 (db = 2·1.5·0.5 = 1.5), sign index 1.
+        b[66..70].copy_from_slice(&((1u32 << 28) | 1).to_le_bytes());
+        let out = dequantize(GgmlType::IQ3_XXS, &b).unwrap();
+        assert_eq!(out.len(), 256);
+        assert_eq!(out[0], -1.5 * 20.0); // KSIGNS[1] bit 0
+        assert_eq!(out[1], 1.5 * 4.0);
+        assert_eq!(out[4], 1.5 * 4.0); // grid2 (index 0) is all 4s
+        assert_eq!(out[7], -1.5 * 4.0); // KSIGNS[1] bit 7 lands on grid2's row
+    }
+
+    #[test]
+    fn iq3_s_superblock_matches_hand_computation() {
+        let mut b = vec![0u8; 110];
+        b[0..2].copy_from_slice(&f16_bytes(1.0));
+        b[2] = 1; // grid1 index 1 = 0x01010103: byte 0 = 3, rest 1
+        b[74] = 1; // signs byte row 0: bit 0
+        b[106] = 0x01; // scales[0] low nibble 1 → db = 1 + 2·1 = 3
+        let out = dequantize(GgmlType::IQ3_S, &b).unwrap();
+        assert_eq!(out.len(), 256);
+        assert_eq!(out[0], -3.0 * 3.0);
+        assert_eq!(out[1], 3.0);
+        assert_eq!(out[4], 3.0); // grid2 (index 0) all 1s, no sign
+        // Group 1 shares scales[0]'s high nibble (0) → db = 1.
+        assert_eq!(out[32], 1.0);
     }
 
     #[test]

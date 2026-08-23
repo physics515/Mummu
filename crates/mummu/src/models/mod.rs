@@ -11,6 +11,7 @@ pub mod minilm;
 pub mod olmoe;
 pub mod qwen2;
 pub mod qwen3;
+pub mod qwen35;
 
 /// Upper bound on one [`CausalLm::warm_up`] call. A warm-up is a fixed,
 /// bounded cost paid off the user's critical path — not a place to spend

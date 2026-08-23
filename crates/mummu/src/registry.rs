@@ -24,6 +24,9 @@ pub enum Architecture {
     /// first MoE). Imports from GGUF (experts pre-fused) or from HF
     /// safetensors (experts fused on import).
     Olmoe,
+    /// `models::qwen35` — Qwen3.5/3.8 hybrid: Gated DeltaNet linear
+    /// attention + gated full attention every 4th layer. GGUF import only.
+    Qwen35,
 }
 
 /// How the checkpoint's weights are stored — which fetch + load path a spec
@@ -259,6 +262,45 @@ pub fn catalog() -> Vec<ModelSpec> {
             architecture: Architecture::Olmoe,
             format: WeightFormat::Safetensors,
             disk_bytes_estimate: 13_800_000_000,
+        },
+        // Qwen3.5 hybrid (Gated DeltaNet + interval attention) — the zoo's
+        // first linear-attention family. BF16 is the parity-reference build;
+        // Q8_0 is the practical download (identical f32 footprint once
+        // dequantized — mummu has no keep-quantized runtime yet, see P9).
+        ModelSpec {
+            name: "qwen3.5-2b".into(),
+            repo: "unsloth/Qwen3.5-2B-GGUF".into(),
+            revision: "main".into(),
+            architecture: Architecture::Qwen35,
+            format: WeightFormat::Gguf {
+                file: "Qwen3.5-2B-BF16.gguf".into(),
+            },
+            disk_bytes_estimate: 4_500_000_000,
+        },
+        ModelSpec {
+            name: "qwen3.5-2b-q8".into(),
+            repo: "unsloth/Qwen3.5-2B-GGUF".into(),
+            revision: "main".into(),
+            architecture: Architecture::Qwen35,
+            format: WeightFormat::Gguf {
+                file: "Qwen3.5-2B-Q8_0.gguf".into(),
+            },
+            disk_bytes_estimate: 2_400_000_000,
+        },
+        // Qwen3.8-27B: the header parses and every tensor dequantizes (the
+        // full IQ family shipped 2026-08-21), but a 27B at f32 is ~109 GB —
+        // loading it needs the P9 keep-quantized runtime. The entry exists
+        // so big-RAM hosts can try the import and everyone else gets the
+        // loud size error instead of silence.
+        ModelSpec {
+            name: "qwen3.8-27b-ud-q4ks".into(),
+            repo: "unsloth/Qwen3.8-27B-GGUF".into(),
+            revision: "main".into(),
+            architecture: Architecture::Qwen35,
+            format: WeightFormat::Gguf {
+                file: "Qwen3.8-27B-UD-Q4_K_S.gguf".into(),
+            },
+            disk_bytes_estimate: 16_400_000_000,
         },
     ];
     debug_assert!(

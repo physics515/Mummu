@@ -9,6 +9,12 @@
 **Stack:** Rust 2024 · **Burn 0.21** (`wgpu` 29 + `burn-flex` CPU, `fusion` + `autotune`, multi-device) ·
 `burn-store` · HF `tokenizers` · runs on **any hardware** — CPU, one GPU, or several (multi-GPU + CPU
 offload). Reference dev machine: Ryzen 9 7950X3D · 128 GB · RTX 4070 Ti SUPER 16 GB.
+*(2026-08-21) Pin watch: **burn 0.21.0 is still the latest STABLE release** (crates.io, checked
+2026-08-21) — the workspace is already on the newest burn there is; a `cargo update` pass brought
+transitive deps current (7 patch/minor bumps, 243 lib tests green). 0.22 exists only as pre-releases
+(`0.22.0-pre.2`, 2026-08-10). The wgpu-30 unblock below therefore waits on **stable 0.22** — the
+parity-pinned stack does not ride pre-releases; when 0.22.0 lands, budget a full parity re-run (rope,
+quantization API churn, wgpu 30's f16-in-WGSL win noted below).*
 *(2026-07-16) Pin watch: wgpu 30 and tokenizers 0.23.1 are out; both held (burn 0.21 resolves wgpu 29,
 and the tokenizers 0.23 change relevant to us — `add_tokens` normalizing content at insertion — touches
 exactly the added-token path `tokenizer_from_gguf` rides, so the bump waits for a parity re-run) —
@@ -859,7 +865,30 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       `--spec-type mtp` to `--spec-type draft-mtp` (2026-05-13), worth knowing before wiring a
       reference leg against it. —
       https://huggingface.co/unsloth/Qwen3.5-9B-MTP-GGUF · https://sebastianraschka.com/llm-architecture-gallery/hybrid-attention/
-- [x] A `Model` trait so new architectures (Hermes-class function-callers, Gemma, Qwen3, …) slot in.
+      *(2026-08-21 ground truth)* Read straight from a real header (`gguf-info`, new `examples/`
+      tool, on `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_S` — arch string is literally **`qwen35`** even for
+      the 3.8 generation): `full_attention_interval = 4` **confirmed**; the linear-attention side is
+      keyed as `ssm.*` (conv_kernel 4, inner_size 6144, state_size 128, group_count 16,
+      time_step_rank 48); `nextn_predict_layers = 1` rides IN the main GGUF as an unused 66th block
+      (`blk.65` `nextn.*` tensors — llama.cpp logs them "unused", so a port can skip them);
+      `rope.dimension_sections = [11, 11, 10, 0]` (MRoPE — the family is multimodal, mmproj sidecar);
+      head_count 24 / kv 4, key/value_length 256, embedding 5120, ffn 17408, 65 blocks, vocab
+      248320, ctx 262144. Fit reality for the 27B: mummu's dequant-to-f32 path would need ~109 GB —
+      the P9 keep-quantized item is a hard prerequisite, not an optimization, for this tier.
+      Its UD quant mixes seven formats: Q4_K/Q5_K/Q6_K/Q8_0/Q3_K (have), **IQ4_XS** (shipped
+      2026-08-21, 172 of 866 tensors), and small counts of IQ4_NL/IQ3_S/IQ3_XXS/IQ2_XS/IQ2_S
+      (29 tensors, still missing — the IQ codebook-grid family).
+      *(2026-08-21, later the same day)* **The full IQ family shipped** (IQ4_NL + the
+      codebook-grid four, tables regex-extracted verbatim from `ggml-common.h` into
+      `gguf_iq_grids.rs`, per-format hand-computed block tests) — `gguf-verify` (new example)
+      streams **all 866 tensors of the 27B UD file to finite, plausible f32**. And the
+      **`models::qwen35` port landed**: Gated DeltaNet (sequential recurrence, rolling conv
+      state) + gated attention with partial RoPE every `full_attention_interval`-th layer,
+      GGUF-only import (NextN/MTP tensors explicitly skipped via the new `GgufMap::Skip`),
+      catalog entries `qwen3.5-2b` (BF16, the parity build), `qwen3.5-2b-q8`, and
+      `qwen3.8-27b-ud-q4ks` (loud-size-error until P9). Toy cache-equivalence tests green;
+      the llama.cpp parity gate is `tests/parity_qwen35.rs` (`MUMMU_QWEN35_GGUF` +
+      `MUMMU_LLAMA_SERVER`; the local Ollama 0.32.15's bundled llama-server speaks qwen35).
       *(2026-07-10) `models::CausalLm<B>` — associated `Cache` type; a port supplies `new_cache` /
       `forward` / `is_eos` and inherits `generate` / `greedy_generate` / `first_token` from the shared
       driver (static dispatch, single code path). Both LLMs now implement it; the parity gate re-ran
@@ -935,7 +964,9 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       (name remap + ggml dim-order transpose), tokenizer-from-GGUF-metadata.*
       *(2026-07-13) **GGUF→running model shipped.** Every storage dtype now dequantizes (added
       Q4_0/Q4_1/Q5_0/Q5_1 + K-quants Q2_K/Q3_K/Q5_K, exact ggml ports, hand-computed block tests —
-      133 unit tests total); `GgufFile::dequant_to_safetensors` bridges a GGUF onto the SAME checked-load
+      133 unit tests total; *2026-08-21:* + **IQ4_XS**, the workhorse of unsloth's UD dynamic quants
+      — the codebook-grid IQ family IQ4_NL/IQ3_S/IQ3_XXS/IQ2_XS/IQ2_S is still unimplemented and is
+      what blocks parsing a UD file end-to-end, see the qwen35 note in P2); `GgufFile::dequant_to_safetensors` bridges a GGUF onto the SAME checked-load
       pipeline as safetensors (dims reversed = row-major HF layout, unmapped tensor names are loud
       errors); `Qwen2Config::from_gguf` reads hyperparameters from `qwen2.*` metadata (vocab from the
       embedding tensor, EOS from tokenizer metadata); `qwen2::load_from_gguf` = one file → running model.
@@ -1673,6 +1704,173 @@ that fits the model AND uses every device to the fullest.
 
 ### P9 — Quantization (fit any model to the hardware)
 The VRAM lever the P6 planner pulls to make the largest useful model fit the user's actual devices.
+- [ ] **Stage 3 — the native multi-precision pack + tiered multi-device MoE** *(directive 2026-08-22:
+      "run any model optimally on any hardware")*. Two parts, in order:
+      **(a) `.mummu` pack format.** Import converts ONCE into mummu's own artifact: a directory with
+      `manifest.json` (source + sha, architecture, config, tokenizer, per-tensor role/shape/offsets)
+      and one blob per precision (`q4.bin`, `q8.bin`, `f16.bin`, `f32.bin`; every tensor — and every
+      MoE **expert** separately — at every level), so a device memory-maps only the precision and
+      the tensors it needs, and the planner picks precision per tensor group without re-importing.
+      f64 is widening, not information: weights born bf16/Q4 gain nothing from f64 storage, so f64
+      is a *compute* option derived from f32 where a backend supports it — stored levels stop at f32.
+      The quantized blobs carry our own layout (i8 / nibbles + f32 block-32 scales); loaders build
+      backend tensors via `q_from_data` where the layout matches, else dequant→quantize per tensor.
+      **(b) tiered MoE execution.** Experts as an `ExpertPool` spread across devices (CPU efficiency
+      cores / performance cores / iGPU / dGPU), each shard at the precision that device runs best,
+      activations crossing devices as `[tokens, hidden]` host copies per layer (a few KB per
+      token); a scheduler assigns experts→(device, precision) from the P6 inventory and can
+      **hot-swap** precision per expert (the pack makes every level available instantly). v1:
+      static assignment by capability; v2: live re-tiering on load/latency/energy signals.
+      Status *(2026-08-22)*: **(a) implemented** — `mummu::pack` (manifest + `header.gguf` +
+      per-precision blobs; block-32 Q4/Q8 in burn's canonical quantized `TensorData` layout so
+      loading is a copy on every backend; nibble-packed Q4 on disk; `quantize_blocks` tested
+      incl. the canonical round-trip), `qwen35::{pack_actions, load_from_pack}`,
+      `olmoe::{pack_actions, load_from_pack}` (experts as separate pack entries — the per-expert
+      tiering hook), and mummu-serve **auto-imports on first use** (`<model dir>/pack`,
+      `MUMMU_PACK=off` to disable, `MUMMU_PACK_PRECISIONS` default all four; temp-dir + rename so
+      a crash never leaves a half pack) then loads from the pack at the planner's level.
+      **Gated** on the 2B BF16 fixture (`tests/real_qwen35_pack.rs`): pack F32 and F16 reproduce
+      the GGUF f32 logits with Δ = 0, pack Q8 ≡ streaming Q8 and pack Q4 ≡ streaming Q4 with
+      Δ = 0 (same quantizer, stored once). Two importer bugs fell out of the gate: the conv
+      kernel's dims order (ggml `ne` vs row-major) and burn 0.21's `TensorData::quantized`, which
+      only handles 8-bit values under the default `PackedU32` store (its Q4 reader unpacks nibbles
+      the constructor never packs) — the pack now builds the canonical packed-u32 + scales bytes
+      itself (`pack::quantized_tensor_data`), which both flex and cubecl ingest. `examples/pack-import`
+      pre-imports a GGUF (the 27B's pack is 4 levels ≈ 220 GB — 4.4 TB free on the models drive).
+      **(b) implemented** — `mummu::tier` (`plan_tiers`: admission at the cheapest slot so no
+      expert is silently dropped, then hottest-first promotion to faster device / higher level
+      within budgets; `diff` for hot-swap lists; `smooth_hotness` EMA; 6 tests),
+      `nn::{ExpertExec, DeviceExpert<B>, ExpertPool, Routing}` (router on the main backend,
+      routed rows cross devices as host f32, every in-service expert runs concurrently on its
+      own device, host scatter-add; hit counters; `swap` = atomic per-expert hot-swap; toy test:
+      pooled ≡ local, hot-swap preserves outputs), `olmoe::{load_trunk_from_pack,
+      load_expert_from_pack, pack_expert_costs, LoadedOlmoeQ::with_pool}`, and mummu-serve's
+      tier runtime (`MUMMU_TIERS`, devices = CPU [Q8, Q4] + CUDA [F32, Q8, Q4] or wgpu [F32, Q8];
+      budgets = backend budget minus the trunk on the main backend; re-plan after every request
+      from routing hits, ≤ 16 moves per pass on a background thread; expert bytes on a backend
+      are subtracted from that backend's fit budget). **Gated** on the real OLMoE-1B-7B
+      (`tests/real_olmoe_tiered.rs`, 300 s, 2026-08-22): pack import 161 s (1024 experts — Q4 3.9 MB /
+      Q8 7.1 MB / F32 25 MB each); all-Q8 pool ≡ same-backend Q8 with Δ = 0; the mixed plan put
+      128 experts at f32 on the wgpu GPU + 586 at int8 + 310 at int4 on the CPU (5.0 GiB CPU /
+      3.0 GiB GPU resident, loaded in 22 s), first token = f32's, greedy "2 + 2 equals 4." (6 tokens,
+      8.0 s — host round trips + CPU dequant fallback; the speed lever is the CUDA/cubecl q_matmul
+      tiers); the hit-driven re-plan promoted hot experts (561 moves), 64 hot-swapped live in 1.1 s
+      (~17 ms/expert) and the model kept answering. The 27B pack: 851 tensors, 192 GiB, 19.4 min.
+      **Deployed** (image rebuilt + `docker compose up -d --no-deps mummu`): the 27B answered from
+      its pre-imported pack on the default path (Cpu @ Q4, 24 tokens, 19.3 min wall incl. load);
+      OLMoE auto-imported in the container (529 s over the bind mount) and was placed 495 experts
+      f32 on CUDA + 529 int8 on CPU — then the **Docker VM's OOM killer** took the process (46 GB
+      anon RSS: the 27B still resident in the CPU slot at ~40 GiB + OLMoE trunk/experts + the
+      import's dirty page cache). Fixes: the importer `sync_data`s every GiB per blob and
+      `sync_all`s at the end (dirty pages no longer pile up against the process); the tier loader
+      calls `ensure_host_room` (MemAvailable vs worst-case CPU tier + 6 GiB slack, evicting the CPU
+      slot's other model) before placing experts; compose sets `MUMMU_GPU_BUDGET_GB=11` for the
+      16 GB card shared with the desktop (lowered to 9 after the re-verified run still showed 15.6 of
+      16 GiB in use). **Re-verified after the fix**: OLMoE placed 324 experts f32 + 1 int8 on CUDA
+      (7.6 GiB after the trunk) + 699 int8 on the CPU, all 1024 resident in 139 s (cpu 4.61 GiB,
+      cuda 7.60 GiB); first request "2+2 equals 4." (47 s incl. prefill — the host-round-trip
+      expert path is correct but slow under WSL2 GPU-PV), warm request 32 tokens in 19 s
+      (1.7 tok/s), background re-tier moved 16 experts in 6.6 s with 390 queued for later requests.
+      Next perf lever: batch a device's in-service experts into one dispatch and keep activations
+      on-device when the expert's device is the main backend (no host hop), then the CUDA q_matmul
+      int8/int4 tiers.
+      **(c) dense models as clusters — implemented and gated (2026-08-22).** `mummu::partition`:
+      MoEfication-style *parameter* clustering (balanced k-means on each neuron's gate‖up vector
+      under a deterministic JL projection — no calibration data, so it runs on import for any
+      size) permutes every layer's FFN intermediate dim so clusters are contiguous and rewrites
+      gate/up/down **in place at every stored level** (same bytes, same names: the dense loader is
+      unchanged, nothing is duplicated); crash-safe per layer via a journal with pre-rewrite
+      fingerprints. `Pack::{tensor_cols, tensor_rows}` slice clusters straight from the quantized
+      bytes (block-aligned, no re-quantization); `qwen35::{load_from_pack_partitioned,
+      load_ffn_clusters, ffn_names}`; `LoadedQwen35::{with_ffn_pool, with_ffn_skip}`; the layer
+      forward = local slab (typed, on the main device) + `ExpertPool::run_dense` (remote clusters,
+      host f32, concurrent), exact when everything runs. **Skipping** (stage "MoE-fy for real") is
+      a training-free gate-energy router: clusters whose `Σ silu(x·g)²` falls below `tau` × the
+      row's total energy are not computed — opt-in only, behind a measured skip table
+      (`examples/pack-calibrate`: hotness prior + tau → max |Δ log-prob| / argmax agreement /
+      kept fraction, written into the manifest) and `MUMMU_FFN_SKIP_TOLERANCE`. Serve: qwen35
+      packs are partitioned on import / first load (`ensure_partition`), `build_partitioned_qwen35`
+      plans clusters per-cluster with the calibrated hotness (main device's ladder pinned to the
+      trunk level), keeps ≥1 local cluster per layer, then **groups the remote clusters by device**
+      into one executor per (layer, device) — in exact mode every cluster runs, so this is one
+      matmul per device per layer, not one per cluster (the 27B: ~128 grouped executors, not 2048).
+      Placement is static (all clusters always run), so there is no runtime re-tier for dense; the
+      fit planner fits only the **trunk** on the preferred backend when units tier out
+      (`pack_trunk_bytes`). **GPU tiers are F32/Q8 only** — burn 0.21's CUDA `q_matmul` panics in
+      autotune on the pooled f32-input × Q4-weight matmul (`Cast element count must match`) and
+      returns garbage, the same GPU-Q4 breakage the wgpu path already refuses; Q4 units run on the
+      CPU (flex dequant fallback, correct). Verified in the container: the 27B partitions (64×32
+      clusters, 45 min once), the trunk lands on CPU@Q8 (the 27B trunk > the 9 GiB GPU budget),
+      FFN clusters group to ~128 executors and load in 837 s (8.7 GiB on CUDA); with the Q4-on-GPU
+      fix the mixed CPU-trunk / GPU-cluster plan is exact. Throughput is CPU-trunk bound (~100 s/tok
+      for the 65-layer DeltaNet on flex) — the trunk-on-GPU lever needs the trunk to fit VRAM.
+      **Capacity finding (2026-08-22):** the 27B does not fully fit this Docker VM's 63 GB during
+      decode — trunk on CPU@Q8 + 1768 Q8 FFN clusters on CPU + flex's 65-layer DeltaNet decode
+      activations reached ~45 GB anon RSS and the VM's global OOM killer took the process
+      mid-generation (partition/placement/load all succeed; it dies while decoding). The relief
+      lever is Q8-on-GPU for FFN clusters (9 GiB fits ~1075 Q8 vs 280 F32, moving ~800 clusters
+      off CPU RAM) — but the planner prefers F32 (highest quality first) and Q8-on-CUDA through the
+      pooled host-f32-input path is unverified (Q4 there panics); pinning that down, or a larger VM,
+      or trunk-on-GPU, is the follow-up. The mechanism is proven on the 2B (exact) and OLMoE
+      (deployed, answering); the 27B is memory-marginal on this specific box, not a feature gap. Gate on the 2B (`tests/real_qwen35_partition.rs`, 186 s): partition
+      61 s (24 layers × 32 clusters of 192 neurons); dense(partitioned) vs dense(original)
+      Δ = 2.8e-5; half the clusters remote at f32 Δ = 3.1e-5 (exact up to summation order);
+      f32-local / int8-remote Δ = 0.149 logit, same first token, correct answer; skip tau=0.02
+      Δ = 4.8 logits on the 2B (SwiGLU is not sparse — skipping is a real trade, which is why it
+      is opt-in and measured). `examples/{pack-partition, pack-calibrate}`; `pack-import`
+      partitions qwen35 packs automatically. Scope notes: the 27B (`Qwen3.8-27B`) is **dense** (65 layers, no expert
+      tensors) — it benefits from the pack's per-tensor level choice, not the expert pool; dense
+      multi-device tiering = layer-wise placement with per-device caches (next). CPU core classes
+      (efficiency vs performance) are one `Cpu` tier until burn-flex can pin threads; f64 compute
+      tiers need an f64-typed backend instance (not wired). Device list comes from the serve
+      backends in use, not yet the P6 inventory (iGPU as a separate wgpu adapter).
+- [x] **Stage 1 — keep-quantized weights on the single path** *(2026-08-21)*. `mummu::quant`:
+      `QuantPolicy::{Off, Q8, Q4}` (burn `Q8S`/`Q4S`, block-32 scales, `MUMMU_QUANT` env), applied by
+      the new **streaming GGUF importer** (`qwen35::load_from_gguf_quantized` — one tensor at a time:
+      dequant whatever the source stored → device → **re-quantize** → assign; peak = model + one f32
+      tensor, never the 109 GB whole-model blob). The SAME modules and forward serve both precisions:
+      a quantized `Param` executes through the backend's `q_matmul` (burn-cubecl runs the mixed
+      float×quantized matmul natively; flex falls back to per-op dequantize). Embeddings/norms/convs
+      stay float deliberately (no `q_select` kernel; precision anchors). **Measured** (`quant-probe`
+      example, 2048² matmul): Q8S correct on flex CPU + wgpu + CUDA (~0.04% err); Q4S correct on CPU
+      + CUDA (~0.8%) but **wgpu's Q4 kernel returns garbage (~98%)** — consumers refuse Q4-on-wgpu
+      loudly (upstream issue to file). Gates: parity_qwen35 re-passed BYTE-IDENTICAL over the
+      streaming loader (same 5.02e-2 Δlogprob, same greedy bytes), and the Q8 2B answers the smoke
+      correctly with its first-token argmax equal to f32's (real_qwen35). **The 27B tier RAN**
+      *(2026-08-21)*: Qwen3.8-27B UD-Q4_K_S → streaming import + Q4 re-quantize in **445.5 s**,
+      ~33.7 GB resident (vs ~109 GB f32 — impossible), 24 correct greedy think-stream tokens on
+      flex CPU at **73.5 s/token** (the fallback re-dequantizes every weight per matmul — the
+      LlamaWeb-style in-kernel path is the throughput follow-up; cubecl's native `q_matmul` already
+      does this on CUDA, where the 27B is VRAM-bound instead: ~18 GB > 16 GB). Two burn 0.21 bugs
+      found and worked around en route: (a) `Linear::forward`'s weight unsqueeze reshapes packed
+      quantized storage and crashes (flex AND wgpu) — qwen35 routes every projection through a
+      `qlinear` helper that flattens the FLOAT input instead; (b) block-level `compute_range`
+      crashes on rows not divisible by the block width — `QuantPolicy::eligible` now requires
+      `dims[1] % 32 == 0` (the 27B's 48-wide β/α projections stay float).
+      *(2026-08-22)* **Stage 2 — the default path + MoE.** mummu-serve gained a **fit planner**
+      (P6-lite): per request it estimates resident bytes from the GGUF header under each policy
+      and picks the first `(backend, quant)` that fits — preferred backend first with the
+      `MUMMU_QUANT` ladder Off→Q8→Q4, then the CPU (budget = min(3/4 total, 85% MemAvailable) —
+      a shared VM's total lies, learned when a Q8-27B plan wiped the 40-GB-free Docker VM), never
+      Q4-on-wgpu; logs every fit check. So `qwen3.8-27b-ud-q4ks` is an ordinary catalog entry
+      now: installed in the container's models dir, it plans `Cpu @ Q4` while the 2B stays on
+      CUDA f32 — **verified end to end in the deployed container** (2026-08-22): the planner's
+      fit log (Cuda@Off 142 GiB … Cpu@Q4 35 GiB vs 42 GiB budget), ~33 GB RSS during import,
+      8 streamed tokens through `/api/chat` in 472 s (≈59 s/token on the 12-core VM — the
+      flex dequant-fallback bound; the in-kernel path is the throughput follow-up). **MoE:** `nn::SparseMoePerExpert` — experts as independent weight triples,
+      each **quantized separately** (own block scales), **routed** compute so only the top-k are
+      in service per token (host readback of `[tokens, k]` routing ids; `select` →
+      three 2-D matmuls → `select_assign(Add)`), proven EXACTLY equal to the dense-mask path in
+      `nn::moe` tests; `olmoe::load_from_gguf_quantized` streams each fused bank once and splits
+      it into its 64 members (`LoadedOlmoeQ`, a separate struct so the parity-proven fused path
+      is untouched; attention/router/embed/head stay float). **Real-weights gate green**
+      (`tests/real_olmoe_quant.rs`, OLMoE-1B-7B Q4_K_M → per-expert Q8 on flex CPU): first-token
+      argmax identical to the fused f32 model, greedy answer "2 + 2 equals 4." (234 s incl. both
+      loads). Remaining: N-resident expert
+      **paging** to disk (needs a fetch-on-demand store; all experts resident-quantized already
+      fit everywhere OLMoE runs), other families onto the streaming path, GPTQ/AWQ, the three
+      upstream burn reports (wgpu Q4 kernel, packed-weight reshape, block-range on non-divisible
+      rows).
 - [ ] **Burn-native quant** — Burn's `Quantizer` int8 / int4 (block-wise, ~4–8× weight reduction) on the wgpu
       + CPU paths; quantize on import or on the fly, keyed to the fit target from P6.
 - [ ] **Import pre-quantized** — run **GGUF K-quants** (Q2_K–Q8_0, per-layer precision) and **GPTQ / AWQ** int4

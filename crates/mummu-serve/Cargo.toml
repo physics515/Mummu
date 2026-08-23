@@ -1,0 +1,31 @@
+[package]
+name = "mummu-serve"
+description = "Minimal HTTP server + web chat UI over the mummu model runner (GPU via wgpu, CPU fallback)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# Defaults mirror mummu's parity-validated GPU configuration. The Docker
+# image builds with a trimmed set (see Dockerfile MUMMU_FEATURES): mesa's
+# dzn driver — the only Vulkan reaching WSL2 containers — breaks under
+# fusion (stream-ordering panics) and the direct-SPIR-V compiler.
+default = ["fusion", "vulkan-spirv"]
+fusion = ["mummu/fusion"]
+vulkan-spirv = ["mummu/vulkan-spirv"]
+# CUDA backend, selected at runtime with MUMMU_BACKEND=cuda. The Docker image
+# builds with this: it is the only correct GPU path inside WSL2 containers
+# (libcuda is injected by the nvidia runtime; dzn/Vulkan computes garbage).
+cuda = ["mummu/cuda"]
+
+[dependencies]
+mummu = { path = "../mummu", default-features = false }
+burn = { workspace = true }
+tokenizers = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Stable fake digests for the ollama shim's /api/tags (clients treat the
+# digest as an opaque identity).
+sha2 = { workspace = true }
+tiny_http = { workspace = true }

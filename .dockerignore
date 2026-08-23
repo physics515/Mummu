@@ -1,0 +1,10 @@
+# Keep the Docker build context to sources only — the workspace target dir,
+# git metadata, worktrees, and multi-GB local model fixtures must not ship.
+target/
+.git/
+.claude/
+**/*.gguf
+**/*.safetensors
+**/model.safetensors*
+bench/
+docs/

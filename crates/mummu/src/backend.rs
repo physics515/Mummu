@@ -25,6 +25,13 @@ pub type GpuF16 = burn::backend::Wgpu<half::f16, i32>;
 /// CPU backend (burn-flex: pure-Rust SIMD + gemm; burn-ndarray's successor).
 pub type Cpu = burn_flex::Flex<f32, i32>;
 
+/// CUDA backend (feature `cuda`, off by default — see the feature's manifest
+/// note). For environments where no correct Vulkan implementation reaches
+/// the process but the NVIDIA driver does (WSL2 containers). Kernels are
+/// NVRTC-compiled at runtime; f32/i32 element types match [`Gpu`].
+#[cfg(feature = "cuda")]
+pub type Cuda = burn::backend::Cuda;
+
 /// The backend's TYPE-level float dtype (`B::FloatElem`).
 ///
 /// Runtime tensor-creation sites pass this explicitly so a tensor's dtype
