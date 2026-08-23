@@ -205,10 +205,36 @@ future intermediary does buffer, `reverse_proxy` grows
 
 ### Retiring the container
 
-Once the host app is answering through Caddy, the Dockerized `mummu-serve`
-can be stopped. Keep its model volume, or point `MUMMU_MODELS_DIR` at the
-host directory that already holds the weights — the on-disk registry layout
-is identical, so no re-download is needed.
+The Dockerized runner is the `mummu` service in
+`D:\Docker Containers\compose\ai.yaml`. It runs with
+`network_mode: service:wireguard-client`, which is exactly why Caddy
+addresses it as `wireguard-client:8095` — the container has no network
+identity of its own. Once the host app is answering through Caddy, stop it:
+
+```powershell
+docker compose -f "D:\Docker Containers\compose\ai.yaml" stop mummu
+```
+
+Three of its environment settings need a decision on the host rather than a
+straight copy:
+
+- **`MUMMU_BACKEND: cuda` — drop it.** CUDA was the *only* correct GPU path
+  inside the container: no NVIDIA Vulkan ICD reaches Docker Desktop/WSL2, and
+  the mesa `dzn` (Vulkan-on-D3D12) route computes garbage on GiB-sized weight
+  buffers. On the host, unset means "probe the adapters", which is the whole
+  point of the move — the parity-validated wgpu/Vulkan stack takes over and
+  both GPUs are visible. Set it again only to A/B the two backends, and only
+  in a `--features cuda` build.
+- **`MUMMU_GPU_BUDGET_GB: "9"` — keep it.** The reasoning is unchanged and if
+  anything stronger: the 16 GB card is shared with the desktop, and now with
+  this app's own webview as well.
+- **`MUMMU_MODELS_DIR: /models` — repoint it.** `/models` is a *bind* mount,
+  not a named volume, so the weights already live on the host at whatever
+  `MUMMU_DATA_DIR` resolves to for that stack (`docker inspect -f
+  '{{range .Mounts}}{{.Source}}{{end}}' mummu` prints the path while the
+  container still exists). Point `MUMMU_MODELS_DIR` straight at it: the
+  on-disk registry layout is identical, so every installed model is picked up
+  as-is — nothing to copy, nothing to re-download.
 
 ## Layout
 
