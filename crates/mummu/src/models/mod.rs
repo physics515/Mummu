@@ -2,7 +2,7 @@
 //! generic over `B: Backend`, all config-driven (hyperparameters come from the
 //! checkpoint's `config.json`, never hardcoded).
 
-use burn::tensor::{Tensor, backend::Backend};
+use burn::tensor::{Device, Tensor};
 
 use crate::decode::{SamplerOptions, argmax_id, generate_loop, top_k_ids};
 
@@ -24,7 +24,7 @@ pub const MAX_WARM_UP_STEPS: usize = 256;
 /// (Hermes-class function-caller, Gemma, Qwen3, …) provides its cache type,
 /// its forward pass, and its EOS check — decoding (greedy, sampled, streamed,
 /// cancellable) comes for free from the shared driver.
-pub trait CausalLm<B: Backend> {
+pub trait CausalLm {
     /// Per-generation decode state (KV cache, conv state, …).
     type Cache;
 
@@ -39,8 +39,8 @@ pub trait CausalLm<B: Backend> {
         new_ids: &[u32],
         past: usize,
         cache: &mut Self::Cache,
-        device: &B::Device,
-    ) -> Tensor<B, 2>;
+        device: &Device,
+    ) -> Tensor<2>;
 
     /// Is `id` an end-of-sequence token for this model?
     fn is_eos(&self, id: u32) -> bool;
@@ -53,7 +53,7 @@ pub trait CausalLm<B: Backend> {
         prompt_ids: &[u32],
         max_tokens: usize,
         opts: &SamplerOptions,
-        device: &B::Device,
+        device: &Device,
         on_token: impl FnMut(u32) -> std::ops::ControlFlow<()>,
     ) -> Result<Vec<u32>, String> {
         let mut cache = self.new_cache();
@@ -73,7 +73,7 @@ pub trait CausalLm<B: Backend> {
         &self,
         prompt_ids: &[u32],
         max_tokens: usize,
-        device: &B::Device,
+        device: &Device,
     ) -> Result<Vec<u32>, String> {
         self.generate(
             prompt_ids,
@@ -89,7 +89,7 @@ pub trait CausalLm<B: Backend> {
         &self,
         prompt_ids: &[u32],
         k: usize,
-        device: &B::Device,
+        device: &Device,
     ) -> Result<Vec<u32>, String> {
         assert!(!prompt_ids.is_empty(), "first_token: empty prompt");
         assert!(k >= 1, "first_token: k must be >= 1");
@@ -114,7 +114,7 @@ pub trait CausalLm<B: Backend> {
         &self,
         probe_ids: &[u32],
         expected_vocab: usize,
-        device: &B::Device,
+        device: &Device,
     ) -> Result<crate::import::SanitySmoke, String> {
         assert!(!probe_ids.is_empty(), "sanity_check: empty probe prompt");
         assert!(
@@ -158,7 +158,7 @@ pub trait CausalLm<B: Backend> {
         &self,
         probe_ids: &[u32],
         steps: usize,
-        device: &B::Device,
+        device: &Device,
     ) -> Result<usize, String> {
         assert!(!probe_ids.is_empty(), "warm_up: empty probe prompt");
         assert!(steps >= 1, "warm_up: steps must be >= 1");

@@ -21,7 +21,6 @@
 //! Q4 kernel returns garbage** (~98% error) — [`QuantPolicy::Q4`] must be
 //! refused on wgpu until that kernel is fixed upstream.
 
-use burn::tensor::backend::Backend;
 use burn::tensor::quantization::{
     Calibration, QuantLevel, QuantParam, QuantScheme, QuantValue, compute_q_params, compute_range,
 };
@@ -100,10 +99,10 @@ impl QuantPolicy {
 /// Quantize one weight tensor per `policy` (min-max calibration — weights
 /// are static, so calibration is exact). The caller has already decided
 /// eligibility; `Off` is a caller bug.
-pub fn quantize_weight<B: Backend, const D: usize>(
+pub fn quantize_weight<const D: usize>(
     policy: QuantPolicy,
-    tensor: Tensor<B, D>,
-) -> Tensor<B, D> {
+    tensor: Tensor<D>,
+) -> Tensor<D> {
     let scheme = policy
         .scheme()
         .expect("quantize_weight called with QuantPolicy::Off");
@@ -115,7 +114,6 @@ pub fn quantize_weight<B: Backend, const D: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::Cpu;
     use burn::tensor::Distribution;
 
     #[test]
@@ -135,8 +133,8 @@ mod tests {
 
     #[test]
     fn q8_roundtrip_error_is_small() {
-        let device = burn::tensor::Device::<Cpu>::default();
-        let w = Tensor::<Cpu, 2>::random([64, 64], Distribution::Default, &device);
+        let device = crate::backend::cpu_device();
+        let w = Tensor::<2>::random([64, 64], Distribution::Default, &device);
         let host = w.clone().into_data().to_vec::<f32>().unwrap();
         let max_abs = host.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
         let q = quantize_weight(QuantPolicy::Q8, w);

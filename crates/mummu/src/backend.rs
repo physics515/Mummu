@@ -13,45 +13,41 @@
 
 use once_cell::sync::OnceCell;
 
-/// GPU backend (wgpu: Vulkan / DX12 / Metal). With the workspace `fusion`
-/// feature this is transparently `Fusion<Wgpu>` — streams of tensor ops are
-/// compiled into far fewer GPU kernels.
-pub type Gpu = burn::backend::Wgpu;
-
-/// GPU backend with the f16 element type — ~2x throughput and half the VRAM
-/// where `SHADER_F16` is available (check [`DeviceInventory::any_shader_f16`]).
-pub type GpuF16 = burn::backend::Wgpu<half::f16, i32>;
-
-/// CPU backend (burn-flex: pure-Rust SIMD + gemm; burn-ndarray's successor).
-pub type Cpu = burn_flex::Flex<f32, i32>;
-
-/// CUDA backend (feature `cuda`, off by default — see the feature's manifest
-/// note). For environments where no correct Vulkan implementation reaches
-/// the process but the NVIDIA driver does (WSL2 containers). Kernels are
-/// NVRTC-compiled at runtime; f32/i32 element types match [`Gpu`].
-#[cfg(feature = "cuda")]
-pub type Cuda = burn::backend::Cuda;
-
-/// The backend's TYPE-level float dtype (`B::FloatElem`).
-///
-/// Runtime tensor-creation sites pass this explicitly so a tensor's dtype
-/// never rides Burn 0.21's per-DEVICE default policy: unspecified-dtype
-/// creation resolves against a global registry that locks to whichever
-/// backend touches the device first — and [`Gpu`] / [`GpuF16`] share the
-/// same device type, so the other alias's float width would silently apply
-/// (the 2026-07-23 `TypeMismatch` hazard). Pinning every creation site makes
-/// running f32 and f16 models in one process defined behavior
-/// (`tests/real_mixed_dtype.rs`).
+/// The default GPU device (wgpu: Vulkan / DX12 / Metal). burn 0.22 selects
+/// backends at runtime through [`burn::tensor::Device`]; with the workspace
+/// `fusion` feature, fusion applies to supporting devices automatically.
 #[must_use]
-pub fn float_dtype<B: burn::tensor::backend::Backend>() -> burn::tensor::DType {
-    <B::FloatElem as burn::tensor::Element>::dtype()
+pub fn gpu_device() -> burn::tensor::Device {
+    burn::tensor::Device::wgpu(Default::default())
 }
 
-/// The backend's TYPE-level int dtype (`B::IntElem`) — same rationale as
-/// [`float_dtype`].
+/// The CPU device (burn-flex: pure-Rust SIMD + gemm).
 #[must_use]
-pub fn int_dtype<B: burn::tensor::backend::Backend>() -> burn::tensor::DType {
-    <B::IntElem as burn::tensor::Element>::dtype()
+pub fn cpu_device() -> burn::tensor::Device {
+    burn::tensor::Device::flex()
+}
+
+/// The CUDA device (feature `cuda`). NVRTC compiles kernels at runtime — the
+/// WSL2-container GPU path where no correct Vulkan reaches the process.
+#[cfg(feature = "cuda")]
+#[must_use]
+pub fn cuda_device() -> burn::tensor::Device {
+    burn::tensor::Device::cuda(0)
+}
+
+/// The float dtype mummu pins at tensor-creation sites (burn 0.22 would
+/// otherwise take the device default from `DeviceSettings`). Explicitness
+/// keeps mixed-precision processes defined behavior, same rationale as the
+/// 0.21 per-backend helper this replaces.
+#[must_use]
+pub fn float_dtype() -> burn::tensor::DType {
+    burn::tensor::DType::F32
+}
+
+/// Int dtype counterpart of [`float_dtype`].
+#[must_use]
+pub fn int_dtype() -> burn::tensor::DType {
+    burn::tensor::DType::I32
 }
 
 /// One enumerated GPU adapter, as reported by wgpu.

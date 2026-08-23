@@ -16,7 +16,7 @@ use std::path::Path;
 use burn::module::Module;
 use burn::nn::{Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear, LinearConfig};
 use burn::store::{ModuleAdapter, PyTorchToBurnAdapter, PytorchStore, SafetensorsStore};
-use burn::tensor::{Int, Tensor, TensorData, activation, backend::Backend};
+use burn::tensor::{Device, Int, Tensor, TensorData, activation};
 
 use crate::import::{
     CastFloatAdapter, ImportError, WeightsFile, load_checked, required_file, weights_file,
@@ -57,41 +57,41 @@ impl BertConfig {
 
 /// Word + position + token-type embeddings, post-LN.
 #[derive(Module, Debug)]
-pub struct Embeddings<B: Backend> {
-    pub word_embeddings: Embedding<B>,
-    pub position_embeddings: Embedding<B>,
-    pub token_type_embeddings: Embedding<B>,
-    pub layer_norm: LayerNorm<B>,
+pub struct Embeddings {
+    pub word_embeddings: Embedding,
+    pub position_embeddings: Embedding,
+    pub token_type_embeddings: Embedding,
+    pub layer_norm: LayerNorm,
 }
 
 /// One post-LN BERT encoder layer (flat field names; HF's nested keys remap
 /// onto these at load).
 #[derive(Module, Debug)]
-pub struct EncoderLayer<B: Backend> {
-    pub query: Linear<B>,
-    pub key: Linear<B>,
-    pub value: Linear<B>,
-    pub attn_output: Linear<B>,
-    pub attn_layer_norm: LayerNorm<B>,
-    pub intermediate: Linear<B>,
-    pub output: Linear<B>,
-    pub output_layer_norm: LayerNorm<B>,
+pub struct EncoderLayer {
+    pub query: Linear,
+    pub key: Linear,
+    pub value: Linear,
+    pub attn_output: Linear,
+    pub attn_layer_norm: LayerNorm,
+    pub intermediate: Linear,
+    pub output: Linear,
+    pub output_layer_norm: LayerNorm,
 }
 
 /// The BERT encoder stack.
 #[derive(Module, Debug)]
-pub struct Bert<B: Backend> {
-    pub embeddings: Embeddings<B>,
-    pub layers: Vec<EncoderLayer<B>>,
+pub struct Bert {
+    pub embeddings: Embeddings,
+    pub layers: Vec<EncoderLayer>,
 }
 
 /// A weight-loaded MiniLM/BERT plus its config.
-pub struct LoadedMiniLm<B: Backend> {
-    pub model: Bert<B>,
+pub struct LoadedMiniLm {
+    pub model: Bert,
     pub config: BertConfig,
 }
 
-fn build<B: Backend>(cfg: &BertConfig, device: &B::Device) -> Bert<B> {
+fn build(cfg: &BertConfig, device: &Device) -> Bert {
     let h = cfg.hidden_size;
     let eps = cfg.layer_norm_eps;
     let lin = |i: usize, o: usize| LinearConfig::new(i, o).init(device);
@@ -157,10 +157,10 @@ const KEY_REMAPS: &[(&str, &str)] = &[
 /// RmsNorm in the decoder models, where the rename is manual — the asymmetry
 /// is intentional; `PytorchStore` applies that adapter internally).
 /// `pooler.*` stays unused (masked-mean pooling instead).
-pub fn load_from_dir<B: Backend>(
+pub fn load_from_dir(
     dir: &Path,
-    device: &B::Device,
-) -> Result<LoadedMiniLm<B>, ImportError> {
+    device: &Device,
+) -> Result<LoadedMiniLm, ImportError> {
     let cfg_path = required_file(dir, "config.json")?;
     let cfg_bytes = std::fs::read(&cfg_path).map_err(|e| ImportError::Parse {
         file: cfg_path.clone(),
@@ -171,11 +171,11 @@ pub fn load_from_dir<B: Backend>(
         reason,
     })?;
 
-    let mut model = build::<B>(&config, device);
-    // Type-level float dtype (`B::FloatElem`) — a probe tensor would follow
+    let mut model = build(&config, device);
+    // Type-level float dtype (`f32`) — a probe tensor would follow
     // the per-DEVICE default policy, which another backend alias sharing the
     // device (Gpu vs GpuF16) may have flipped in this process.
-    let target_float = <B::FloatElem as burn::tensor::Element>::dtype();
+    let target_float = crate::backend::float_dtype();
     match weights_file(dir)? {
         WeightsFile::Safetensors(weights) => {
             let mut store = SafetensorsStore::from_file(weights.clone())
@@ -200,26 +200,26 @@ pub fn load_from_dir<B: Backend>(
     Ok(LoadedMiniLm { model, config })
 }
 
-fn embeddings_forward<B: Backend>(
-    e: &Embeddings<B>,
-    ids: &Tensor<B, 2, Int>,
-    device: &B::Device,
-) -> Tensor<B, 3> {
+fn embeddings_forward(
+    e: &Embeddings,
+    ids: &Tensor<2, Int>,
+    device: &Device,
+) -> Tensor<3> {
     let [b, n] = ids.dims();
     let w = e.word_embeddings.forward(ids.clone()); // [b, n, h]
-    let pos = Tensor::<B, 1, Int>::arange(0..n as i64, device).reshape([1, n]);
+    let pos = Tensor::<1, Int>::arange(0..n as i64, device).reshape([1, n]);
     let p = e.position_embeddings.forward(pos); // [1, n, h]
-    let tt = Tensor::<B, 2, Int>::zeros([b, n], device);
+    let tt = Tensor::<2, Int>::zeros([b, n], device);
     let t = e.token_type_embeddings.forward(tt); // [b, n, h]
     e.layer_norm.forward(w.add(p).add(t))
 }
 
-fn layer_forward<B: Backend>(
-    l: &EncoderLayer<B>,
-    x: Tensor<B, 3>,
-    add_mask: &Tensor<B, 4>,
+fn layer_forward(
+    l: &EncoderLayer,
+    x: Tensor<3>,
+    add_mask: &Tensor<4>,
     num_heads: usize,
-) -> Tensor<B, 3> {
+) -> Tensor<3> {
     let [b, n, h] = x.dims();
     debug_assert!(h.is_multiple_of(num_heads), "hidden not divisible by heads");
     let hd = h / num_heads;
@@ -255,7 +255,7 @@ fn layer_forward<B: Backend>(
     l.output_layer_norm.forward(l.output.forward(inter).add(x))
 }
 
-impl<B: Backend> LoadedMiniLm<B> {
+impl LoadedMiniLm {
     /// Encode one tokenized string (`ids` + `mask`, 1.0 = real token) into a
     /// masked-mean-pooled, **L2-normalized** sentence embedding of
     /// `hidden_size` floats.
@@ -263,7 +263,7 @@ impl<B: Backend> LoadedMiniLm<B> {
         &self,
         ids: &[u32],
         mask: &[f32],
-        device: &B::Device,
+        device: &Device,
     ) -> Result<Vec<f32>, String> {
         let n = ids.len();
         assert!(n >= 1, "embed_ids: empty token sequence");
@@ -279,14 +279,14 @@ impl<B: Backend> LoadedMiniLm<B> {
 
         let ids32: Vec<i32> = ids.iter().map(|&i| i as i32).collect();
         // Dtypes pinned to the backend TYPE, never the per-device policy.
-        let id_t = Tensor::<B, 1, Int>::from_data(
+        let id_t = Tensor::<1, Int>::from_data(
             TensorData::new(ids32, [n]),
-            (device, crate::backend::int_dtype::<B>()),
+            (device, crate::backend::int_dtype()),
         )
         .reshape([1, n]);
-        let mask_t = Tensor::<B, 1>::from_data(
+        let mask_t = Tensor::<1>::from_data(
             TensorData::new(mask.to_vec(), [n]),
-            (device, crate::backend::float_dtype::<B>()),
+            (device, crate::backend::float_dtype()),
         )
         .reshape([1, n]);
 
@@ -323,9 +323,8 @@ impl<B: Backend> LoadedMiniLm<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::Cpu;
 
-    type Dev = burn::tensor::Device<Cpu>;
+    type Dev = burn::tensor::Device;
 
     fn toy_config() -> BertConfig {
         BertConfig {
@@ -352,9 +351,9 @@ mod tests {
 
     #[test]
     fn embeddings_are_unit_norm() {
-        let device = Dev::default();
+        let device = crate::backend::cpu_device();
         let cfg = toy_config();
-        let loaded = LoadedMiniLm::<Cpu> {
+        let loaded = LoadedMiniLm {
             model: build(&cfg, &device),
             config: cfg,
         };
@@ -370,9 +369,9 @@ mod tests {
     /// out of attention AND the mean pool.
     #[test]
     fn padding_is_invisible_to_the_embedding() {
-        let device = Dev::default();
+        let device = crate::backend::cpu_device();
         let cfg = toy_config();
-        let loaded = LoadedMiniLm::<Cpu> {
+        let loaded = LoadedMiniLm {
             model: build(&cfg, &device),
             config: cfg,
         };
@@ -390,9 +389,9 @@ mod tests {
     #[test]
     #[should_panic(expected = "mask length")]
     fn embed_rejects_mismatched_mask() {
-        let device = Dev::default();
+        let device = crate::backend::cpu_device();
         let cfg = toy_config();
-        let loaded = LoadedMiniLm::<Cpu> {
+        let loaded = LoadedMiniLm {
             model: build(&cfg, &device),
             config: cfg,
         };

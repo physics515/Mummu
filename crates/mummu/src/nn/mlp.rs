@@ -4,17 +4,17 @@
 
 use burn::module::Module;
 use burn::nn::{Linear, LinearConfig};
-use burn::tensor::{Tensor, activation, backend::Backend};
+use burn::tensor::{Device, Tensor, activation};
 
 /// SwiGLU MLP, no biases (both proven architectures ship it bias-free).
 #[derive(Module, Debug)]
-pub struct SwiGluMlp<B: Backend> {
+pub struct SwiGluMlp {
     /// SiLU branch (LFM2: `w1`).
-    pub gate_proj: Linear<B>,
+    pub gate_proj: Linear,
     /// Multiplicative branch (LFM2: `w3`).
-    pub up_proj: Linear<B>,
+    pub up_proj: Linear,
     /// Projection back to the model width (LFM2: `w2`).
-    pub down_proj: Linear<B>,
+    pub down_proj: Linear,
 }
 
 /// Shape config for [`SwiGluMlp`].
@@ -26,7 +26,7 @@ pub struct SwiGluMlpConfig {
 
 impl SwiGluMlpConfig {
     /// Initialize the module (random weights; real weights come from import).
-    pub fn init<B: Backend>(&self, device: &B::Device) -> SwiGluMlp<B> {
+    pub fn init(&self, device: &Device) -> SwiGluMlp {
         assert!(self.hidden_size >= 1, "SwiGLU: hidden_size must be >= 1");
         assert!(
             self.intermediate_size >= 1,
@@ -46,9 +46,9 @@ impl SwiGluMlpConfig {
     }
 }
 
-impl<B: Backend> SwiGluMlp<B> {
+impl SwiGluMlp {
     /// `[b, t, hidden]` → `[b, t, hidden]`.
-    pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+    pub fn forward(&self, x: Tensor<3>) -> Tensor<3> {
         let gate = activation::silu(self.gate_proj.forward(x.clone()));
         let up = self.up_proj.forward(x);
         self.down_proj.forward(gate.mul(up))
@@ -58,32 +58,31 @@ impl<B: Backend> SwiGluMlp<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::Cpu;
     use burn::tensor::TensorData;
 
-    type Dev = burn::tensor::Device<Cpu>;
+    type Dev = burn::tensor::Device;
 
     #[test]
     fn forward_preserves_shape() {
-        let device = Dev::default();
+        let device = crate::backend::cpu_device();
         let mlp = SwiGluMlpConfig {
             hidden_size: 8,
             intermediate_size: 20,
         }
-        .init::<Cpu>(&device);
-        let x = Tensor::<Cpu, 3>::zeros([2, 3, 8], &device);
+        .init(&device);
+        let x = Tensor::<3>::zeros([2, 3, 8], &device);
         assert_eq!(mlp.forward(x).dims(), [2, 3, 8]);
     }
 
     #[test]
     fn zero_input_gives_zero_output_without_biases() {
-        let device = Dev::default();
+        let device = crate::backend::cpu_device();
         let mlp = SwiGluMlpConfig {
             hidden_size: 4,
             intermediate_size: 8,
         }
-        .init::<Cpu>(&device);
-        let x = Tensor::<Cpu, 3>::zeros([1, 2, 4], &device);
+        .init(&device);
+        let x = Tensor::<3>::zeros([1, 2, 4], &device);
         let out = mlp.forward(x).into_data().to_vec::<f32>().unwrap();
         assert!(
             out.iter().all(|&v| v == 0.0),
@@ -95,17 +94,17 @@ mod tests {
     fn forward_is_position_independent() {
         // An MLP acts per-position: the same row through a [1,1,h] and a
         // [1,2,h] batch must give identical outputs.
-        let device = Dev::default();
+        let device = crate::backend::cpu_device();
         let mlp = SwiGluMlpConfig {
             hidden_size: 4,
             intermediate_size: 8,
         }
-        .init::<Cpu>(&device);
+        .init(&device);
         let row: Vec<f32> = vec![0.3, -1.2, 0.8, 2.0];
-        let single = Tensor::<Cpu, 1>::from_data(TensorData::new(row.clone(), [4]), &device)
+        let single = Tensor::<1>::from_data(TensorData::new(row.clone(), [4]), &device)
             .reshape([1, 1, 4]);
         let double =
-            Tensor::<Cpu, 1>::from_data(TensorData::new([row.clone(), row].concat(), [8]), &device)
+            Tensor::<1>::from_data(TensorData::new([row.clone(), row].concat(), [8]), &device)
                 .reshape([1, 2, 4]);
         let s = mlp.forward(single).into_data().to_vec::<f32>().unwrap();
         let d = mlp.forward(double).into_data().to_vec::<f32>().unwrap();

@@ -34,7 +34,7 @@ use burn::nn::conv::{Conv1d, Conv1dConfig};
 use burn::nn::{
     Embedding, EmbeddingConfig, Linear, LinearConfig, PaddingConfig1d, RmsNorm, RmsNormConfig,
 };
-use burn::tensor::{DType, Int, Tensor, TensorData, activation, backend::Backend};
+use burn::tensor::{Device, DType, Int, Tensor, TensorData, activation};
 
 use crate::gguf::{GgufFile, GgufMap, GgufTensorInfo, GgufValue};
 use crate::import::ImportError;
@@ -200,7 +200,7 @@ impl Qwen35Config {
 /// from the logical one — measured with Q4 on flex AND wgpu, 2026-08-21).
 /// Flatten the FLOAT input instead; the weight goes into the matmul as-is.
 /// All qwen35 projections are bias-free.
-fn qlinear<B: Backend>(l: &Linear<B>, x: Tensor<B, 3>) -> Tensor<B, 3> {
+fn qlinear(l: &Linear, x: Tensor<3>) -> Tensor<3> {
     debug_assert!(l.bias.is_none(), "qwen35 projections are bias-free");
     let [b, t, d_in] = x.dims();
     let w = l.weight.val(); // [in, out]
@@ -209,7 +209,7 @@ fn qlinear<B: Backend>(l: &Linear<B>, x: Tensor<B, 3>) -> Tensor<B, 3> {
 }
 
 /// The 2-D twin of [`qlinear`] (the lm-head path).
-fn qlinear2<B: Backend>(l: &Linear<B>, x: Tensor<B, 2>) -> Tensor<B, 2> {
+fn qlinear2(l: &Linear, x: Tensor<2>) -> Tensor<2> {
     debug_assert!(l.bias.is_none(), "qwen35 projections are bias-free");
     x.matmul(l.weight.val())
 }
@@ -217,28 +217,28 @@ fn qlinear2<B: Backend>(l: &Linear<B>, x: Tensor<B, 2>) -> Tensor<B, 2> {
 /// Gated full attention (see the module docs). Field names are this port's
 /// own (the family has no HF safetensors convention to mirror yet).
 #[derive(Module, Debug)]
-pub struct GatedAttention<B: Backend> {
+pub struct GatedAttention {
     /// Emits `[q_h | gate_h]` interleaved per head — `2·num_heads·head_dim` wide.
-    pub q_proj: Linear<B>,
-    pub k_proj: Linear<B>,
-    pub v_proj: Linear<B>,
-    pub o_proj: Linear<B>,
+    pub q_proj: Linear,
+    pub k_proj: Linear,
+    pub v_proj: Linear,
+    pub o_proj: Linear,
     /// Per-head RMSNorm over `head_dim`.
-    pub q_norm: RmsNorm<B>,
-    pub k_norm: RmsNorm<B>,
+    pub q_norm: RmsNorm,
+    pub k_norm: RmsNorm,
 }
 
-impl<B: Backend> GatedAttention<B> {
+impl GatedAttention {
     #[allow(clippy::too_many_arguments)] // mirrors the reference data flow
     fn forward(
         &self,
-        x: Tensor<B, 3>,
+        x: Tensor<3>,
         cfg: &Qwen35Config,
-        cos: &Tensor<B, 4>,
-        sin: &Tensor<B, 4>,
-        mask: Option<&Tensor<B, 4>>,
-        kv: &mut LayerKv<B>,
-    ) -> Tensor<B, 3> {
+        cos: &Tensor<4>,
+        sin: &Tensor<4>,
+        mask: Option<&Tensor<4>>,
+        kv: &mut LayerKv,
+    ) -> Tensor<3> {
         let [b, t, _] = x.dims();
         let (nh, nkv, hd) = (
             cfg.num_attention_heads,
@@ -260,7 +260,7 @@ impl<B: Backend> GatedAttention<B> {
             .swap_dims(1, 2);
 
         // Partial RoPE: rotate the first rope_dim dims, pass the rest through.
-        let rope = |x: Tensor<B, 4>| -> Tensor<B, 4> {
+        let rope = |x: Tensor<4>| -> Tensor<4> {
             let rot = x.clone().narrow(3, 0, cfg.rope_dim);
             let rest = x.narrow(3, cfg.rope_dim, hd - cfg.rope_dim);
             let rot = crate::nn::apply_rope(rot, cos, sin);
@@ -306,41 +306,41 @@ impl<B: Backend> GatedAttention<B> {
 
 /// Gated DeltaNet linear attention (see the module docs).
 #[derive(Module, Debug)]
-pub struct GatedDeltaNet<B: Backend> {
+pub struct GatedDeltaNet {
     /// Mixes q/k/v: `hidden → 2·key_dim + d_inner`.
-    pub qkv_proj: Linear<B>,
+    pub qkv_proj: Linear,
     /// The gate `z`: `hidden → d_inner`.
-    pub z_proj: Linear<B>,
+    pub z_proj: Linear,
     /// Per-value-head β logits: `hidden → n_v_heads`.
-    pub beta_proj: Linear<B>,
+    pub beta_proj: Linear,
     /// Per-value-head decay logits: `hidden → n_v_heads`.
-    pub alpha_proj: Linear<B>,
+    pub alpha_proj: Linear,
     /// Decay bias added to the α logits before softplus.
-    pub dt_bias: Param<Tensor<B, 1>>,
+    pub dt_bias: Param<Tensor<1>>,
     /// `-exp(A_log)` — negative per-head decay magnitudes.
-    pub a: Param<Tensor<B, 1>>,
+    pub a: Param<Tensor<1>>,
     /// Depthwise causal conv over the q/k/v mix, kernel `conv_kernel`.
-    pub conv1d: Conv1d<B>,
+    pub conv1d: Conv1d,
     /// Gated output RMSNorm over `d_state` (per value head).
-    pub norm: RmsNorm<B>,
-    pub out_proj: Linear<B>,
+    pub norm: RmsNorm,
+    pub out_proj: Linear,
 }
 
 /// DeltaNet decode state: the rolling conv window and the recurrent memory.
-pub struct DeltaState<B: Backend> {
+pub struct DeltaState {
     /// Last `conv_kernel - 1` mix columns, `[b, conv_dim, k-1]`.
-    pub conv: Option<Tensor<B, 3>>,
+    pub conv: Option<Tensor<3>>,
     /// Per-head associative memory `[b, n_v_heads, d_state, d_state]`.
-    pub state: Option<Tensor<B, 4>>,
+    pub state: Option<Tensor<4>>,
 }
 
-impl<B: Backend> GatedDeltaNet<B> {
+impl GatedDeltaNet {
     fn forward(
         &self,
-        x: Tensor<B, 3>,
+        x: Tensor<3>,
         cfg: &Qwen35Config,
-        cache: &mut DeltaState<B>,
-    ) -> Tensor<B, 3> {
+        cache: &mut DeltaState,
+    ) -> Tensor<3> {
         let [b, t, _] = x.dims();
         let (hk, hv, ds) = (cfg.n_k_heads, cfg.n_v_heads, cfg.d_state);
         let key_dim = cfg.key_dim();
@@ -365,7 +365,7 @@ impl<B: Backend> GatedDeltaNet<B> {
             let window = match &cache.conv {
                 Some(prev) => Tensor::cat(vec![prev.clone(), mix_cm.clone()], 2),
                 None => {
-                    let pad = Tensor::<B, 3>::zeros([b, conv_dim, kk - 1], &device);
+                    let pad = Tensor::<3>::zeros([b, conv_dim, kk - 1], &device);
                     Tensor::cat(vec![pad, mix_cm.clone()], 2)
                 }
             };
@@ -381,7 +381,7 @@ impl<B: Backend> GatedDeltaNet<B> {
             if len >= kk - 1 {
                 combined.narrow(2, len - (kk - 1), kk - 1)
             } else {
-                let pad = Tensor::<B, 3>::zeros([b, conv_dim, (kk - 1) - len], &device);
+                let pad = Tensor::<3>::zeros([b, conv_dim, (kk - 1) - len], &device);
                 Tensor::cat(vec![pad, combined], 2)
             }
         });
@@ -389,7 +389,7 @@ impl<B: Backend> GatedDeltaNet<B> {
 
         // Split into q/k/v and L2-normalize q/k per head: x / max(‖x‖, ε).
         let eps = cfg.rms_norm_eps as f32;
-        let l2 = |x: Tensor<B, 4>| -> Tensor<B, 4> {
+        let l2 = |x: Tensor<4>| -> Tensor<4> {
             let norm = x
                 .clone()
                 .powi_scalar(2)
@@ -410,7 +410,7 @@ impl<B: Backend> GatedDeltaNet<B> {
         // Tile k-heads across the value heads (llama.cpp's ggml_repeat:
         // head h_v reads k-head h_v % n_k_heads).
         let tile = hv / hk;
-        let expand = |x: Tensor<B, 4>| -> Tensor<B, 4> {
+        let expand = |x: Tensor<4>| -> Tensor<4> {
             if tile == 1 {
                 x
             } else {
@@ -426,9 +426,9 @@ impl<B: Backend> GatedDeltaNet<B> {
         // i indexes the key dim, j the value dim.
         let scale = 1.0 / (ds as f32).sqrt();
         let mut s = cache.state.take().unwrap_or_else(|| {
-            Tensor::<B, 4>::zeros([b, hv, ds, ds], &device)
+            Tensor::<4>::zeros([b, hv, ds, ds], &device)
         });
-        let mut outs: Vec<Tensor<B, 4>> = Vec::with_capacity(t);
+        let mut outs: Vec<Tensor<4>> = Vec::with_capacity(t);
         for tau in 0..t {
             let q_t = q.clone().narrow(2, tau, 1).mul_scalar(scale); // [b, hv, 1, ds]
             let k_t = k.clone().narrow(2, tau, 1); // [b, hv, 1, ds]
@@ -465,34 +465,34 @@ impl<B: Backend> GatedDeltaNet<B> {
 
 /// One trunk layer: exactly one of `self_attn` / `linear_attn`.
 #[derive(Module, Debug)]
-pub struct Qwen35Layer<B: Backend> {
-    pub input_norm: RmsNorm<B>,
-    pub post_attn_norm: RmsNorm<B>,
-    pub self_attn: Option<GatedAttention<B>>,
-    pub linear_attn: Option<GatedDeltaNet<B>>,
-    pub mlp: SwiGluMlp<B>,
+pub struct Qwen35Layer {
+    pub input_norm: RmsNorm,
+    pub post_attn_norm: RmsNorm,
+    pub self_attn: Option<GatedAttention>,
+    pub linear_attn: Option<GatedDeltaNet>,
+    pub mlp: SwiGluMlp,
 }
 
 /// The qwen35 decoder stack.
 #[derive(Module, Debug)]
-pub struct Qwen35<B: Backend> {
-    pub embed_tokens: Embedding<B>,
-    pub layers: Vec<Qwen35Layer<B>>,
-    pub norm: RmsNorm<B>,
+pub struct Qwen35 {
+    pub embed_tokens: Embedding,
+    pub layers: Vec<Qwen35Layer>,
+    pub norm: RmsNorm,
     /// Untied head when the checkpoint carries `output.weight`; tied to the
     /// embedding otherwise.
-    pub lm_head: Option<Linear<B>>,
+    pub lm_head: Option<Linear>,
 }
 
 /// Per-layer decode cache.
-pub enum Qwen35Kv<B: Backend> {
-    Attn(LayerKv<B>),
-    Delta(DeltaState<B>),
+pub enum Qwen35Kv {
+    Attn(LayerKv),
+    Delta(DeltaState),
 }
 
 /// A weight-loaded qwen35 plus its config.
-pub struct LoadedQwen35<B: Backend> {
-    pub model: Qwen35<B>,
+pub struct LoadedQwen35 {
+    pub model: Qwen35,
     pub config: Qwen35Config,
     /// `None` for GGUF loads (self-contained; no sibling file).
     pub tokenizer_config: Option<crate::tok_config::TokenizerConfig>,
@@ -506,13 +506,13 @@ pub struct LoadedQwen35<B: Backend> {
     pub ffn_skip_tau: f32,
 }
 
-fn build<B: Backend>(cfg: &Qwen35Config, device: &B::Device, untied_head: bool) -> Qwen35<B> {
-    let norm = |dim: usize, dev: &B::Device| {
+fn build(cfg: &Qwen35Config, device: &Device, untied_head: bool) -> Qwen35 {
+    let norm = |dim: usize, dev: &Device| {
         RmsNormConfig::new(dim)
             .with_epsilon(cfg.rms_norm_eps)
             .init(dev)
     };
-    let linear = |inp: usize, out: usize, dev: &B::Device| {
+    let linear = |inp: usize, out: usize, dev: &Device| {
         LinearConfig::new(inp, out).with_bias(false).init(dev)
     };
     let mlp_cfg = SwiGluMlpConfig {
@@ -643,10 +643,10 @@ fn qwen35_field(field: &str) -> Option<&'static str> {
 /// Load a qwen35 model straight from a GGUF file — the classic f32 path,
 /// which is [`load_from_gguf_quantized`] with quantization off. One import
 /// path serves every precision (P9's "single path" rule).
-pub fn load_from_gguf<B: Backend>(
+pub fn load_from_gguf(
     path: &Path,
-    device: &B::Device,
-) -> Result<LoadedQwen35<B>, ImportError> {
+    device: &Device,
+) -> Result<LoadedQwen35, ImportError> {
     load_from_gguf_quantized(path, device, QuantPolicy::Off)
 }
 
@@ -656,11 +656,11 @@ pub fn load_from_gguf<B: Backend>(
 /// `policy` when eligible, and assigned. Peak memory is the finished model
 /// plus a single f32 tensor — never the whole model at f32, which is what
 /// makes the 27B tier loadable at all (its f32 form is ~109 GB).
-pub fn load_from_gguf_quantized<B: Backend>(
+pub fn load_from_gguf_quantized(
     path: &Path,
-    device: &B::Device,
+    device: &Device,
     policy: QuantPolicy,
-) -> Result<LoadedQwen35<B>, ImportError> {
+) -> Result<LoadedQwen35, ImportError> {
     let parse = |reason: String| ImportError::Parse {
         file: path.to_path_buf(),
         reason,
@@ -669,7 +669,7 @@ pub fn load_from_gguf_quantized<B: Backend>(
     let config = Qwen35Config::from_gguf(&f).map_err(parse)?;
     let untied = f.tensor("output.weight").is_some();
     let trunk = config.num_layers;
-    let mut model = build::<B>(&config, device, untied);
+    let mut model = build(&config, device, untied);
 
     let mut assigned = 0usize;
     for info in &f.tensors {
@@ -692,7 +692,7 @@ pub fn load_from_gguf_quantized<B: Backend>(
         let values = f
             .read_tensor_f32(&info.name)
             .map_err(|e| parse(e.to_string()))?;
-        assign_param::<B>(
+        assign_param(
             &mut model,
             &name,
             ParamSrc::F32 { values, shape },
@@ -735,28 +735,28 @@ fn expected_tensor_count(cfg: &Qwen35Config, untied: bool) -> usize {
 
 /// Build a device tensor from row-major f32 `values` of `shape`, cast to the
 /// backend float dtype.
-fn device_tensor<B: Backend, const D: usize>(
+fn device_tensor<const D: usize>(
     values: Vec<f32>,
     shape: [usize; D],
-    device: &B::Device,
-) -> Tensor<B, D> {
-    let dtype = crate::backend::float_dtype::<B>();
+    device: &Device,
+) -> Tensor<D> {
+    let dtype = crate::backend::float_dtype();
     Tensor::from_data(TensorData::new(values, shape), (device, dtype))
 }
 
 /// A 2-D **linear weight**: GGUF row-major is `[out, in]`, burn's `Linear`
 /// wants `[in, out]` — transpose on device, then quantize when the policy
 /// takes it.
-fn linear_weight<B: Backend>(
+fn linear_weight(
     values: Vec<f32>,
     shape: &[usize],
     policy: QuantPolicy,
-    device: &B::Device,
-) -> Result<Tensor<B, 2>, String> {
+    device: &Device,
+) -> Result<Tensor<2>, String> {
     let &[out, inp] = shape else {
         return Err(format!("linear weight must be 2-D, got {shape:?}"));
     };
-    let w = device_tensor::<B, 2>(values, [out, inp], device).swap_dims(0, 1);
+    let w = device_tensor::<2>(values, [out, inp], device).swap_dims(0, 1);
     Ok(if policy.eligible(&[inp, out]) {
         crate::quant::quantize_weight(policy, w)
     } else {
@@ -767,19 +767,19 @@ fn linear_weight<B: Backend>(
 /// Where a parameter's data comes from: raw f32 (the GGUF streaming path —
 /// transposed/quantized here) or a ready 2-D tensor (the pack path — already
 /// `[in, out]` at its chosen precision).
-pub enum ParamSrc<B: Backend> {
+pub enum ParamSrc {
     F32 { values: Vec<f32>, shape: Vec<usize> },
-    Ready2(Tensor<B, 2>),
+    Ready2(Tensor<2>),
 }
 
 /// A linear weight from either source.
-fn take_linear<B: Backend>(
-    ready: Option<Tensor<B, 2>>,
+fn take_linear(
+    ready: Option<Tensor<2>>,
     values: Vec<f32>,
     shape: &[usize],
     policy: QuantPolicy,
-    device: &B::Device,
-) -> Result<Tensor<B, 2>, String> {
+    device: &Device,
+) -> Result<Tensor<2>, String> {
     match ready {
         Some(t) => Ok(t),
         None => linear_weight(values, shape, policy, device),
@@ -788,26 +788,26 @@ fn take_linear<B: Backend>(
 
 /// Route one mapped tensor into its module field. An unknown path is a loud
 /// error — silence here would mean silently dropped weights.
-fn assign_param<B: Backend>(
-    model: &mut Qwen35<B>,
+fn assign_param(
+    model: &mut Qwen35,
     name: &str,
-    src: ParamSrc<B>,
+    src: ParamSrc,
     policy: QuantPolicy,
-    device: &B::Device,
+    device: &Device,
 ) -> Result<(), String> {
     use burn::module::Param;
 
-    let (values, shape_vec, ready): (Vec<f32>, Vec<usize>, Option<Tensor<B, 2>>) = match src {
+    let (values, shape_vec, ready): (Vec<f32>, Vec<usize>, Option<Tensor<2>>) = match src {
         ParamSrc::F32 { values, shape } => (values, shape, None),
         ParamSrc::Ready2(t) => (Vec::new(), t.dims().to_vec(), Some(t)),
     };
     let shape = shape_vec.as_slice();
 
-    let expect_1d = |values: Vec<f32>, shape: &[usize]| -> Result<Tensor<B, 1>, String> {
+    let expect_1d = |values: Vec<f32>, shape: &[usize]| -> Result<Tensor<1>, String> {
         let &[n] = shape else {
             return Err(format!("expected 1-D, got {shape:?}"));
         };
-        Ok(device_tensor::<B, 1>(values, [n], device))
+        Ok(device_tensor::<1>(values, [n], device))
     };
 
     match name {
@@ -819,7 +819,7 @@ fn assign_param<B: Backend>(
                     let &[v, h] = shape else {
                         return Err(format!("embedding must be 2-D, got {shape:?}"));
                     };
-                    device_tensor::<B, 2>(values, [v, h], device)
+                    device_tensor::<2>(values, [v, h], device)
                 }
             };
             model.embed_tokens.weight = Param::from_tensor(t);
@@ -937,7 +937,7 @@ fn assign_param<B: Backend>(
                             return Err(format!("conv kernel middle dim must be 1, got {one}"));
                         }
                         delta.conv1d.weight =
-                            Param::from_tensor(device_tensor::<B, 3>(values, [ch, 1, k], device));
+                            Param::from_tensor(device_tensor::<3>(values, [ch, 1, k], device));
                     }
                     other => return Err(format!("unknown DeltaNet field '{other}'")),
                 }
@@ -1013,38 +1013,38 @@ fn pack_param_path(name: &str, trunk_layers: usize) -> Option<String> {
 /// Load from a `.mummu` pack, choosing each tensor's precision through
 /// `choose` (the planner's tiering hook — per tensor, so a policy can mix
 /// levels). Quantized levels arrive pre-packed (no re-quantization).
-pub fn load_from_pack<B: Backend>(
+pub fn load_from_pack(
     dir: &Path,
-    device: &B::Device,
+    device: &Device,
     choose: &dyn Fn(&crate::pack::TensorEntry) -> crate::pack::Precision,
-) -> Result<LoadedQwen35<B>, ImportError> {
-    load_from_pack_inner::<B>(dir, device, choose, None)
+) -> Result<LoadedQwen35, ImportError> {
+    load_from_pack_inner(dir, device, choose, None)
 }
 
 /// Load a **partitioned** pack with only `local(layer)` FFN clusters in each
 /// layer's `mlp` (at the level `choose` picks for that entry); the caller
 /// attaches the remote clusters as an `ExpertPool` via [`LoadedQwen35::with_ffn_pool`].
 /// Every layer must keep at least one local cluster.
-pub fn load_from_pack_partitioned<B: Backend>(
+pub fn load_from_pack_partitioned(
     dir: &Path,
-    device: &B::Device,
+    device: &Device,
     choose: &dyn Fn(&crate::pack::TensorEntry) -> crate::pack::Precision,
     local: &dyn Fn(usize) -> Vec<usize>,
-) -> Result<LoadedQwen35<B>, ImportError> {
-    load_from_pack_inner::<B>(dir, device, choose, Some(local))
+) -> Result<LoadedQwen35, ImportError> {
+    load_from_pack_inner(dir, device, choose, Some(local))
 }
 
 /// One layer's FFN restricted to `clusters` of a partitioned pack, at
 /// `precision`, in Linear layout — the local slab or a remote executor's
 /// weights. Columns of gate/up and rows of down are sliced straight from
 /// the stored bytes (no re-quantization).
-pub fn load_ffn_clusters<B: Backend>(
+pub fn load_ffn_clusters(
     pack: &crate::pack::Pack,
     layer: usize,
     clusters: &[usize],
     precision: crate::pack::Precision,
-    device: &B::Device,
-) -> Result<crate::nn::ExpertWeights<B>, String> {
+    device: &Device,
+) -> Result<crate::nn::ExpertWeights, String> {
     use burn::module::Param;
     let part = pack
         .manifest
@@ -1072,13 +1072,13 @@ pub fn load_ffn_clusters<B: Backend>(
     let u = entry(&names[1])?;
     let d = entry(&names[2])?;
     Ok(crate::nn::ExpertWeights {
-        gate: Param::from_tensor(pack.tensor_cols::<B>(g, pick(g), &ranges, device)?),
-        up: Param::from_tensor(pack.tensor_cols::<B>(u, pick(u), &ranges, device)?),
-        down: Param::from_tensor(pack.tensor_rows::<B>(d, pick(d), &ranges, device)?),
+        gate: Param::from_tensor(pack.tensor_cols(g, pick(g), &ranges, device)?),
+        up: Param::from_tensor(pack.tensor_cols(u, pick(u), &ranges, device)?),
+        down: Param::from_tensor(pack.tensor_rows(d, pick(d), &ranges, device)?),
     })
 }
 
-impl<B: Backend> LoadedQwen35<B> {
+impl LoadedQwen35 {
     /// Attach the remote FFN clusters (one pool row per layer, ragged).
     #[must_use]
     pub fn with_ffn_pool(mut self, pool: std::sync::Arc<crate::nn::ExpertPool>) -> Self {
@@ -1095,12 +1095,12 @@ impl<B: Backend> LoadedQwen35<B> {
     }
 }
 
-fn load_from_pack_inner<B: Backend>(
+fn load_from_pack_inner(
     dir: &Path,
-    device: &B::Device,
+    device: &Device,
     choose: &dyn Fn(&crate::pack::TensorEntry) -> crate::pack::Precision,
     local: Option<&dyn Fn(usize) -> Vec<usize>>,
-) -> Result<LoadedQwen35<B>, ImportError> {
+) -> Result<LoadedQwen35, ImportError> {
     use crate::pack::{Pack, Role};
     let parse = |reason: String| ImportError::Parse {
         file: dir.to_path_buf(),
@@ -1111,7 +1111,7 @@ fn load_from_pack_inner<B: Backend>(
     let config = Qwen35Config::from_gguf(&header).map_err(parse)?;
     let untied = pack.entry("output.weight").is_some();
     let trunk = config.num_layers;
-    let mut model = build::<B>(&config, device, untied);
+    let mut model = build(&config, device, untied);
 
     // Partitioned FFN entries → (layer, proj index) for the local-cluster path.
     let ffn_index: std::collections::HashMap<&str, (usize, usize)> = match (&local, &pack.manifest.ffn_partition) {
@@ -1152,12 +1152,12 @@ fn load_from_pack_inner<B: Backend>(
                 if entry.precisions.contains_key(&p) { p } else { *entry.precisions.keys().max().expect("stored level") }
             };
             let t = if proj == 2 {
-                pack.tensor_rows::<B>(entry, precision, &ranges, device)
+                pack.tensor_rows(entry, precision, &ranges, device)
             } else {
-                pack.tensor_cols::<B>(entry, precision, &ranges, device)
+                pack.tensor_cols(entry, precision, &ranges, device)
             }
             .map_err(parse)?;
-            assign_param::<B>(&mut model, &path, ParamSrc::Ready2(t), QuantPolicy::Off, device).map_err(parse)?;
+            assign_param(&mut model, &path, ParamSrc::Ready2(t), QuantPolicy::Off, device).map_err(parse)?;
             assigned += 1;
             continue;
         }
@@ -1176,14 +1176,14 @@ fn load_from_pack_inner<B: Backend>(
         };
         let src = match entry.role {
             Role::Linear | Role::Expert { .. } | Role::Embedding => ParamSrc::Ready2(
-                pack.tensor::<B, 2>(entry, precision, device).map_err(parse)?,
+                pack.tensor::<2>(entry, precision, device).map_err(parse)?,
             ),
             Role::Vector | Role::Conv => ParamSrc::F32 {
                 values: pack.read_f32(entry).map_err(parse)?,
                 shape: entry.shape.clone(),
             },
         };
-        assign_param::<B>(&mut model, &path, src, QuantPolicy::Off, device).map_err(parse)?;
+        assign_param(&mut model, &path, src, QuantPolicy::Off, device).map_err(parse)?;
         assigned += 1;
     }
     let expected = expected_tensor_count(&config, untied);
@@ -1201,8 +1201,8 @@ fn load_from_pack_inner<B: Backend>(
     })
 }
 
-impl<B: Backend> CausalLm<B> for LoadedQwen35<B> {
-    type Cache = Vec<Qwen35Kv<B>>;
+impl CausalLm for LoadedQwen35 {
+    type Cache = Vec<Qwen35Kv>;
 
     fn is_eos(&self, id: u32) -> bool {
         self.config.eos_token_id.contains(id)
@@ -1228,8 +1228,8 @@ impl<B: Backend> CausalLm<B> for LoadedQwen35<B> {
         new_ids: &[u32],
         past: usize,
         cache: &mut Self::Cache,
-        device: &B::Device,
-    ) -> Tensor<B, 2> {
+        device: &Device,
+    ) -> Tensor<2> {
         let t = new_ids.len();
         assert!(t >= 1, "qwen35 forward: need at least one token");
         assert!(
@@ -1241,15 +1241,15 @@ impl<B: Backend> CausalLm<B> for LoadedQwen35<B> {
         let cfg = &self.config;
 
         let ids32: Vec<i32> = new_ids.iter().map(|&i| i as i32).collect();
-        let input = Tensor::<B, 1, Int>::from_data(
+        let input = Tensor::<1, Int>::from_data(
             TensorData::new(ids32, [t]),
-            (device, crate::backend::int_dtype::<B>()),
+            (device, crate::backend::int_dtype()),
         )
         .reshape([1, t]);
         let mut x = self.model.embed_tokens.forward(input);
 
-        let (cos, sin) = rope_tables::<B>(t, past, cfg.rope_dim, cfg.rope_theta, device);
-        let mask = (t > 1).then(|| causal_mask::<B>(t, past, device));
+        let (cos, sin) = rope_tables(t, past, cfg.rope_dim, cfg.rope_theta, device);
+        let mask = (t > 1).then(|| causal_mask(t, past, device));
 
         for (li, (layer, kv)) in self.model.layers.iter().zip(cache.iter_mut()).enumerate() {
             let h = layer.input_norm.forward(x.clone());
@@ -1306,7 +1306,6 @@ impl<B: Backend> CausalLm<B> for LoadedQwen35<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::Cpu;
 
     /// A toy config exercising both layer kinds: layer 1 is full attention
     /// (`(1+1) % 2 == 0`), layers 0 and 2 are DeltaNet.
@@ -1332,12 +1331,12 @@ mod tests {
         }
     }
 
-    fn toy_model() -> LoadedQwen35<Cpu> {
+    fn toy_model() -> LoadedQwen35 {
         let cfg = toy_config();
         cfg.validate().expect("toy config validates");
-        let device = burn::tensor::Device::<Cpu>::default();
+        let device = crate::backend::cpu_device();
         LoadedQwen35 {
-            model: build::<Cpu>(&cfg, &device, false),
+            model: build(&cfg, &device, false),
             config: cfg,
             tokenizer_config: None,
             ffn_pool: None,
@@ -1351,7 +1350,7 @@ mod tests {
     #[test]
     fn cached_decode_matches_full_prefill() {
         let m = toy_model();
-        let device = burn::tensor::Device::<Cpu>::default();
+        let device = crate::backend::cpu_device();
         let ids: Vec<u32> = vec![3, 17, 42, 9, 60, 11];
 
         let mut full_cache = m.new_cache();
@@ -1385,7 +1384,7 @@ mod tests {
     #[test]
     fn recurrent_state_carries_the_prefix() {
         let m = toy_model();
-        let device = burn::tensor::Device::<Cpu>::default();
+        let device = crate::backend::cpu_device();
         let mut c1 = m.new_cache();
         let mut c2 = m.new_cache();
         let _ = m.forward(&[1, 2, 3], 0, &mut c1, &device);

@@ -17,9 +17,13 @@ repository = "https://github.com/physics515/Mummu"
 # `fusion` + `autotune` are the throughput levers: fusion compiles streams of tensor ops
 # into far fewer GPU kernels and autotune picks the fastest kernel variant; with `fusion`,
 # `Wgpu` transparently becomes `Fusion<Wgpu>`.
-burn = { version = "0.21", default-features = false, features = [
+burn = { version = "0.22.0-pre.2", default-features = false, features = [
 	"std",
 	"wgpu",
+	# burn 0.22 selects backends at runtime through `Device`, so the flex
+	# integration must be on for `Device::flex()` to exist (0.21 reached the
+	# CPU backend through the `burn_flex::Flex` type instead).
+	"flex",
 	"autotune",
 	"store",
 ] }
@@ -36,11 +40,11 @@ burn = { version = "0.21", default-features = false, features = [
 # (0.21 release notes); swapped in 2026-07-10 after the MiniLM Candle-parity
 # gate passed on it bit-for-bit-equivalent (cosine 0.99999994, max component
 # diff 1.3e-7) with all 80 unit tests green.
-burn-flex = "0.21"
+burn-flex = "0.22.0-pre.2"
 # Direct handle on burn-store (the same crate burn's `store` feature pulls) to
 # turn on its `pytorch` feature: .pth / pytorch_model.bin state-dict loading
 # for models never re-shipped as safetensors (feature-unified, no duplicate).
-burn-store = { version = "0.21", default-features = false, features = [
+burn-store = { version = "0.22.0-pre.2", default-features = false, features = [
 	"std",
 	"safetensors",
 	"pytorch",
@@ -51,11 +55,11 @@ burn-store = { version = "0.21", default-features = false, features = [
 # CubeCL itself discovers — `crate::tune` reports and clears it. Feature-
 # unified, so this adds no compile time; hardcoding the discovery rule instead
 # would drift from cubecl's the first time it changes.
-cubecl-runtime = "0.10"
+cubecl-runtime = "0.11.0-pre.2"
 
 # Direct handle on wgpu (the same version Burn resolves) for the cheap startup
 # adapter probe: enumerate GPUs to decide GPU vs CPU before building a backend.
-wgpu = "29"
+wgpu = "30"
 # Block on wgpu 29's async adapter enumeration from the sync startup probe.
 pollster = "1.0"
 # f16 element type for the GPU backend; the same `half` version Burn pulls.

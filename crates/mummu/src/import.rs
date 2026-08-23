@@ -196,14 +196,13 @@ impl ModuleAdapter for CastFloatAdapter {
 /// is an [`ImportError::Incomplete`] carrying the store's own readable
 /// report. Unused checkpoint tensors are *allowed* (e.g. BERT's
 /// intentionally-skipped `pooler.*`) — callers that care inspect the report.
-pub fn load_checked<M, B, S>(
+pub fn load_checked<M, S>(
     module: &mut M,
     store: &mut S,
     weights_path: &Path,
 ) -> Result<(), ImportError>
 where
-    M: Module<B> + ModuleSnapshot<B>,
-    B: burn::tensor::backend::Backend,
+    M: Module + ModuleSnapshot,
     S: ModuleStore,
 {
     let report = module.load_from(store).map_err(|e| ImportError::Load {
@@ -338,11 +337,11 @@ impl Drop for ScratchFile {
 ///
 /// This is the one place the four GGUF ports share: the sink choice, the
 /// adapter chain, and — the part worth centralizing — taking the target float
-/// dtype from the TYPE (`B::FloatElem`) rather than from a probe tensor.
+/// dtype from the TYPE (`f32`) rather than from a probe tensor.
 /// Unspecified-dtype tensor creation follows the per-DEVICE default policy,
 /// which another backend alias sharing the device (`Gpu` vs `GpuF16`) may have
 /// flipped in this process.
-pub fn gguf_store<B: burn::tensor::backend::Backend>(
+pub fn gguf_store(
     f: &GgufFile,
     map: &dyn Fn(&GgufTensorInfo) -> Option<GgufMap>,
     sink: DequantSink,
@@ -352,7 +351,7 @@ pub fn gguf_store<B: burn::tensor::backend::Backend>(
         reason,
     };
     let total_f32_bytes: u64 = f.tensors.iter().map(|t| t.element_count() * 4).sum();
-    let target_float = <B::FloatElem as burn::tensor::Element>::dtype();
+    let target_float = crate::backend::float_dtype();
     let adapter = PyTorchToBurnAdapter.chain(CastFloatAdapter::new(target_float));
 
     match sink.resolve(total_f32_bytes) {
