@@ -454,21 +454,26 @@ fn tier_devices(
     };
     // `speed` ranks devices for THIS workload, and the workload here is
     // decode: one token at a time, so every projection is a matrix-VECTOR
-    // product. Measured on the reference box, `[1,5120]x[5120,2176]`:
+    // product. Measured on the reference box for `[1,5120]x[5120,2176]`,
+    // with a WARM autotune cache:
     //
-    //   CPU (flex)  3.9 ms      GPU (+sync)  96 ms
+    //   GPU (+sync)  2.5-3.3 ms      CPU (flex)  ~1.7 ms equivalent
     //
-    // The GPU is ~25x slower, because a single-row matmul cannot fill it —
-    // the time is launch and synchronization, which WSL2 GPU-PV makes worse.
-    // The GPU only wins with enough work per launch: at m=8 the same FFN
-    // matmul costs the SAME wall-clock as m=1 (8x the work for free), so
-    // batched prefill and speculative decode are what make GPU tiers pay.
+    // Close, with the CPU modestly ahead — nothing like the 25x gap an
+    // earlier COLD-cache measurement suggested (96 ms, which was autotune
+    // being paid inside the timing loop, not steady-state throughput; see
+    // `examples/sync-probe.rs` and warm it before believing a number).
     //
-    // Hence: the CPU outranks the GPU for decode, and the GPU is used for
-    // what it is actually needed for here — CAPACITY. Its VRAM is what makes
-    // a model larger than host RAM fit at all, and `plan_tiers` fills the
-    // fastest device first, so ranking the CPU higher keeps hot clusters on
-    // the fast device and spills only the overflow to the GPU.
+    // The GPU's 2.5 ms is launch-latency bound, not bandwidth bound — it
+    // moves 44 MB in that time, far under VRAM bandwidth — so it amortizes
+    // much better as work per launch grows: at m=8 the same FFN matmul costs
+    // the SAME wall-clock as m=1 (8x the work for free). Batched prefill and
+    // speculative decode are what make GPU tiers pay properly.
+    //
+    // The ranking is therefore a close call that depends on batch size, and
+    // the default keeps the CPU marginally ahead for single-token decode
+    // while `MUMMU_TIER_SPEED=gpu-first` flips it for batched serving. Do
+    // not read either ordering as a large effect.
     let decode_speed = |gpu: bool| -> u32 {
         if std::env::var("MUMMU_TIER_SPEED")
             .ok()

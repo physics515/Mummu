@@ -43,6 +43,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         cuda-cudart-dev-12-6 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/mummu-serve /usr/local/bin/mummu-serve
+# CubeCL discovers its config by walking UP from the process CWD, and this
+# image runs with CWD=/ — so the file has to live at the root to be found.
+# Without it the autotune cache has nowhere to persist (the default root is
+# the Cargo target tree, absent from a runtime image) and every container
+# start re-tunes from scratch.
+COPY crates/mummu-serve/cubecl.toml /cubecl.toml
 
 ENV MUMMU_MODELS_DIR=/models \
     MUMMU_ADDR=0.0.0.0:8095 \

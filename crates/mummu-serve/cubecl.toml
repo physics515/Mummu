@@ -1,0 +1,12 @@
+# CubeCL configuration for the container image.
+#
+# CubeCL autotunes each kernel shape on first use and persists the winner.
+# Its default cache root (`target`) is the Cargo target tree, which does not
+# exist in a runtime image — so without this the container re-tunes from
+# scratch on every start, and autotune is NOT cheap: the same decode matmul
+# measures ~96 ms while tuning against ~2.5 ms once tuned.
+#
+# `/models` is the bind mount that already survives restarts, so the cache
+# persists with the weights it was tuned for.
+[environment]
+path = { directory = "/models/.cubecl-cache" }
