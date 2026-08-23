@@ -234,8 +234,18 @@ async fn models() -> Response {
 
 async fn unload() -> Response {
     // Dropping a resident model frees VRAM/RAM — device work, not async work.
-    blocking(engine::unload_all).await;
-    json_response(200, json!({"status": "unloaded"}))
+    // Report what actually happened: a generation holding the slot means the
+    // model is still resident, and answering "unloaded" would be a lie the
+    // caller acts on (it frees nothing, and the next request still hits the
+    // old model).
+    if blocking(engine::unload_all).await {
+        json_response(200, json!({"status": "unloaded"}))
+    } else {
+        json_response(
+            409,
+            json!({"error": "a generation is in flight — the model stays resident until it finishes"}),
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------

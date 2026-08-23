@@ -266,7 +266,14 @@ async fn delete(body: Bytes) -> Response {
         let Some(spec) = resolve(&manager, &parsed.model) else {
             return not_found(&parsed.model);
         };
-        engine::unload_all(); // the dir may be the resident model's backing store
+        // The dir may be the resident model's backing store — refuse rather
+        // than delete files out from under a running generation.
+        if !engine::unload_all() {
+            return json_response(
+                409,
+                json!({"error": "a generation is in flight — cannot delete a model that is loaded"}),
+            );
+        }
         match manager.remove(&spec.name) {
             Ok(()) => json_response(200, json!({})),
             Err(e) => json_response(500, json!({"error": e})),

@@ -105,17 +105,45 @@ impl<T> ModelSlot<T> {
 
     /// Drop the cached model (freeing its VRAM/RAM). No-op when empty.
     ///
-    /// Takes the lock blockingly: callable from sync context (shutdown paths,
-    /// tests). From inside a runtime, prefer doing this where a block is
-    /// acceptable — it waits for any in-flight generation to finish.
-    pub fn clear(&self) {
-        *self.inner.blocking_lock() = None;
+    /// Returns `false` when a generation currently holds the slot — the model
+    /// cannot be freed under it, and *saying so* beats the alternatives:
+    /// blocking here panics inside a tokio runtime ("cannot block the current
+    /// thread from within a runtime"), and waiting would park a worker behind
+    /// a decode that can run for minutes. Use [`Self::clear_async`] to wait.
+    pub fn clear(&self) -> bool {
+        match self.inner.try_lock() {
+            Ok(mut guard) => {
+                *guard = None;
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// [`Self::clear`], waiting for any in-flight generation to release the
+    /// slot first.
+    pub async fn clear_async(&self) {
+        *self.inner.lock().await = None;
     }
 
     /// The checkpoint dir currently loaded, if any — for settings UIs.
+    ///
+    /// A **peek**: `None` when the slot is empty *or* busy serving a
+    /// generation. Callers use this to answer "is this already loaded?" and
+    /// "what is resident?", where waiting behind a multi-minute decode would
+    /// be worse than a conservative answer (and blocking inside a runtime
+    /// would panic outright).
     #[must_use]
     pub fn loaded_key(&self) -> Option<PathBuf> {
-        self.inner.blocking_lock().as_ref().map(|e| e.key.clone())
+        self.inner
+            .try_lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|e| e.key.clone()))
+    }
+
+    /// [`Self::loaded_key`], waiting for the slot instead of reporting busy.
+    pub async fn loaded_key_async(&self) -> Option<PathBuf> {
+        self.inner.lock().await.as_ref().map(|e| e.key.clone())
     }
 }
 

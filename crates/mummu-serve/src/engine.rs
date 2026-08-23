@@ -142,13 +142,16 @@ fn resident_in(backend: BackendChoice) -> Option<(std::path::PathBuf, u64)> {
 }
 
 /// Drop any resident model (frees VRAM/RAM).
-pub fn unload_all() {
+pub fn unload_all() -> bool {
     clear_tiers();
-    SLOT.clear();
-    RESIDENT
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clear();
+    let freed = SLOT.clear();
+    if freed {
+        RESIDENT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+    freed
 }
 
 /// The model dirs currently resident in any backend slot (the ollama shim's
@@ -1090,11 +1093,18 @@ fn ensure_host_room(need: u64, keep: BackendChoice) {
             dir.display(),
             bytes >> 30
         );
-        SLOT.clear();
-        RESIDENT
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|(b, _, _)| *b != BackendChoice::Cpu);
+        if SLOT.clear() {
+            RESIDENT
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|(b, _, _)| *b != BackendChoice::Cpu);
+        } else {
+            // Busy: a generation holds the model. Say so — pretending the
+            // eviction happened is how the caller walks into an OOM.
+            eprintln!(
+                "[mummu-serve] host RAM: could not evict — a generation is holding the model slot"
+            );
+        }
     }
 }
 
@@ -1256,7 +1266,9 @@ async fn drive(
     // planner's decision cosmetic.
     let device = device_of(backend);
     let key = spec.dir(models_root);
-    if slot.loaded_key().as_deref() != Some(key.as_path()) && tiers_pack_in(&key).is_none() {
+    if slot.loaded_key_async().await.as_deref() != Some(key.as_path())
+        && tiers_pack_in(&key).is_none()
+    {
         // This slot is about to evict its occupant; if that was the tiered
         // model, its experts on the *other* devices go with it.
         clear_tiers_if_slot(backend);
