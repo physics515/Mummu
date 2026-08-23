@@ -28,4 +28,10 @@ serde_json = { workspace = true }
 # Stable fake digests for the ollama shim's /api/tags (clients treat the
 # digest as an opaque identity).
 sha2 = { workspace = true }
-tiny_http = { workspace = true }
+# Async HTTP + runtime (replaced tiny_http's thread-per-request model when
+# mummu went async end to end).
+tokio = { workspace = true }
+axum = { workspace = true }
+futures = { workspace = true }
+async-stream = { workspace = true }
+tokio-stream = { workspace = true }

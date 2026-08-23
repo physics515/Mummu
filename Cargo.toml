@@ -84,9 +84,28 @@ ureq = "3"
 sha2 = "0.11"
 
 serde = { version = "1", features = ["derive"] }
-# The mummu-serve HTTP layer: a tiny sync server (threads, no async runtime),
-# matching the library's sync surface the same way ureq does on the client side.
-tiny_http = "0.12"
+# The async runtime. mummu is async end to end (not just the server): burn
+# 0.22 exposes real async readbacks (`into_data_async`), so a decode that
+# waits on the device yields its worker instead of parking it, and a
+# disconnected client's generation can actually be cancelled at an await
+# point. Multi-threaded flavor — the model runtime is CPU-bound work that
+# must spread across cores.
+tokio = { version = "1", features = [
+	"rt-multi-thread",
+	"macros",
+	"sync",
+	"time",
+	"fs",
+	"io-util",
+	"net",
+	"signal",
+] }
+# Async HTTP for mummu-serve, replacing tiny_http's thread-per-request model.
+axum = "0.8"
+tower = "0.5"
+futures = "0.3"
+async-stream = "0.3"
+tokio-stream = "0.1"
 # `preserve_order` (insertion-order maps) is deliberate and load-bearing for
 # prompt bytes: Python/transformers renders tool JSON in dict insertion order,
 # so our tool-bearing prompts only byte-match the reference stack's rendering

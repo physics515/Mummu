@@ -55,16 +55,19 @@ pub trait CausalLm {
         opts: &SamplerOptions,
         device: &Device,
         on_token: impl FnMut(u32) -> std::ops::ControlFlow<()>,
-    ) -> Result<Vec<u32>, String> {
-        let mut cache = self.new_cache();
-        generate_loop(
-            |ids, past| self.forward(ids, past, &mut cache, device),
-            prompt_ids,
-            max_tokens,
-            opts,
-            |id| self.is_eos(id),
-            on_token,
-        )
+    ) -> impl std::future::Future<Output = Result<Vec<u32>, String>> {
+        async move {
+            let mut cache = self.new_cache();
+            generate_loop(
+                |ids, past| self.forward(ids, past, &mut cache, device),
+                prompt_ids,
+                max_tokens,
+                opts,
+                |id| self.is_eos(id),
+                on_token,
+            )
+            .await
+        }
     }
 
     /// Greedy decode (the parity-gate path): [`Self::generate`] at
@@ -74,14 +77,16 @@ pub trait CausalLm {
         prompt_ids: &[u32],
         max_tokens: usize,
         device: &Device,
-    ) -> Result<Vec<u32>, String> {
-        self.generate(
-            prompt_ids,
-            max_tokens,
-            &SamplerOptions::greedy(),
-            device,
-            |_| std::ops::ControlFlow::Continue(()),
-        )
+    ) -> impl std::future::Future<Output = Result<Vec<u32>, String>> {
+        // The options must outlive the future, so own them here rather than
+        // passing a temporary that dies at the end of this statement.
+        async move {
+            let opts = SamplerOptions::greedy();
+            self.generate(prompt_ids, max_tokens, &opts, device, |_| {
+                std::ops::ControlFlow::Continue(())
+            })
+            .await
+        }
     }
 
     /// Parity probe: top-k next-token ids for a single prefill.
@@ -90,17 +95,21 @@ pub trait CausalLm {
         prompt_ids: &[u32],
         k: usize,
         device: &Device,
-    ) -> Result<Vec<u32>, String> {
+    ) -> impl std::future::Future<Output = Result<Vec<u32>, String>> {
         assert!(!prompt_ids.is_empty(), "first_token: empty prompt");
         assert!(k >= 1, "first_token: k must be >= 1");
-        let mut cache = self.new_cache();
-        let logits = self.forward(prompt_ids, 0, &mut cache, device);
-        let v = logits
-            .into_data()
-            .convert::<f32>()
-            .to_vec::<f32>()
-            .map_err(|e| format!("logits readback: {e:?}"))?;
-        Ok(top_k_ids(&v, k))
+        async move {
+            let mut cache = self.new_cache();
+            let logits = self.forward(prompt_ids, 0, &mut cache, device);
+            let v = logits
+                .into_data_async()
+                .await
+                .map_err(|e| format!("logits readback: {e:?}"))?
+                .convert::<f32>()
+                .to_vec::<f32>()
+                .map_err(|e| format!("logits readback: {e:?}"))?;
+            Ok(top_k_ids(&v, k))
+        }
     }
 
     /// Post-import **sanity smoke**: one forward on `probe_ids` must yield
@@ -115,20 +124,24 @@ pub trait CausalLm {
         probe_ids: &[u32],
         expected_vocab: usize,
         device: &Device,
-    ) -> Result<crate::import::SanitySmoke, String> {
+    ) -> impl std::future::Future<Output = Result<crate::import::SanitySmoke, String>> {
         assert!(!probe_ids.is_empty(), "sanity_check: empty probe prompt");
         assert!(
             expected_vocab > 0,
             "sanity_check: expected_vocab must be positive"
         );
-        let mut cache = self.new_cache();
-        let logits = self.forward(probe_ids, 0, &mut cache, device);
-        let v = logits
-            .into_data()
-            .convert::<f32>()
-            .to_vec::<f32>()
-            .map_err(|e| format!("logits readback: {e:?}"))?;
-        crate::import::logit_sanity(&v, expected_vocab).map_err(|e| e.to_string())
+        async move {
+            let mut cache = self.new_cache();
+            let logits = self.forward(probe_ids, 0, &mut cache, device);
+            let v = logits
+                .into_data_async()
+                .await
+                .map_err(|e| format!("logits readback: {e:?}"))?
+                .convert::<f32>()
+                .to_vec::<f32>()
+                .map_err(|e| format!("logits readback: {e:?}"))?;
+            crate::import::logit_sanity(&v, expected_vocab).map_err(|e| e.to_string())
+        }
     }
 
     /// Pay the **cold-start tax off the user's critical path**: one prefill
@@ -159,21 +172,24 @@ pub trait CausalLm {
         probe_ids: &[u32],
         steps: usize,
         device: &Device,
-    ) -> Result<usize, String> {
+    ) -> impl std::future::Future<Output = Result<usize, String>> {
+        // Validate EAGERLY, outside the future: an argument bound that only
+        // fires when the future is awaited is a contract the caller can hold
+        // wrong indefinitely (and a `should_panic` test never sees).
         assert!(!probe_ids.is_empty(), "warm_up: empty probe prompt");
         assert!(steps >= 1, "warm_up: steps must be >= 1");
         assert!(
             steps <= MAX_WARM_UP_STEPS,
             "warm_up: {steps} steps exceeds the {MAX_WARM_UP_STEPS} bound"
         );
-
+        async move {
         let mut cache = self.new_cache();
         let logits = self.forward(probe_ids, 0, &mut cache, device);
-        let mut next = argmax_id(logits)?;
+        let mut next = argmax_id(logits).await?;
         let mut forwards = 1usize;
         for past in (probe_ids.len()..).take(steps) {
             let logits = self.forward(&[next], past, &mut cache, device);
-            next = argmax_id(logits)?;
+            next = argmax_id(logits).await?;
             forwards += 1;
         }
 
@@ -183,5 +199,6 @@ pub trait CausalLm {
             "warm_up must run exactly one prefill plus `steps` decode forwards"
         );
         Ok(forwards)
+        }
     }
 }

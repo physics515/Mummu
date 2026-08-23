@@ -684,8 +684,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn greedy_generate_respects_max_tokens_bound() {
+    #[tokio::test]
+    async fn greedy_generate_respects_max_tokens_bound() {
         let device = crate::backend::cpu_device();
         let cfg = toy_config();
         let loaded = LoadedLfm2 {
@@ -693,7 +693,7 @@ mod tests {
             config: cfg,
             tokenizer_config: None,
         };
-        let out = loaded.greedy_generate(&[1, 2], 3, &device).unwrap();
+        let out = loaded.greedy_generate(&[1, 2], 3, &device).await.unwrap();
         assert!(out.len() <= 3);
     }
 

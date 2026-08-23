@@ -664,8 +664,8 @@ mod tests {
         assert_eq!(qwen2_gguf_name("blk.x.attn_q.weight"), None);
     }
 
-    #[test]
-    fn sanity_check_passes_on_a_live_toy_model_and_flags_a_vocab_mismatch() {
+    #[tokio::test]
+    async fn sanity_check_passes_on_a_live_toy_model_and_flags_a_vocab_mismatch() {
         let device = crate::backend::cpu_device();
         let cfg = toy_config();
         let vocab = cfg.vocab_size;
@@ -678,15 +678,15 @@ mod tests {
         // distribution — the smoke passes and reports a valid top id.
         let smoke = loaded
             .sanity_check(&[1, 2, 3], vocab, &device)
-            .expect("live toy model passes the smoke");
+            .await.expect("live toy model passes the smoke");
         assert!((smoke.top_id as usize) < vocab, "top id in vocab range");
         assert!(smoke.spread > 0.0, "a live forward has positive spread");
         // The wrong expected vocab is caught as a mismatch, not a silent pass.
-        assert!(loaded.sanity_check(&[1, 2, 3], vocab + 1, &device).is_err());
+        assert!(loaded.sanity_check(&[1, 2, 3], vocab + 1, &device).await.is_err());
     }
 
-    #[test]
-    fn warm_up_runs_one_prefill_plus_its_steps_and_leaves_the_model_usable() {
+    #[tokio::test]
+    async fn warm_up_runs_one_prefill_plus_its_steps_and_leaves_the_model_usable() {
         let device = crate::backend::cpu_device();
         let cfg = toy_config();
         let loaded = LoadedQwen2 {
@@ -696,13 +696,13 @@ mod tests {
         };
         let forwards = loaded
             .warm_up(&[1, 2, 3], 4, &device)
-            .expect("warm-up runs on a live toy model");
+            .await.expect("warm-up runs on a live toy model");
         assert_eq!(forwards, 5, "one prefill plus four decode steps");
         // The warm-up cache is a throwaway: a generation after it starts from
         // an empty cache and still decodes (nothing leaked into the model).
         let out = loaded
             .greedy_generate(&[1, 2, 3], 2, &device)
-            .expect("decodes after a warm-up");
+            .await.expect("decodes after a warm-up");
         assert!(!out.is_empty(), "generation after warm-up produces tokens");
     }
 
@@ -719,8 +719,8 @@ mod tests {
         let _ = loaded.warm_up(&[1, 2, 3], crate::models::MAX_WARM_UP_STEPS + 1, &device);
     }
 
-    #[test]
-    fn greedy_generate_respects_max_tokens_bound() {
+    #[tokio::test]
+    async fn greedy_generate_respects_max_tokens_bound() {
         let device = crate::backend::cpu_device();
         let cfg = toy_config();
         let loaded = LoadedQwen2 {
@@ -728,7 +728,7 @@ mod tests {
             config: cfg,
             tokenizer_config: None,
         };
-        let out = loaded.greedy_generate(&[1, 2, 3], 4, &device).unwrap();
+        let out = loaded.greedy_generate(&[1, 2, 3], 4, &device).await.unwrap();
         assert!(out.len() <= 4);
     }
 }
