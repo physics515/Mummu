@@ -441,20 +441,90 @@ where
     }
 }
 
-/// A pooled expert's weight ready for an `f32`-input matmul: a quantized
-/// weight (Q4/Q8, stored compactly) is **dequantized on its own device**
-/// first, so the matmul is always float×float. This keeps the storage
-/// savings while sidestepping the mixed f32-input × quantized-weight
-/// `q_matmul` — which burn 0.21's CUDA backend panics on ("Cast element
-/// count must match") and wgpu computes wrong. The dequantized tensor is
-/// transient (freed after the matmul); the `Param` stays quantized.
+/// A pooled expert's weight, ready to multiply.
+///
+/// A quantized weight is handed to `matmul` **as-is** when this device's
+/// backend multiplies it natively — that reads 4–8x fewer weight bytes and
+/// skips materializing an f32 copy. Where the native path is broken it is
+/// dequantized first instead (transient; the `Param` stays quantized).
+///
+/// Which backends work is a property of the burn version and the device, so
+/// it is **probed**, not hardcoded — see [`native_qmatmul_ok`].
 fn compute_weight(w: &Param<Tensor<2>>) -> Tensor<2> {
     let t = w.val();
-    if matches!(t.dtype(), DType::QFloat(_)) {
-        t.dequantize()
-    } else {
-        t
+    match t.dtype() {
+        DType::QFloat(_) if native_qmatmul_ok(&t.device(), t.dtype()) => t,
+        DType::QFloat(_) => t.dequantize(),
+        _ => t,
     }
+}
+
+/// Does this device multiply a quantized weight natively — without panicking,
+/// and with the right answer?
+///
+/// Probed once per (device, scheme) and cached. Burn 0.21's CUDA `q_matmul`
+/// panicked in kernel expansion; 0.22 fixed CUDA but wgpu still panics on Q4,
+/// and upstream's own autotune candidates are documented as panicking "on the
+/// level rather than declining it". A capability that varies by version,
+/// backend and dtype is exactly the kind that should be measured on the
+/// machine in front of us rather than asserted from a table.
+///
+/// Conservative by construction: any panic, or an answer that disagrees with
+/// the dequantized path, means "no".
+fn native_qmatmul_ok(device: &Device, dtype: DType) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    static CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    let key = format!("{device:?}/{dtype:?}");
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(&hit) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return hit;
+    }
+
+    // Small enough to be free, wide enough to cross a quantization block.
+    let (k, n) = (64usize, 64usize);
+    let ok = std::panic::catch_unwind(|| {
+        let x = Tensor::<2>::from_data(
+            burn::tensor::TensorData::new(vec![0.5f32; k], [1, k]),
+            (device, crate::backend::float_dtype()),
+        );
+        let w = Tensor::<2>::from_data(
+            burn::tensor::TensorData::new(
+                (0..k * n).map(|i| ((i % 17) as f32 - 8.0) * 0.1).collect::<Vec<f32>>(),
+                [k, n],
+            ),
+            (device, crate::backend::float_dtype()),
+        );
+        let DType::QFloat(scheme) = dtype else {
+            return false;
+        };
+        let qw = w.clone().quantize_dynamic(&scheme);
+        let native = x.clone().matmul(qw.clone()).into_data().convert::<f32>().to_vec::<f32>();
+        let deq = x.matmul(qw.dequantize()).into_data().convert::<f32>().to_vec::<f32>();
+        match (native, deq) {
+            (Ok(a), Ok(b)) => {
+                // Agreement, not just absence of a panic: a native path that
+                // silently computes something else is worse than one that fails.
+                let scale = b.iter().map(|v| v.abs()).fold(1e-3, f32::max);
+                a.iter().zip(&b).all(|(x, y)| (x - y).abs() <= 0.05 * scale)
+            }
+            _ => false,
+        }
+    })
+    .unwrap_or(false);
+
+    if !ok {
+        // Worth saying once: it silently costs bandwidth on every matmul.
+        eprintln!(
+            "[mummu] {key}: no usable native quantized matmul — dequantizing before each matmul"
+        );
+    }
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, ok);
+    ok
 }
 
 /// An expert whose weights live in **host RAM**, staged onto a device only
@@ -1264,32 +1334,44 @@ mod tests {
         }
     }
 
-    /// The P9-3c fix: a pooled expert with a **quantized** weight must run
-    /// through `compute_weight`'s on-device dequantize (never burn's mixed
-    /// f32-input × quantized-weight q_matmul, which the CUDA/wgpu backends
-    /// mishandle). Here on CPU we check the dequantize itself: an f32 param
-    /// passes through untouched; a Q8 param comes back float and ≈ the
-    /// original within block-32 quant error.
+    /// `compute_weight` hands `matmul` something that produces the RIGHT
+    /// ANSWER — either the quantized weight itself (where the backend
+    /// multiplies it natively) or a dequantized copy (where it does not).
+    ///
+    /// The test asserts the invariant, not the mechanism: which branch runs
+    /// depends on the backend, the burn version and the dtype, and is probed
+    /// at runtime. Asserting "it always dequantizes" would have to be
+    /// rewritten every time a backend gains a working kernel — and would
+    /// have failed the moment burn 0.22 fixed CUDA.
     #[test]
-    fn compute_weight_dequantizes_quantized_params() {
+    fn compute_weight_yields_a_matmul_ready_weight() {
         use crate::quant::{QuantPolicy, quantize_weight};
         use burn::tensor::TensorData;
         let device = crate::backend::cpu_device();
         let vals: Vec<f32> = (0..32 * 64).map(|i| ((i as f32) * 0.05).sin()).collect();
         let t = Tensor::<2>::from_data(TensorData::new(vals.clone(), [32, 64]), &device);
 
-        // Float param: returned as-is (still float).
+        // Float param: returned as-is (still float, never re-quantized).
         let out_f32 = compute_weight(&Param::from_tensor(t.clone()));
         assert!(!matches!(out_f32.dtype(), DType::QFloat(_)), "float weight must stay float");
 
-        // Quantized param: really quantized, and compute_weight floats it back.
+        // Quantized param: whatever comes back must MULTIPLY correctly.
         let q = quantize_weight(QuantPolicy::Q8, t.clone());
         assert!(matches!(q.dtype(), DType::QFloat(_)), "weight should be quantized");
-        let out_q = compute_weight(&Param::from_tensor(q));
-        assert!(!matches!(out_q.dtype(), DType::QFloat(_)), "compute_weight must dequantize");
-        let back = out_q.into_data().to_vec::<f32>().unwrap();
-        for (i, (x, y)) in vals.iter().zip(&back).enumerate() {
-            assert!((x - y).abs() < 0.05, "Q8 dequant elem {i}: {x} vs {y}");
+        let ready = compute_weight(&Param::from_tensor(q));
+
+        let x = Tensor::<2>::from_data(
+            TensorData::new(vec![0.25f32; 32], [1, 32]),
+            (&device, crate::backend::float_dtype()),
+        );
+        let want = x.clone().matmul(t).into_data().to_vec::<f32>().unwrap();
+        let got = x.matmul(ready).into_data().to_vec::<f32>().unwrap();
+        let scale = want.iter().map(|v| v.abs()).fold(1e-3, f32::max);
+        for (i, (a, b)) in want.iter().zip(&got).enumerate() {
+            assert!(
+                (a - b).abs() <= 0.05 * scale,
+                "elem {i}: quantized path gave {b}, f32 gave {a}"
+            );
         }
     }
 
