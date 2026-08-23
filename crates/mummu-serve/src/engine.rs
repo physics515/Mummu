@@ -251,6 +251,15 @@ fn load_any(
                             .ok()
                             .is_some_and(|p| p.manifest.ffn_partition.is_some());
                         match tiers_mode() {
+                            // qwen35 is DENSE: every FFN cluster runs on every
+                            // token, so splitting a layer across devices buys
+                            // nothing and costs a crossing. Place whole layers
+                            // instead (`MUMMU_TIERS=clusters` restores the
+                            // cluster-granular path for experimenting).
+                            Some(_) if partitioned && !cluster_granular() => {
+                                clear_tiers();
+                                AnyLm::Qwen35(build_layered_qwen35(&pack_dir, backend, policy)?)
+                            }
                             Some(cpu_only) if partitioned => {
                                 // P9 stage 3c: trunk + local FFN clusters here,
                                 // the other clusters tiered across devices.
@@ -655,6 +664,16 @@ fn load_ffn_group_on(
     }))
 }
 
+/// Use the cluster-granular tier path for a dense model?
+///
+/// Off by default: measured 24.7 s/tok against 4.8 for whole-layer placement
+/// on the 27B, because a dense model touches every cluster every token, so
+/// splitting a layer across devices adds a crossing and saves nothing.
+/// `MUMMU_TIERS=clusters` opts back in for experiments.
+fn cluster_granular() -> bool {
+    std::env::var("MUMMU_TIERS").is_ok_and(|v| v.eq_ignore_ascii_case("clusters"))
+}
+
 /// P9 stage 4: is the working set on? `MUMMU_WORKING_SET=on` loads FFN
 /// clusters into host RAM and lets the schedule stage them onto the device,
 /// instead of assigning each one a permanent home.
@@ -745,6 +764,113 @@ fn pack_trunk_bytes(pack: &mummu::pack::Pack, level: mummu::pack::Precision) -> 
         };
     }
     bytes * 135 / 100 + (1 << 30)
+}
+
+/// Bytes one layer of a pack costs on a device at `level` — every tensor
+/// whose parameter path names that layer, trunk and FFN alike.
+fn pack_layer_bytes(pack: &mummu::pack::Pack, level: mummu::pack::Precision) -> Vec<u64> {
+    use mummu::pack::{Precision, Role};
+    let mut per_layer: std::collections::BTreeMap<usize, u64> = std::collections::BTreeMap::new();
+    for t in &pack.manifest.tensors {
+        // `blk.<n>.` is the GGUF naming the pack preserves.
+        let Some(rest) = t.name.strip_prefix("blk.") else {
+            continue;
+        };
+        let Some((idx, _)) = rest.split_once('.') else {
+            continue;
+        };
+        let Ok(layer) = idx.parse::<usize>() else {
+            continue;
+        };
+        let numel = t.shape.iter().product::<usize>() as u64;
+        let bytes = match (&t.role, t.precisions.get(&level)) {
+            (Role::Linear | Role::Expert { .. }, Some(b))
+                if matches!(level, Precision::Q4 | Precision::Q8) =>
+            {
+                b.values_len + b.scales_len
+            }
+            _ => numel * 4,
+        };
+        *per_layer.entry(layer).or_insert(0) += bytes;
+    }
+    per_layer.into_values().collect()
+}
+
+/// How many whole layers fit `budget_bytes`, leaving room for activations.
+fn layers_that_fit(layer_bytes: &[u64], budget_bytes: u64) -> usize {
+    // Activations, KV/recurrent state and kernel workspaces are not weights;
+    // the fit planner's slack elsewhere uses the same 1 GiB reservation.
+    let usable = budget_bytes.saturating_sub(1 << 30);
+    let mut used = 0u64;
+    let mut n = 0usize;
+    for &b in layer_bytes {
+        if used + b > usable {
+            break;
+        }
+        used += b;
+        n += 1;
+    }
+    n
+}
+
+/// Load a dense qwen35 pack with **whole layers** on the device — as many as
+/// VRAM holds — and the rest on the host.
+///
+/// This is llama.cpp's `n_gpu_layers` shape, and it exists because the
+/// cluster-granular path is the wrong granularity for a dense model. There,
+/// every layer's FFN is split across devices, and since every cluster runs on
+/// every token there is no selectivity to pay for the crossing: measured
+/// 24.7 s/tok, against 4.8 for a placement that kept layers whole. Whole
+/// layers cross ONCE, where the assignment changes.
+///
+/// Cluster granularity remains correct for a routed MoE, where only top-k of
+/// E experts are touched and the k/E saving does pay for the crossing.
+fn build_layered_qwen35(
+    pack_dir: &Path,
+    main: BackendChoice,
+    policy: mummu::quant::QuantPolicy,
+) -> Result<qwen35::LoadedQwen35, String> {
+    use mummu::pack::Pack;
+    let pack = Pack::open(pack_dir)?;
+    let level = precision_for(policy);
+    let layer_bytes = pack_layer_bytes(&pack, level);
+    if layer_bytes.is_empty() {
+        return Err("pack has no per-layer tensors".into());
+    }
+    let device = device_of(main);
+    let host = mummu::backend::cpu_device();
+
+    let on_device = if main == BackendChoice::Cpu {
+        layer_bytes.len() // everything is already on the host
+    } else {
+        layers_that_fit(&layer_bytes, backend_budget(main))
+    };
+    let total: u64 = layer_bytes.iter().sum();
+    let placed: u64 = layer_bytes.iter().take(on_device).sum();
+    eprintln!(
+        "[mummu-serve] layers: {on_device}/{} on {} ({:.2} of {:.2} GiB); the rest on the host",
+        layer_bytes.len(),
+        label_of(main),
+        placed as f64 / f64::from(1u32 << 30),
+        total as f64 / f64::from(1u32 << 30),
+    );
+
+    // Host room for the layers that stay behind, plus slack.
+    let host_bytes: u64 = layer_bytes.iter().skip(on_device).sum();
+    ensure_host_room(host_bytes + (6u64 << 30), main);
+
+    let dev_for = |l: usize| if l < on_device { device.clone() } else { host.clone() };
+    // Embedding on the host (a gather; see `pack_trunk_bytes`), and the head
+    // with the last layer so the final projection does not cross.
+    let head = dev_for(layer_bytes.len().saturating_sub(1));
+    let started = Instant::now();
+    let model = qwen35::load_from_pack_layered(pack_dir, &dev_for, &host, &head, &|_| level)
+        .map_err(|e| e.to_string())?;
+    eprintln!(
+        "[mummu-serve] layered model resident in {:.0}s",
+        started.elapsed().as_secs_f32()
+    );
+    Ok(model)
 }
 
 /// Plan and load a partitioned qwen35 pack: trunk + local FFN clusters on

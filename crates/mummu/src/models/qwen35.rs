@@ -1057,6 +1057,111 @@ pub fn load_from_pack_partitioned_split(
     load_from_pack_inner(dir, device, choose, Some(local), Some(embed_device))
 }
 
+/// Load a pack with **each layer on its own device** — the dense-model
+/// placement (llama.cpp calls the knob `n_gpu_layers`).
+///
+/// `layer_device(l)` says where layer `l` lives; every tensor of that layer,
+/// trunk and FFN alike, is loaded there, so a layer never crosses a device
+/// boundary mid-computation. Activations cross once, where the assignment
+/// changes.
+///
+/// This exists because the cluster-granular path is the wrong shape for a
+/// dense model: it splits each layer's FFN across devices, and since every
+/// cluster runs on every token there is no selectivity to pay for the
+/// crossing — measured at 24.7 s/tok against 4.8 for keeping layers whole.
+/// Cluster granularity stays right for a routed MoE, where only top-k
+/// experts are touched.
+pub fn load_from_pack_layered(
+    dir: &Path,
+    layer_device: &dyn Fn(usize) -> Device,
+    embed_device: &Device,
+    head_device: &Device,
+    choose: &dyn Fn(&crate::pack::TensorEntry) -> crate::pack::Precision,
+) -> Result<LoadedQwen35, ImportError> {
+    use crate::pack::{Pack, Role};
+    let parse = |reason: String| ImportError::Parse {
+        file: dir.to_path_buf(),
+        reason,
+    };
+    let pack = Pack::open(dir).map_err(parse)?;
+    let header = pack.header().map_err(parse)?;
+    let config = Qwen35Config::from_gguf(&header).map_err(parse)?;
+    let untied = pack.entry("output.weight").is_some();
+    let trunk = config.num_layers;
+
+    // Build each layer on its own device.
+    let mut model = build(&config, &layer_device(0), untied);
+    for (l, layer) in model.layers.iter_mut().enumerate() {
+        let d = layer_device(l);
+        *layer = layer.clone().to_device(&d);
+    }
+    model.embed_tokens = model.embed_tokens.clone().to_device(embed_device);
+    model.norm = model.norm.clone().to_device(head_device);
+    if let Some(h) = model.lm_head.take() {
+        model.lm_head = Some(h.to_device(head_device));
+    }
+
+    let mut assigned = 0usize;
+    for entry in &pack.manifest.tensors {
+        let Some(path) = pack_param_path(&entry.name, trunk) else {
+            continue;
+        };
+        // Which device this tensor belongs on: its layer's, or the special
+        // homes for the embedding and the head.
+        let device = match entry.role {
+            Role::Embedding => embed_device.clone(),
+            _ => layer_of_path(&path).map_or_else(|| head_device.clone(), &layer_device),
+        };
+        let precision = {
+            let p = choose(entry);
+            if entry.precisions.contains_key(&p) {
+                p
+            } else {
+                *entry
+                    .precisions
+                    .keys()
+                    .max()
+                    .ok_or_else(|| parse(format!("'{}' has no stored precision", entry.name)))?
+            }
+        };
+        let src = match entry.role {
+            Role::Linear | Role::Expert { .. } | Role::Embedding => ParamSrc::Ready2(
+                pack.tensor::<2>(entry, precision, &device).map_err(parse)?,
+            ),
+            Role::Vector | Role::Conv => ParamSrc::F32 {
+                values: pack.read_f32(entry).map_err(parse)?,
+                shape: entry.shape.clone(),
+            },
+        };
+        assign_param(&mut model, &path, src, QuantPolicy::Off, &device).map_err(parse)?;
+        assigned += 1;
+    }
+    let expected = expected_tensor_count(&config, untied);
+    if assigned != expected {
+        return Err(parse(format!(
+            "pack supplied {assigned} trunk tensors, the architecture needs {expected}"
+        )));
+    }
+    Ok(LoadedQwen35 {
+        model,
+        config,
+        tokenizer_config: None,
+        ffn_pool: None,
+        ffn_skip_tau: 0.0,
+        ffn_plan: None,
+    })
+}
+
+/// The layer index a parameter path belongs to, if any
+/// (`model.layers.7.mlp.gate_proj.weight` -> 7).
+fn layer_of_path(path: &str) -> Option<usize> {
+    path.strip_prefix("model.layers.")?
+        .split('.')
+        .next()?
+        .parse()
+        .ok()
+}
+
 /// One layer's FFN restricted to `clusters` of a partitioned pack, at
 /// `precision`, in Linear layout — the local slab or a remote executor's
 /// weights. Columns of gate/up and rows of down are sliced straight from
@@ -1300,10 +1405,30 @@ impl CausalLm for LoadedQwen35 {
         let mask = (t > 1).then(|| causal_mask(t, past, device));
 
         for (li, (layer, kv)) in self.model.layers.iter().zip(cache.iter_mut()).enumerate() {
+            // Layers may live on different devices (the dense placement puts
+            // as many whole layers on the GPU as VRAM holds, the rest on the
+            // host). Moving `x` here is a no-op while the device does not
+            // change, so a same-device model pays nothing, and a split model
+            // crosses ONCE — where the assignment changes — instead of twice
+            // per layer.
+            let layer_device = layer.input_norm.gamma.val().device();
+            if x.device() != layer_device {
+                x = x.to_device(&layer_device);
+            }
             let h = layer.input_norm.forward(x.clone());
+            // The rope tables and mask were built once on the entry device;
+            // an attention layer elsewhere needs them there too.
+            let (cos_l, sin_l) = if cos.device() == layer_device {
+                (cos.clone(), sin.clone())
+            } else {
+                (cos.clone().to_device(&layer_device), sin.clone().to_device(&layer_device))
+            };
+            let mask_l = mask
+                .as_ref()
+                .map(|m| if m.device() == layer_device { m.clone() } else { m.clone().to_device(&layer_device) });
             let h = match (&layer.self_attn, &layer.linear_attn, kv) {
                 (Some(attn), None, Qwen35Kv::Attn(kv_state)) => {
-                    attn.forward(h, cfg, &cos, &sin, mask.as_ref(), kv_state)
+                    attn.forward(h, cfg, &cos_l, &sin_l, mask_l.as_ref(), kv_state)
                 }
                 (None, Some(delta), Qwen35Kv::Delta(state)) => delta.forward(h, cfg, state),
                 _ => unreachable!("qwen35 forward: layer/cache kind mismatch"),
@@ -1346,6 +1471,13 @@ impl CausalLm for LoadedQwen35 {
             }
             x = x.add(ffn);
         }
+        // The final norm and head may live elsewhere than the last layer.
+        let head_device = self.model.norm.gamma.val().device();
+        let x = if x.device() == head_device {
+            x
+        } else {
+            x.to_device(&head_device)
+        };
         let x = self.model.norm.forward(x);
 
         // Last position only → logits [1, vocab].
