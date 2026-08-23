@@ -452,6 +452,38 @@ fn tier_devices(
     let budget = |b: BackendChoice| {
         backend_budget(b).saturating_sub(if b == main { trunk_bytes } else { 0 })
     };
+    // `speed` ranks devices for THIS workload, and the workload here is
+    // decode: one token at a time, so every projection is a matrix-VECTOR
+    // product. Measured on the reference box, `[1,5120]x[5120,2176]`:
+    //
+    //   CPU (flex)  3.9 ms      GPU (+sync)  96 ms
+    //
+    // The GPU is ~25x slower, because a single-row matmul cannot fill it —
+    // the time is launch and synchronization, which WSL2 GPU-PV makes worse.
+    // The GPU only wins with enough work per launch: at m=8 the same FFN
+    // matmul costs the SAME wall-clock as m=1 (8x the work for free), so
+    // batched prefill and speculative decode are what make GPU tiers pay.
+    //
+    // Hence: the CPU outranks the GPU for decode, and the GPU is used for
+    // what it is actually needed for here — CAPACITY. Its VRAM is what makes
+    // a model larger than host RAM fit at all, and `plan_tiers` fills the
+    // fastest device first, so ranking the CPU higher keeps hot clusters on
+    // the fast device and spills only the overflow to the GPU.
+    let decode_speed = |gpu: bool| -> u32 {
+        if std::env::var("MUMMU_TIER_SPEED")
+            .ok()
+            .as_deref()
+            .is_some_and(|v| v.eq_ignore_ascii_case("gpu-first"))
+        {
+            // Escape hatch for batched/prefill-heavy serving, where the
+            // measured ordering flips.
+            if gpu { 10 } else { 1 }
+        } else if gpu {
+            1
+        } else {
+            10
+        }
+    };
     let mut out = vec![(
         BackendChoice::Cpu,
         TierDevice {
@@ -459,7 +491,7 @@ fn tier_devices(
             class: DeviceClass::Cpu,
             ladder: vec![Precision::Q8, Precision::Q4],
             budget_bytes: budget(BackendChoice::Cpu),
-            speed: 1,
+            speed: decode_speed(false),
         },
     )];
     if cpu_only {
@@ -480,7 +512,7 @@ fn tier_devices(
                 // clusters at Q4 than at F32, which is what makes a 27B fit.
                 ladder: vec![Precision::F32, Precision::Q8, Precision::Q4],
                 budget_bytes: budget(BackendChoice::Cuda),
-                speed: 10,
+                speed: decode_speed(true),
             },
         ));
         return out;
@@ -493,7 +525,7 @@ fn tier_devices(
                 class: DeviceClass::DiscreteGpu,
                 ladder: vec![Precision::F32, Precision::Q8],
                 budget_bytes: budget(BackendChoice::Wgpu),
-                speed: 10,
+                speed: decode_speed(true),
             },
         ));
     }
