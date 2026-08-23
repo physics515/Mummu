@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/mummu", "crates/mummu-bench"]
+members = ["crates/mummu", "crates/mummu-bench", "crates/mummu-serve"]
 
 [workspace.package]
 version = "0.1.0"
@@ -20,15 +20,18 @@ repository = "https://github.com/physics515/Mummu"
 burn = { version = "0.21", default-features = false, features = [
 	"std",
 	"wgpu",
-	# `vulkan` switches CubeCL's kernel compiler on Vulkan adapters from
-	# WGSL/naga to direct SPIR-V; other APIs keep WGSL in the same binary.
-	# Adopted 2026-07-12: decode 70.7 -> 54.3 ms/token with parity
-	# byte-identical (see bench/BASELINE.md).
-	"vulkan",
-	"fusion",
 	"autotune",
 	"store",
 ] }
+# `vulkan` switches CubeCL's kernel compiler on Vulkan adapters from
+# WGSL/naga to direct SPIR-V; other APIs keep WGSL in the same binary.
+# Adopted 2026-07-12: decode 70.7 -> 54.3 ms/token with parity
+# byte-identical (see bench/BASELINE.md).
+# `vulkan` and `fusion` moved OUT of this list on 2026-08-21: they are now
+# forwarded through mummu's `vulkan-spirv` / `fusion` features (both in
+# mummu's default set, so every existing build is unchanged) because
+# mummu-serve's WSL2 container needs to opt out — mesa's dzn driver
+# (Vulkan-on-D3D12) breaks under them (burn-fusion stream-ordering panics).
 # The CPU backend: pure-Rust SIMD + gemm, burn-ndarray's designated successor
 # (0.21 release notes); swapped in 2026-07-10 after the MiniLM Candle-parity
 # gate passed on it bit-for-bit-equivalent (cosine 0.99999994, max component
@@ -77,6 +80,9 @@ ureq = "3"
 sha2 = "0.11"
 
 serde = { version = "1", features = ["derive"] }
+# The mummu-serve HTTP layer: a tiny sync server (threads, no async runtime),
+# matching the library's sync surface the same way ureq does on the client side.
+tiny_http = "0.12"
 # `preserve_order` (insertion-order maps) is deliberate and load-bearing for
 # prompt bytes: Python/transformers renders tool JSON in dict insertion order,
 # so our tool-bearing prompts only byte-match the reference stack's rendering

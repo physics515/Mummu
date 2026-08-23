@@ -1,0 +1,294 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mummu</title>
+<style>
+  :root {
+    --bg: #101014; --panel: #17171d; --panel2: #1e1e26; --border: #2a2a35;
+    --text: #e7e7ee; --dim: #8a8a99; --accent: #7aa2f7; --user: #24283b;
+    --err: #f7768e; --ok: #9ece6a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.55 system-ui, "Segoe UI", sans-serif;
+    display: flex; flex-direction: column; height: 100dvh;
+  }
+  header {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 10px 14px; background: var(--panel); border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 16px; margin: 0 6px 0 0; font-weight: 600; letter-spacing: .04em; }
+  header h1 span { color: var(--accent); }
+  select, input[type=number], button, textarea {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 6px 10px; font: inherit;
+  }
+  select { max-width: 300px; }
+  button { cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .45; cursor: default; }
+  .badge {
+    font-size: 12px; color: var(--dim); border: 1px solid var(--border);
+    border-radius: 999px; padding: 2px 10px; white-space: nowrap;
+  }
+  .badge.gpu { color: var(--ok); }
+  #pullwrap { display: flex; align-items: center; gap: 8px; }
+  #pullbar { width: 140px; height: 6px; background: var(--panel2); border-radius: 3px; overflow: hidden; display: none; }
+  #pullbar div { height: 100%; width: 0%; background: var(--accent); transition: width .2s; }
+  #log { flex: 1; overflow-y: auto; padding: 18px 0 8px; }
+  .msg { max-width: 760px; margin: 0 auto 14px; padding: 0 16px; }
+  .msg .who { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--dim); margin-bottom: 3px; }
+  .msg .body { white-space: pre-wrap; word-wrap: break-word; }
+  .msg.user .body { background: var(--user); border-radius: 10px; padding: 8px 12px; }
+  .msg.assistant .body { padding: 2px 0; }
+  .msg .meta { font-size: 11px; color: var(--dim); margin-top: 4px; }
+  .msg .body details {
+    color: var(--dim); font-size: 13px; border-left: 2px solid var(--border);
+    padding-left: 10px; margin: 4px 0; white-space: pre-wrap;
+  }
+  .msg .body details summary { cursor: pointer; user-select: none; }
+  .err { color: var(--err); }
+  footer { padding: 10px 16px 14px; background: var(--panel); border-top: 1px solid var(--border); }
+  .inputrow { max-width: 760px; margin: 0 auto; display: flex; gap: 8px; align-items: flex-end; }
+  textarea { flex: 1; resize: none; min-height: 42px; max-height: 180px; }
+  .opts { max-width: 760px; margin: 8px auto 0; display: flex; gap: 14px; font-size: 12px; color: var(--dim); align-items: center; flex-wrap: wrap; }
+  .opts label { display: flex; gap: 5px; align-items: center; }
+  .opts input { width: 70px; padding: 2px 6px; font-size: 12px; }
+  #empty { text-align: center; color: var(--dim); margin-top: 12vh; }
+  #empty .big { font-size: 40px; }
+</style>
+</head>
+<body>
+<header>
+  <h1><span>mummu</span> serve</h1>
+  <select id="model" title="model"></select>
+  <span id="pullwrap">
+    <button id="pull" style="display:none">Pull</button>
+    <span id="pullbar"><div></div></span>
+    <span id="pullpct" class="badge" style="display:none"></span>
+  </span>
+  <span style="flex:1"></span>
+  <button id="unload" title="Drop the resident model from GPU/CPU memory">Unload</button>
+  <button id="clear" title="Clear the conversation">Clear</button>
+  <span id="device" class="badge">…</span>
+</header>
+
+<div id="log"><div id="empty"><div class="big">𒀯</div>Pick a model, pull it if needed, and say something.</div></div>
+
+<footer>
+  <div class="inputrow">
+    <textarea id="input" placeholder="Message… (Enter to send, Shift+Enter for newline)" rows="1"></textarea>
+    <button id="send">Send</button>
+  </div>
+  <div class="opts">
+    <label>temp <input id="temp" type="number" min="0" max="2" step="0.1" value="0.7"></label>
+    <label>top_p <input id="topp" type="number" min="0.05" max="1" step="0.05" value="0.9"></label>
+    <label>max tokens <input id="maxtok" type="number" min="1" max="4096" step="1" value="512"></label>
+    <label><input id="system" type="text" placeholder="system prompt (optional)" style="width:280px"></label>
+  </div>
+</footer>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const log = $("log"), modelSel = $("model"), pullBtn = $("pull");
+let models = [], history = [], generating = false;
+
+function fmtBytes(b) {
+  if (!b) return "?";
+  const u = ["B","KB","MB","GB"]; let i = 0;
+  while (b >= 1024 && i < u.length - 1) { b /= 1024; i++; }
+  return b.toFixed(i ? 1 : 0) + " " + u[i];
+}
+
+async function refresh() {
+  const [h, m] = await Promise.all([
+    fetch("/api/health").then(r => r.json()),
+    fetch("/api/models").then(r => r.json()),
+  ]);
+  const dev = $("device");
+  dev.textContent = h.device;
+  dev.classList.toggle("gpu", h.device.includes("GPU"));
+  dev.title = (h.gpus || []).map(g => `${g.name} (${g.api})`).join("\n") || "no GPU adapters";
+  models = m.models;
+  const prev = modelSel.value;
+  modelSel.innerHTML = "";
+  for (const mod of models) {
+    const o = document.createElement("option");
+    o.value = mod.name;
+    o.textContent = `${mod.installed ? "●" : "○"} ${mod.name} (${mod.format}, ~${fmtBytes(mod.disk_bytes_estimate)})`;
+    modelSel.appendChild(o);
+  }
+  const installed = models.find(x => x.installed);
+  modelSel.value = prev && models.some(x => x.name === prev) ? prev : (installed ? installed.name : (models[0] || {}).name || "");
+  syncPull();
+}
+
+function current() { return models.find(x => x.name === modelSel.value); }
+function syncPull() {
+  const c = current();
+  pullBtn.style.display = c && !c.installed ? "" : "none";
+}
+modelSel.addEventListener("change", syncPull);
+
+function addMsg(who, text) {
+  $("empty") && $("empty").remove();
+  const div = document.createElement("div");
+  div.className = "msg " + who;
+  div.innerHTML = `<div class="who">${who}</div><div class="body"></div><div class="meta"></div>`;
+  renderBody(div.querySelector(".body"), text);
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+  return div;
+}
+
+// Render text with <think>…</think> blocks folded into <details>.
+function renderBody(el, text) {
+  el.textContent = "";
+  const re = /<think>([\s\S]*?)(<\/think>|$)/g;
+  let last = 0, m;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) el.appendChild(document.createTextNode(text.slice(last, m.index)));
+    const d = document.createElement("details");
+    const s = document.createElement("summary");
+    s.textContent = "thinking…";
+    d.appendChild(s);
+    d.appendChild(document.createTextNode(m[1]));
+    el.appendChild(d);
+    last = re.lastIndex;
+  }
+  if (last < text.length) el.appendChild(document.createTextNode(text.slice(last)));
+}
+
+async function readSse(resp, onEvent) {
+  const reader = resp.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let idx;
+    while ((idx = buf.indexOf("\n\n")) >= 0) {
+      const frame = buf.slice(0, idx); buf = buf.slice(idx + 2);
+      for (const line of frame.split("\n")) {
+        if (line.startsWith("data: ")) onEvent(JSON.parse(line.slice(6)));
+      }
+    }
+  }
+}
+
+pullBtn.addEventListener("click", async () => {
+  const c = current();
+  if (!c) return;
+  pullBtn.disabled = true;
+  $("pullbar").style.display = "inline-block";
+  $("pullpct").style.display = "";
+  try {
+    const resp = await fetch("/api/pull", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: c.name }),
+    });
+    await readSse(resp, ev => {
+      if (ev.type === "progress") {
+        const pct = ev.percent == null ? null : ev.percent;
+        $("pullbar").firstElementChild.style.width = (pct ?? 0) + "%";
+        $("pullpct").textContent = pct != null ? pct + "%" : fmtBytes(ev.received_bytes);
+      } else if (ev.type === "error") {
+        alert("pull failed: " + ev.error);
+      }
+    });
+  } finally {
+    pullBtn.disabled = false;
+    $("pullbar").style.display = "none";
+    $("pullpct").style.display = "none";
+    refresh();
+  }
+});
+
+$("unload").addEventListener("click", () => fetch("/api/unload", { method: "POST" }));
+$("clear").addEventListener("click", () => {
+  history = [];
+  log.innerHTML = '<div id="empty"><div class="big">𒀯</div>Pick a model, pull it if needed, and say something.</div>';
+});
+
+async function send() {
+  const text = $("input").value.trim();
+  const c = current();
+  if (!text || generating || !c) return;
+  if (!c.installed) { alert("Pull this model first."); return; }
+  generating = true; $("send").disabled = true;
+  $("input").value = ""; autosize();
+  addMsg("user", text);
+  history.push({ role: "user", content: text });
+
+  const messages = [];
+  const sys = $("system").value.trim();
+  if (sys) messages.push({ role: "system", content: sys });
+  messages.push(...history);
+
+  const div = addMsg("assistant", "");
+  const body = div.querySelector(".body");
+  let acc = "";
+  try {
+    const resp = await fetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: c.name,
+        messages,
+        options: {
+          temperature: parseFloat($("temp").value),
+          top_p: parseFloat($("topp").value),
+          max_tokens: parseInt($("maxtok").value, 10),
+        },
+      }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({ error: resp.statusText }));
+      throw new Error(err.error || resp.statusText);
+    }
+    await readSse(resp, ev => {
+      if (ev.type === "delta") {
+        acc += ev.text;
+        renderBody(body, acc);
+        log.scrollTop = log.scrollHeight;
+      } else if (ev.type === "done") {
+        renderBody(body, ev.text || acc);
+        div.querySelector(".meta").textContent =
+          `${ev.tokens} tokens · ${ev.tokens_per_second} tok/s · ${ev.device}`;
+        history.push({ role: "assistant", content: ev.text || acc });
+      } else if (ev.type === "error") {
+        throw new Error(ev.error);
+      }
+    });
+  } catch (e) {
+    body.innerHTML += `<div class="err">⚠ ${e.message}</div>`;
+    // keep history consistent: a failed turn contributes no assistant message
+    if (history[history.length - 1]?.role !== "assistant") { /* nothing to pop */ }
+  } finally {
+    generating = false; $("send").disabled = false;
+    log.scrollTop = log.scrollHeight;
+  }
+}
+
+$("send").addEventListener("click", send);
+$("input").addEventListener("keydown", e => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+});
+function autosize() {
+  const t = $("input");
+  t.style.height = "auto";
+  t.style.height = Math.min(t.scrollHeight, 180) + "px";
+}
+$("input").addEventListener("input", autosize);
+
+refresh();
+setInterval(() => { if (!generating) refresh(); }, 30000);
+</script>
+</body>
+</html>

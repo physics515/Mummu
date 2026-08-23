@@ -14,17 +14,23 @@ pub mod cache;
 pub mod chat;
 pub mod decode;
 pub mod gguf;
+/// Generated IQ-quant codebook tables (see the module header).
+mod gguf_iq_grids;
 pub mod hub;
 pub mod import;
 pub mod manage;
 pub mod models;
 pub mod nn;
+pub mod pack;
+pub mod partition;
 pub mod plan;
+pub mod quant;
 pub mod registry;
 pub mod safetensors;
 /// Render a checkpoint's own imported chat template (feature `jinja-template`).
 #[cfg(feature = "jinja-template")]
 pub mod template;
+pub mod tier;
 pub mod tok_config;
 pub mod tokenizer;
 pub mod tune;

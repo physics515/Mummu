@@ -7,7 +7,26 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = []
+# `fusion` + `vulkan-spirv` are the parity-validated GPU configuration and
+# stay in the default set — every existing consumer, test, and bench builds
+# exactly as before the 2026-08-21 feature split. They exist as features so
+# mummu-serve's WSL2 container can opt out: mesa's dzn (Vulkan-on-D3D12)
+# driver panics burn-fusion's stream executor and its SPIR-V→DXIL path is
+# unproven, while plain WGSL-compiled Wgpu works.
+default = ["fusion", "vulkan-spirv"]
+# Compile streams of tensor ops into fewer GPU kernels (burn's `fusion`;
+# `Wgpu` transparently becomes `Fusion<Wgpu>`).
+fusion = ["burn/fusion"]
+# CubeCL compiles kernels as direct SPIR-V on Vulkan adapters instead of
+# WGSL/naga (decode 70.7 -> 54.3 ms/token, bench/BASELINE.md).
+vulkan-spirv = ["burn/vulkan"]
+# The CUDA backend (`backend::Cuda`), OFF by default: wgpu is the
+# parity-validated stack and needs no CUDA toolchain. This exists for
+# environments where no correct Vulkan reaches the process but libcuda does —
+# concretely mummu-serve's WSL2 container (Docker Desktop injects libcuda;
+# mesa's dzn Vulkan-on-D3D12 driver computes WRONG results there, 2026-08-21).
+# Consumers opting in take on kernel compilation via NVRTC at runtime.
+cuda = ["burn/cuda"]
 # Render a checkpoint's OWN imported `chat_template` Jinja (crate::template),
 # for models whose family has no hardcoded `chat` renderer. Off by default:
 # the from-scratch renderers cover the zoo byte-for-byte and a default build
