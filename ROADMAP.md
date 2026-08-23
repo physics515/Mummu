@@ -1934,15 +1934,22 @@ The VRAM lever the P6 planner pulls to make the largest useful model fit the use
       FFN clusters group to ~128 executors and load in 837 s (8.7 GiB on CUDA); with the Q4-on-GPU
       fix the mixed CPU-trunk / GPU-cluster plan is exact. Throughput is CPU-trunk bound (~100 s/tok
       for the 65-layer DeltaNet on flex) — the trunk-on-GPU lever needs the trunk to fit VRAM.
-      **Capacity finding (2026-08-22):** the 27B does not fully fit this Docker VM's 63 GB during
-      decode — trunk on CPU@Q8 + 1768 Q8 FFN clusters on CPU + flex's 65-layer DeltaNet decode
-      activations reached ~45 GB anon RSS and the VM's global OOM killer took the process
-      mid-generation (partition/placement/load all succeed; it dies while decoding). The relief
-      lever is Q8-on-GPU for FFN clusters (9 GiB fits ~1075 Q8 vs 280 F32, moving ~800 clusters
-      off CPU RAM) — but the planner prefers F32 (highest quality first) and Q8-on-CUDA through the
-      pooled host-f32-input path is unverified (Q4 there panics); pinning that down, or a larger VM,
-      or trunk-on-GPU, is the follow-up. The mechanism is proven on the 2B (exact) and OLMoE
-      (deployed, answering); the 27B is memory-marginal on this specific box, not a feature gap. Gate on the 2B (`tests/real_qwen35_partition.rs`, 186 s): partition
+      **RUNNING (2026-08-23, commit aacca4e):** the dense 27B now generates coherently through the
+      tiered path in the container — trunk on CPU@f32, 1793 FFN clusters on CUDA @ Q4 (8.72 GiB),
+      255 on CPU; "2+2 equals…" with a correct `<think>` trace, no panic, no OOM (~29 s/tok,
+      CPU-trunk + host-hop bound). Three fixes closed the gap that the 2026-08-22 runs hit: (1)
+      `nn::compute_weight` dequantizes a pooled expert's quantized weight **on-device** before the
+      matmul — burn 0.21's CUDA `q_matmul` panics on the f32-input × quantized-weight path ("Cast
+      element count must match") and wgpu computes it wrong, so we never take it, and storage stays
+      Q4 (the GPU holds ~4× more clusters than at F32, which is what makes the model fit VRAM
+      instead of spilling to CPU RAM and OOMing); (2) Q4 re-enabled on the CUDA ladder — at F32-only
+      the GPU held too few clusters and the planner spilled the model onto the CPU until admission
+      failed loudly ("expert N fits no device"); (3) `run_dense` runs a layer's executors
+      **sequentially** on the calling thread — a spawned thread makes cubecl-cuda open a new CUDA
+      stream/client with its own VRAM pool, and 64 layers of that exhausted the card
+      (CUDA_ERROR_OUT_OF_MEMORY "Can create a new stream"). Follow-up perf levers: trunk-on-GPU
+      (needs the trunk to fit VRAM), batch grouped clusters, keep activations on-device.
+      Gate on the 2B (`tests/real_qwen35_partition.rs`, 186 s): partition
       61 s (24 layers × 32 clusters of 192 neurons); dense(partitioned) vs dense(original)
       Δ = 2.8e-5; half the clusters remote at f32 Δ = 3.1e-5 (exact up to summation order);
       f32-local / int8-remote Δ = 0.149 logit, same first token, correct answer; skip tau=0.02
