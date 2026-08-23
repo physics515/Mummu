@@ -452,42 +452,31 @@ fn tier_devices(
     let budget = |b: BackendChoice| {
         backend_budget(b).saturating_sub(if b == main { trunk_bytes } else { 0 })
     };
-    // `speed` ranks devices for THIS workload, and the workload here is
-    // decode: one token at a time, so every projection is a matrix-VECTOR
-    // product. Measured on the reference box for `[1,5120]x[5120,2176]`,
-    // with a WARM autotune cache:
+    // `speed` ranks devices for this workload. Measured on the reference box
+    // for the decode shape `[1,5120]x[5120,6144]`, WARM and averaged over 20
+    // iterations (`examples/{qmatmul-probe,cpu-matmul-probe}.rs`):
     //
-    //   GPU (+sync)  2.5-3.3 ms      CPU (flex)  ~1.7 ms equivalent
+    //   CUDA native q_matmul   0.08 ms        CPU (flex)   4.72 ms
     //
-    // Close, with the CPU modestly ahead — nothing like the 25x gap an
-    // earlier COLD-cache measurement suggested (96 ms, which was autotune
-    // being paid inside the timing loop, not steady-state throughput; see
-    // `examples/sync-probe.rs` and warm it before believing a number).
+    // The GPU is ~59x faster, so it ranks first and `plan_tiers` fills it
+    // before spilling to the CPU.
     //
-    // The GPU's 2.5 ms is launch-latency bound, not bandwidth bound — it
-    // moves 44 MB in that time, far under VRAM bandwidth — so it amortizes
-    // much better as work per launch grows: at m=8 the same FFN matmul costs
-    // the SAME wall-clock as m=1 (8x the work for free). Batched prefill and
-    // speculative decode are what make GPU tiers pay properly.
+    // History worth keeping, because it cost a wrong decision: an earlier
+    // reading of 96 ms put the GPU ~25x SLOWER and this function ranked the
+    // CPU first on that basis — which sent 1984 of 2048 FFN clusters to the
+    // CPU while 5.2 GiB of VRAM sat idle. That 96 ms was a COLD autotune
+    // cache, i.e. autotune running inside the timing loop, not throughput.
+    // Warm every probe before believing a number.
     //
-    // The ranking is therefore a close call that depends on batch size, and
-    // the default keeps the CPU marginally ahead for single-token decode
-    // while `MUMMU_TIER_SPEED=gpu-first` flips it for batched serving. Do
-    // not read either ordering as a large effect.
+    // `MUMMU_TIER_SPEED=cpu-first` restores the old ordering for a host whose
+    // GPU genuinely is slower (no working native quantized matmul, so every
+    // matmul pays a dequantize — see `nn::compute_weight`).
     let decode_speed = |gpu: bool| -> u32 {
-        if std::env::var("MUMMU_TIER_SPEED")
+        let cpu_first = std::env::var("MUMMU_TIER_SPEED")
             .ok()
             .as_deref()
-            .is_some_and(|v| v.eq_ignore_ascii_case("gpu-first"))
-        {
-            // Escape hatch for batched/prefill-heavy serving, where the
-            // measured ordering flips.
-            if gpu { 10 } else { 1 }
-        } else if gpu {
-            1
-        } else {
-            10
-        }
+            .is_some_and(|v| v.eq_ignore_ascii_case("cpu-first"));
+        if gpu == cpu_first { 1 } else { 10 }
     };
     let mut out = vec![(
         BackendChoice::Cpu,
