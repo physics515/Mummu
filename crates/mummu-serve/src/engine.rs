@@ -392,6 +392,78 @@ struct TierRuntime {
 }
 
 static TIERS: std::sync::Mutex<Option<TierRuntime>> = std::sync::Mutex::new(None);
+
+/// The adaptive placement controller (see [`mummu::adapt`]). Present once a
+/// tiered model is loaded; fed by every completed generation.
+static PLACEMENT: std::sync::Mutex<Option<mummu::adapt::Controller>> =
+    std::sync::Mutex::new(None);
+
+/// Set when a device allocation failed during a generation — the controller's
+/// one hard signal, and the reason it can act without waiting for the dwell.
+static ALLOC_FAILED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Report a completed generation to the placement controller, and re-tier if
+/// it asks for a different device budget.
+///
+/// Called after every request, which is the natural observation window: it is
+/// exactly one placement's worth of real work, measured the way the user
+/// experiences it (tokens per second), rather than a synthetic probe.
+fn observe_placement(tokens: usize, elapsed_ms: u128) {
+    use mummu::adapt::{Adjust, Sample};
+    if tokens == 0 || elapsed_ms == 0 {
+        return; // nothing to learn from
+    }
+    let mut guard = PLACEMENT.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(controller) = guard.as_mut() else {
+        return;
+    };
+    let sample = Sample {
+        tokens_per_sec: tokens as f64 / (elapsed_ms as f64 / 1000.0),
+        device_alloc_failed: ALLOC_FAILED.swap(false, std::sync::atomic::Ordering::SeqCst),
+        host_available_bytes: mem_available_bytes(),
+        device_bytes_in_use: {
+            let g = TIERS.lock().unwrap_or_else(|e| e.into_inner());
+            g.as_ref().map_or(0, |rt| {
+                let used = rt.pool.used_bytes(rt.devices.len());
+                rt.devices
+                    .iter()
+                    .zip(&used)
+                    .filter(|((b, _), _)| *b != BackendChoice::Cpu)
+                    .map(|(_, &u)| u)
+                    .sum()
+            })
+        },
+    };
+    let decision = controller.observe(&sample, Instant::now());
+    let budget = controller.budget();
+    drop(guard);
+
+    match decision {
+        Adjust::Hold => {}
+        Adjust::Grow(_) | Adjust::Shrink(_) => {
+            eprintln!(
+                "[mummu-serve] placement: {:.2} tok/s -> device budget {} GiB ({decision:?})",
+                sample.tokens_per_sec,
+                budget >> 30
+            );
+            // Push the new budget into the tier runtime and let the existing
+            // bounded hot-swap machinery move what it can. Never blocks the
+            // request that produced the observation.
+            {
+                let mut g = TIERS.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(rt) = g.as_mut() {
+                    for (backend, dev) in &mut rt.devices {
+                        if *backend != BackendChoice::Cpu {
+                            dev.budget_bytes = budget;
+                        }
+                    }
+                }
+            }
+            rebalance_tiers();
+        }
+    }
+}
 static REBALANCING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// `None` = tiers off; `Some(cpu_only)` otherwise (default on).
@@ -806,6 +878,21 @@ fn build_partitioned_qwen35(
             .collect::<Vec<_>>()
             .join(", ")
     );
+    // Arm the placement controller for this model: start where the planner
+    // put us, and let it adapt from measured throughput from here on.
+    {
+        let total = mummu::backend::inventory()
+            .gpus
+            .iter()
+            .filter_map(|g| g.vram_bytes)
+            .max()
+            .unwrap_or(devices[main_idx].1.budget_bytes);
+        // Leave the desktop (and anything else sharing the card) its share.
+        let policy = mummu::adapt::Policy::for_device(total, 2 << 30);
+        *PLACEMENT.lock().unwrap_or_else(|e| e.into_inner()) = Some(
+            mummu::adapt::Controller::new(policy, devices[main_idx].1.budget_bytes),
+        );
+    }
     let tau = ffn_skip_tau(&part, &pack.manifest.source_file);
     // A dense model's placement is static — every cluster runs each token in
     // exact mode, so there is nothing to re-tier at runtime (the calibrated
@@ -1396,6 +1483,9 @@ async fn drive(
                 .tokenizer
                 .decode(&out, true)
                 .map_err(|e| format!("decode: {e}"))?;
+            let elapsed_ms = start.elapsed().as_millis();
+            // Every completed generation is one placement's worth of evidence.
+            observe_placement(out.len(), elapsed_ms);
             if matches!(&m.lm, AnyLm::OlmoeQ(q) if q.pool.is_some()) {
                 rebalance_tiers();
             }
@@ -1403,7 +1493,7 @@ async fn drive(
             text,
             tokens: out.len(),
             device: label,
-            elapsed_ms: start.elapsed().as_millis(),
+            elapsed_ms,
         })
     }
 }
