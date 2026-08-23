@@ -1949,6 +1949,20 @@ The VRAM lever the P6 planner pulls to make the largest useful model fit the use
       stream/client with its own VRAM pool, and 64 layers of that exhausted the card
       (CUDA_ERROR_OUT_OF_MEMORY "Can create a new stream"). Follow-up perf levers: trunk-on-GPU
       (needs the trunk to fit VRAM), batch grouped clusters, keep activations on-device.
+      **MEASURED 6.2x (2026-08-23)**: 29.7 s/tok in the container -> 10.4 cold -> **4.8 s/tok
+      warm** running natively on the host, same weights, same correct output. Three causes,
+      separated by the cold/warm pair: (1) the container had **no persistent autotune cache at
+      all** — CubeCL walks up from CWD (`/` in a runtime image) and defaults its root to the
+      Cargo `target/` tree, so every start re-tuned; fixed by shipping `/cubecl.toml` pointing
+      at the `/models` bind mount, and the cold->warm gap (10.4 -> 4.8) is that cost amortized
+      over 24 tokens. (2) no WSL2 GPU-PV natively. (3) a 45 GiB host budget instead of ~19
+      changes placement (1469 CPU clusters at F32 + 579 on GPU at mixed Q8/F32). The native
+      server also enumerates the AMD iGPU, invisible inside the container — the iGPU tier is
+      only reachable off Docker. **Correction to an earlier entry**: the "GPU is ~25x slower for
+      decode (96 ms vs 3.9 ms)" measurement was a COLD autotune cache — autotune running inside
+      the timing loop, not throughput. Warm it is 2.5-3.3 ms, on par with the CPU and
+      launch-latency bound (44 MB in 2.5 ms), so it amortizes as work per launch grows. Warm
+      every probe before believing a number (`examples/sync-probe.rs`).
       Gate on the 2B (`tests/real_qwen35_partition.rs`, 186 s): partition
       61 s (24 layers × 32 clusters of 192 neurons); dense(partitioned) vs dense(original)
       Δ = 2.8e-5; half the clusters remote at f32 Δ = 3.1e-5 (exact up to summation order);
