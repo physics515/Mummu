@@ -34,8 +34,13 @@ cuda = ["burn/cuda"]
 # hf-chat-template (minijinja) — the same crate, same version, that the
 # template BYTE gate already trusts as the transformers-equivalent reference.
 jinja-template = ["dep:hf-chat-template"]
+# Render `prof`'s folded stacks to flame-graph SVGs (pulls inferno, the pure
+# -Rust port of the flamegraph tools). The profiler itself needs no feature —
+# only the SVG rendering does.
+flamegraph = ["dep:inferno"]
 
 [dependencies]
+inferno = { version = "0.11", optional = true, default-features = false }
 # The async runtime: mummu's model runtime is async (burn 0.22 readbacks,
 # cancellable decode loops), so the library owns a tokio dependency rather
 # than leaving async to consumers.

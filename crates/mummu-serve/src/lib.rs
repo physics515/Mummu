@@ -244,6 +244,9 @@ pub fn router() -> Router {
         // at 100 s — see `chat_ws`.
         .route("/api/chat/ws", get(chat_ws))
         .route("/api/unload", post(unload))
+        // Flame graphs from a profiled generation — see `profile_svg`.
+        .route("/api/profile", get(profile_svg))
+        .route("/api/profile/folded", get(profile_folded))
         // The sync server matched on (method, path) and answered anything
         // else with the same 404 JSON — keep that, rather than axum's bare
         // 405, so a client sees one error shape.
@@ -597,6 +600,13 @@ struct ChatRequest {
     messages: Vec<ChatMessage>,
     #[serde(default)]
     options: ChatOptions,
+    /// Profile this generation: scope wall-times are collected during the
+    /// run and the flame graph is published at `GET /api/profile` when it
+    /// completes. The profiler is process-global, so profile one request at
+    /// a time; `MUMMU_PROFILE` in the environment forces this on for every
+    /// request.
+    #[serde(default)]
+    profile: bool,
 }
 
 pub(crate) fn to_turns(messages: &[ChatMessage]) -> Result<Vec<Turn>, String> {
@@ -647,6 +657,71 @@ fn sampler_options(o: &ChatOptions) -> Result<SamplerOptions, String> {
         top_k,
         seed,
     })
+}
+
+/// The most recent profiled generation, as (svg, folded stacks). One slot —
+/// each profiled request replaces the last — served by `GET /api/profile`.
+static LAST_PROFILE: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
+
+/// Disables the process-global profiler on drop — the panic backstop for a
+/// profiled generation (see the comment at its use).
+struct DisableProfilerOnDrop;
+
+impl Drop for DisableProfilerOnDrop {
+    fn drop(&mut self) {
+        mummu::prof::set_enabled(false);
+    }
+}
+
+/// Fold what the profiler collected and render the flame graph.
+fn publish_profile() {
+    let folded = mummu::prof::folded();
+    if folded.is_empty() {
+        eprintln!("[mummu-serve] profile: nothing collected (no instrumented code ran?)");
+        return;
+    }
+    match mummu::prof::flamegraph_svg(&folded) {
+        Ok(svg) => {
+            eprintln!(
+                "[mummu-serve] profile: {} stacks — GET /api/profile for the flame graph",
+                folded.lines().count()
+            );
+            *LAST_PROFILE.lock().unwrap_or_else(|e| e.into_inner()) = Some((svg, folded));
+        }
+        Err(e) => eprintln!("[mummu-serve] profile: flamegraph failed: {e}"),
+    }
+}
+
+/// GET /api/profile — the last profiled generation's flame graph, as SVG a
+/// browser renders directly (frames are zoomable; widths are self time).
+async fn profile_svg() -> Response {
+    let last = LAST_PROFILE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    match last {
+        Some((svg, _)) => Response::builder()
+            .header("content-type", "image/svg+xml")
+            .body(svg.into())
+            .expect("static response"),
+        None => json_response(
+            404,
+            json!({"error": "no profiled generation yet — POST /api/chat with \"profile\": true, then retry"}),
+        ),
+    }
+}
+
+/// GET /api/profile/folded — the same data as folded stacks (`path (Nx) µs`
+/// per line), for tooling or a quick sort in a terminal.
+async fn profile_folded() -> Response {
+    let last = LAST_PROFILE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    match last {
+        Some((_, folded)) => Response::builder()
+            .header("content-type", "text/plain; charset=utf-8")
+            .body(folded.into())
+            .expect("static response"),
+        None => json_response(
+            404,
+            json!({"error": "no profiled generation yet — POST /api/chat with \"profile\": true, then retry"}),
+        ),
+    }
 }
 
 async fn chat(body: Bytes) -> Response {
@@ -702,12 +777,27 @@ fn start_chat(
         )));
     }
 
+    let profile = parsed.profile || std::env::var("MUMMU_PROFILE").is_ok();
     let (tx, rx) = mpsc::unbounded_channel::<serde_json::Value>();
     // A normal async task: the generation is mostly awaits. The one part
     // that genuinely blocks — the model load — declares itself as blocking
     // where it happens, in `mummu::cache`, rather than this pushing the whole
     // future onto a blocking thread.
     tokio::spawn(async move {
+        // Panic-safe by construction: the guard disables the profiler on
+        // Drop even when the generation unwinds. Without it, a panic
+        // anywhere in a profiled run — and generation panics have happened
+        // (OOM, unreachable!) — would be swallowed by tokio::spawn with the
+        // process-global flag left on, so every later request from every
+        // client would silently pay a String join and a global mutex lock
+        // per scope while the stale graph kept serving. Found in review,
+        // before production found it. Holding this across the await is fine:
+        // its Drop flips an atomic and never touches a thread-local stack.
+        let profile_session = profile.then(|| {
+            mummu::prof::reset();
+            mummu::prof::set_enabled(true);
+            DisableProfilerOnDrop
+        });
         let started = std::time::Instant::now();
         let result = engine::run_chat(&spec, &root, &turns, &opts, max_tokens, |delta| {
             if tx.send(json!({"type": "delta", "text": delta})).is_err() {
@@ -716,6 +806,10 @@ fn start_chat(
             ControlFlow::Continue(())
         })
         .await;
+        if let Some(session) = profile_session {
+            drop(session); // stop collecting before folding the report
+            publish_profile();
+        }
         let done = match result {
             Ok(r) => {
                 let secs = (r.elapsed_ms as f64 / 1000.0).max(1e-3);

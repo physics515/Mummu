@@ -2098,6 +2098,9 @@ async fn drive(
     let load_device = device.clone();
     let m = slot
         .acquire(&key, move |_| {
+            // One bar for the whole load: a profiled COLD request would
+            // otherwise smear minutes of import across the decode graph.
+            let _s = mummu::prof::scope("model_load");
             load_any(spec, models_root, &load_device, policy, backend)
         })
         .await?;

@@ -216,10 +216,20 @@ pub async fn generate_loop(
 
     let mut rng = Pcg32::new(opts.seed);
     let greedy = opts.temperature == 0.0;
-    let mut logits = step(prompt_ids, 0);
+    let mut logits = {
+        let _s = crate::prof::scope("prefill");
+        step(prompt_ids, 0)
+    };
     let mut out: Vec<u32> = Vec::with_capacity(max_tokens);
     for past in (prompt_ids.len()..).take(max_tokens) {
         let vocab = logits.dims()[1] as u32;
+        // This span crosses an await, so it must not hold a scope guard
+        // (thread-local stack; the future may resume on another worker) —
+        // timed by hand and attributed with `record` instead. It is also
+        // where every enqueued-but-unfinished GPU op comes due: the readback
+        // is the sync point, so GPU-side FFN time surfaces HERE, not in the
+        // scopes that enqueued it.
+        let readback_started = std::time::Instant::now();
         let next = if greedy {
             argmax_id(logits).await?
         } else {
@@ -232,6 +242,7 @@ pub async fn generate_loop(
                 .map_err(|e| format!("logits readback: {e:?}"))?;
             sample_id(&v, opts, &mut rng)
         };
+        crate::prof::record("logits_readback+sample", readback_started.elapsed());
         // A GPU argmax over NaN logits can return an out-of-range sentinel
         // (observed: exactly `vocab` on f16 numeric collapse) — fail loudly
         // instead of emitting garbage ids the tokenizer silently drops.
@@ -251,7 +262,10 @@ pub async fn generate_loop(
         // blocking compute between awaits, and without this a single
         // generation would monopolize its worker for the whole request.
         tokio::task::yield_now().await;
-        logits = step(&[next], past);
+        logits = {
+            let _s = crate::prof::scope("step");
+            step(&[next], past)
+        };
     }
     debug_assert!(out.len() <= max_tokens);
     Ok(out)

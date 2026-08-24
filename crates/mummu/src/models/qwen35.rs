@@ -1394,36 +1394,21 @@ impl CausalLm for LoadedQwen35 {
             (&embed_device, crate::backend::int_dtype()),
         )
         .reshape([1, t]);
-        let mut x = self.model.embed_tokens.forward(input).to_device(device);
+        let _prof_forward = crate::prof::scope("forward");
+        let mut x = {
+            let _s = crate::prof::scope("embed");
+            self.model.embed_tokens.forward(input).to_device(device)
+        };
 
         let (cos, sin) = rope_tables(t, past, cfg.rope_dim, cfg.rope_theta, device);
         let mask = (t > 1).then(|| causal_mask(t, past, device));
 
-        // Per-stage timing, behind `MUMMU_PROFILE`. Off by default and costing
-        // a single env lookup when off. Meaningful because the trunk runs on
-        // burn-flex, which is synchronous — a GPU stage's queued work may land
-        // in whichever stage forces the next readback, so read the device
-        // totals as "where the sync happened", not as kernel time.
-        let profile = std::env::var("MUMMU_PROFILE").is_ok();
-        let mut t_norm = std::time::Duration::ZERO;
-        let mut t_attn = std::time::Duration::ZERO;
-        let mut t_local = std::time::Duration::ZERO;
-        let mut t_remote = std::time::Duration::ZERO;
-        let mut n_attn = 0usize;
-        let mut n_delta = 0usize;
-        macro_rules! stage {
-            ($acc:expr, $body:expr) => {{
-                if profile {
-                    let started = std::time::Instant::now();
-                    let out = $body;
-                    $acc += started.elapsed();
-                    out
-                } else {
-                    $body
-                }
-            }};
-        }
-
+        // Stage attribution lives in `crate::prof`: the scope guards below feed
+        // a flame graph (serve: POST /api/chat with {"profile": true}, then
+        // GET /api/profile). This forward is synchronous on the flex trunk, so
+        // guards never cross an await and wall time attributes cleanly;
+        // device-queued work lands wherever the next readback syncs, so read
+        // GPU bars as "where the sync happened", not as kernel time.
         for (li, (layer, kv)) in self.model.layers.iter().zip(cache.iter_mut()).enumerate() {
             // Layers may live on different devices (the dense placement puts
             // as many whole layers on the GPU as VRAM holds, the rest on the
@@ -1435,7 +1420,11 @@ impl CausalLm for LoadedQwen35 {
             if x.device() != layer_device {
                 x = x.to_device(&layer_device);
             }
-            let h = stage!(t_norm, layer.input_norm.forward(x.clone()));
+            let _prof_layer = crate::prof::scope("layer");
+            let h = {
+                let _s = crate::prof::scope("norm1");
+                layer.input_norm.forward(x.clone())
+            };
             // The rope tables and mask were built once on the entry device;
             // an attention layer elsewhere needs them there too.
             let (cos_l, sin_l) = if cos.device() == layer_device {
@@ -1446,30 +1435,39 @@ impl CausalLm for LoadedQwen35 {
             let mask_l = mask
                 .as_ref()
                 .map(|m| if m.device() == layer_device { m.clone() } else { m.clone().to_device(&layer_device) });
-            let h = stage!(
-                t_attn,
-                match (&layer.self_attn, &layer.linear_attn, kv) {
-                    (Some(attn), None, Qwen35Kv::Attn(kv_state)) => {
-                        n_attn += 1;
-                        attn.forward(h, cfg, &cos_l, &sin_l, mask_l.as_ref(), kv_state)
-                    }
-                    (None, Some(delta), Qwen35Kv::Delta(state)) => {
-                        n_delta += 1;
-                        delta.forward(h, cfg, state)
-                    }
-                    _ => unreachable!("qwen35 forward: layer/cache kind mismatch"),
+            let h = match (&layer.self_attn, &layer.linear_attn, kv) {
+                (Some(attn), None, Qwen35Kv::Attn(kv_state)) => {
+                    let _s = crate::prof::scope("attn.full");
+                    attn.forward(h, cfg, &cos_l, &sin_l, mask_l.as_ref(), kv_state)
                 }
-            );
+                (None, Some(delta), Qwen35Kv::Delta(state)) => {
+                    let _s = crate::prof::scope("attn.delta");
+                    delta.forward(h, cfg, state)
+                }
+                _ => unreachable!("qwen35 forward: layer/cache kind mismatch"),
+            };
             x = x.add(h);
-            let h2 = stage!(t_norm, layer.post_attn_norm.forward(x.clone()));
+            let h2 = {
+                let _s = crate::prof::scope("norm2");
+                layer.post_attn_norm.forward(x.clone())
+            };
             // SwiGLU spelled through qlinear (the mlp's own forward would
             // reshape a packed quantized weight — see qlinear).
-            let (gate, mut ffn) = stage!(t_local, {
-                let gate = activation::silu(qlinear(&layer.mlp.gate_proj, h2.clone()));
-                let up = qlinear(&layer.mlp.up_proj, h2.clone());
-                let ffn = qlinear(&layer.mlp.down_proj, gate.clone().mul(up));
-                (gate, ffn)
-            });
+            // Three separate scopes: gate/up multiply [1,h]x[h,inter] while
+            // down multiplies [1,inter]x[inter,h] — if one shape hits a slow
+            // kernel path, the graph should say which.
+            let gate = {
+                let _s = crate::prof::scope("mlp.gate");
+                activation::silu(qlinear(&layer.mlp.gate_proj, h2.clone()))
+            };
+            let up = {
+                let _s = crate::prof::scope("mlp.up");
+                qlinear(&layer.mlp.up_proj, h2.clone())
+            };
+            let mut ffn = {
+                let _s = crate::prof::scope("mlp.down");
+                qlinear(&layer.mlp.down_proj, gate.clone().mul(up))
+            };
             if let Some(pool) = &self.ffn_pool {
                 // Working set: issue THIS layer's staging decisions before
                 // its FFN runs, so the transfers for the next layer overlap
@@ -1495,21 +1493,15 @@ impl CausalLm for LoadedQwen35 {
                     Vec::new()
                 };
                 let skip = (self.ffn_skip_tau > 0.0).then_some((self.ffn_skip_tau, local_energy.as_slice()));
-                if let Some(remote) = stage!(t_remote, pool.run_dense(li, h2.reshape([b * tt, hd]), skip)) {
+                let remote = {
+                    let _s = crate::prof::scope("ffn.remote");
+                    pool.run_dense(li, h2.reshape([b * tt, hd]), skip)
+                };
+                if let Some(remote) = remote {
                     ffn = ffn.add(remote.reshape([b, tt, hd]));
                 }
             }
             x = x.add(ffn);
-        }
-        if profile {
-            let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
-            eprintln!(
-                "[mummu profile] norms {:.0} ms | attn {:.0} ms ({n_attn} full, {n_delta} delta) |                  local ffn {:.0} ms | remote ffn {:.0} ms",
-                ms(t_norm),
-                ms(t_attn),
-                ms(t_local),
-                ms(t_remote),
-            );
         }
         // The final norm and head may live elsewhere than the last layer.
         let head_device = self.model.norm.gamma.val().device();
@@ -1518,10 +1510,17 @@ impl CausalLm for LoadedQwen35 {
         } else {
             x.to_device(&head_device)
         };
-        let x = self.model.norm.forward(x);
+        let x = {
+            let _s = crate::prof::scope("final_norm");
+            self.model.norm.forward(x)
+        };
 
         // Last position only → logits [1, vocab].
         let last = x.narrow(1, t - 1, 1).reshape([1, cfg.hidden_size]);
+        // Suspect number one for unattributed time: the tied head is a
+        // [1, 5120] x [5120, 248320] f32 matmul, and it runs on whichever
+        // device holds the embedding table — the HOST, for a split model.
+        let _s = crate::prof::scope("lm_head");
         match &self.model.lm_head {
             Some(head) => qlinear2(head, last),
             None => {

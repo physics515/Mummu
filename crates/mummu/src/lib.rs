@@ -27,6 +27,7 @@ pub mod nn;
 pub mod pack;
 pub mod partition;
 pub mod plan;
+pub mod prof;
 pub mod quant;
 pub mod registry;
 pub mod safetensors;
