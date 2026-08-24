@@ -146,13 +146,23 @@ function addMsg(who, text) {
 }
 
 // Render text with <think>…</think> blocks folded into <details>.
+//
+// Streaming re-renders this body on EVERY delta, and a rebuilt <details>
+// defaults to closed — which collapsed the thinking fold under the reader
+// dozens of times per reply. So the open flags are carried across renders by
+// position: whatever the user (or the streaming default) set, survives. A
+// fold first seen mid-stream (no </think> yet) starts open so the thinking
+// is visible while it happens; one first seen complete starts closed.
 function renderBody(el, text) {
+  const prevOpen = [...el.querySelectorAll("details")].map(d => d.open);
   el.textContent = "";
   const re = /<think>([\s\S]*?)(<\/think>|$)/g;
-  let last = 0, m;
+  let last = 0, m, fold = 0;
   while ((m = re.exec(text)) !== null) {
     if (m.index > last) el.appendChild(document.createTextNode(text.slice(last, m.index)));
     const d = document.createElement("details");
+    d.open = fold < prevOpen.length ? prevOpen[fold] : m[2] === "";
+    fold++;
     const s = document.createElement("summary");
     s.textContent = "thinking…";
     d.appendChild(s);

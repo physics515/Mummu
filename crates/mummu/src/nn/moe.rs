@@ -912,10 +912,15 @@ impl ExpertPool {
             let partials: Vec<Tensor<2>> = std::thread::scope(|scope| {
                 let handles: Vec<_> = by_device
                     .iter()
-                    .map(|(_, members)| {
+                    .map(|(key, members)| {
                         let execs = &execs;
                         let xt = xt.clone();
                         scope.spawn(move || {
+                            // A worker thread's stack starts empty, so this
+                            // is a new flame-graph ROOT beside the forward's
+                            // — read the widths as parallel wall time.
+                            let _w = crate::prof::scope("ffn_worker");
+                            let _d = crate::prof::scope(key.clone());
                             let mut acc: Option<Tensor<2>> = None;
                             for &e in members {
                                 let y = execs[e].run_tensor(xt.clone());
