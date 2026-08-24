@@ -1385,6 +1385,7 @@ pub fn load_expert_from_pack(
         return Err(format!("pack is missing projections of expert ({layer}, {index})"));
     };
     Ok(crate::nn::DeviceExpert {
+        native_ok: std::sync::atomic::AtomicBool::new(true),
         weights: ExpertWeights { gate, up, down },
         device: device.clone(),
         tier,
