@@ -716,11 +716,16 @@ fn tier_devices(
                 TierDevice {
                     name: "igpu".into(),
                     class: DeviceClass::IntegratedGpu,
-                    // Same ladder as the discrete card: this is a wgpu device,
-                    // so it runs the same cubecl kernels and a quantized
-                    // matmul costs it nothing (unlike burn-flex, where one is
-                    // 18x slower — which is why the CPU tier differs).
-                    ladder: vec![Precision::F32, Precision::Q8, Precision::Q4],
+                    // F32 ONLY — the integrated GPU never touches a
+                    // quantized weight. Both packed-compute options broke on
+                    // it in production (2026-08-24): native q_matmul panics
+                    // on m=1 x some group widths (cubecl quant/view.rs:223),
+                    // and per-call dequantize churns transients through a
+                    // pool that allocates 1 GiB chunks. Its memory is system
+                    // RAM, so f32 residency costs the cheap resource, and
+                    // f32 is precisely what its 14.15 ms/cluster throughput
+                    // rating was measured on (`device-throughput.rs`).
+                    ladder: vec![Precision::F32],
                     budget_bytes: budget(BackendChoice::IntegratedGpu),
                     speed: decode_speed(BackendChoice::IntegratedGpu),
                     preload_units: 0,
@@ -1182,7 +1187,40 @@ fn build_partitioned_qwen35(
         }
         let mut row = Vec::new();
         for ((dev, _), (tier, clusters, bytes)) in by_slot {
-            row.push(load_ffn_group_on(devices[dev].0, &pack, l, &clusters, tier, bytes)?);
+            // Bounded executor groups on accelerators. One executor per
+            // (layer, device, precision) was optimal for dispatch count, but
+            // a ~19-cluster packed group dequantizes to a ~210 MB f32
+            // transient per multiply, and cubecl's pool allocates ~1 GiB
+            // chunks to hold those — measured to OOM the discrete card
+            // around the 8th token once other apps held 5 GiB of it. Eight
+            // clusters cap the transient near 90 MB, and uniform widths let
+            // the pool and autotune converge on a handful of shapes instead
+            // of one per layer. The extra dispatches are noise: splitting
+            // 32-wide into per-cluster matmuls measured 2.4x, so ~3 groups
+            // instead of 1 costs a few percent. The host keeps whole groups
+            // — flex has no pool chunking and its matmul is f32 already.
+            // The cap applies ONLY to groups that will dequantize per call
+            // (the 8-bit family on accelerators — see `nn::compute_weight`):
+            // it exists to bound the f32 transient that dequantize
+            // materializes, and Q8 groups are the only ones that make one.
+            // Native-computed Q4 groups stay WHOLE, deliberately: capping
+            // them at 8 clusters (width 4352) drove burn's wgpu q_matmul
+            // into the `num_quants 8` variant of the vector-size panic,
+            // while the organic 17-27-cluster widths ran dozens of tokens
+            // across four separate loads without one. The width rule lives
+            // inside cubecl's kernel selection and is not knowable from
+            // here, so the planner sticks to the empirically proven regime
+            // instead of inventing new widths.
+            let cap = match (devices[dev].0, tier.precision) {
+                (BackendChoice::Cpu, _) => usize::MAX,
+                (_, mummu::pack::Precision::Q8) => WGPU_GROUP_MAX_CLUSTERS,
+                _ => usize::MAX,
+            };
+            let per_cluster = bytes / clusters.len().max(1) as u64;
+            for chunk in clusters.chunks(cap) {
+                let chunk_bytes = per_cluster * chunk.len() as u64;
+                row.push(load_ffn_group_on(devices[dev].0, &pack, l, chunk, tier, chunk_bytes)?);
+            }
         }
         rows.push(row);
     }
@@ -1545,6 +1583,12 @@ fn charge_trunk_to_its_device(
     }
 }
 
+/// Most clusters one accelerator-resident executor may fuse into a single
+/// matmul. Bounds the f32 transient a packed group dequantizes into (~90 MB
+/// at this width) — see the grouping loop for the measured failure this
+/// prevents.
+const WGPU_GROUP_MAX_CLUSTERS: usize = 8;
+
 /// The checkpoint's own bits per parameter, from the pack manifest.
 fn source_bits_per_param(pack: &mummu::pack::Pack) -> f64 {
     let params: u64 = pack
@@ -1584,11 +1628,18 @@ fn cap_ladders_at_source(devices: &mut [(BackendChoice, mummu::tier::TierDevice)
     let mut trimmed = Vec::new();
     for (_, dev) in devices.iter_mut() {
         let before = dev.ladder.len();
+        let original = dev.ladder.clone();
         dev.ladder.retain(|&p| rung_bits(p) <= cap_bits);
         // Never leave a device with no rung at all: if the cap removed
-        // everything, keep the cheapest it had.
-        if dev.ladder.is_empty() {
-            dev.ladder.push(Precision::Q4);
+        // everything, keep the coarsest the device OFFERED — its ladder is a
+        // kernel-safety statement, not just a fidelity preference. The first
+        // version pushed a hardcoded Q4 here, which silently re-armed
+        // quantized kernels on the integrated GPU right after its ladder was
+        // narrowed to F32 precisely to keep quantized weights off it.
+        if dev.ladder.is_empty()
+            && let Some(&coarsest) = original.last()
+        {
+            dev.ladder.push(coarsest);
         }
         if dev.ladder.len() != before {
             trimmed.push(dev.name.clone());

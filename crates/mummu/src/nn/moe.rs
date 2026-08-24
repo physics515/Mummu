@@ -453,10 +453,47 @@ where
 fn compute_weight(w: &Param<Tensor<2>>) -> Tensor<2> {
     let t = w.val();
     match t.dtype() {
+        // wgpu: dequantize the 8-BIT family before the multiply — and only
+        // that family. This is not the retracted "wgpu Q4 is broken" claim
+        // of 2026-08-23 (a probe artifact); it has a production backtrace:
+        // burn 0.22's wgpu q_matmul panics at cubecl-std quant/view.rs:223
+        // ("quantized view float vector size 1 must be a positive multiple
+        // of num_quants 4") when the kernel chosen for an m=1 decode step
+        // vectorizes the float side at 1. `num_quants 4` is four values per
+        // u32 — the 8-bit schemes. Q4S packs eight and has never produced
+        // this panic in any log; a blanket wgpu-dequantize guard was tried
+        // and traded the panic for something worse: dequantizing every Q4
+        // group churned ~90-210 MB f32 transients through a pool that
+        // allocates ~1 GiB chunks, and OOM-killed generations once other
+        // apps held part of the card. Narrow beats broad here:
+        //   Q8-family -> dequantize (small groups, tiny transients, covers
+        //                the entire observed panic family);
+        //   Q4S       -> native, zero transients (speed measured identical
+        //                either way: 1.61 ms both, bit-identical results).
+        // CUDA keeps the probed native path for everything.
+        DType::QFloat(scheme)
+            if is_wgpu(&t.device())
+                && matches!(
+                    scheme.value,
+                    burn::tensor::quantization::QuantValue::Q8S
+                        | burn::tensor::quantization::QuantValue::Q8F
+                        | burn::tensor::quantization::QuantValue::E4M3
+                        | burn::tensor::quantization::QuantValue::E5M2
+                ) =>
+        {
+            t.dequantize()
+        }
         DType::QFloat(_) if native_qmatmul_ok(&t.device(), t.dtype()) => t,
         DType::QFloat(_) => t.dequantize(),
         _ => t,
     }
+}
+
+/// Is this a wgpu device? burn 0.22 selects backends by runtime `Device`
+/// value and exposes no kind accessor, so the debug form is the handle
+/// available. Covers the discrete and integrated adapters alike.
+fn is_wgpu(device: &Device) -> bool {
+    format!("{device:?}").contains("Wgpu")
 }
 
 /// Does this device multiply a quantized weight natively — without panicking,
@@ -935,7 +972,17 @@ impl ExpertPool {
                     .collect();
                 handles
                     .into_iter()
-                    .filter_map(|h| h.join().ok().flatten())
+                    .filter_map(|h| match h.join() {
+                        Ok(partial) => partial,
+                        // A worker panic must never become a silently missing
+                        // partial: dropping one device's clusters from the
+                        // FFN sum produces a WRONG answer that still reads
+                        // fluently — observed in production when the iGPU's
+                        // workers OOM'd and `.ok()` discarded their share.
+                        // Re-raise on the caller so the generation fails
+                        // loudly instead of lying.
+                        Err(payload) => std::panic::resume_unwind(payload),
+                    })
                     .collect()
             });
 
@@ -1443,6 +1490,34 @@ mod tests {
                 "elem {i}: quantized path gave {b}, f32 gave {a}"
             );
         }
+    }
+
+    /// On wgpu a quantized weight must come back float from
+    /// `compute_weight`: the native q_matmul panics on shapes the tier
+    /// planner routinely produces (m=1 decode x some group widths), so the
+    /// packed tensor must never reach `matmul`. Storage stays quantized;
+    /// only the multiply dequantizes. Skips without a wgpu device.
+    #[test]
+    fn wgpu_weights_are_dequantized_before_matmul() {
+        if !crate::backend::inventory().has_gpu() {
+            return;
+        }
+        let device = crate::backend::gpu_device();
+        if !is_wgpu(&device) {
+            return;
+        }
+        let vals: Vec<f32> = (0..64 * 64).map(|i| ((i as f32) * 0.03).sin()).collect();
+        let t = Tensor::<2>::from_data(
+            burn::tensor::TensorData::new(vals, [64, 64]),
+            (&device, crate::backend::float_dtype()),
+        );
+        let q = crate::quant::quantize_weight(crate::quant::QuantPolicy::Q8, t);
+        assert!(matches!(q.dtype(), DType::QFloat(_)), "setup: weight quantized");
+        let ready = compute_weight(&Param::from_tensor(q));
+        assert!(
+            !matches!(ready.dtype(), DType::QFloat(_)),
+            "a packed weight must never reach matmul on wgpu"
+        );
     }
 
     fn input(t: usize, seed: f32, device: &Dev) -> Tensor<3> {
