@@ -571,7 +571,17 @@ fn tier_devices(
 ) -> Vec<(BackendChoice, mummu::tier::TierDevice)> {
     use mummu::tier::{DeviceClass, Precision, TierDevice};
     let budget = |b: BackendChoice| {
-        backend_budget(b).saturating_sub(if b == main { trunk_bytes } else { 0 })
+        let raw = backend_budget(b).saturating_sub(if b == main { trunk_bytes } else { 0 });
+        // Accelerator budgets must leave room for what is not a weight —
+        // activations, KV state, dequantize temporaries, and cubecl's own
+        // pool chunking. Without this the tier planner happily filled a card
+        // to its last byte and generation died with `out of device memory`
+        // mid-token. The host is not reserved against: it has 96 GiB and its
+        // allocator does not fail this way.
+        match b {
+            BackendChoice::Cpu => raw,
+            _ => raw.saturating_sub(ACTIVATION_RESERVE),
+        }
     };
     // `speed` ranks devices for this workload. Measured on the reference box
     // for the decode shape `[1,5120]x[5120,6144]`, WARM and averaged over 20
@@ -603,17 +613,34 @@ fn tier_devices(
     // controller between them. It ranks just above the CPU so overflow
     // spreads onto it first and the CPU takes what is left, rather than one
     // device carrying everything while the other idles.
+    // MEASURED throughput, not an ordinal rank. Scheduler A divides work in
+    // proportion to these numbers, so an invented ordering becomes an
+    // invented split: ranking the iGPU 2 against the CPU's 1 — when the two
+    // are level — handed it 457 clusters against the CPU's 64 and made it the
+    // makespan, at which point extra VRAM on the discrete card bought nothing
+    // because the quota, not memory, was binding.
+    //
+    // From `examples/device-throughput.rs` (warm, real pack weight, decode
+    // shape), inverted into work per second and scaled to keep integer
+    // granularity:
+    //
+    //   dGPU  1.59 ms -> 629    iGPU 14.15 ms -> 71    CPU 13.82 ms -> 72
+    //
+    // Re-measure after any change to kernels, dtypes or hardware; these are
+    // facts about this box, not constants of the universe.
     let decode_speed = |backend: BackendChoice| -> u32 {
         let cpu_first = std::env::var("MUMMU_TIER_SPEED")
             .ok()
             .as_deref()
             .is_some_and(|v| v.eq_ignore_ascii_case("cpu-first"));
-        let rank = match backend {
-            BackendChoice::Cpu => 1,
-            BackendChoice::IntegratedGpu => 2,
-            _ => 10,
+        let measured = match backend {
+            BackendChoice::Cpu => 72,
+            BackendChoice::IntegratedGpu => 71,
+            _ => 629,
         };
-        if cpu_first { 11 - rank } else { rank }
+        // The override exists for a host whose GPU genuinely is the slow one;
+        // invert the ordering without pretending to know its ratios.
+        if cpu_first { 700 - measured } else { measured }
     };
     let mut out = vec![(
         BackendChoice::Cpu,
@@ -633,6 +660,7 @@ fn tier_devices(
             ladder: vec![Precision::F32, Precision::Q8, Precision::Q4],
             budget_bytes: budget(BackendChoice::Cpu),
             speed: decode_speed(BackendChoice::Cpu),
+            preload_units: 0, // set by `charge_trunk_to_its_device`
         },
     )];
     if cpu_only {
@@ -654,6 +682,7 @@ fn tier_devices(
                 ladder: vec![Precision::F32, Precision::Q8, Precision::Q4],
                 budget_bytes: budget(BackendChoice::Cuda),
                 speed: decode_speed(BackendChoice::Cuda),
+                preload_units: 0,
             },
         ));
         return out;
@@ -675,6 +704,7 @@ fn tier_devices(
                 ladder: vec![Precision::F32, Precision::Q8, Precision::Q4],
                 budget_bytes: budget(BackendChoice::Wgpu),
                 speed: decode_speed(BackendChoice::Wgpu),
+                preload_units: 0,
             },
         ));
         // The integrated GPU, if this machine has one that is not already the
@@ -693,6 +723,7 @@ fn tier_devices(
                     ladder: vec![Precision::F32, Precision::Q8, Precision::Q4],
                     budget_bytes: budget(BackendChoice::IntegratedGpu),
                     speed: decode_speed(BackendChoice::IntegratedGpu),
+                    preload_units: 0,
                 },
             ));
         }
@@ -1056,6 +1087,8 @@ fn build_partitioned_qwen35(
         .sum();
     ensure_host_room(cpu_worst + if main == BackendChoice::Cpu { trunk } else { 0 } + (6u64 << 30), main);
     let mut devices = tier_devices(main, trunk, cpu_only);
+    cap_ladders_at_source(&mut devices, &pack);
+    charge_trunk_to_its_device(&mut devices, main, trunk, &costs);
     let main_idx = devices
         .iter()
         .position(|(b, _)| *b == main)
@@ -1219,7 +1252,10 @@ fn build_tiered_experts(
         + if main == BackendChoice::Cpu { trunk } else { 0 }
         + (6u64 << 30);
     ensure_host_room(host_need, main);
-    let devices = tier_devices(main, trunk, cpu_only);
+    let mut devices = tier_devices(main, trunk, cpu_only);
+    cap_ladders_at_source(&mut devices, &pack);
+    charge_trunk_to_its_device(&mut devices, main, trunk, &costs);
+    let devices = devices;
     let hotness = {
         let g = TIERS.lock().unwrap_or_else(|e| e.into_inner());
         g.as_ref()
@@ -1405,17 +1441,7 @@ fn mixed_precision(
     // 4 B/param there would be twice the bytes for none of the information,
     // which is also the answer to "why not f64": the ceiling is the source,
     // and the source is nowhere near it.
-    let params: u64 = pack
-        .manifest
-        .tensors
-        .iter()
-        .map(|t| t.shape.iter().product::<usize>() as u64)
-        .sum();
-    let source_bits = if params > 0 {
-        pack.manifest.source_bytes as f64 * 8.0 / params as f64
-    } else {
-        f64::INFINITY
-    };
+    let source_bits = source_bits_per_param(pack);
     let source_cap = mummu::quant::QuantPolicy::ceiling_for_source(source_bits);
     let ceiling = if ceiling.bits() > source_cap.bits() {
         eprintln!(
@@ -1463,6 +1489,105 @@ fn mixed_precision(
         });
     }
     chosen
+}
+
+/// Tell the scheduler what the trunk already costs the device that holds it.
+///
+/// The trunk runs on every token, exactly like every FFN cluster, but it is
+/// placed by the fit planner rather than by scheduler A — so without this the
+/// device carrying it looks completely idle and is handed a full share of
+/// clusters on top. Measured: the host, already running a trunk that
+/// saturates it, was given 191 further clusters as its "fair share".
+///
+/// Expressed in cluster equivalents so it is the same unit the scheduler
+/// divides in: how many clusters' worth of work the trunk represents.
+fn charge_trunk_to_its_device(
+    devices: &mut [(BackendChoice, mummu::tier::TierDevice)],
+    main: BackendChoice,
+    trunk_bytes: u64,
+    costs: &[mummu::tier::ExpertCost],
+) {
+    let cluster_bytes = {
+        let mut total = 0u64;
+        let mut n = 0u64;
+        for c in costs {
+            if let Some(&b) = c.bytes.values().max() {
+                total += b;
+                n += 1;
+            }
+        }
+        if n == 0 { 0 } else { total / n }
+    };
+    if cluster_bytes == 0 {
+        return;
+    }
+    let units = (trunk_bytes / cluster_bytes) as usize;
+    for (backend, dev) in devices.iter_mut() {
+        if *backend == main {
+            dev.preload_units = units;
+            eprintln!(
+                "[mummu-serve] trunk charged to {}: {units} cluster-equivalents of work per token",
+                dev.name
+            );
+        }
+    }
+}
+
+/// The checkpoint's own bits per parameter, from the pack manifest.
+fn source_bits_per_param(pack: &mummu::pack::Pack) -> f64 {
+    let params: u64 = pack
+        .manifest
+        .tensors
+        .iter()
+        .map(|t| t.shape.iter().product::<usize>() as u64)
+        .sum();
+    if params == 0 {
+        f64::INFINITY
+    } else {
+        pack.manifest.source_bytes as f64 * 8.0 / params as f64
+    }
+}
+
+/// Drop rungs finer than the source from every device's ladder.
+///
+/// Precision above the source is bytes without information, and on a device
+/// whose scarce resource is memory those bytes are *capacity* — every one
+/// spent is an expert that could have been resident. Concretely: with F32 on
+/// the ladder, the discrete GPU spent most of its 9 GiB on 219 F32 clusters
+/// and could hold only 610 in total, while the 8.9x slower integrated GPU
+/// carried 1374. This 27B ships at 4.55 bits/param, so its f32 is an upcast
+/// of 4-bit data and f16 reproduces it exactly (measured 0.0000 relative
+/// error) — those 219 clusters were paying quadruple for nothing.
+fn cap_ladders_at_source(devices: &mut [(BackendChoice, mummu::tier::TierDevice)], pack: &mummu::pack::Pack) {
+    use mummu::pack::Precision;
+    let bits = source_bits_per_param(pack);
+    let cap = mummu::quant::QuantPolicy::ceiling_for_source(bits);
+    let cap_bits = cap.bits();
+    let rung_bits = |p: Precision| match p {
+        Precision::F32 => 32,
+        Precision::F16 => 16,
+        Precision::Q8 => 8,
+        Precision::Q4 => 4,
+    };
+    let mut trimmed = Vec::new();
+    for (_, dev) in devices.iter_mut() {
+        let before = dev.ladder.len();
+        dev.ladder.retain(|&p| rung_bits(p) <= cap_bits);
+        // Never leave a device with no rung at all: if the cap removed
+        // everything, keep the cheapest it had.
+        if dev.ladder.is_empty() {
+            dev.ladder.push(Precision::Q4);
+        }
+        if dev.ladder.len() != before {
+            trimmed.push(dev.name.clone());
+        }
+    }
+    if !trimmed.is_empty() {
+        eprintln!(
+            "[mummu-serve] source is {bits:.2} bits/param — ladders capped at {cap:?} on {}",
+            trimmed.join(", ")
+        );
+    }
 }
 
 /// The layer a GGUF tensor name belongs to (`blk.7.ffn_up.weight` -> 7).

@@ -32,6 +32,14 @@ pub struct Device {
     /// a unit costs at the least precise rung it will accept. This is where
     /// scheduler B feeds in.
     pub capacity_units: usize,
+    /// Work this device is ALREADY committed to every step, in the same
+    /// units — not schedulable, but it delays everything scheduled behind it.
+    ///
+    /// Without this, `throughput` silently means "speed when idle", and the
+    /// device carrying the model trunk looks as free as one doing nothing.
+    /// Measured consequence: the host, already running a trunk that saturates
+    /// it, was handed 191 further clusters as its "fair share".
+    pub preload_units: usize,
 }
 
 /// How the work came out.
@@ -46,15 +54,16 @@ pub struct Plan {
 
 impl Plan {
     /// Time the slowest device takes, in the reciprocal of `throughput`'s
-    /// unit. This is what a layer actually costs when devices run
-    /// concurrently, and the quantity the split minimizes.
+    /// unit — including whatever it was already committed to. This is what a
+    /// layer actually costs when devices run concurrently, and the quantity
+    /// the split minimizes.
     #[must_use]
     pub fn makespan(&self, devices: &[Device]) -> f64 {
         devices
             .iter()
             .zip(&self.units)
             .filter(|(d, _)| d.throughput > 0.0)
-            .map(|(d, &n)| n as f64 / d.throughput)
+            .map(|(d, &n)| (d.preload_units + n) as f64 / d.throughput)
             .fold(0.0, f64::max)
     }
 }
@@ -67,59 +76,36 @@ impl Plan {
 #[must_use]
 pub fn divide(devices: &[Device], total_units: usize) -> Plan {
     let mut units = vec![0usize; devices.len()];
-    // Open devices are those that can still take more work.
-    let mut open: Vec<usize> = (0..devices.len())
-        .filter(|&i| devices[i].throughput > 0.0 && devices[i].capacity_units > 0)
-        .collect();
     let mut remaining = total_units;
 
-    while remaining > 0 && !open.is_empty() {
-        let total_throughput: f64 = open.iter().map(|&i| devices[i].throughput).sum();
-        if total_throughput <= 0.0 {
-            break;
-        }
-
-        // Proportional share of what is left. Rounding is deliberately down
-        // so the loop never over-assigns; the remainder is placed one unit at
-        // a time below, which also handles shares smaller than a whole unit.
-        let mut handed_out = 0usize;
-        let mut share: Vec<(usize, usize)> = Vec::with_capacity(open.len());
-        for &i in &open {
-            let want = (remaining as f64 * devices[i].throughput / total_throughput) as usize;
-            let want = want.min(devices[i].capacity_units - units[i]);
-            share.push((i, want));
-            handed_out += want;
-        }
-        for (i, want) in &share {
-            units[*i] += want;
-        }
-        remaining -= handed_out;
-
-        // Anything left after rounding goes to whichever open device is
-        // currently *earliest* to finish — the same greedy that the
-        // proportional step approximates, applied one unit at a time.
-        let mut progress = handed_out > 0;
-        while remaining > 0 {
-            let Some(&best) = open
-                .iter()
-                .filter(|&&i| units[i] < devices[i].capacity_units)
-                .min_by(|&&a, &&b| {
-                    let finish = |i: usize| units[i] as f64 / devices[i].throughput;
-                    finish(a).partial_cmp(&finish(b)).unwrap_or(std::cmp::Ordering::Equal)
-                })
-            else {
-                break;
-            };
-            units[best] += 1;
-            remaining -= 1;
-            progress = true;
-        }
-
-        // Close anything that is now full; if a whole pass placed nothing,
-        // every open device is full and the rest is unplaceable.
-        open.retain(|&i| units[i] < devices[i].capacity_units);
-        if !progress {
-            break;
+    // Greedy on the RESULTING finish time, one unit at a time.
+    //
+    // This replaces a proportional pass plus a remainder pass. Proportional
+    // shares cannot express preloaded work — a device that is already busy
+    // deserves a smaller share, not the same fraction — and the two passes
+    // could disagree at the boundary. Assigning to whichever device would
+    // finish earliest WITH the unit handles both, and is the textbook
+    // approximation for makespan on identical tasks.
+    //
+    // O(units x devices): a few thousand comparisons for a whole model, which
+    // is nothing beside the work being placed.
+    while remaining > 0 {
+        let best = (0..devices.len())
+            .filter(|&i| devices[i].throughput > 0.0 && units[i] < devices[i].capacity_units)
+            .min_by(|&a, &b| {
+                let finish_with = |i: usize| {
+                    (devices[i].preload_units + units[i] + 1) as f64 / devices[i].throughput
+                };
+                finish_with(a)
+                    .partial_cmp(&finish_with(b))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        match best {
+            Some(i) => {
+                units[i] += 1;
+                remaining -= 1;
+            }
+            None => break, // every device is full or dead
         }
     }
 
@@ -134,11 +120,11 @@ mod tests {
     use super::*;
 
     fn dev(name: &str, throughput: f64, capacity_units: usize) -> Device {
-        Device {
-            name: name.into(),
-            throughput,
-            capacity_units,
-        }
+        Device { name: name.into(), throughput, capacity_units, preload_units: 0 }
+    }
+
+    fn busy(name: &str, throughput: f64, capacity_units: usize, preload_units: usize) -> Device {
+        Device { name: name.into(), throughput, capacity_units, preload_units }
     }
 
     /// With memory to spare, work splits in proportion to speed — so every
@@ -185,6 +171,34 @@ mod tests {
             greedy.units,
             greedy.makespan(&devices)
         );
+    }
+
+    /// A device already busy gets a SMALLER share, not an equal one. The host
+    /// carrying a model trunk is not idle just because no clusters are on it
+    /// yet, and treating it as idle handed it 191 clusters it had no time for.
+    #[test]
+    fn a_preloaded_device_is_given_less_work() {
+        let idle = vec![dev("a", 1.0, 1000), dev("b", 1.0, 1000)];
+        assert_eq!(divide(&idle, 100).units, vec![50, 50], "equal when both idle");
+
+        // Same speeds, but `b` already owes 40 units of work.
+        let loaded = vec![dev("a", 1.0, 1000), busy("b", 1.0, 1000, 40)];
+        let plan = divide(&loaded, 100);
+        assert!(plan.units[0] > plan.units[1], "the busy device takes less: {plan:?}");
+        // ...and they still finish together, which is the point.
+        let finish = |i: usize| (loaded[i].preload_units + plan.units[i]) as f64;
+        assert!((finish(0) - finish(1)).abs() <= 1.0, "{plan:?}");
+    }
+
+    /// The last unit goes where it finishes soonest, not where the device is
+    /// idlest. Ranking by current load put it on an empty slow device and
+    /// tripled the makespan.
+    #[test]
+    fn the_remainder_goes_where_it_finishes_soonest() {
+        let devices = vec![dev("cpu", 1.0, 100), dev("gpu", 10.0, 100)];
+        let plan = divide(&devices, 4);
+        assert_eq!(plan.units, vec![0, 4], "all four belong on the fast device");
+        assert!((plan.makespan(&devices) - 0.4).abs() < 1e-9);
     }
 
     /// A device that cannot hold its proportional share is clamped, and what

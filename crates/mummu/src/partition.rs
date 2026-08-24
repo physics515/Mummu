@@ -363,7 +363,13 @@ pub fn cluster_costs(pack: &Pack, layer: usize) -> Result<Vec<crate::tier::Exper
         for (&p, blob) in &e.precisions {
             let bytes = match p {
                 Precision::Q4 | Precision::Q8 => blob.values_len + blob.scales_len,
-                Precision::F16 | Precision::F32 => numel * 4,
+                Precision::F32 => numel * 4,
+                // f16 is TWO bytes. Costing it as four made it look exactly
+                // as expensive as f32 to the tier planner, so it could never
+                // win a placement — which is why an f16 rung never appeared
+                // in a plan despite being the cheapest lossless option for a
+                // quantized source.
+                Precision::F16 => numel * 2,
             };
             // Bytes per neuron (column/row) — the entry is [hidden, inter] or [inter, hidden].
             *per_neuron.entry(p).or_insert(0) += bytes / inter as u64;

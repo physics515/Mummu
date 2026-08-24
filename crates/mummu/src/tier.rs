@@ -46,6 +46,10 @@ pub struct TierDevice {
     /// (e.g. a discrete GPU `[F32, Q8]`, a CPU `[Q8, Q4]`). A level absent
     /// here is never placed on this device, whatever the pack stores.
     pub ladder: Vec<Precision>,
+    /// Work this device is already committed to every step, in expert
+    /// equivalents. The trunk lives on exactly one device and runs on every
+    /// token; without it that device looks idle to the scheduler.
+    pub preload_units: usize,
     /// Bytes of expert weights this device may hold (after whatever else
     /// — the trunk, caches, the desktop — already lives there).
     pub budget_bytes: u64,
@@ -208,6 +212,11 @@ pub fn plan_tiers(
                     } else {
                         (dev.budget_bytes / cheapest) as usize
                     },
+                    // Work this device already owes every token, in cluster
+                    // equivalents — the trunk, for whichever device holds it.
+                    // Counting it is what stops a host that is already
+                    // saturated from being handed a "fair share" on top.
+                    preload_units: dev.preload_units,
                 }
             })
             .collect();
@@ -228,30 +237,66 @@ pub fn plan_tiers(
                 .then(a.cmp(&b))
         });
     }
+    // Two phases, because placement and precision optimize different things
+    // and one pass let the wrong one win.
+    //
+    // Moving an expert from a 14.15 ms device to a 1.59 ms one saves 12.6 ms
+    // EVERY token. Upgrading the precision of an expert already on the fast
+    // device saves nothing — for a quantized checkpoint the extra bytes buy
+    // no accuracy at all (measured 0.0000 relative error for f16 against a
+    // 4.55 bits/param source) — and those bytes are capacity another expert
+    // could have used. Interleaved, precision won: the fast device ended up
+    // holding 610 experts at mixed rungs while the slow one held 1374.
+    //
+    // So: fill the fast devices first, at their CHEAPEST rung, and only then
+    // spend whatever is left over on precision.
+
+    // Phase 1 — placement. Hottest first, onto the fastest device with room.
     for &e in &order {
         let cur = tiers[e];
         let cur_bytes = cost_of(cur, e).expect("admitted tier has a cost");
-        for &slot in &slots {
+        for &d in &by_speed {
+            if devices[d].speed <= devices[cur.device].speed {
+                break; // by_speed is descending: nothing faster remains
+            }
+            if held[d] >= quota[d] {
+                continue; // scheduler A's balanced share for this device
+            }
+            // Cheapest rung this device accepts — capacity beats precision.
+            let Some((bytes, slot)) = devices[d]
+                .ladder
+                .iter()
+                .filter_map(|&p| {
+                    let slot = Tier { device: d, precision: p };
+                    cost_of(slot, e).map(|b| (b, slot))
+                })
+                .min_by_key(|&(b, _)| b)
+            else {
+                continue;
+            };
+            if used[d] + bytes <= devices[d].budget_bytes {
+                used[cur.device] -= cur_bytes;
+                used[d] += bytes;
+                held[cur.device] -= 1;
+                held[d] += 1;
+                tiers[e] = slot;
+                break;
+            }
+        }
+    }
+
+    // Phase 2 — precision, with what is left, and without moving anything.
+    for &e in &order {
+        let cur = tiers[e];
+        let cur_bytes = cost_of(cur, e).expect("admitted tier has a cost");
+        for &p in &devices[cur.device].ladder {
+            let slot = Tier { device: cur.device, precision: p };
             if slot == cur {
-                break; // already at the best slot it can hold
+                break; // the ladder is best-first: nothing finer remains
             }
             let Some(bytes) = cost_of(slot, e) else { continue };
-            // Scheduler A's quota: moving ONTO another device may not push it
-            // past its balanced share. Promoting in place (same device, finer
-            // precision) changes no counts and is always allowed.
-            if slot.device != cur.device && held[slot.device] >= quota[slot.device] {
-                continue;
-            }
-            // Room on the target, counting what this expert frees if the
-            // target is its current device.
-            let freed = if slot.device == cur.device { cur_bytes } else { 0 };
-            if used[slot.device] - freed + bytes <= devices[slot.device].budget_bytes {
-                used[cur.device] -= cur_bytes;
-                used[slot.device] += bytes;
-                if slot.device != cur.device {
-                    held[cur.device] -= 1;
-                    held[slot.device] += 1;
-                }
+            if used[cur.device] - cur_bytes + bytes <= devices[cur.device].budget_bytes {
+                used[cur.device] = used[cur.device] - cur_bytes + bytes;
                 tiers[e] = slot;
                 break;
             }
@@ -301,6 +346,7 @@ mod tests {
                 ladder: vec![Precision::Q8, Precision::Q4],
                 budget_bytes: cpu_budget,
                 speed: 1,
+                preload_units: 0,
             },
             TierDevice {
                 name: "gpu".into(),
@@ -308,21 +354,54 @@ mod tests {
                 ladder: vec![Precision::F32, Precision::Q8],
                 budget_bytes: gpu_budget,
                 speed: 10,
+                preload_units: 0,
             },
         ]
     }
 
+    /// The fast device is filled with EXPERTS before any of its bytes go on
+    /// precision.
+    ///
+    /// This reverses the earlier policy, deliberately and on measurement. Here
+    /// the GPU's 8 bytes hold either one f32 expert or four q8 ones, and it is
+    /// 10x the CPU's speed: four experts on it beats one on it and three on
+    /// the CPU, by a wide margin. The old ordering interleaved placement and
+    /// precision, so precision won — on the real 27B that left the 1.59 ms
+    /// device holding 610 clusters while the 14.15 ms device held 1374.
+    ///
+    /// Precision above the source buys nothing anyway (measured 0.0000
+    /// relative error for f16 against a 4.55 bits/param checkpoint), while a
+    /// byte spent on it is capacity another expert could have used.
     #[test]
-    fn hottest_experts_take_the_fast_device_at_its_best_level() {
-        // 4 experts; GPU holds one f32 expert or two q8 ones.
+    fn the_fast_device_is_filled_with_experts_before_precision() {
         let costs = vec![cost(1, 2, 8); 4];
         let plan = plan_tiers(&devices(100, 8), &costs, &[0.1, 0.5, 0.3, 0.1]).unwrap();
-        assert_eq!(plan.tiers[1], Tier { device: 1, precision: Precision::F32 });
-        // Expert 2 (second hottest) can't get f32 (full) — takes GPU only if
-        // q8 fits: 8 + 2 > 8, no. Falls to the CPU at its best level (q8).
-        assert_eq!(plan.tiers[2], Tier { device: 0, precision: Precision::Q8 });
-        assert_eq!(plan.tiers[0], Tier { device: 0, precision: Precision::Q8 });
-        assert_eq!(plan.used_bytes, vec![6, 8]);
+        assert!(
+            plan.tiers.iter().all(|t| t.device == 1),
+            "every expert should be on the fast device: {:?}",
+            plan.tiers
+        );
+        assert!(
+            plan.tiers.iter().all(|t| t.precision == Precision::Q8),
+            "at its cheapest rung, not its best: {:?}",
+            plan.tiers
+        );
+        assert_eq!(plan.used_bytes, vec![0, 8]);
+    }
+
+    /// ...and when the fast device is genuinely full, hotness still decides
+    /// who gets in.
+    #[test]
+    fn the_hottest_expert_wins_the_last_slot_on_the_fast_device() {
+        let costs = vec![cost(1, 2, 8); 4];
+        // GPU budget 2 = exactly one expert at its cheapest rung (q8).
+        let plan = plan_tiers(&devices(100, 2), &costs, &[0.1, 0.5, 0.3, 0.1]).unwrap();
+        assert_eq!(plan.tiers[1], Tier { device: 1, precision: Precision::Q8 });
+        assert!(
+            plan.tiers.iter().enumerate().all(|(e, t)| e == 1 || t.device == 0),
+            "only the hottest gets the fast device: {:?}",
+            plan.tiers
+        );
     }
 
     #[test]
@@ -355,12 +434,15 @@ mod tests {
     #[test]
     fn diff_lists_only_moved_experts() {
         let costs = vec![cost(1, 2, 8); 3];
-        let a = plan_tiers(&devices(100, 8), &costs, &[1.0, 0.0, 0.0]).unwrap();
-        let b = plan_tiers(&devices(100, 8), &costs, &[0.0, 1.0, 0.0]).unwrap();
+        // A GPU budget of 2 holds exactly ONE expert at its cheapest rung, so
+        // hotness decides which — without that contention every expert lands
+        // on the fast device in both plans and there is no diff to observe.
+        let a = plan_tiers(&devices(100, 2), &costs, &[1.0, 0.0, 0.0]).unwrap();
+        let b = plan_tiers(&devices(100, 2), &costs, &[0.0, 1.0, 0.0]).unwrap();
         let moves = a.diff(&b);
         assert_eq!(moves.len(), 2, "{moves:?}");
-        assert!(moves.contains(&(1, Tier { device: 1, precision: Precision::F32 })));
-        assert!(moves.contains(&(0, Tier { device: 0, precision: Precision::Q8 })));
+        assert!(moves.contains(&(1, Tier { device: 1, precision: Precision::Q8 })), "{moves:?}");
+        assert!(moves.contains(&(0, Tier { device: 0, precision: Precision::Q8 })), "{moves:?}");
     }
 
     #[test]
