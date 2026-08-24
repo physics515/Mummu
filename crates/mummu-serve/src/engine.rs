@@ -1148,28 +1148,40 @@ fn build_partitioned_qwen35(
         &|l| local[l].clone(),
     )
     .map_err(|e| e.to_string())?;
-    // Remote clusters grouped by device: one executor per (layer, device),
-    // covering every cluster the plan put there at that device's tier. In
-    // exact mode all clusters run, so this is one matmul per device per
-    // layer — not one per cluster. (Different clusters on one device could
-    // in principle carry different precisions, but the FFN plan uses each
-    // device's single ladder level, so a group shares its precision.)
+    // Remote clusters grouped by (device, PRECISION): one executor per group,
+    // covering every cluster the plan put there at that rung.
+    // `load_ffn_clusters` concatenates their ranges, so a group is one matmul
+    // — not one per cluster. Measured on the 27B: 62 of 64 layers come out as
+    // a single group, 2 as two, so 2048 clusters become 66 matmuls.
+    //
+    // Keying on the device ALONE was a latent bug. It was safe only while the
+    // FFN plan gave each device one ladder level, and that stopped being true
+    // when promotion gained a second phase that upgrades individual clusters
+    // with leftover bytes: a real plan now reads `wgpu @ Q4: 1677` and
+    // `wgpu @ Q8: 107`. The old grouping took the FIRST cluster's tier and
+    // loaded the whole group at it, so 107 clusters were silently materialized
+    // at a precision the planner never chose, while the byte total added up
+    // costs for rungs that were never loaded.
     let mut rows: Vec<Vec<std::sync::Arc<dyn mummu::nn::ExpertExec>>> = Vec::with_capacity(layers);
     for l in 0..layers {
-        let mut by_device: std::collections::BTreeMap<usize, (mummu::tier::Tier, Vec<usize>, u64)> =
-            std::collections::BTreeMap::new();
+        let mut by_slot: std::collections::BTreeMap<
+            (usize, mummu::pack::Precision),
+            (mummu::tier::Tier, Vec<usize>, u64),
+        > = std::collections::BTreeMap::new();
         for c in 0..epl {
             let tier = plan.tiers[l * epl + c];
             if tier.device == main_idx {
                 continue; // the local slab is in the model's own mlp
             }
             let bytes = costs[l * epl + c].bytes.get(&tier.precision).copied().unwrap_or(0);
-            let g = by_device.entry(tier.device).or_insert((tier, Vec::new(), 0));
+            let g = by_slot
+                .entry((tier.device, tier.precision))
+                .or_insert((tier, Vec::new(), 0));
             g.1.push(c);
             g.2 += bytes;
         }
         let mut row = Vec::new();
-        for (dev, (tier, clusters, bytes)) in by_device {
+        for ((dev, _), (tier, clusters, bytes)) in by_slot {
             row.push(load_ffn_group_on(devices[dev].0, &pack, l, &clusters, tier, bytes)?);
         }
         rows.push(row);
@@ -1678,15 +1690,37 @@ fn ensure_pack(
 /// the tier runtime can spread them across devices. Crash-safe per layer
 /// (journal); a pack partitioned before is left alone.
 fn ensure_partition(pack_dir: &Path, spec: &ModelSpec) -> Result<(), String> {
-    if spec.architecture != Architecture::Qwen35 {
+    // Every dense decoder, not just qwen35. Partitioning is EXACT — the
+    // neurons of a layer's FFN are only reordered, consistently across
+    // gate/up columns and down rows — so a pack is safe to partition even
+    // for a loader that ignores the partition entirely. That is what makes
+    // one path for every model possible: the pack carries the clusters, and
+    // whether a given model's loader spreads them across devices is then its
+    // own business rather than a fork in the format.
+    //
+    // OLMoE is excluded because its FFN is already a bank of experts with its
+    // own tiering; MiniLm is an embedder with nothing worth spreading.
+    let dense = matches!(
+        spec.architecture,
+        Architecture::Qwen2 | Architecture::Qwen3 | Architecture::Lfm2 | Architecture::Qwen35
+    );
+    if !dense {
         return Ok(());
     }
     let mut pack = mummu::pack::Pack::open(pack_dir)?;
     if pack.manifest.ffn_partition.is_some() {
         return Ok(());
     }
+    // Trunk depth from the GGUF header, which every architecture records the
+    // same way; the FFN names are the standard triple for all of them.
     let header = pack.header()?;
-    let trunk = qwen35::Qwen35Config::from_gguf(&header)?.num_layers;
+    let trunk = header
+        .metadata
+        .iter()
+        .find(|(k, _)| k.ends_with(".block_count"))
+        .and_then(|(_, v)| v.as_u64())
+        .map(|n| n as usize)
+        .ok_or("pack header has no <arch>.block_count")?;
     drop(header);
     eprintln!(
         "[mummu-serve] partitioning {}'s FFNs into {} clusters per layer (one-time, in place)",
@@ -1696,7 +1730,7 @@ fn ensure_partition(pack_dir: &Path, spec: &ModelSpec) -> Result<(), String> {
     let started = Instant::now();
     mummu::partition::partition_pack(
         &mut pack,
-        &qwen35::ffn_names(trunk),
+        &mummu::partition::ffn_names(trunk),
         mummu::partition::DEFAULT_CLUSTERS,
         |i, n| {
             if i % 8 == 0 {
