@@ -248,6 +248,7 @@ impl GatedAttention {
 
         // Split the joint projection into q and gate: per head the layout is
         // [q (hd) | gate (hd)], so a [b, t, nh, 2, hd] view separates them.
+        let _s_qkv = crate::prof::scope("fa.qkv");
         let qg = qlinear(&self.q_proj, x.clone()).reshape([b, t, nh, 2, hd]);
         let q = qg.clone().narrow(3, 0, 1).reshape([b, t, nh, hd]);
         let gate = qg.narrow(3, 1, 1).reshape([b, t, nh, hd]);
@@ -259,6 +260,8 @@ impl GatedAttention {
             .reshape([b, t, nkv, hd])
             .swap_dims(1, 2);
 
+        drop(_s_qkv);
+        let _s_rope = crate::prof::scope("fa.rope");
         // Partial RoPE: rotate the first rope_dim dims, pass the rest through.
         let rope = |x: Tensor<4>| -> Tensor<4> {
             let rot = x.clone().narrow(3, 0, cfg.rope_dim);
@@ -268,6 +271,8 @@ impl GatedAttention {
         };
         let q = rope(q);
         let k_new = rope(k_new);
+        drop(_s_rope);
+        let _s_kv = crate::prof::scope("fa.kv");
 
         let (k_all, v_all) = match kv.take() {
             Some((pk, pv)) => (
@@ -281,6 +286,8 @@ impl GatedAttention {
         let group = nh / nkv;
         let k = repeat_kv(k_all, group);
         let v = repeat_kv(v_all, group);
+        drop(_s_kv);
+        let _s_scores = crate::prof::scope("fa.scores");
 
         // f32 island for the scores — the same overflow guard as GqaAttention.
         let ambient = q.dtype();
@@ -294,6 +301,8 @@ impl GatedAttention {
         }
         let probs = activation::softmax(scores, 3).cast(ambient);
         let ctx = probs.matmul(v); // [b, nh, t, hd]
+        drop(_s_scores);
+        let _s = crate::prof::scope("fa.out");
 
         // Per-head output gate: out ⊙ sigmoid(gate).
         let gated = ctx
@@ -348,6 +357,7 @@ impl GatedDeltaNet {
         let kk = cfg.conv_kernel;
         let device = x.device();
 
+        let _s_proj = crate::prof::scope("delta.proj");
         let mixed = qlinear(&self.qkv_proj, x.clone()); // [b, t, conv_dim]
         let z = qlinear(&self.z_proj, x.clone()); // [b, t, d_inner]
         let beta = activation::sigmoid(qlinear(&self.beta_proj, x.clone())); // [b, t, hv]
@@ -356,8 +366,10 @@ impl GatedDeltaNet {
             qlinear(&self.alpha_proj, x).add(self.dt_bias.val().reshape([1, 1, hv]));
         let g = activation::softplus(alpha, 1.0).mul(self.a.val().reshape([1, 1, hv]));
 
+        drop(_s_proj);
         // Depthwise causal conv over the sequence, rolling the decode state
         // exactly like nn::ShortConv (algebraic equivalence proven there).
+        let _s_conv = crate::prof::scope("delta.conv");
         let mix_cm = mixed.swap_dims(1, 2); // channel-major [b, conv_dim, t]
         let conv_out = if t > 1 {
             self.conv1d.forward(mix_cm.clone()).narrow(2, 0, t)
@@ -386,6 +398,8 @@ impl GatedDeltaNet {
             }
         });
         let conv_out = activation::silu(conv_out.swap_dims(1, 2)); // [b, t, conv_dim]
+        drop(_s_conv);
+        let _s_split = crate::prof::scope("delta.split");
 
         // Split into q/k/v and L2-normalize q/k per head: x / max(‖x‖, ε).
         let eps = cfg.rms_norm_eps as f32;
@@ -421,6 +435,8 @@ impl GatedDeltaNet {
         let q = expand(q).swap_dims(1, 2); // [b, hv, t, ds]
         let k = expand(k).swap_dims(1, 2);
         let v = v.swap_dims(1, 2);
+        drop(_s_split);
+        let _s_recur = crate::prof::scope("delta.recur");
 
         // The recurrence, one token at a time. State S[b, h, i, j]:
         // i indexes the key dim, j the value dim.
@@ -454,6 +470,8 @@ impl GatedDeltaNet {
         }
         cache.state = Some(s);
         let o = Tensor::cat(outs, 2); // [b, hv, t, ds]
+        drop(_s_recur);
+        let _s = crate::prof::scope("delta.out");
 
         // Gated RMSNorm per value head, then flatten and project out.
         let o = self.norm.forward(o.swap_dims(1, 2)); // [b, t, hv, ds]
@@ -1427,6 +1445,7 @@ impl CausalLm for LoadedQwen35 {
             };
             // The rope tables and mask were built once on the entry device;
             // an attention layer elsewhere needs them there too.
+            let _s_glue_rope = crate::prof::scope("glue.rope");
             let (cos_l, sin_l) = if cos.device() == layer_device {
                 (cos.clone(), sin.clone())
             } else {
@@ -1435,6 +1454,7 @@ impl CausalLm for LoadedQwen35 {
             let mask_l = mask
                 .as_ref()
                 .map(|m| if m.device() == layer_device { m.clone() } else { m.clone().to_device(&layer_device) });
+            drop(_s_glue_rope);
             let h = match (&layer.self_attn, &layer.linear_attn, kv) {
                 (Some(attn), None, Qwen35Kv::Attn(kv_state)) => {
                     let _s = crate::prof::scope("attn.full");
@@ -1446,7 +1466,10 @@ impl CausalLm for LoadedQwen35 {
                 }
                 _ => unreachable!("qwen35 forward: layer/cache kind mismatch"),
             };
-            x = x.add(h);
+            {
+                let _s = crate::prof::scope("glue.resid1");
+                x = x.add(h);
+            }
             let h2 = {
                 let _s = crate::prof::scope("norm2");
                 layer.post_attn_norm.forward(x.clone())
@@ -1477,6 +1500,7 @@ impl CausalLm for LoadedQwen35 {
                 if let Some(plan) = &self.ffn_plan
                     && let Some(sched) = plan.layers.get(li)
                 {
+                    let _s = crate::prof::scope("glue.sched");
                     pool.apply_schedule(li, sched, device);
                 }
                 // Remote clusters of a partitioned FFN (exact sum; skip only
@@ -1498,10 +1522,14 @@ impl CausalLm for LoadedQwen35 {
                     pool.run_dense(li, h2.reshape([b * tt, hd]), skip)
                 };
                 if let Some(remote) = remote {
+                    let _s = crate::prof::scope("glue.merge");
                     ffn = ffn.add(remote.reshape([b, tt, hd]));
                 }
             }
-            x = x.add(ffn);
+            {
+                let _s = crate::prof::scope("glue.resid2");
+                x = x.add(ffn);
+            }
         }
         // The final norm and head may live elsewhere than the last layer.
         let head_device = self.model.norm.gamma.val().device();
