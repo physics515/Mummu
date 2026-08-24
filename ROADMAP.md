@@ -536,6 +536,65 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       on a model that fits one card would make every small model 2.4x slower to buy placement
       flexibility it never uses. The generalization is right; it needs the planner to skip partitioning
       when scheduler A puts everything on one device.
+- [x] **The placement-dependent decode panic, root-caused: burn's wgpu q_matmul cannot launch some
+      m=1 x Q8 shapes — so wgpu now always dequantizes before the multiply.** *(2026-08-24)* The
+      symptom seen twice (iteration 4, and again after the drill-down deploy): prefill works, the first
+      single-token decode step kills the generation, and whether it happens depends on the tier plan.
+      Reproduced with a captured backtrace: `cubecl-std quant/view.rs:223 — quantized view float vector
+      size 1 must be a positive multiple of num_quants 4`, on the enqueue thread. `num_quants 4` is
+      Q8S; the kernel chosen for an m=1 matmul vectorizes the float side at 1 for some weight widths,
+      and the cluster grouping decides the widths — which is why iteration 5's placement "fixed" it and
+      a later plan brought it back. NOT the retracted probe-artifact claim: this one has a backtrace
+      from production and a deterministic reproduction.
+      Fix in `nn::compute_weight`: on wgpu (discrete and integrated), a quantized weight is always
+      dequantized before `matmul`. Measured cost: none — 1.61 ms native vs 1.61 ms dequantized for a
+      full-width FFN matmul, bit-identical results. Storage stays packed, so capacity is untouched;
+      CUDA keeps its probed native path. Known remaining exposure, deliberately not patched yet:
+      `qwen35::qlinear` multiplies `Param` weights raw, so a future whole-model-on-wgpu load at Q8
+      (the layered path) would hit the same kernel gap — route it through the same guard when that
+      path comes back into use.
+- [x] **Surviving memory pressure: bounded dequantize transients, an unquantized iGPU, and partials
+      that fail loudly.** *(2026-08-24)* The wgpu dequantize guard (previous entry) traded a panic for
+      an OOM: per-call dequantize of a ~19-cluster group is a ~210 MB f32 transient, cubecl's pool
+      allocates ~1 GiB chunks to hold those, and with other apps holding 5 GiB of the card the discrete
+      GPU died around the 8th token. Three changes, each earning its place the hard way:
+      **(1) Accelerator executor groups cap at 8 clusters** (`WGPU_GROUP_MAX_CLUSTERS`): transients drop
+      to ~90 MB, and uniform widths let the pool and autotune converge on a handful of shapes instead of
+      one per layer. Dispatch cost is noise — the full per-cluster split measured 2.4x, so ~3 groups
+      instead of 1 is a few percent. The host keeps whole groups; flex has no pool chunking.
+      **(2) The integrated GPU never touches a quantized weight** — its ladder is F32-only. Both packed
+      options broke on it in production (the m=1 kernel panic; the dequantize churn), its memory is
+      system RAM where f32 residency is the cheap resource, and f32 is what its 14.15 ms/cluster rating
+      was measured on. Two follow-on bugs from this change, both caught before merge: the
+      source-precision cap emptied an [F32] ladder and the empty-ladder fallback pushed a hardcoded Q4 —
+      silently re-arming the exact kernels the ladder was narrowed to avoid (fallback now keeps the
+      device's own coarsest rung); and with F32 the expensive slot, phase-1 placement's "strictly
+      faster only" gate made the iGPU **unreachable** — admission parks everything on the cheap host
+      slot, and 71 &lt; 72 meant zero clusters ever moved to it (found by adversarial review, verified
+      line-by-line against `plan_tiers`). Phase 1 now trusts scheduler A's quota as the arbiter: an
+      equal-speed idle device relieves a holder that is past its balanced share, which the
+      trunk-preloaded host always is. Pinned by `an_equal_speed_idle_device_relieves_an_overloaded_one`.
+      **(3) A panicking FFN worker now fails the generation instead of the answer.** `run_dense`'s
+      parallel path collected partials with `h.join().ok()`, so a worker that died from the iGPU OOM
+      had its device's entire cluster contribution silently dropped from the FFN sum — producing a
+      fluent, wrong reply ("Blue, red, and green." with 562 clusters missing from every layer). Worker
+      panics now `resume_unwind` on the caller. A wrong answer that parses is strictly worse than an
+      error.
+      **(4) The dequantize guard narrowed to the family that actually breaks.** Every `quant/view`
+      panic in every log says `num_quants 4` — four values per u32, the 8-BIT schemes. Q4S packs eight
+      and never produced the panic; blanket-dequantizing it was pure OOM fuel (44 device-memory panics
+      in one three-request run, zero of them quantized-view). Now on wgpu only Q8S/Q8F/E4M3/E5M2
+      dequantize — small groups, tiny transients — while Q4S runs native with zero transients, at
+      measured-identical speed either way. The lesson generalizes: when a workaround's blast radius is
+      bigger than the bug's, narrow the workaround until the logs say the bug's family and nothing else.
+      **(5) ...and the transient cap turned out to be its own width bug.** With Q4 native again, three
+      fresh panics appeared reading `num_quants 8` — Q4S's variant of the same vector-size assert. The
+      8-cluster cap (added to bound dequantize transients) had forced native Q4 groups to width 4352,
+      inside the kernel's bad regime, while the organic 17-27-cluster widths had run dozens of tokens
+      across four loads without incident. The width rule lives inside cubecl's kernel selection and is
+      not knowable from outside, so the cap now applies ONLY to groups that actually dequantize (the
+      Q8 family), and native groups keep their proven organic widths. Upstream issue to file against
+      burn: wgpu q_matmul, m=1, both `num_quants 4` and `num_quants 8` reproduced with exact shapes.
 
 ## Phases
 

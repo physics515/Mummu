@@ -176,34 +176,42 @@ mod tests {
     }
 
     /// Nested guards must produce nested paths, and the folded output must
-    /// carry SELF time: the parent's bar shrinks by exactly its child's
-    /// share, or the flame graph double-counts every nanosecond.
+    /// carry SELF time: the parent's bar shrinks by its child's share, or
+    /// the flame graph double-counts every nanosecond.
+    ///
+    /// Asserted structurally, not by wall-clock bounds: outer does no work
+    /// of its own, so a correct fold gives it (near) zero self time while a
+    /// double-counting fold would credit it the child's entire sleep. The
+    /// first version bounded outer at 45 ms and flaked — Windows' ~16 ms
+    /// timer granularity plus parallel-test scheduling pushed a 20 ms sleep
+    /// to 59 ms observed.
     #[test]
     fn nested_scopes_fold_into_self_time() {
         run_isolated(|| {
             {
                 let _outer = scope("outer");
-                std::thread::sleep(Duration::from_millis(20));
                 {
                     let _inner = scope("inner");
-                    std::thread::sleep(Duration::from_millis(20));
+                    std::thread::sleep(Duration::from_millis(60));
                 }
             }
             let folded = folded();
-            let get = |needle: &str| -> u64 {
+            let get = |needle: &str| -> Option<u64> {
                 folded
                     .lines()
                     .find(|l| l.starts_with(needle))
                     .and_then(|l| l.rsplit(' ').next())
                     .and_then(|v| v.parse().ok())
-                    .unwrap_or_else(|| panic!("missing {needle:?} in {folded:?}"))
             };
-            let outer = get("outer (");
-            let inner = get("outer;inner (");
-            assert!(inner >= 15_000, "inner self ~20ms, got {inner}µs");
+            let inner = get("outer;inner (").expect("inner line present");
+            // Sleeps never return early; only overshoot is possible.
+            assert!(inner >= 50_000, "inner slept 60ms, got {inner}µs");
+            // A sub-µs outer self is dropped from the report entirely — that
+            // is the ideal outcome, not an error.
+            let outer = get("outer (").unwrap_or(0);
             assert!(
-                (15_000..=45_000).contains(&outer),
-                "outer self must exclude the child: got {outer}µs"
+                outer < inner,
+                "outer ({outer}µs) credited its child's time ({inner}µs) — double-counted"
             );
         });
     }

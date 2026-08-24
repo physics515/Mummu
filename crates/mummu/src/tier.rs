@@ -256,11 +256,26 @@ pub fn plan_tiers(
         let cur = tiers[e];
         let cur_bytes = cost_of(cur, e).expect("admitted tier has a cost");
         for &d in &by_speed {
-            if devices[d].speed <= devices[cur.device].speed {
-                break; // by_speed is descending: nothing faster remains
+            if d == cur.device {
+                continue;
             }
             if held[d] >= quota[d] {
                 continue; // scheduler A's balanced share for this device
+            }
+            // Move when the destination is faster — or when the CURRENT
+            // holder is past its own balanced share, even at equal-or-lower
+            // speed. The quota is the arbiter, not raw speed: it already
+            // prices in preloaded work, so a device level with the CPU on
+            // throughput is still a win while the CPU carries the trunk.
+            // The old strict "only strictly faster" gate made an
+            // equal-speed device UNREACHABLE — admission parks everything
+            // on the cheapest host slot, and with the integrated GPU rated
+            // 71 against the host's 72 it received zero clusters in every
+            // default plan (found by adversarial review, verified against
+            // this function line by line).
+            if devices[d].speed <= devices[cur.device].speed && held[cur.device] <= quota[cur.device]
+            {
+                continue; // no makespan gain from this move
             }
             // Cheapest rung this device accepts — capacity beats precision.
             let Some((bytes, slot)) = devices[d]
@@ -387,6 +402,51 @@ mod tests {
             plan.tiers
         );
         assert_eq!(plan.used_bytes, vec![0, 8]);
+    }
+
+    /// An equal-speed device must still receive work when the current
+    /// holder is over its balanced share. The trunk-preloaded host and the
+    /// integrated GPU are level on measured throughput; the old strictly-
+    /// faster gate made the iGPU unreachable — every cluster admitted to
+    /// the cheap host slot and stayed there, while scheduler A's quota
+    /// assumed the iGPU would carry ~a fifth of the slow-tier work.
+    #[test]
+    fn an_equal_speed_idle_device_relieves_an_overloaded_one() {
+        let devices = vec![
+            TierDevice {
+                name: "cpu".into(),
+                class: DeviceClass::Cpu,
+                ladder: vec![Precision::Q8, Precision::Q4],
+                budget_bytes: 1_000,
+                speed: 72,
+                // Busy with the trunk: its balanced share of extra work is
+                // near zero, so held > quota from the first admission.
+                preload_units: 1_000,
+            },
+            TierDevice {
+                name: "igpu".into(),
+                class: DeviceClass::IntegratedGpu,
+                // The expensive rung only — the kernel-safety shape of the
+                // real integrated GPU after the source cap.
+                ladder: vec![Precision::F32],
+                budget_bytes: 1_000,
+                speed: 71,
+                preload_units: 0,
+            },
+        ];
+        let costs = vec![cost(1, 2, 8); 8];
+        let plan = plan_tiers(&devices, &costs, &[]).unwrap();
+        let on_igpu = plan.tiers.iter().filter(|t| t.device == 1).count();
+        assert!(
+            on_igpu > 0,
+            "the idle equal-speed device took nothing: {:?}",
+            plan.tiers
+        );
+        assert!(
+            plan.tiers.iter().filter(|t| t.device == 1).all(|t| t.precision == Precision::F32),
+            "only its own ladder's rung may be used: {:?}",
+            plan.tiers
+        );
     }
 
     /// ...and when the fast device is genuinely full, hotness still decides
