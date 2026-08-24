@@ -207,6 +207,23 @@ fn permute_cols(values: &[f32], rows: usize, cols: usize, perm: &[usize]) -> Vec
     out
 }
 
+/// The FFN entry names of every trunk layer — the partitioner's input.
+///
+/// Not architecture-specific: Qwen2, Qwen3, LFM2 and Qwen3.5 all store the
+/// standard GGUF triple, so this lives here rather than in any one model.
+/// A model whose FFN is named differently, or which has none, supplies its
+/// own list (or an empty one).
+#[must_use]
+pub fn ffn_names(trunk_layers: usize) -> Vec<FfnNames> {
+    (0..trunk_layers)
+        .map(|l| FfnNames {
+            gate: format!("blk.{l}.ffn_gate.weight"),
+            up: format!("blk.{l}.ffn_up.weight"),
+            down: format!("blk.{l}.ffn_down.weight"),
+        })
+        .collect()
+}
+
 /// Permute the rows of a row-major `[rows, cols]` matrix.
 fn permute_rows(values: &[f32], rows: usize, cols: usize, perm: &[usize]) -> Vec<f32> {
     let mut out = Vec::with_capacity(values.len());

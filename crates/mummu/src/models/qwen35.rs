@@ -983,17 +983,12 @@ pub fn pack_actions(
     })
 }
 
-/// The FFN entry names of every trunk layer — the partitioner's input.
-#[must_use]
-pub fn ffn_names(trunk_layers: usize) -> Vec<crate::partition::FfnNames> {
-    (0..trunk_layers)
-        .map(|l| crate::partition::FfnNames {
-            gate: format!("blk.{l}.ffn_gate.weight"),
-            up: format!("blk.{l}.ffn_up.weight"),
-            down: format!("blk.{l}.ffn_down.weight"),
-        })
-        .collect()
-}
+/// The FFN entry names of every trunk layer.
+///
+/// Re-exported from [`crate::partition::ffn_names`], which is where it
+/// belongs: every dense decoder in the zoo stores the same GGUF triple, so
+/// this is not a qwen35 fact. Kept as a path so existing callers do not move.
+pub use crate::partition::ffn_names;
 
 /// Pack tensor name → parameter path (the pack keeps GGUF names).
 fn pack_param_path(name: &str, trunk_layers: usize) -> Option<String> {
