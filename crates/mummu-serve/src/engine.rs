@@ -786,6 +786,7 @@ fn load_ffn_group_on(
         )));
     }
     Ok(std::sync::Arc::new(mummu::nn::DeviceExpert {
+        native_ok: std::sync::atomic::AtomicBool::new(true),
         weights,
         device,
         tier,
@@ -1669,7 +1670,14 @@ fn precision_for(policy: mummu::quant::QuantPolicy) -> mummu::pack::Precision {
         QuantPolicy::Q2 | QuantPolicy::Q4 => Precision::Q4,
         QuantPolicy::Q8 => Precision::Q8,
         QuantPolicy::F16 => Precision::F16,
-        QuantPolicy::Off => Precision::F32,
+        // Float placements read the HALF-WIDTH blob: `read_floats` widens it
+        // to the same f32 tensor in RAM, and the disk read halves — the pack
+        // lives on an HDD RAID that pegs at 100% for the whole 8-10 minute
+        // load, and the trunk alone is 37 GB at f32 against 18.5 at f16.
+        // Numerically: f16 rounding is ~1e-3 relative against the f32 blob,
+        // an order below the Q8 rung's measured 5.8e-3 — and both blobs are
+        // upcasts of the same 4.57 bits/param source.
+        QuantPolicy::Off => Precision::F16,
     }
 }
 

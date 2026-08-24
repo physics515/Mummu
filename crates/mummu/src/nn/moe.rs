@@ -331,6 +331,23 @@ pub trait ExpertExec: Send + Sync {
     /// data on-device when the caller is already on this expert's device.
     fn run(&self, x: &[f32], rows: usize, hidden: usize) -> Vec<f32>;
 
+    /// Like [`Self::run_tensor`], but the result stays wherever this expert
+    /// computed it — the caller moves it later, batched with every other
+    /// partial, so the enqueue returns without waiting on the device.
+    ///
+    /// Default: `run_tensor`, whose result is already caller-resident — the
+    /// later move is then a no-op. Device-pinned executors override to skip
+    /// their trailing move.
+    fn run_tensor_resident(&self, x: Tensor<2>) -> Tensor<2> {
+        self.run_tensor(x)
+    }
+
+    /// Stop handing this executor's packed weights to the native quantized
+    /// matmul — dequantize before every multiply instead. Called after a
+    /// caught kernel-gap panic; default is a no-op for executors that never
+    /// take the native path.
+    fn disable_native(&self) {}
+
     /// Bring this expert's weights onto `device` (the working set's
     /// prefetch). Default: nothing — an executor pinned to one device is
     /// already where it will run, so staging it is a no-op rather than an
@@ -384,6 +401,10 @@ pub struct DeviceExpert {
     pub device: Device,
     pub tier: crate::tier::Tier,
     pub bytes: u64,
+    /// Cleared the first time this group's native quantized matmul panics
+    /// (the width-dependent cubecl kernel gap); afterwards every multiply
+    /// dequantizes first. Per GROUP, because the gap is per shape.
+    pub native_ok: std::sync::atomic::AtomicBool,
 }
 
 impl ExpertExec for DeviceExpert
@@ -419,11 +440,34 @@ where
         // `to_device` is a no-op when the tensor is already here, so a
         // cluster group living on the caller's device costs zero transfers.
         let caller = x.device();
+        crate::backend::move_to(self.run_tensor_resident(x), &caller)
+    }
+
+    fn run_tensor_resident(&self, x: Tensor<2>) -> Tensor<2> {
         let xt = crate::backend::move_to(x, &self.device);
         let w = &self.weights;
-        let acts = activation::silu(xt.clone().matmul(compute_weight(&w.gate)))
-            .mul(xt.matmul(compute_weight(&w.up)));
-        crate::backend::move_to(acts.matmul(compute_weight(&w.down)), &caller)
+        // After a caught kernel-gap panic, `native_ok` is false and packed
+        // weights are dequantized up front — the path that is correct at
+        // every width, at measured-identical speed for a single group.
+        let ready = |p: &burn::module::Param<Tensor<2>>| -> Tensor<2> {
+            if self.native_ok.load(std::sync::atomic::Ordering::Relaxed) {
+                compute_weight(p)
+            } else {
+                let t = p.val();
+                match t.dtype() {
+                    DType::QFloat(_) => t.dequantize(),
+                    _ => t,
+                }
+            }
+        };
+        let acts = activation::silu(xt.clone().matmul(ready(&w.gate)))
+            .mul(xt.matmul(ready(&w.up)));
+        acts.matmul(ready(&w.down))
+    }
+
+    fn disable_native(&self) {
+        self.native_ok
+            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn gate_energy(&self, x: &[f32], rows: usize, hidden: usize) -> Vec<f32> {
@@ -877,6 +921,151 @@ impl ExpertPool {
         used
     }
 
+}
+
+/// Run one dense executor with the adaptive native fallback: a panic from
+/// the width-dependent cubecl kernel gap (quant/view vector-size assert,
+/// `num_quants 4`/`8`) is caught ONCE, the group is switched to
+/// dequantize-first, and the same input is retried. Any second panic — a
+/// genuine failure, OOM included — propagates loudly as ever.
+///
+/// The catch is sound here for the same reason `native_qmatmul_ok` could
+/// probe this panic: it fires at kernel expand on the calling thread, before
+/// submission, and the device server measurably survives it.
+fn run_with_native_fallback(
+    exec: &std::sync::Arc<dyn ExpertExec>,
+    xt: &Tensor<2>,
+) -> Tensor<2> {
+    let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        exec.run_tensor(xt.clone())
+    }));
+    match attempt {
+        Ok(y) => y,
+        Err(_) => {
+            eprintln!(
+                "[mummu] native quantized matmul panicked for one expert group \
+                 (cubecl kernel gap; width-dependent) — group switched to \
+                 dequantize-first and retried"
+            );
+            exec.disable_native();
+            exec.run_tensor(xt.clone())
+        }
+    }
+}
+
+/// One layer's remote FFN, in flight: each device's worker thread is
+/// computing AND draining its own device — concurrently, exactly as the old
+/// synchronous path did — and only the JOIN is deferred, so the caller's
+/// local slab runs while the devices chew.
+///
+/// This is the second design. The first deferred the device sync itself
+/// into [`Self::resolve`], and adversarial review proved against the
+/// burn-fusion sources that nothing executes at enqueue — the worker
+/// streams' queued IR first ran inside resolve's drain, and resolving
+/// partials one at a time serialized the devices where the old workers
+/// drained them in parallel (wall `local + T_a + T_b` instead of
+/// `local + max(T_a, T_b)`). Deferring only the join keeps the proven
+/// concurrent drains and still buys the overlap: per-layer wall becomes
+/// `max(local, T_a, T_b)` plus the join.
+pub struct PendingRemote {
+    handles: Vec<std::thread::JoinHandle<Option<Tensor<2>>>>,
+}
+
+impl PendingRemote {
+    /// Join the workers and sum their caller-resident partials. `merge.join`
+    /// in a profile is the residual wait after overlap; `merge.sum` the
+    /// additions.
+    #[must_use]
+    pub fn resolve(self) -> Option<Tensor<2>> {
+        let mut out: Option<Tensor<2>> = None;
+        for handle in self.handles {
+            let partial = {
+                let _s = crate::prof::scope("merge.join");
+                match handle.join() {
+                    Ok(p) => p,
+                    // Same rule as everywhere in this pool: a dead worker is
+                    // a dead generation, never a silently smaller sum.
+                    Err(payload) => std::panic::resume_unwind(payload),
+                }
+            };
+            if let Some(p) = partial {
+                let _s = crate::prof::scope("merge.sum");
+                out = Some(match out {
+                    Some(acc) => acc.add(p),
+                    None => p,
+                });
+            }
+        }
+        out
+    }
+}
+
+impl ExpertPool {
+    /// The exact dense remote FFN with a deferred join: spawn one worker per
+    /// device (the bounded-stream rule), each running its members and moving
+    /// its accumulated partial to the caller — the drain — on its own
+    /// thread, then return without joining. Skip-mode (tau > 0) stays on
+    /// [`Self::run_dense`]: it needs host energies up front.
+    ///
+    /// Plain `std::thread::spawn`, not a scope: the whole point is that the
+    /// threads outlive this call. Everything moved in is `Arc`s and owned
+    /// tensors. ~2 spawns per layer is microseconds against multi-ms drains;
+    /// a persistent pool is the upgrade if a profile ever says otherwise.
+    pub fn run_dense_pending(&self, layer: usize, xt: Tensor<2>) -> Option<PendingRemote> {
+        let n = self.row_len(layer);
+        if n == 0 {
+            return None;
+        }
+        let [bt, _h] = xt.dims();
+        let execs: Vec<std::sync::Arc<dyn ExpertExec>> =
+            (0..n).map(|e| self.get(layer, e)).collect();
+
+        let mut by_device: Vec<(String, Vec<std::sync::Arc<dyn ExpertExec>>)> = Vec::new();
+        for exec in &execs {
+            let key = format!("{:?}", exec.tier().device);
+            match by_device.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, list)) => list.push(exec.clone()),
+                None => by_device.push((key, vec![exec.clone()])),
+            }
+        }
+        for (e, _) in execs.iter().enumerate() {
+            self.hits[layer][e].fetch_add(bt as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.dense_rows[0].fetch_add(bt as u64, std::sync::atomic::Ordering::Relaxed);
+        self.dense_rows[1].fetch_add(bt as u64, std::sync::atomic::Ordering::Relaxed);
+
+        let handles: Vec<std::thread::JoinHandle<Option<Tensor<2>>>> = by_device
+            .into_iter()
+            .map(|(key, members)| {
+                let xt = xt.clone();
+                std::thread::spawn(move || {
+                    let _w = crate::prof::scope("ffn_worker");
+                    let _d = crate::prof::scope(key);
+                    let mut acc: Option<Tensor<2>> = None;
+                    for exec in &members {
+                        // The MOVING call via the fallback wrapper: the
+                        // trailing move_to is this worker's drain, concurrent
+                        // with the other workers and the caller's local slab;
+                        // a kernel-gap panic downgrades the group and retries
+                        // instead of killing the generation.
+                        let y = run_with_native_fallback(exec, &xt);
+                        acc = Some(match acc {
+                            Some(a) => a.add(y),
+                            None => y,
+                        });
+                    }
+                    // Force the accumulated partial to be DONE before the
+                    // join sees it: flex is eager, so the adds above already
+                    // ran; the executor's own move_to synced the device.
+                    acc
+                })
+            })
+            .collect();
+        Some(PendingRemote { handles })
+    }
+}
+
+impl ExpertPool {
     /// Dense-model FFN path (P9 stage 3c): run **every** executor of
     /// `layer` on every row and sum — the remote clusters' share of a
     /// partitioned SwiGLU (the local slab runs on the model's own device).
@@ -937,7 +1126,7 @@ impl ExpertPool {
             if by_device.len() < 2 {
                 let mut out: Option<Tensor<2>> = None;
                 for exec in &execs {
-                    let y = exec.run_tensor(xt.clone());
+                    let y = run_with_native_fallback(exec, &xt);
                     out = Some(match out {
                         Some(acc) => acc.add(y),
                         None => y,
@@ -1336,7 +1525,7 @@ mod tests {
         let tier = Tier { device: 0, precision: Precision::F32 };
         let staged = StagedExpert::new(split(0), device.clone(), tier, 0);
         // A pinned reference on the same device, for comparison.
-        let pinned = DeviceExpert { weights: split(0), device: device.clone(), tier, bytes: 0 };
+        let pinned = DeviceExpert { weights: split(0), device: device.clone(), tier, bytes: 0, native_ok: std::sync::atomic::AtomicBool::new(true) };
 
         let x = Tensor::<2>::from_data(
             TensorData::new((0..HIDDEN).map(|i| (i as f32) * 0.25 - 0.5).collect::<Vec<f32>>(), [1, HIDDEN]),
@@ -1406,6 +1595,7 @@ mod tests {
         // marker type), so the closure clones per expert instead of copying.
         let exec = |e: usize, tier: Tier| -> Arc<dyn ExpertExec> {
             Arc::new(DeviceExpert {
+                native_ok: std::sync::atomic::AtomicBool::new(true),
                 weights: split(e),
                 device: device.clone(),
                 tier,

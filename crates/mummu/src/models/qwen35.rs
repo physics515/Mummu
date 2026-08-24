@@ -1474,6 +1474,26 @@ impl CausalLm for LoadedQwen35 {
                 let _s = crate::prof::scope("norm2");
                 layer.post_attn_norm.forward(x.clone())
             };
+            // ENQUEUE-FIRST: hand the remote FFN to the accelerators before
+            // the local slab runs, so they work while the host does. The
+            // profile that motivated this: the local mlp (0.67 s/token) ran
+            // serially in FRONT of a 1.59 s/token device wait, card idle.
+            // Exact-mode only — the skip path needs host energies up front
+            // and keeps the sequential call below.
+            let pending = match &self.ffn_pool {
+                Some(pool) if self.ffn_skip_tau <= 0.0 => {
+                    if let Some(plan) = &self.ffn_plan
+                        && let Some(sched) = plan.layers.get(li)
+                    {
+                        let _s = crate::prof::scope("glue.sched");
+                        pool.apply_schedule(li, sched, device);
+                    }
+                    let [b, tt, hd] = h2.dims();
+                    let _s = crate::prof::scope("ffn.enqueue");
+                    pool.run_dense_pending(li, h2.clone().reshape([b * tt, hd]))
+                }
+                _ => None,
+            };
             // SwiGLU spelled through qlinear (the mlp's own forward would
             // reshape a packed quantized weight — see qlinear).
             // Three separate scopes: gate/up multiply [1,h]x[h,inter] while
@@ -1491,7 +1511,13 @@ impl CausalLm for LoadedQwen35 {
                 let _s = crate::prof::scope("mlp.down");
                 qlinear(&layer.mlp.down_proj, gate.clone().mul(up))
             };
-            if let Some(pool) = &self.ffn_pool {
+            if let Some(pending) = pending {
+                let _s = crate::prof::scope("glue.merge");
+                if let Some(remote) = pending.resolve() {
+                    let [b, tt, hd] = ffn.dims();
+                    ffn = ffn.add(remote.reshape([b, tt, hd]));
+                }
+            } else if let Some(pool) = &self.ffn_pool {
                 // Working set: issue THIS layer's staging decisions before
                 // its FFN runs, so the transfers for the next layer overlap
                 // this layer's compute instead of stalling in front of it.

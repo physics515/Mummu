@@ -655,7 +655,7 @@ impl Pack {
                 Ok(Tensor::from_data(quantized_tensor_data(&v, &s, [rows, width], scheme), device))
             }
             Precision::F16 | Precision::F32 => {
-                let all = self.read_f32(entry)?;
+                let all = self.read_floats(entry, precision)?;
                 let mut v = Vec::with_capacity(rows * width);
                 for r in 0..rows {
                     for &(start, len) in ranges {
@@ -695,7 +695,7 @@ impl Pack {
                 Ok(Tensor::from_data(quantized_tensor_data(&v, &s, [height, cols], scheme), device))
             }
             Precision::F16 | Precision::F32 => {
-                let all = self.read_f32(entry)?;
+                let all = self.read_floats(entry, precision)?;
                 let mut v = Vec::with_capacity(height * cols);
                 for &(start, len) in ranges {
                     v.extend_from_slice(&all[start * cols..(start + len) * cols]);
@@ -723,6 +723,36 @@ impl Pack {
         let mut buf = vec![0u8; usize::try_from(len).expect("blob fits")];
         file.read_exact(&mut buf).map_err(|e| format!("read {}: {e}", precision.blob_name()))?;
         Ok(buf)
+    }
+
+    /// The f32 values of a tensor read from the REQUESTED float level when
+    /// stored: `F16` reads the half-width blob and widens — same tensor in
+    /// RAM, half the bytes off the disk, which matters because the pack
+    /// lives on an HDD RAID that runs at 100% for the whole load. Falls back
+    /// to [`Self::read_f32`]'s best-available order when the requested level
+    /// is absent.
+    ///
+    /// Exists because the float arms of `tensor`/`tensor_cols`/`tensor_rows`
+    /// used to funnel through `read_f32`, which prefers f32 — so every
+    /// "F16" load silently read `f32.bin`, including the probe that once
+    /// "measured" F16 speed on flex.
+    pub fn read_floats(
+        &self,
+        entry: &TensorEntry,
+        prefer: Precision,
+    ) -> Result<Vec<f32>, String> {
+        if prefer == Precision::F16
+            && let Some(b) = entry.precisions.get(&Precision::F16)
+        {
+            let bytes = self.read_range(Precision::F16, b.values_offset, b.values_len)?;
+            return Ok(bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| half::f16::from_le_bytes(*c).to_f32())
+                .collect());
+        }
+        self.read_f32(entry)
     }
 
     /// The f32 values of a tensor at its best float level (f32, else f16
@@ -810,7 +840,7 @@ impl Pack {
                 Ok(Tensor::from_data(data, device))
             }
             Precision::F16 | Precision::F32 => {
-                let values = self.read_f32(entry)?;
+                let values = self.read_floats(entry, precision)?;
                 let dtype = crate::backend::float_dtype();
                 Ok(Tensor::from_data(TensorData::new(values, shape), (device, dtype)))
             }
