@@ -12,71 +12,73 @@
 //! pretending. Model names are mummu's catalog names; a trailing `:latest`
 //! (which ollama CLIs append) is accepted and stripped.
 
+use std::convert::Infallible;
 use std::ops::ControlFlow;
-use std::sync::Arc;
-use std::sync::mpsc::{SyncSender, sync_channel};
 use std::time::Instant;
 
+use axum::Router;
+use axum::body::{Body, Bytes};
+use axum::extract::DefaultBodyLimit;
+use axum::http::header;
+use axum::response::{IntoResponse, Response};
+use axum::routing::{delete as delete_route, get, post};
 use mummu::manage::ModelManager;
 use mummu::registry::{ModelSpec, WeightFormat};
 use serde::Deserialize;
 use serde_json::json;
-use tiny_http::{Header, Method, Request, Response, Server};
+use tokio::sync::mpsc;
 
 use crate::{
-    ChannelReader, ChatMessage, DEFAULT_MAX_TOKENS, MAX_MAX_TOKENS, engine, models_root,
-    read_json, respond_json, to_turns,
+    ChatMessage, DEFAULT_MAX_TOKENS, MAX_BODY_BYTES, MAX_MAX_TOKENS, blocking, engine,
+    json_response, models_root, parse_json, to_turns,
 };
 
-/// Spawn the shim's listener + workers; returns quietly (with a log line)
-/// when the address can't be bound so the native API keeps serving.
-pub(crate) fn spawn(addr: &str) {
-    let server = match Server::http(addr) {
-        Ok(s) => Arc::new(s),
-        Err(e) => {
-            eprintln!("[mummu-serve] ollama shim: bind {addr} failed ({e}) — shim disabled");
-            return;
-        }
-    };
-    eprintln!("[mummu-serve] ollama-compatible shim listening on http://{addr}");
-    for _ in 0..2 {
-        let server = Arc::clone(&server);
-        std::thread::spawn(move || {
-            while let Ok(req) = server.recv() {
-                handle(req);
-            }
-        });
-    }
+/// The shim's routes. Binding and serving them (and draining them on
+/// shutdown) belongs to `crate::serve_on`, which owns both listeners.
+pub(crate) fn router() -> Router {
+    Router::new()
+        // `get` also answers HEAD (axum strips the body), which is what the
+        // sync shim spelled out as a separate `HEAD /` arm.
+        .route("/", get(root))
+        .route("/api/version", get(version))
+        .route("/api/tags", get(tags))
+        .route("/api/ps", get(ps))
+        .route("/api/show", post(show))
+        .route("/api/chat", post(chat))
+        .route("/api/generate", post(generate))
+        .route("/api/pull", post(pull))
+        .route("/api/delete", delete_route(delete))
+        .route("/api/embed", post(no_embeddings))
+        .route("/api/embeddings", post(no_embeddings))
+        .route("/api/create", post(unsupported))
+        .route("/api/copy", post(unsupported))
+        .route("/api/push", post(unsupported))
+        .fallback(not_found_path)
+        .method_not_allowed_fallback(not_found_path)
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES + 1))
 }
 
-fn handle(req: Request) {
-    let method = req.method().clone();
-    let url = req.url().to_string();
-    let path = url.split('?').next().unwrap_or("").to_string();
-    let result = match (&method, path.as_str()) {
-        (Method::Get, "/") => req.respond(Response::from_string("Ollama is running")),
-        (Method::Head, "/") => req.respond(Response::empty(200)),
-        (Method::Get, "/api/version") => respond_json(req, 200, json!({"version": "0.1.0"})),
-        (Method::Get, "/api/tags") => tags(req),
-        (Method::Get, "/api/ps") => ps(req),
-        (Method::Post, "/api/show") => show(req),
-        (Method::Post, "/api/chat") => chat(req),
-        (Method::Post, "/api/generate") => generate(req),
-        (Method::Post, "/api/pull") => pull(req),
-        (Method::Delete, "/api/delete") => delete(req),
-        (Method::Post, "/api/embed") | (Method::Post, "/api/embeddings") => respond_json(
-            req,
-            501,
-            json!({"error": "embeddings are not supported by the mummu-serve shim"}),
-        ),
-        (Method::Post, "/api/create") | (Method::Post, "/api/copy") | (Method::Post, "/api/push") => {
-            respond_json(req, 501, json!({"error": "not supported by the mummu-serve shim"}))
-        }
-        _ => respond_json(req, 404, json!({"error": "not found"})),
-    };
-    if let Err(e) = result {
-        eprintln!("[mummu-serve] shim {method} {path}: respond failed: {e}");
-    }
+async fn root() -> &'static str {
+    "Ollama is running"
+}
+
+async fn version() -> Response {
+    json_response(200, json!({"version": "0.1.0"}))
+}
+
+async fn no_embeddings() -> Response {
+    json_response(
+        501,
+        json!({"error": "embeddings are not supported by the mummu-serve shim"}),
+    )
+}
+
+async fn unsupported() -> Response {
+    json_response(501, json!({"error": "not supported by the mummu-serve shim"}))
+}
+
+async fn not_found_path() -> Response {
+    json_response(404, json!({"error": "not found"}))
 }
 
 // ---------------------------------------------------------------------------
@@ -166,35 +168,42 @@ fn model_entry(spec: &ModelSpec, root: &std::path::Path) -> serde_json::Value {
 // Catalog endpoints
 // ---------------------------------------------------------------------------
 
-fn tags(req: Request) -> std::io::Result<()> {
-    let root = models_root();
-    let manager = ModelManager::new(root.clone());
-    let models: Vec<_> = manager
-        .catalog()
-        .iter()
-        .filter(|s| !matches!(s.architecture, mummu::registry::Architecture::MiniLm))
-        .filter(|s| engine::is_installed(s, &root))
-        .map(|s| model_entry(s, &root))
-        .collect();
-    respond_json(req, 200, json!({"models": models}))
+async fn tags() -> Response {
+    // `dir_size` walks every installed model's directory — disk work.
+    blocking(|| {
+        let root = models_root();
+        let manager = ModelManager::new(root.clone());
+        let models: Vec<_> = manager
+            .catalog()
+            .iter()
+            .filter(|s| !matches!(s.architecture, mummu::registry::Architecture::MiniLm))
+            .filter(|s| engine::is_installed(s, &root))
+            .map(|s| model_entry(s, &root))
+            .collect();
+        json_response(200, json!({"models": models}))
+    })
+    .await
 }
 
-fn ps(req: Request) -> std::io::Result<()> {
-    let root = models_root();
-    let manager = ModelManager::new(root.clone());
-    let resident = engine::resident_dirs();
-    let models: Vec<_> = manager
-        .catalog()
-        .iter()
-        .filter(|s| resident.iter().any(|d| *d == s.dir(&root)))
-        .map(|s| {
-            let mut entry = model_entry(s, &root);
-            entry["expires_at"] = json!(now_rfc3339());
-            entry["size_vram"] = entry["size"].clone();
-            entry
-        })
-        .collect();
-    respond_json(req, 200, json!({"models": models}))
+async fn ps() -> Response {
+    blocking(|| {
+        let root = models_root();
+        let manager = ModelManager::new(root.clone());
+        let resident = engine::resident_dirs();
+        let models: Vec<_> = manager
+            .catalog()
+            .iter()
+            .filter(|s| resident.iter().any(|d| *d == s.dir(&root)))
+            .map(|s| {
+                let mut entry = model_entry(s, &root);
+                entry["expires_at"] = json!(now_rfc3339());
+                entry["size_vram"] = entry["size"].clone();
+                entry
+            })
+            .collect();
+        json_response(200, json!({"models": models}))
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -203,18 +212,18 @@ struct NameRequest {
     model: String,
 }
 
-fn show(req: Request) -> std::io::Result<()> {
-    let Some((req, parsed)) = read_json::<NameRequest>(req)? else {
-        return Ok(());
+async fn show(body: Bytes) -> Response {
+    let parsed: NameRequest = match parse_json(&body) {
+        Ok(p) => p,
+        Err(response) => return *response,
     };
     let root = models_root();
     let manager = ModelManager::new(root);
     let Some(spec) = resolve(&manager, &parsed.model) else {
-        return not_found(req, &parsed.model);
+        return not_found(&parsed.model);
     };
     let family = format!("{:?}", spec.architecture).to_lowercase();
-    respond_json(
-        req,
+    json_response(
         200,
         json!({
             "modelfile": format!("# mummu catalog model {} ({})", spec.name, spec.repo),
@@ -227,58 +236,64 @@ fn show(req: Request) -> std::io::Result<()> {
     )
 }
 
-fn delete(req: Request) -> std::io::Result<()> {
-    let Some((req, parsed)) = read_json::<NameRequest>(req)? else {
-        return Ok(());
+async fn delete(body: Bytes) -> Response {
+    let parsed: NameRequest = match parse_json(&body) {
+        Ok(p) => p,
+        Err(response) => return *response,
     };
-    let manager = ModelManager::new(models_root());
-    let Some(spec) = resolve(&manager, &parsed.model) else {
-        return not_found(req, &parsed.model);
-    };
-    engine::unload_all(); // the dir may be the resident model's backing store
-    match manager.remove(&spec.name) {
-        Ok(()) => respond_json(req, 200, json!({})),
-        Err(e) => respond_json(req, 500, json!({"error": e})),
-    }
+    blocking(move || {
+        let manager = ModelManager::new(models_root());
+        let Some(spec) = resolve(&manager, &parsed.model) else {
+            return not_found(&parsed.model);
+        };
+        // The dir may be the resident model's backing store — refuse rather
+        // than delete files out from under a running generation.
+        if !engine::unload_all() {
+            return json_response(
+                409,
+                json!({"error": "a generation is in flight — cannot delete a model that is loaded"}),
+            );
+        }
+        match manager.remove(&spec.name) {
+            Ok(()) => json_response(200, json!({})),
+            Err(e) => json_response(500, json!({"error": e})),
+        }
+    })
+    .await
 }
 
-fn not_found(req: Request, model: &str) -> std::io::Result<()> {
-    respond_json(
-        req,
+fn not_found(model: &str) -> Response {
+    json_response(
         404,
         json!({"error": format!("model {model:?} not found, try pulling it first")}),
     )
 }
 
 // ---------------------------------------------------------------------------
-// NDJSON plumbing (ollama streams one JSON object per line)
+// NDJSON plumbing (ollama streams one JSON object per line). Same shape as
+// the native API's SSE: a worker task feeds an mpsc channel, and the
+// response body drains it — a dropped client closes the receiver, the next
+// send fails, and the worker breaks off cooperatively.
 // ---------------------------------------------------------------------------
 
-fn ndjson_frame(value: &serde_json::Value) -> Vec<u8> {
-    format!("{value}\n").into_bytes()
+fn ndjson_frame(value: &serde_json::Value) -> String {
+    format!("{value}\n")
 }
 
-fn respond_ndjson(
-    req: Request,
-    work: impl FnOnce(&SyncSender<Vec<u8>>) + Send + 'static,
-) -> std::io::Result<()> {
-    let (tx, rx) = sync_channel::<Vec<u8>>(64);
-    std::thread::spawn(move || work(&tx));
-    let headers = vec![
-        Header::from_bytes(&b"Content-Type"[..], &b"application/x-ndjson"[..]).expect("static"),
-        Header::from_bytes(&b"Cache-Control"[..], &b"no-cache"[..]).expect("static"),
-    ];
-    req.respond(Response::new(
-        200.into(),
-        headers,
-        ChannelReader {
-            rx,
-            buf: Vec::new(),
-            pos: 0,
-        },
-        None,
-        None,
-    ))
+fn ndjson_response(mut rx: mpsc::UnboundedReceiver<serde_json::Value>) -> Response {
+    let stream = async_stream::stream! {
+        while let Some(frame) = rx.recv().await {
+            yield Ok::<String, Infallible>(ndjson_frame(&frame));
+        }
+    };
+    (
+        [
+            (header::CONTENT_TYPE, "application/x-ndjson"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        Body::from_stream(stream),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -363,47 +378,32 @@ struct RunPlan {
     max_tokens: usize,
 }
 
+/// Validate a request into a `RunPlan`, or hand back the error response.
 fn plan(
-    req: Request,
     model: &str,
     messages: &[ChatMessage],
     options: &OllamaOptions,
-) -> std::io::Result<Option<(Request, RunPlan)>> {
+) -> Result<RunPlan, Box<Response>> {
     let root = models_root();
     let manager = ModelManager::new(root.clone());
     let Some(spec) = resolve(&manager, model) else {
-        not_found(req, model)?;
-        return Ok(None);
+        return Err(Box::new(not_found(model)));
     };
     if !engine::is_installed(&spec, &root) {
-        not_found(req, model)?;
-        return Ok(None);
+        return Err(Box::new(not_found(model)));
     }
-    let turns = match to_turns(messages) {
-        Ok(t) => t,
-        Err(e) => {
-            respond_json(req, 400, json!({"error": e}))?;
-            return Ok(None);
-        }
-    };
-    let opts = match options.sampler() {
-        Ok(o) => o,
-        Err(e) => {
-            respond_json(req, 400, json!({"error": e}))?;
-            return Ok(None);
-        }
-    };
+    let turns = to_turns(messages).map_err(|e| json_response(400, json!({"error": e})))?;
+    let opts = options
+        .sampler()
+        .map_err(|e| json_response(400, json!({"error": e})))?;
     let max_tokens = options.max_tokens();
-    Ok(Some((
-        req,
-        RunPlan {
-            spec,
-            root,
-            turns,
-            opts,
-            max_tokens,
-        },
-    )))
+    Ok(RunPlan {
+        spec,
+        root,
+        turns,
+        opts,
+        max_tokens,
+    })
 }
 
 /// Ollama's final frame: timing in nanoseconds.
@@ -427,16 +427,17 @@ fn done_value(model: &str, r: &engine::ChatResult, started: Instant) -> serde_js
 /// Run one completion for the shim: streamed (one NDJSON frame per delta)
 /// or buffered, with `wrap` turning a text delta into the endpoint's frame
 /// shape (`message.content` for /api/chat, `response` for /api/generate).
-fn run(
-    req: Request,
+/// Either way the engine runs on a blocking thread.
+async fn run(
     p: RunPlan,
     stream: bool,
     wrap: fn(&str, &str) -> serde_json::Value,
     finish: fn(&str, &str, &engine::ChatResult, Instant) -> serde_json::Value,
-) -> std::io::Result<()> {
+) -> Response {
     let started = Instant::now();
     if stream {
-        return respond_ndjson(req, move |tx| {
+        let (tx, rx) = mpsc::unbounded_channel::<serde_json::Value>();
+        tokio::spawn(async move {
             let result = engine::run_chat(
                 &p.spec,
                 &p.root,
@@ -444,12 +445,13 @@ fn run(
                 &p.opts,
                 p.max_tokens,
                 |delta| {
-                    if tx.send(ndjson_frame(&wrap(&p.spec.name, delta))).is_err() {
+                    if tx.send(wrap(&p.spec.name, delta)).is_err() {
                         return ControlFlow::Break(());
                     }
                     ControlFlow::Continue(())
                 },
-            );
+            )
+            .await;
             let last = match result {
                 Ok(r) => finish(&p.spec.name, "", &r, started),
                 Err(e) => {
@@ -457,34 +459,37 @@ fn run(
                     json!({"error": e})
                 }
             };
-            let _ = tx.send(ndjson_frame(&last));
+            let _ = tx.send(last);
         });
+        return ndjson_response(rx);
     }
     // Non-stream: run to completion, answer with one object.
     let result = engine::run_chat(&p.spec, &p.root, &p.turns, &p.opts, p.max_tokens, |_| {
         ControlFlow::Continue(())
-    });
+    })
+    .await;
     match result {
         Ok(r) => {
             let text = r.text.clone();
-            respond_json(req, 200, finish(&p.spec.name, &text, &r, started))
+            json_response(200, finish(&p.spec.name, &text, &r, started))
         }
         Err(e) => {
             eprintln!("[mummu-serve] shim chat {}: {e}", p.spec.name);
-            respond_json(req, 500, json!({"error": e}))
+            json_response(500, json!({"error": e}))
         }
     }
 }
 
-fn chat(req: Request) -> std::io::Result<()> {
-    let Some((req, parsed)) = read_json::<OllamaChatRequest>(req)? else {
-        return Ok(());
+async fn chat(body: Bytes) -> Response {
+    let parsed: OllamaChatRequest = match parse_json(&body) {
+        Ok(p) => p,
+        Err(response) => return *response,
     };
-    let Some((req, p)) = plan(req, &parsed.model, &parsed.messages, &parsed.options)? else {
-        return Ok(());
+    let p = match plan(&parsed.model, &parsed.messages, &parsed.options) {
+        Ok(p) => p,
+        Err(response) => return *response,
     };
     run(
-        req,
         p,
         parsed.stream.unwrap_or(true),
         |model, delta| {
@@ -501,11 +506,13 @@ fn chat(req: Request) -> std::io::Result<()> {
             v
         },
     )
+    .await
 }
 
-fn generate(req: Request) -> std::io::Result<()> {
-    let Some((req, parsed)) = read_json::<OllamaGenerateRequest>(req)? else {
-        return Ok(());
+async fn generate(body: Bytes) -> Response {
+    let parsed: OllamaGenerateRequest = match parse_json(&body) {
+        Ok(p) => p,
+        Err(response) => return *response,
     };
     // Ollama applies the model's chat template to `prompt` (unless raw);
     // mirror that by wrapping it as (system +) user turns.
@@ -520,11 +527,11 @@ fn generate(req: Request) -> std::io::Result<()> {
         role: "user".into(),
         content: parsed.prompt.clone(),
     });
-    let Some((req, p)) = plan(req, &parsed.model, &messages, &parsed.options)? else {
-        return Ok(());
+    let p = match plan(&parsed.model, &messages, &parsed.options) {
+        Ok(p) => p,
+        Err(response) => return *response,
     };
     run(
-        req,
         p,
         parsed.stream.unwrap_or(true),
         |model, delta| {
@@ -541,6 +548,7 @@ fn generate(req: Request) -> std::io::Result<()> {
             v
         },
     )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -554,14 +562,14 @@ struct PullRequest {
     stream: Option<bool>,
 }
 
-fn pull(req: Request) -> std::io::Result<()> {
-    let Some((req, parsed)) = read_json::<PullRequest>(req)? else {
-        return Ok(());
+async fn pull(body: Bytes) -> Response {
+    let parsed: PullRequest = match parse_json(&body) {
+        Ok(p) => p,
+        Err(response) => return *response,
     };
     let manager = ModelManager::new(models_root());
     let Some(spec) = resolve(&manager, &parsed.model) else {
-        return respond_json(
-            req,
+        return json_response(
             404,
             json!({"error": format!(
                 "model {:?} is not in the mummu catalog (the shim can only pull catalog models)",
@@ -571,13 +579,19 @@ fn pull(req: Request) -> std::io::Result<()> {
     };
     let stream = parsed.stream.unwrap_or(true);
     if !stream {
-        let result = manager.install(&spec.name, |_| {});
-        return match result {
-            Ok(_) => respond_json(req, 200, json!({"status": "success"})),
-            Err(e) => respond_json(req, 500, json!({"error": e})),
-        };
+        let name = spec.name.clone();
+        return blocking(move || {
+            let manager = ModelManager::new(models_root());
+            match manager.install(&name, |_| {}) {
+                Ok(_) => json_response(200, json!({"status": "success"})),
+                Err(e) => json_response(500, json!({"error": e})),
+            }
+        })
+        .await;
     }
-    respond_ndjson(req, move |tx| {
+    let (tx, rx) = mpsc::unbounded_channel::<serde_json::Value>();
+    // The hub downloader is still synchronous, so it gets a blocking thread.
+    tokio::task::spawn_blocking(move || {
         let manager = ModelManager::new(models_root());
         let mut last_pct: i64 = -1;
         let mut cancelled = false;
@@ -595,12 +609,12 @@ fn pull(req: Request) -> std::io::Result<()> {
                 return;
             }
             last_pct = pct;
-            let frame = ndjson_frame(&json!({
+            let frame = json!({
                 "status": format!("pulling {}", p.file),
                 "digest": "",
                 "total": total,
                 "completed": p.received_bytes,
-            }));
+            });
             if tx.send(frame).is_err() {
                 cancelled = true;
             }
@@ -609,6 +623,7 @@ fn pull(req: Request) -> std::io::Result<()> {
             Ok(_) => json!({"status": "success"}),
             Err(e) => json!({"error": e}),
         };
-        let _ = tx.send(ndjson_frame(&last));
-    })
+        let _ = tx.send(last);
+    });
+    ndjson_response(rx)
 }

@@ -7,19 +7,19 @@
 use burn::module::Module;
 use burn::nn::conv::{Conv1d, Conv1dConfig};
 use burn::nn::{Linear, LinearConfig, PaddingConfig1d};
-use burn::tensor::{Tensor, backend::Backend};
+use burn::tensor::{Device, Tensor};
 
 /// Rolling decode state: the last `K-1` gated inputs `[b, d, K-1]`, `None`
 /// until the first forward.
-pub type ConvState<B> = Option<Tensor<B, 3>>;
+pub type ConvState = Option<Tensor<3>>;
 
 /// Double-gated causal short conv (LFM2 "LIV" block). Field names mirror the
 /// HF checkpoint (`in_proj`/`conv`/`out_proj`).
 #[derive(Module, Debug)]
-pub struct ShortConv<B: Backend> {
-    pub in_proj: Linear<B>,
-    pub conv: Conv1d<B>,
-    pub out_proj: Linear<B>,
+pub struct ShortConv {
+    pub in_proj: Linear,
+    pub conv: Conv1d,
+    pub out_proj: Linear,
 }
 
 /// Shape config for [`ShortConv`].
@@ -32,7 +32,7 @@ pub struct ShortConvConfig {
 
 impl ShortConvConfig {
     /// Initialize the module (random weights; real weights come from import).
-    pub fn init<B: Backend>(&self, device: &B::Device) -> ShortConv<B> {
+    pub fn init(&self, device: &Device) -> ShortConv {
         let (d, k) = (self.hidden_size, self.kernel_len);
         assert!(d >= 1, "ShortConv: hidden_size must be >= 1");
         assert!(
@@ -51,15 +51,15 @@ impl ShortConvConfig {
     }
 }
 
-impl<B: Backend> ShortConv<B> {
+impl ShortConv {
     /// Cache-aware forward. `x` is `[b, t, d]`: the whole prompt at prefill,
     /// one token per decode step after. Rolls `state` forward either way.
     pub fn forward(
         &self,
-        x: Tensor<B, 3>,
+        x: Tensor<3>,
         kernel_len: usize,
-        state: &mut ConvState<B>,
-    ) -> Tensor<B, 3> {
+        state: &mut ConvState,
+    ) -> Tensor<3> {
         let [b, t, d] = x.dims();
         let kk = kernel_len;
         assert!(kk >= 2, "ShortConv forward: kernel_len must be >= 2");
@@ -84,7 +84,7 @@ impl<B: Backend> ShortConv<B> {
             let window = match state {
                 Some(prev) => Tensor::cat(vec![prev.clone(), bx.clone()], 2), // [b, d, K]
                 None => {
-                    let pad = Tensor::<B, 3>::zeros([b, d, kk - 1], &bx.device());
+                    let pad = Tensor::<3>::zeros([b, d, kk - 1], &bx.device());
                     Tensor::cat(vec![pad, bx.clone()], 2)
                 }
             };
@@ -102,7 +102,7 @@ impl<B: Backend> ShortConv<B> {
             if len >= kk - 1 {
                 combined.narrow(2, len - (kk - 1), kk - 1)
             } else {
-                let pad = Tensor::<B, 3>::zeros([b, d, (kk - 1) - len], &combined.device());
+                let pad = Tensor::<3>::zeros([b, d, (kk - 1) - len], &combined.device());
                 Tensor::cat(vec![pad, combined], 2)
             }
         };
@@ -116,15 +116,14 @@ impl<B: Backend> ShortConv<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::Cpu;
     use burn::tensor::TensorData;
 
-    type Dev = burn::tensor::Device<Cpu>;
+    type Dev = burn::tensor::Device;
 
     const D: usize = 6;
     const K: usize = 3;
 
-    fn conv(device: &Dev) -> ShortConv<Cpu> {
+    fn conv(device: &Dev) -> ShortConv {
         ShortConvConfig {
             hidden_size: D,
             kernel_len: K,
@@ -132,23 +131,23 @@ mod tests {
         .init(device)
     }
 
-    fn input(t: usize, seed: f32, device: &Dev) -> Tensor<Cpu, 3> {
+    fn input(t: usize, seed: f32, device: &Dev) -> Tensor<3> {
         let data: Vec<f32> = (0..t * D)
             .map(|i| ((i as f32 + seed) * 0.9).cos())
             .collect();
-        Tensor::<Cpu, 2>::from_data(TensorData::new(data, [t, D]), device).reshape([1, t, D])
+        Tensor::<2>::from_data(TensorData::new(data, [t, D]), device).reshape([1, t, D])
     }
 
     /// The load-bearing invariant: prefill + one-token-at-a-time decode via
     /// the rolling state must equal one full prefill over the same tokens.
     #[test]
     fn rolling_state_decode_matches_full_prefill() {
-        let device = Dev::default();
+        let device = crate::backend::cpu_device();
         let c = conv(&device);
         let x = input(7, 5.0, &device);
 
         // Reference: all 7 positions through the padded conv.
-        let mut ref_state: ConvState<Cpu> = None;
+        let mut ref_state: ConvState = None;
         let full = c
             .forward(x.clone(), K, &mut ref_state)
             .into_data()
@@ -156,7 +155,7 @@ mod tests {
             .unwrap();
 
         // Cached: prefill 4, then decode 5th..7th one at a time.
-        let mut state: ConvState<Cpu> = None;
+        let mut state: ConvState = None;
         let _ = c.forward(x.clone().narrow(1, 0, 4), K, &mut state);
         for pos in 4..7 {
             let out = c
@@ -177,12 +176,12 @@ mod tests {
     /// The conv is causal: a future token cannot change an earlier output.
     #[test]
     fn conv_is_causal() {
-        let device = Dev::default();
+        let device = crate::backend::cpu_device();
         let c = conv(&device);
         let x1 = input(5, 1.0, &device);
         let x2 = Tensor::cat(vec![x1.clone().narrow(1, 0, 4), input(1, 77.0, &device)], 1);
-        let mut s1: ConvState<Cpu> = None;
-        let mut s2: ConvState<Cpu> = None;
+        let mut s1: ConvState = None;
+        let mut s2: ConvState = None;
         let o1 = c
             .forward(x1, K, &mut s1)
             .into_data()
@@ -202,11 +201,11 @@ mod tests {
     /// zero-pad seeding path.
     #[test]
     fn first_decode_step_seeds_state_like_prefill() {
-        let device = Dev::default();
+        let device = crate::backend::cpu_device();
         let c = conv(&device);
         let x = input(1, 2.0, &device);
 
-        let mut s_decode: ConvState<Cpu> = None;
+        let mut s_decode: ConvState = None;
         let via_decode = c
             .forward(x.clone(), K, &mut s_decode)
             .into_data()
@@ -215,7 +214,7 @@ mod tests {
 
         // Same single token inside a longer prefill whose first position it is.
         let longer = Tensor::cat(vec![x, input(2, 50.0, &device)], 1);
-        let mut s_pre: ConvState<Cpu> = None;
+        let mut s_pre: ConvState = None;
         let via_prefill = c
             .forward(longer, K, &mut s_pre)
             .into_data()
@@ -238,11 +237,11 @@ mod tests {
     #[test]
     #[should_panic(expected = "kernel_len must be >= 2")]
     fn init_rejects_degenerate_kernel() {
-        let device = Dev::default();
+        let device = crate::backend::cpu_device();
         let _ = ShortConvConfig {
             hidden_size: D,
             kernel_len: 1,
         }
-        .init::<Cpu>(&device);
+        .init(&device);
     }
 }

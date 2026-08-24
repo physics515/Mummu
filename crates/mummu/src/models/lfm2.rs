@@ -13,7 +13,7 @@ use std::path::Path;
 use burn::module::Module;
 use burn::nn::{Embedding, EmbeddingConfig, RmsNorm, RmsNormConfig};
 use burn::store::{ModuleAdapter, PyTorchToBurnAdapter, SafetensorsStore};
-use burn::tensor::{Int, Tensor, TensorData, backend::Backend};
+use burn::tensor::{Device, Int, Tensor, TensorData};
 
 use crate::gguf::{GgufFile, GgufMap, GgufTensorInfo, GgufValue};
 use crate::import::{
@@ -254,32 +254,32 @@ impl RopeParameters {
 /// One hybrid layer: exactly one of `conv` / `self_attn` is present, per
 /// `layer_types[i]`. Field names mirror the HF checkpoint.
 #[derive(Module, Debug)]
-pub struct HybridLayer<B: Backend> {
-    pub conv: Option<ShortConv<B>>,
-    pub self_attn: Option<GqaAttention<B>>,
-    pub feed_forward: SwiGluMlp<B>,
-    pub operator_norm: RmsNorm<B>,
-    pub ffn_norm: RmsNorm<B>,
+pub struct HybridLayer {
+    pub conv: Option<ShortConv>,
+    pub self_attn: Option<GqaAttention>,
+    pub feed_forward: SwiGluMlp,
+    pub operator_norm: RmsNorm,
+    pub ffn_norm: RmsNorm,
 }
 
 /// The LFM2 decoder stack (tied lm-head).
 #[derive(Module, Debug)]
-pub struct Lfm2<B: Backend> {
-    pub embed_tokens: Embedding<B>,
-    pub layers: Vec<HybridLayer<B>>,
-    pub embedding_norm: RmsNorm<B>,
+pub struct Lfm2 {
+    pub embed_tokens: Embedding,
+    pub layers: Vec<HybridLayer>,
+    pub embedding_norm: RmsNorm,
 }
 
 /// Per-layer decode cache: conv layers roll the last `K-1` gated inputs,
 /// attention layers keep the running k/v.
-pub enum HybridKv<B: Backend> {
-    Conv(ConvState<B>),
-    Attn(LayerKv<B>),
+pub enum HybridKv {
+    Conv(ConvState),
+    Attn(LayerKv),
 }
 
 /// A weight-loaded LFM2 plus its config.
-pub struct LoadedLfm2<B: Backend> {
-    pub model: Lfm2<B>,
+pub struct LoadedLfm2 {
+    pub model: Lfm2,
     pub config: Lfm2Config,
     /// The parsed sibling `tokenizer_config.json`, when one was present and
     /// well-formed beside a safetensors checkpoint (the load-time gate has
@@ -289,7 +289,7 @@ pub struct LoadedLfm2<B: Backend> {
     pub tokenizer_config: Option<crate::tok_config::TokenizerConfig>,
 }
 
-fn build<B: Backend>(cfg: &Lfm2Config, device: &B::Device) -> Lfm2<B> {
+fn build(cfg: &Lfm2Config, device: &Device) -> Lfm2 {
     let attn_cfg = GqaAttentionConfig {
         hidden_size: cfg.hidden_size,
         num_heads: cfg.num_attention_heads,
@@ -307,7 +307,7 @@ fn build<B: Backend>(cfg: &Lfm2Config, device: &B::Device) -> Lfm2<B> {
         hidden_size: cfg.hidden_size,
         intermediate_size: cfg.ff_dim(),
     };
-    let norm = |dev: &B::Device| {
+    let norm = |dev: &Device| {
         RmsNormConfig::new(cfg.hidden_size)
             .with_epsilon(cfg.norm_eps)
             .init(dev)
@@ -335,10 +335,10 @@ fn build<B: Backend>(cfg: &Lfm2Config, device: &B::Device) -> Lfm2<B> {
 /// `dir/model.safetensors`, checked. Key remap: strip `model.`, RmsNorm
 /// `weight` → `gamma`, and LFM2's `out_proj`/`q_layernorm`/`k_layernorm` onto
 /// the shared block's `o_proj`/`q_norm`/`k_norm`.
-pub fn load_from_dir<B: Backend>(
+pub fn load_from_dir(
     dir: &Path,
-    device: &B::Device,
-) -> Result<LoadedLfm2<B>, ImportError> {
+    device: &Device,
+) -> Result<LoadedLfm2, ImportError> {
     let cfg_path = required_file(dir, "config.json")?;
     let weights = required_file(dir, "model.safetensors")?;
     let cfg_bytes = std::fs::read(&cfg_path).map_err(|e| ImportError::Parse {
@@ -367,11 +367,11 @@ pub fn load_from_dir<B: Backend>(
         "validate_checkpoint_dir returned a config whose EOS disagrees with config.json"
     );
 
-    let mut model = build::<B>(&config, device);
-    // Type-level float dtype (`B::FloatElem`) — a probe tensor would follow
+    let mut model = build(&config, device);
+    // Type-level float dtype (`f32`) — a probe tensor would follow
     // the per-DEVICE default policy, which another backend alias sharing the
     // device (Gpu vs GpuF16) may have flipped in this process.
-    let target_float = <B::FloatElem as burn::tensor::Element>::dtype();
+    let target_float = crate::backend::float_dtype();
     let mut store = SafetensorsStore::from_file(weights.clone())
         .with_from_adapter(PyTorchToBurnAdapter.chain(CastFloatAdapter::new(target_float)))
         .allow_partial(true)
@@ -443,10 +443,10 @@ fn gguf_tensor_to_hf(info: &GgufTensorInfo) -> Option<GgufMap> {
 /// from the `lfm2.*` metadata (layer kinds from the per-layer kv-head
 /// array), weights dequantized and driven through the exact store pipeline
 /// the safetensors path uses.
-pub fn load_from_gguf<B: Backend>(
+pub fn load_from_gguf(
     path: &Path,
-    device: &B::Device,
-) -> Result<LoadedLfm2<B>, ImportError> {
+    device: &Device,
+) -> Result<LoadedLfm2, ImportError> {
     let parse = |reason: String| ImportError::Parse {
         file: path.to_path_buf(),
         reason,
@@ -455,9 +455,9 @@ pub fn load_from_gguf<B: Backend>(
     let config = Lfm2Config::from_gguf(&f).map_err(parse)?;
     // The scratch guard (Some only when the payload went to disk) must
     // outlive `load_checked`: the store reads that file lazily.
-    let (base, _scratch) = gguf_store::<B>(&f, &gguf_tensor_to_hf, DequantSink::Auto)?;
+    let (base, _scratch) = gguf_store(&f, &gguf_tensor_to_hf, DequantSink::Auto)?;
 
-    let mut model = build::<B>(&config, device);
+    let mut model = build(&config, device);
     let mut store = base
         .with_key_remapping(r"^model\.", "")
         .with_key_remapping(r"(self_attn)\.out_proj\.", "$1.o_proj.")
@@ -479,8 +479,8 @@ pub fn load_from_gguf<B: Backend>(
     })
 }
 
-impl<B: Backend> CausalLm<B> for LoadedLfm2<B> {
-    type Cache = Vec<HybridKv<B>>;
+impl CausalLm for LoadedLfm2 {
+    type Cache = Vec<HybridKv>;
 
     fn is_eos(&self, id: u32) -> bool {
         self.config.eos_token_id.contains(id)
@@ -506,8 +506,8 @@ impl<B: Backend> CausalLm<B> for LoadedLfm2<B> {
         new_ids: &[u32],
         past: usize,
         cache: &mut Self::Cache,
-        device: &B::Device,
-    ) -> Tensor<B, 2> {
+        device: &Device,
+    ) -> Tensor<2> {
         let t = new_ids.len();
         assert!(t >= 1, "LFM2 forward: need at least one token");
         assert!(
@@ -520,15 +520,15 @@ impl<B: Backend> CausalLm<B> for LoadedLfm2<B> {
 
         // Dtype pinned to the backend TYPE, never the per-device policy.
         let ids32: Vec<i32> = new_ids.iter().map(|&i| i as i32).collect();
-        let input = Tensor::<B, 1, Int>::from_data(
+        let input = Tensor::<1, Int>::from_data(
             TensorData::new(ids32, [t]),
-            (device, crate::backend::int_dtype::<B>()),
+            (device, crate::backend::int_dtype()),
         )
         .reshape([1, t]);
         let mut x = self.model.embed_tokens.forward(input);
 
-        let (cos, sin) = rope_tables::<B>(t, past, cfg.head_dim(), cfg.rope_theta, device);
-        let mask = (t > 1).then(|| causal_mask::<B>(t, past, device));
+        let (cos, sin) = rope_tables(t, past, cfg.head_dim(), cfg.rope_theta, device);
+        let mask = (t > 1).then(|| causal_mask(t, past, device));
         let kk = cfg.conv_l_cache;
 
         for (layer, kv) in self.model.layers.iter().zip(cache.iter_mut()) {
@@ -562,9 +562,8 @@ impl<B: Backend> CausalLm<B> for LoadedLfm2<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::Cpu;
 
-    type Dev = burn::tensor::Device<Cpu>;
+    type Dev = burn::tensor::Device;
 
     /// A 3-layer toy hybrid: conv, attention, conv.
     fn toy_config() -> Lfm2Config {
@@ -643,9 +642,9 @@ mod tests {
 
     #[test]
     fn build_places_operators_by_layer_type() {
-        let device = Dev::default();
+        let device = crate::backend::cpu_device();
         let cfg = toy_config();
-        let model = build::<Cpu>(&cfg, &device);
+        let model = build(&cfg, &device);
         assert!(model.layers[0].conv.is_some() && model.layers[0].self_attn.is_none());
         assert!(model.layers[1].conv.is_none() && model.layers[1].self_attn.is_some());
         assert!(model.layers[2].conv.is_some() && model.layers[2].self_attn.is_none());
@@ -655,9 +654,9 @@ mod tests {
     /// equals one full forward, across BOTH cache kinds at once.
     #[test]
     fn toy_hybrid_cached_decode_matches_full_forward() {
-        let device = Dev::default();
+        let device = crate::backend::cpu_device();
         let cfg = toy_config();
-        let loaded = LoadedLfm2::<Cpu> {
+        let loaded = LoadedLfm2 {
             model: build(&cfg, &device),
             config: cfg,
             tokenizer_config: None,
@@ -685,16 +684,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn greedy_generate_respects_max_tokens_bound() {
-        let device = Dev::default();
+    #[tokio::test]
+    async fn greedy_generate_respects_max_tokens_bound() {
+        let device = crate::backend::cpu_device();
         let cfg = toy_config();
-        let loaded = LoadedLfm2::<Cpu> {
+        let loaded = LoadedLfm2 {
             model: build(&cfg, &device),
             config: cfg,
             tokenizer_config: None,
         };
-        let out = loaded.greedy_generate(&[1, 2], 3, &device).unwrap();
+        let out = loaded.greedy_generate(&[1, 2], 3, &device).await.unwrap();
         assert!(out.len() <= 3);
     }
 

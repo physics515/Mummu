@@ -1,0 +1,32 @@
+[package]
+name = "mummu-app"
+description = "Tauri desktop shell that hosts mummu-serve natively on the Windows host, so wgpu/Vulkan can see every local adapter."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# Mirror mummu-serve's defaults exactly: on the host both the NVIDIA and the
+# AMD adapter are real Vulkan devices, so the parity-validated fusion +
+# direct-SPIR-V configuration is the right one. (The Docker image had to
+# drop both because mesa's dzn — the only Vulkan reaching a WSL2 container —
+# breaks under them. Running natively is precisely what buys them back.)
+default = ["fusion", "vulkan-spirv"]
+fusion = ["mummu-serve/fusion"]
+vulkan-spirv = ["mummu-serve/vulkan-spirv"]
+# CUDA backend, still runtime-selected with MUMMU_BACKEND=cuda.
+cuda = ["mummu-serve/cuda"]
+
+[dependencies]
+# `default-features = false` so this crate's own feature set (above) is what
+# decides the backend build, rather than two default sets fighting.
+mummu-serve = { path = "../mummu-serve", default-features = false }
+tokio = { workspace = true }
+# `tray-icon` is the only non-default feature: the tray menu is built in
+# `setup`. Everything else the shell needs (window creation, run events) is
+# core tauri.
+tauri = { version = "2", features = ["tray-icon"] }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }

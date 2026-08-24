@@ -4,20 +4,20 @@
 
 use burn::module::Module;
 use burn::nn::{Linear, LinearConfig, RmsNorm, RmsNormConfig};
-use burn::tensor::{DType, Tensor, TensorData, activation, backend::Backend};
+use burn::tensor::{Device, DType, Tensor, TensorData, activation};
 
 use super::MAX_CONTEXT_TOKENS;
 use super::rope::apply_rope;
 
 /// Per-layer KV cache entry: cached keys and values, each `[b, nkv, seq, hd]`.
 /// `None` until the layer's first forward (the prompt prefill seeds it).
-pub type LayerKv<B> = Option<(Tensor<B, 4>, Tensor<B, 4>)>;
+pub type LayerKv = Option<(Tensor<4>, Tensor<4>)>;
 
 /// Additive causal mask `[1, 1, t, past+t]`: query row `i` (absolute position
 /// `past+i`) may attend to key columns `0..=past+i`; future columns get a
 /// large negative. `-1e4` (not `-inf`) so the f16 GPU path (max ~65504) never
 /// overflows — `exp(-1e4)` is still exactly 0 after softmax.
-pub fn causal_mask<B: Backend>(t: usize, past: usize, device: &B::Device) -> Tensor<B, 4> {
+pub fn causal_mask(t: usize, past: usize, device: &Device) -> Tensor<4> {
     assert!(t >= 1, "causal_mask: need at least one query row, got t=0");
     assert!(
         past + t <= MAX_CONTEXT_TOKENS,
@@ -33,14 +33,14 @@ pub fn causal_mask<B: Backend>(t: usize, past: usize, device: &B::Device) -> Ten
     }
     // Dtype pinned to the backend TYPE: unspecified-dtype creation follows
     // the per-DEVICE policy another alias sharing the device may have locked.
-    let dtype = crate::backend::float_dtype::<B>();
-    Tensor::<B, 2>::from_data(TensorData::new(m, [t, kcols]), (device, dtype))
+    let dtype = crate::backend::float_dtype();
+    Tensor::<2>::from_data(TensorData::new(m, [t, kcols]), (device, dtype))
         .reshape([1, 1, t, kcols])
 }
 
 /// GQA expand: `[b, nkv, s, hd]` → `[b, nkv*group, s, hd]`, each KV head
 /// repeated `group` times contiguously (HF `repeat_kv`).
-pub fn repeat_kv<B: Backend>(x: Tensor<B, 4>, group: usize) -> Tensor<B, 4> {
+pub fn repeat_kv(x: Tensor<4>, group: usize) -> Tensor<4> {
     assert!(group >= 1, "repeat_kv: group must be >= 1");
     if group == 1 {
         return x;
@@ -57,16 +57,16 @@ pub fn repeat_kv<B: Backend>(x: Tensor<B, 4>, group: usize) -> Tensor<B, 4> {
 /// whose checkpoints differ (LFM2's `out_proj`, `q_layernorm`) remap keys at
 /// load time instead of renaming fields.
 #[derive(Module, Debug)]
-pub struct GqaAttention<B: Backend> {
-    pub q_proj: Linear<B>,
-    pub k_proj: Linear<B>,
-    pub v_proj: Linear<B>,
-    pub o_proj: Linear<B>,
+pub struct GqaAttention {
+    pub q_proj: Linear,
+    pub k_proj: Linear,
+    pub v_proj: Linear,
+    pub o_proj: Linear,
     /// Per-head RMSNorm on q, applied post-projection at `[b, t, nh, hd]`
     /// (LFM2-style). `None` for architectures without it (Qwen2).
-    pub q_norm: Option<RmsNorm<B>>,
+    pub q_norm: Option<RmsNorm>,
     /// Per-head RMSNorm on k — present iff `q_norm` is.
-    pub k_norm: Option<RmsNorm<B>>,
+    pub k_norm: Option<RmsNorm>,
 }
 
 /// Shape/behavior config for [`GqaAttention`].
@@ -89,7 +89,7 @@ pub struct GqaAttentionConfig {
 
 impl GqaAttentionConfig {
     /// Initialize the module (random weights; real weights come from import).
-    pub fn init<B: Backend>(&self, device: &B::Device) -> GqaAttention<B> {
+    pub fn init(&self, device: &Device) -> GqaAttention {
         assert!(
             self.num_kv_heads >= 1 && self.num_heads.is_multiple_of(self.num_kv_heads),
             "GQA: num_heads ({}) must be a positive multiple of num_kv_heads ({})",
@@ -138,12 +138,12 @@ impl GqaAttentionConfig {
 /// projection **before** the head split (OLMoE). The two coincide at `n == 1`.
 /// Inferring from the loaded gamma keeps the module shape identical across
 /// families — a checkpoint's own norm width picks its semantics.
-fn qk_norm_forward<B: Backend>(
-    norm: &RmsNorm<B>,
-    x: Tensor<B, 3>, // [b, t, n*hd]
+fn qk_norm_forward(
+    norm: &RmsNorm,
+    x: Tensor<3>, // [b, t, n*hd]
     n: usize,
     hd: usize,
-) -> Tensor<B, 4> {
+) -> Tensor<4> {
     let [b, t, width] = x.dims();
     debug_assert!(width == n * hd, "q/k projection width must be n * head_dim");
     let gamma = norm.gamma.dims()[0];
@@ -159,7 +159,7 @@ fn qk_norm_forward<B: Backend>(
     }
 }
 
-impl<B: Backend> GqaAttention<B> {
+impl GqaAttention {
     /// Cache-aware forward: RoPE the new q/k at the offset positions, append
     /// the new k/v to this layer's cache, attend over the full cached range.
     ///
@@ -168,15 +168,15 @@ impl<B: Backend> GqaAttention<B> {
     #[allow(clippy::too_many_arguments)] // mirrors the proven reference signature
     pub fn forward(
         &self,
-        x: Tensor<B, 3>,
+        x: Tensor<3>,
         num_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
-        cos: &Tensor<B, 4>,
-        sin: &Tensor<B, 4>,
-        mask: Option<&Tensor<B, 4>>,
-        kv: &mut LayerKv<B>,
-    ) -> Tensor<B, 3> {
+        cos: &Tensor<4>,
+        sin: &Tensor<4>,
+        mask: Option<&Tensor<4>>,
+        kv: &mut LayerKv,
+    ) -> Tensor<3> {
         let [b, t, _h] = x.dims();
         let (nh, nkv, hd) = (num_heads, num_kv_heads, head_dim);
         assert!(
@@ -251,10 +251,9 @@ impl<B: Backend> GqaAttention<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::Cpu;
     use crate::nn::rope::rope_tables;
 
-    type Dev = burn::tensor::Device<Cpu>;
+    type Dev = burn::tensor::Device;
 
     const HIDDEN: usize = 16;
     const HEADS: usize = 4;
@@ -262,7 +261,7 @@ mod tests {
     const HEAD_DIM: usize = 4;
     const THETA: f32 = 1e4;
 
-    fn attn(qk_norm: bool, projection: bool, device: &Dev) -> GqaAttention<Cpu> {
+    fn attn(qk_norm: bool, projection: bool, device: &Dev) -> GqaAttention {
         GqaAttentionConfig {
             hidden_size: HIDDEN,
             num_heads: HEADS,
@@ -276,20 +275,20 @@ mod tests {
     }
 
     /// Deterministic pseudo-random input `[1, t, HIDDEN]`.
-    fn input(t: usize, seed: f32, device: &Dev) -> Tensor<Cpu, 3> {
+    fn input(t: usize, seed: f32, device: &Dev) -> Tensor<3> {
         let data: Vec<f32> = (0..t * HIDDEN)
             .map(|i| ((i as f32 + seed) * 0.7).sin())
             .collect();
-        Tensor::<Cpu, 2>::from_data(TensorData::new(data, [t, HIDDEN]), device)
+        Tensor::<2>::from_data(TensorData::new(data, [t, HIDDEN]), device)
             .reshape([1, t, HIDDEN])
     }
 
     /// Full forward over `t` positions in one call (prefill-style).
-    fn full_forward(a: &GqaAttention<Cpu>, x: Tensor<Cpu, 3>, device: &Dev) -> Vec<f32> {
+    fn full_forward(a: &GqaAttention, x: Tensor<3>, device: &Dev) -> Vec<f32> {
         let t = x.dims()[1];
-        let (cos, sin) = rope_tables::<Cpu>(t, 0, HEAD_DIM, THETA, device);
-        let mask = causal_mask::<Cpu>(t, 0, device);
-        let mut kv: LayerKv<Cpu> = None;
+        let (cos, sin) = rope_tables(t, 0, HEAD_DIM, THETA, device);
+        let mask = causal_mask(t, 0, device);
+        let mut kv: LayerKv = None;
         a.forward(
             x,
             HEADS,
@@ -307,8 +306,8 @@ mod tests {
 
     #[test]
     fn causal_mask_is_strictly_causal() {
-        let device = Dev::default();
-        let m = causal_mask::<Cpu>(3, 2, &device);
+        let device = crate::backend::cpu_device();
+        let m = causal_mask(3, 2, &device);
         assert_eq!(m.dims(), [1, 1, 3, 5]);
         let v = m.into_data().to_vec::<f32>().unwrap();
         for i in 0..3 {
@@ -318,7 +317,7 @@ mod tests {
             }
         }
         // A single decode step attends to everything cached: all zeros.
-        let one = causal_mask::<Cpu>(1, 4, &device);
+        let one = causal_mask(1, 4, &device);
         assert!(
             one.into_data()
                 .to_vec::<f32>()
@@ -330,8 +329,8 @@ mod tests {
 
     #[test]
     fn repeat_kv_repeats_each_head_contiguously() {
-        let device = Dev::default();
-        let x = Tensor::<Cpu, 1>::from_floats([1.0, 2.0, 3.0, 4.0], &device).reshape([1, 2, 1, 2]); // 2 kv heads, hd=2
+        let device = crate::backend::cpu_device();
+        let x = Tensor::<1>::from_floats([1.0, 2.0, 3.0, 4.0], &device).reshape([1, 2, 1, 2]); // 2 kv heads, hd=2
         let y = repeat_kv(x, 2); // -> 4 heads
         assert_eq!(y.dims(), [1, 4, 1, 2]);
         assert_eq!(
@@ -344,7 +343,7 @@ mod tests {
     /// through the KV cache must equal one full forward over the same tokens.
     #[test]
     fn kv_cache_decode_matches_full_forward() {
-        let device = Dev::default();
+        let device = crate::backend::cpu_device();
         for (qk_norm, projection) in [(false, false), (true, false), (true, true)] {
             let a = attn(qk_norm, projection, &device);
             let x = input(6, 3.0, &device);
@@ -354,10 +353,10 @@ mod tests {
             let last_full = &full[5 * HIDDEN..];
 
             // Cached: prefill 5, then decode position 5 alone.
-            let mut kv: LayerKv<Cpu> = None;
+            let mut kv: LayerKv = None;
             let prefill = x.clone().narrow(1, 0, 5);
-            let (cos, sin) = rope_tables::<Cpu>(5, 0, HEAD_DIM, THETA, &device);
-            let mask = causal_mask::<Cpu>(5, 0, &device);
+            let (cos, sin) = rope_tables(5, 0, HEAD_DIM, THETA, &device);
+            let mask = causal_mask(5, 0, &device);
             let _ = a.forward(
                 prefill,
                 HEADS,
@@ -370,7 +369,7 @@ mod tests {
             );
 
             let step = x.narrow(1, 5, 1);
-            let (cos1, sin1) = rope_tables::<Cpu>(1, 5, HEAD_DIM, THETA, &device);
+            let (cos1, sin1) = rope_tables(1, 5, HEAD_DIM, THETA, &device);
             let out = a
                 .forward(step, HEADS, KV_HEADS, HEAD_DIM, &cos1, &sin1, None, &mut kv)
                 .into_data()
@@ -389,7 +388,7 @@ mod tests {
     /// Causality: changing a future token must not change an earlier output row.
     #[test]
     fn future_tokens_cannot_affect_past_outputs() {
-        let device = Dev::default();
+        let device = crate::backend::cpu_device();
         let a = attn(false, false, &device);
         let x1 = input(4, 1.0, &device);
         // Same first 3 tokens, different 4th.
@@ -409,7 +408,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "must be a positive multiple")]
     fn init_rejects_indivisible_head_grouping() {
-        let device = Dev::default();
+        let device = crate::backend::cpu_device();
         let _ = GqaAttentionConfig {
             hidden_size: HIDDEN,
             num_heads: 3,
@@ -419,7 +418,7 @@ mod tests {
             qk_norm_eps: None,
             qk_norm_projection: false,
         }
-        .init::<Cpu>(&device);
+        .init(&device);
     }
 
     /// Negative space: the projection-wide norm is a different function than
@@ -428,7 +427,7 @@ mod tests {
     /// collapsing to one branch.
     #[test]
     fn projection_norm_differs_from_per_head_norm() {
-        let device = Dev::default();
+        let device = crate::backend::cpu_device();
         let per_head = attn(true, false, &device);
         // Same module, but re-shaped norms: reuse per_head's projections and
         // swap in projection-wide norms with unit gamma? Simpler: two configs
@@ -441,9 +440,9 @@ mod tests {
         // cache-equivalence loop above; here pin that a projection-normed
         // forward actually runs (no panic) and returns the right shape.
         let x = input(3, 5.0, &device);
-        let (cos, sin) = rope_tables::<Cpu>(3, 0, HEAD_DIM, THETA, &device);
-        let mask = causal_mask::<Cpu>(3, 0, &device);
-        let mut kv: LayerKv<Cpu> = None;
+        let (cos, sin) = rope_tables(3, 0, HEAD_DIM, THETA, &device);
+        let mask = causal_mask(3, 0, &device);
+        let mut kv: LayerKv = None;
         let out = projection.forward(
             x,
             HEADS,

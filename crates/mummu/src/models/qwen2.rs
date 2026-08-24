@@ -13,7 +13,7 @@ use std::path::Path;
 use burn::module::Module;
 use burn::nn::{Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig};
 use burn::store::{ModuleAdapter, PyTorchToBurnAdapter, SafetensorsStore};
-use burn::tensor::{Int, Tensor, TensorData, backend::Backend};
+use burn::tensor::{Device, Int, Tensor, TensorData};
 
 use crate::gguf::{GgufFile, GgufMap, GgufTensorInfo, GgufValue};
 use crate::import::{
@@ -180,11 +180,11 @@ impl Qwen2Config {
 /// One decoder layer. Field names mirror the HF checkpoint so the key remap
 /// stays trivial.
 #[derive(Module, Debug)]
-pub struct DecoderLayer<B: Backend> {
-    pub self_attn: GqaAttention<B>,
-    pub mlp: SwiGluMlp<B>,
-    pub input_layernorm: RmsNorm<B>,
-    pub post_attention_layernorm: RmsNorm<B>,
+pub struct DecoderLayer {
+    pub self_attn: GqaAttention,
+    pub mlp: SwiGluMlp,
+    pub input_layernorm: RmsNorm,
+    pub post_attention_layernorm: RmsNorm,
 }
 
 /// The Qwen2 decoder stack (HF's `model.*` subtree). The lm-head is tied on
@@ -192,16 +192,16 @@ pub struct DecoderLayer<B: Backend> {
 /// every llama.cpp GGUF (which materializes the head as `output.weight`, at
 /// higher precision than the embedding) — carry it explicitly.
 #[derive(Module, Debug)]
-pub struct Qwen2<B: Backend> {
-    pub embed_tokens: Embedding<B>,
-    pub layers: Vec<DecoderLayer<B>>,
-    pub norm: RmsNorm<B>,
-    pub lm_head: Option<Linear<B>>,
+pub struct Qwen2 {
+    pub embed_tokens: Embedding,
+    pub layers: Vec<DecoderLayer>,
+    pub norm: RmsNorm,
+    pub lm_head: Option<Linear>,
 }
 
 /// A weight-loaded Qwen2 plus its config — everything a forward needs.
-pub struct LoadedQwen2<B: Backend> {
-    pub model: Qwen2<B>,
+pub struct LoadedQwen2 {
+    pub model: Qwen2,
     pub config: Qwen2Config,
     /// The parsed sibling `tokenizer_config.json`, when one was present and
     /// well-formed beside a safetensors checkpoint (the load-time gate has
@@ -211,7 +211,7 @@ pub struct LoadedQwen2<B: Backend> {
     pub tokenizer_config: Option<crate::tok_config::TokenizerConfig>,
 }
 
-fn build<B: Backend>(cfg: &Qwen2Config, device: &B::Device) -> Qwen2<B> {
+fn build(cfg: &Qwen2Config, device: &Device) -> Qwen2 {
     let attn_cfg = GqaAttentionConfig {
         hidden_size: cfg.hidden_size,
         num_heads: cfg.num_attention_heads,
@@ -225,7 +225,7 @@ fn build<B: Backend>(cfg: &Qwen2Config, device: &B::Device) -> Qwen2<B> {
         hidden_size: cfg.hidden_size,
         intermediate_size: cfg.intermediate_size,
     };
-    let norm = |dev: &B::Device| {
+    let norm = |dev: &Device| {
         RmsNormConfig::new(cfg.hidden_size)
             .with_epsilon(cfg.rms_norm_eps)
             .init(dev)
@@ -258,10 +258,10 @@ fn build<B: Backend>(cfg: &Qwen2Config, device: &B::Device) -> Qwen2<B> {
 /// `model.` prefix and rename RmsNorm `weight` → Burn's `gamma`
 /// (`PyTorchToBurnAdapter` renames Layer/Batch/Group norm params but NOT
 /// RmsNorm; it does transpose the Linear weights).
-pub fn load_from_dir<B: Backend>(
+pub fn load_from_dir(
     dir: &Path,
-    device: &B::Device,
-) -> Result<LoadedQwen2<B>, ImportError> {
+    device: &Device,
+) -> Result<LoadedQwen2, ImportError> {
     let cfg_path = required_file(dir, "config.json")?;
     let weights = required_file(dir, "model.safetensors")?;
     let cfg_bytes = std::fs::read(&cfg_path).map_err(|e| ImportError::Parse {
@@ -290,12 +290,12 @@ pub fn load_from_dir<B: Backend>(
         "validate_checkpoint_dir returned a config whose EOS disagrees with config.json"
     );
 
-    let mut model = build::<B>(&config, device);
+    let mut model = build(&config, device);
     // The backend's own float dtype (f32, or f16 on the GpuF16 alias), taken
-    // from the TYPE (`B::FloatElem`), never from a probe tensor: unspecified-
+    // from the TYPE (`f32`), never from a probe tensor: unspecified-
     // dtype tensor creation follows the per-DEVICE default policy, which
     // another backend alias sharing the device may have flipped in-process.
-    let target_float = <B::FloatElem as burn::tensor::Element>::dtype();
+    let target_float = crate::backend::float_dtype();
     let mut store = SafetensorsStore::from_file(weights.clone())
         .with_from_adapter(PyTorchToBurnAdapter.chain(CastFloatAdapter::new(target_float)))
         .allow_partial(true)
@@ -350,10 +350,10 @@ fn qwen2_gguf_name(name: &str) -> Option<String> {
 /// suite covers — Q4_K_M, Q8_0, F16, …): hyperparameters from the GGUF
 /// metadata, weights dequantized to f32 and driven through the exact store
 /// pipeline (adapters + remaps + checked load) the safetensors path uses.
-pub fn load_from_gguf<B: Backend>(
+pub fn load_from_gguf(
     path: &Path,
-    device: &B::Device,
-) -> Result<LoadedQwen2<B>, ImportError> {
+    device: &Device,
+) -> Result<LoadedQwen2, ImportError> {
     let parse = |reason: String| ImportError::Parse {
         file: path.to_path_buf(),
         reason,
@@ -362,9 +362,9 @@ pub fn load_from_gguf<B: Backend>(
     let config = Qwen2Config::from_gguf(&f).map_err(parse)?;
     // The scratch guard (Some only when the payload went to disk) must
     // outlive `load_checked`: the store reads that file lazily.
-    let (base, _scratch) = gguf_store::<B>(&f, &gguf_tensor_to_hf, DequantSink::Auto)?;
+    let (base, _scratch) = gguf_store(&f, &gguf_tensor_to_hf, DequantSink::Auto)?;
 
-    let mut model = build::<B>(&config, device);
+    let mut model = build(&config, device);
     let mut store = base
         .with_key_remapping(r"^model\.", "")
         .with_key_remapping(r"(input_layernorm)\.weight$", "$1.gamma")
@@ -379,8 +379,8 @@ pub fn load_from_gguf<B: Backend>(
     })
 }
 
-impl<B: Backend> CausalLm<B> for LoadedQwen2<B> {
-    type Cache = Vec<LayerKv<B>>;
+impl CausalLm for LoadedQwen2 {
+    type Cache = Vec<LayerKv>;
 
     fn new_cache(&self) -> Self::Cache {
         (0..self.config.num_hidden_layers).map(|_| None).collect()
@@ -395,8 +395,8 @@ impl<B: Backend> CausalLm<B> for LoadedQwen2<B> {
         new_ids: &[u32],
         past: usize,
         cache: &mut Self::Cache,
-        device: &B::Device,
-    ) -> Tensor<B, 2> {
+        device: &Device,
+    ) -> Tensor<2> {
         let t = new_ids.len();
         assert!(t >= 1, "Qwen2 forward: need at least one token");
         assert!(
@@ -410,17 +410,17 @@ impl<B: Backend> CausalLm<B> for LoadedQwen2<B> {
         // i32 token ids: native for wgpu and the flex CPU backend alike.
         // Dtype pinned to the backend TYPE, never the per-device policy.
         let ids32: Vec<i32> = new_ids.iter().map(|&i| i as i32).collect();
-        let input = Tensor::<B, 1, Int>::from_data(
+        let input = Tensor::<1, Int>::from_data(
             TensorData::new(ids32, [t]),
-            (device, crate::backend::int_dtype::<B>()),
+            (device, crate::backend::int_dtype()),
         )
         .reshape([1, t]);
         let mut x = self.model.embed_tokens.forward(input); // [1, t, hidden]
 
-        let (cos, sin) = rope_tables::<B>(t, past, cfg.head_dim, cfg.rope_theta, device);
+        let (cos, sin) = rope_tables(t, past, cfg.head_dim, cfg.rope_theta, device);
         // A single-token decode step needs no mask (the one query attends to
         // all cached keys); only a multi-token prefill needs the triangle.
-        let mask = (t > 1).then(|| causal_mask::<B>(t, past, device));
+        let mask = (t > 1).then(|| causal_mask(t, past, device));
 
         for (layer, kv) in self.model.layers.iter().zip(cache.iter_mut()) {
             let h = layer.input_layernorm.forward(x.clone());
@@ -460,9 +460,8 @@ impl<B: Backend> CausalLm<B> for LoadedQwen2<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::Cpu;
 
-    type Dev = burn::tensor::Device<Cpu>;
+    type Dev = burn::tensor::Device;
 
     /// A synthetic 2-layer toy config: everything runs without real weights.
     fn toy_config() -> Qwen2Config {
@@ -517,9 +516,9 @@ mod tests {
     /// — the whole-stack version of the nn-level equivalence tests.
     #[test]
     fn toy_model_cached_decode_matches_full_forward() {
-        let device = Dev::default();
+        let device = crate::backend::cpu_device();
         let cfg = toy_config();
-        let loaded = LoadedQwen2::<Cpu> {
+        let loaded = LoadedQwen2 {
             model: build(&cfg, &device),
             config: cfg,
             tokenizer_config: None,
@@ -613,11 +612,11 @@ mod tests {
 
     #[test]
     fn untied_toy_config_builds_and_uses_an_lm_head() {
-        let device = Dev::default();
+        let device = crate::backend::cpu_device();
         let mut cfg = toy_config();
         cfg.tie_word_embeddings = false;
         let vocab = cfg.vocab_size;
-        let loaded = LoadedQwen2::<Cpu> {
+        let loaded = LoadedQwen2 {
             model: build(&cfg, &device),
             config: cfg,
             tokenizer_config: None,
@@ -665,12 +664,12 @@ mod tests {
         assert_eq!(qwen2_gguf_name("blk.x.attn_q.weight"), None);
     }
 
-    #[test]
-    fn sanity_check_passes_on_a_live_toy_model_and_flags_a_vocab_mismatch() {
-        let device = Dev::default();
+    #[tokio::test]
+    async fn sanity_check_passes_on_a_live_toy_model_and_flags_a_vocab_mismatch() {
+        let device = crate::backend::cpu_device();
         let cfg = toy_config();
         let vocab = cfg.vocab_size;
-        let loaded = LoadedQwen2::<Cpu> {
+        let loaded = LoadedQwen2 {
             model: build(&cfg, &device),
             config: cfg,
             tokenizer_config: None,
@@ -679,40 +678,40 @@ mod tests {
         // distribution — the smoke passes and reports a valid top id.
         let smoke = loaded
             .sanity_check(&[1, 2, 3], vocab, &device)
-            .expect("live toy model passes the smoke");
+            .await.expect("live toy model passes the smoke");
         assert!((smoke.top_id as usize) < vocab, "top id in vocab range");
         assert!(smoke.spread > 0.0, "a live forward has positive spread");
         // The wrong expected vocab is caught as a mismatch, not a silent pass.
-        assert!(loaded.sanity_check(&[1, 2, 3], vocab + 1, &device).is_err());
+        assert!(loaded.sanity_check(&[1, 2, 3], vocab + 1, &device).await.is_err());
     }
 
-    #[test]
-    fn warm_up_runs_one_prefill_plus_its_steps_and_leaves_the_model_usable() {
-        let device = Dev::default();
+    #[tokio::test]
+    async fn warm_up_runs_one_prefill_plus_its_steps_and_leaves_the_model_usable() {
+        let device = crate::backend::cpu_device();
         let cfg = toy_config();
-        let loaded = LoadedQwen2::<Cpu> {
+        let loaded = LoadedQwen2 {
             model: build(&cfg, &device),
             config: cfg,
             tokenizer_config: None,
         };
         let forwards = loaded
             .warm_up(&[1, 2, 3], 4, &device)
-            .expect("warm-up runs on a live toy model");
+            .await.expect("warm-up runs on a live toy model");
         assert_eq!(forwards, 5, "one prefill plus four decode steps");
         // The warm-up cache is a throwaway: a generation after it starts from
         // an empty cache and still decodes (nothing leaked into the model).
         let out = loaded
             .greedy_generate(&[1, 2, 3], 2, &device)
-            .expect("decodes after a warm-up");
+            .await.expect("decodes after a warm-up");
         assert!(!out.is_empty(), "generation after warm-up produces tokens");
     }
 
     #[test]
     #[should_panic(expected = "exceeds the 256 bound")]
     fn warm_up_rejects_an_unbounded_step_count() {
-        let device = Dev::default();
+        let device = crate::backend::cpu_device();
         let cfg = toy_config();
-        let loaded = LoadedQwen2::<Cpu> {
+        let loaded = LoadedQwen2 {
             model: build(&cfg, &device),
             config: cfg,
             tokenizer_config: None,
@@ -720,16 +719,16 @@ mod tests {
         let _ = loaded.warm_up(&[1, 2, 3], crate::models::MAX_WARM_UP_STEPS + 1, &device);
     }
 
-    #[test]
-    fn greedy_generate_respects_max_tokens_bound() {
-        let device = Dev::default();
+    #[tokio::test]
+    async fn greedy_generate_respects_max_tokens_bound() {
+        let device = crate::backend::cpu_device();
         let cfg = toy_config();
-        let loaded = LoadedQwen2::<Cpu> {
+        let loaded = LoadedQwen2 {
             model: build(&cfg, &device),
             config: cfg,
             tokenizer_config: None,
         };
-        let out = loaded.greedy_generate(&[1, 2, 3], 4, &device).unwrap();
+        let out = loaded.greedy_generate(&[1, 2, 3], 4, &device).await.unwrap();
         assert!(out.len() <= 4);
     }
 }

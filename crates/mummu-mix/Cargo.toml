@@ -1,0 +1,11 @@
+[package]
+name = "mummu-mix"
+description = "Scheduler B: per-tensor precision placement under a byte budget."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Dependency-free: see the crate docs. The burn binding for a rung lives in
+# `mummu::quant`, which depends on THIS crate rather than the other way round.
+[dependencies]

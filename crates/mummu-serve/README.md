@@ -111,6 +111,33 @@ the Docker VM's OOM killer. On a GPU shared with a desktop set
 `MUMMU_GPU_BUDGET_GB` below the card (the DeepStack compose uses 11 on a
 16 GB card); the tiers and the fit planner both honor it.
 
+## Embedding
+
+The crate is a library plus a thin binary. `src/main.rs` only translates the
+environment into arguments; everything else lives in `src/lib.rs`, so another
+process can host the same server:
+
+```rust
+// Bind and serve until ctrl-c — what the binary does.
+mummu_serve::serve("0.0.0.0:8095", Some("0.0.0.0:11435")).await?;
+
+// Or bind first, so you know the port before anything is served on it,
+// and stop on your own trigger instead of a signal.
+let api = mummu_serve::bind("127.0.0.1:0").await?;
+let port = api.local_addr()?.port();
+mummu_serve::serve_on(api, None, async { rx.await.ok(); }).await?;
+```
+
+`router()` and `ollama_router()` hand back the two axum `Router`s for a
+caller that would rather mount them itself; `UI_HTML` is the chat page as
+`GET /` serves it. Both surfaces share one process-wide model slot, so this
+is embedding, not duplicating — a second `serve_on` in the same process would
+contend for the same resident model.
+
+[`mummu-app`](../mummu-app) is the in-tree consumer: a Tauri shell that runs
+this server natively on the Windows host, where wgpu can see every local
+adapter instead of the one CUDA device a WSL2 container exposes.
+
 ## Docker
 
 Build from the **repo root** (the workspace is the context):

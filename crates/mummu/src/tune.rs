@@ -21,13 +21,12 @@
 
 use std::path::{Path, PathBuf};
 
-use cubecl_runtime::config::{CubeClRuntimeConfig, RuntimeConfig};
 
-/// Directory segment CubeCL appends to the configured cache root for autotune
-/// data (`CacheOption::name("autotune")`). Load-bearing for safety: every path
-/// this module deletes ends in this segment, so a misconfigured root can never
-/// turn a clear into a wider delete.
-const AUTOTUNE_SEGMENT: &str = "autotune";
+/// File-name stem of the environment database cubecl 0.11 persists autotune
+/// picks into, under the configured cache root. Load-bearing for safety:
+/// [`clear_autotune_cache`] removes only files starting with this stem, never
+/// the root itself (which defaults to the Cargo `target/` tree).
+const ENVIRONMENT_DB_STEM: &str = "environment";
 
 /// Bound on a cache walk. The layout is
 /// `<root>/autotune/<version>/<device>/<kernel>.json.log` — a few hundred
@@ -88,16 +87,12 @@ impl TuneCacheReport {
 /// building any backend), exactly as CubeCL requires.
 #[must_use]
 pub fn autotune_cache_dir() -> PathBuf {
-    let dir = CubeClRuntimeConfig::get()
-        .autotune
-        .cache
-        .root()
-        .join(AUTOTUNE_SEGMENT);
-    debug_assert!(
-        dir.ends_with(AUTOTUNE_SEGMENT),
-        "the cache dir must always end in the autotune segment"
-    );
-    dir
+    // cubecl 0.11 moved autotune persistence out of a per-file directory and
+    // into an environment database under the configured cache root (the
+    // `AutotuneConfig` no longer carries a path at all — only `disable_cache`).
+    // The root is still the thing a consumer wants to report and clear, so
+    // this returns it directly.
+    cubecl_runtime::config::cache::CacheConfig::default().root()
 }
 
 /// Measure the persisted cache without changing it. A missing directory is
@@ -117,19 +112,39 @@ pub fn autotune_cache_report() -> Result<TuneCacheReport, TuneError> {
 /// backend). Idempotent: clearing an absent cache reports zero and succeeds.
 pub fn clear_autotune_cache() -> Result<TuneCacheReport, TuneError> {
     let report = autotune_cache_report()?;
-    assert!(
-        report.dir.ends_with(AUTOTUNE_SEGMENT),
-        "refusing to remove a directory that is not the autotune cache: {:?}",
-        report.dir
-    );
     if !report.dir.exists() {
         debug_assert!(report.is_empty(), "an absent cache cannot hold files");
         return Ok(report);
     }
-    std::fs::remove_dir_all(&report.dir).map_err(|e| TuneError::Io {
+    // Remove the environment database files, never the root itself: under
+    // cubecl 0.11's default (`CacheConfig::Target`) that root is the Cargo
+    // `target/` tree, so a recursive delete here would blow away the build.
+    let mut removed = false;
+    for entry in std::fs::read_dir(&report.dir).map_err(|e| TuneError::Io {
         path: report.dir.clone(),
         message: e.to_string(),
-    })?;
+    })? {
+        let entry = entry.map_err(|e| TuneError::Io {
+            path: report.dir.clone(),
+            message: e.to_string(),
+        })?;
+        let path = entry.path();
+        let is_db = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(ENVIRONMENT_DB_STEM));
+        if is_db && path.is_file() {
+            std::fs::remove_file(&path).map_err(|e| TuneError::Io {
+                path: path.clone(),
+                message: e.to_string(),
+            })?;
+            removed = true;
+        }
+    }
+    debug_assert!(
+        removed || report.is_empty(),
+        "a non-empty cache should have had a database to remove"
+    );
     Ok(report)
 }
 
@@ -179,12 +194,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_cache_dir_always_ends_in_the_autotune_segment() {
+    fn the_cache_dir_is_an_absolute_root() {
         let dir = autotune_cache_dir();
-        assert!(
-            dir.ends_with(AUTOTUNE_SEGMENT),
-            "cache dir {dir:?} must end in {AUTOTUNE_SEGMENT}"
-        );
         // And it must be an absolute path — the roots CubeCL can resolve to
         // (CWD, the project target dir, the user config dir, or an explicit
         // file path) are all absolute in practice, and a relative one would
@@ -234,7 +245,6 @@ mod tests {
         // `clear` on a machine that has never tuned must not error; the real
         // dir may or may not exist here, so assert on the shape of the result.
         let before = autotune_cache_report().expect("report");
-        assert!(before.dir.ends_with(AUTOTUNE_SEGMENT));
         if !before.dir.exists() {
             let cleared = clear_autotune_cache().expect("clearing nothing succeeds");
             assert!(cleared.is_empty(), "nothing to clear reports empty");

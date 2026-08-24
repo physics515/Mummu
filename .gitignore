@@ -8,6 +8,9 @@ target/
 *.safetensors
 *.gguf
 
+# tauri-build writes the capability JSON schemas here on every build
+/crates/mummu-app/gen
+
 # OS / editor
 .DS_Store
 Thumbs.db

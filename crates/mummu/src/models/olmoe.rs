@@ -32,7 +32,7 @@ use std::path::Path;
 use burn::module::Module;
 use burn::nn::{Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig};
 use burn::store::{ModuleAdapter, PyTorchToBurnAdapter, SafetensorsStore};
-use burn::tensor::{Int, Tensor, TensorData, backend::Backend};
+use burn::tensor::{Device, Int, Tensor, TensorData};
 
 use crate::gguf::{GgufFile, GgufMap, GgufTensorInfo, GgufValue};
 use crate::import::{
@@ -177,25 +177,25 @@ impl OlmoeConfig {
 
 /// One OLMoE decoder layer. Field names mirror the HF checkpoint layout.
 #[derive(Module, Debug)]
-pub struct DecoderLayer<B: Backend> {
-    pub self_attn: GqaAttention<B>,
-    pub mlp: SparseMoe<B>,
-    pub input_layernorm: RmsNorm<B>,
-    pub post_attention_layernorm: RmsNorm<B>,
+pub struct DecoderLayer {
+    pub self_attn: GqaAttention,
+    pub mlp: SparseMoe,
+    pub input_layernorm: RmsNorm,
+    pub post_attention_layernorm: RmsNorm,
 }
 
 /// The OLMoE decoder stack (HF's `model.*` subtree). The 1B-7B ships untied.
 #[derive(Module, Debug)]
-pub struct Olmoe<B: Backend> {
-    pub embed_tokens: Embedding<B>,
-    pub layers: Vec<DecoderLayer<B>>,
-    pub norm: RmsNorm<B>,
-    pub lm_head: Option<Linear<B>>,
+pub struct Olmoe {
+    pub embed_tokens: Embedding,
+    pub layers: Vec<DecoderLayer>,
+    pub norm: RmsNorm,
+    pub lm_head: Option<Linear>,
 }
 
 /// A weight-loaded OLMoE plus its config — everything a forward needs.
-pub struct LoadedOlmoe<B: Backend> {
-    pub model: Olmoe<B>,
+pub struct LoadedOlmoe {
+    pub model: Olmoe,
     pub config: OlmoeConfig,
     /// The sibling `tokenizer_config.json`, when the checkpoint dir ships one
     /// — config-driven EOS/BOS/PAD for a consumer to read. `None` for a GGUF
@@ -203,7 +203,7 @@ pub struct LoadedOlmoe<B: Backend> {
     pub tokenizer_config: Option<crate::tok_config::TokenizerConfig>,
 }
 
-fn build<B: Backend>(cfg: &OlmoeConfig, device: &B::Device) -> Olmoe<B> {
+fn build(cfg: &OlmoeConfig, device: &Device) -> Olmoe {
     let attn_cfg = GqaAttentionConfig {
         hidden_size: cfg.hidden_size,
         num_heads: cfg.num_attention_heads,
@@ -219,7 +219,7 @@ fn build<B: Backend>(cfg: &OlmoeConfig, device: &B::Device) -> Olmoe<B> {
         num_experts: cfg.num_experts,
         num_experts_per_tok: cfg.num_experts_per_tok,
     };
-    let norm = |dev: &B::Device| {
+    let norm = |dev: &Device| {
         RmsNormConfig::new(cfg.hidden_size)
             .with_epsilon(cfg.rms_norm_eps)
             .init(dev)
@@ -308,10 +308,10 @@ fn olmoe_gguf_name(name: &str) -> Option<String> {
 /// the ~28 GB model from it is the sum a 128 GB box with other tenants
 /// actually fails to satisfy. Streaming keeps the peak at the model plus one
 /// tensor. The file is this process's to delete, on success or failure.
-pub fn load_from_gguf<B: Backend>(
+pub fn load_from_gguf(
     path: &Path,
-    device: &B::Device,
-) -> Result<LoadedOlmoe<B>, ImportError> {
+    device: &Device,
+) -> Result<LoadedOlmoe, ImportError> {
     let parse = |reason: String| ImportError::Parse {
         file: path.to_path_buf(),
         reason,
@@ -321,9 +321,9 @@ pub fn load_from_gguf<B: Backend>(
     // The scratch guard (Some only when the payload went to disk, which at
     // OLMoE's size it always does) must outlive `load_checked`: the store
     // reads that file lazily.
-    let (base, _scratch) = gguf_store::<B>(&f, &gguf_tensor_to_hf, DequantSink::Auto)?;
+    let (base, _scratch) = gguf_store(&f, &gguf_tensor_to_hf, DequantSink::Auto)?;
 
-    let mut model = build::<B>(&config, device);
+    let mut model = build(&config, device);
     let mut store = install_remaps(base);
     load_checked(&mut model, &mut store, path)?;
     Ok(LoadedOlmoe {
@@ -385,10 +385,10 @@ fn fused_expert_target(name: &str, num_experts: usize) -> Option<Fuse> {
 ///
 /// Budget note: the fused blob is the checkpoint's own size (~13.8 GB in bf16
 /// for the 1B-7B) and the loaded f32 model is ~28 GB — size the target device.
-pub fn load_from_dir<B: Backend>(
+pub fn load_from_dir(
     dir: &Path,
-    device: &B::Device,
-) -> Result<LoadedOlmoe<B>, ImportError> {
+    device: &Device,
+) -> Result<LoadedOlmoe, ImportError> {
     let cfg_path = required_file(dir, "config.json")?;
     let cfg_bytes = std::fs::read(&cfg_path).map_err(|e| ImportError::Parse {
         file: cfg_path.clone(),
@@ -424,10 +424,10 @@ pub fn load_from_dir<B: Backend>(
     })?;
     assert!(bytes > 8, "a fused checkpoint yields a non-empty payload");
 
-    let mut model = build::<B>(&config, device);
-    // The backend's float dtype from the TYPE (`B::FloatElem`), never a probe
+    let mut model = build(&config, device);
+    // The backend's float dtype from the TYPE (`f32`), never a probe
     // tensor (the per-device default-dtype policy hazard).
-    let target_float = <B::FloatElem as burn::tensor::Element>::dtype();
+    let target_float = crate::backend::float_dtype();
     let mut store = install_remaps(
         SafetensorsStore::from_file(fused.path().to_path_buf())
             .with_from_adapter(PyTorchToBurnAdapter.chain(CastFloatAdapter::new(target_float)))
@@ -441,8 +441,8 @@ pub fn load_from_dir<B: Backend>(
     })
 }
 
-impl<B: Backend> CausalLm<B> for LoadedOlmoe<B> {
-    type Cache = Vec<LayerKv<B>>;
+impl CausalLm for LoadedOlmoe {
+    type Cache = Vec<LayerKv>;
 
     fn new_cache(&self) -> Self::Cache {
         (0..self.config.num_hidden_layers).map(|_| None).collect()
@@ -457,8 +457,8 @@ impl<B: Backend> CausalLm<B> for LoadedOlmoe<B> {
         new_ids: &[u32],
         past: usize,
         cache: &mut Self::Cache,
-        device: &B::Device,
-    ) -> Tensor<B, 2> {
+        device: &Device,
+    ) -> Tensor<2> {
         let t = new_ids.len();
         assert!(t >= 1, "OLMoE forward: need at least one token");
         assert!(
@@ -472,15 +472,15 @@ impl<B: Backend> CausalLm<B> for LoadedOlmoe<B> {
 
         // Dtype pinned to the backend TYPE, never the per-device policy.
         let ids32: Vec<i32> = new_ids.iter().map(|&i| i as i32).collect();
-        let input = Tensor::<B, 1, Int>::from_data(
+        let input = Tensor::<1, Int>::from_data(
             TensorData::new(ids32, [t]),
-            (device, crate::backend::int_dtype::<B>()),
+            (device, crate::backend::int_dtype()),
         )
         .reshape([1, t]);
         let mut x = self.model.embed_tokens.forward(input); // [1, t, hidden]
 
-        let (cos, sin) = rope_tables::<B>(t, past, hd, cfg.rope_theta, device);
-        let mask = (t > 1).then(|| causal_mask::<B>(t, past, device));
+        let (cos, sin) = rope_tables(t, past, hd, cfg.rope_theta, device);
+        let mask = (t > 1).then(|| causal_mask(t, past, device));
 
         for (layer, kv) in self.model.layers.iter().zip(cache.iter_mut()) {
             let h = layer.input_layernorm.forward(x.clone());
@@ -522,10 +522,9 @@ impl<B: Backend> CausalLm<B> for LoadedOlmoe<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::Cpu;
     use crate::gguf::{GgmlType, GgufTensorInfo};
 
-    type Dev = burn::tensor::Device<Cpu>;
+    type Dev = burn::tensor::Device;
 
     /// A synthetic toy MoE config: 4 experts, top-2, MHA, untied head.
     fn toy_config() -> OlmoeConfig {
@@ -582,9 +581,9 @@ mod tests {
     /// through the MoE layers and the projection-wide q/k norm.
     #[test]
     fn toy_model_cached_decode_matches_full_forward() {
-        let device = Dev::default();
+        let device = crate::backend::cpu_device();
         let cfg = toy_config();
-        let loaded = LoadedOlmoe::<Cpu> {
+        let loaded = LoadedOlmoe {
             model: build(&cfg, &device),
             config: cfg,
             tokenizer_config: None,
@@ -615,9 +614,9 @@ mod tests {
 
     #[test]
     fn projection_qk_norm_spans_the_whole_projection() {
-        let device = Dev::default();
+        let device = crate::backend::cpu_device();
         let cfg = toy_config();
-        let model = build::<Cpu>(&cfg, &device);
+        let model = build(&cfg, &device);
         let q_dim = cfg.num_attention_heads * cfg.head_dim();
         assert_eq!(
             model.layers[0]
@@ -737,16 +736,16 @@ mod tests {
         assert_eq!(olmoe_gguf_name("rope_freqs.weight"), None);
     }
 
-    #[test]
-    fn greedy_generate_respects_max_tokens_bound() {
-        let device = Dev::default();
+    #[tokio::test]
+    async fn greedy_generate_respects_max_tokens_bound() {
+        let device = crate::backend::cpu_device();
         let cfg = toy_config();
-        let loaded = LoadedOlmoe::<Cpu> {
+        let loaded = LoadedOlmoe {
             model: build(&cfg, &device),
             config: cfg,
             tokenizer_config: None,
         };
-        let out = loaded.greedy_generate(&[1, 2, 3], 4, &device).unwrap();
+        let out = loaded.greedy_generate(&[1, 2, 3], 4, &device).await.unwrap();
         assert!(out.len() <= 4);
     }
 
@@ -832,28 +831,28 @@ mod tests {
 
 /// One decoder layer of the quantized variant.
 #[derive(Module, Debug)]
-pub struct QDecoderLayer<B: Backend> {
-    pub self_attn: GqaAttention<B>,
-    pub mlp: crate::nn::SparseMoePerExpert<B>,
-    pub input_layernorm: RmsNorm<B>,
-    pub post_attention_layernorm: RmsNorm<B>,
+pub struct QDecoderLayer {
+    pub self_attn: GqaAttention,
+    pub mlp: crate::nn::SparseMoePerExpert,
+    pub input_layernorm: RmsNorm,
+    pub post_attention_layernorm: RmsNorm,
 }
 
 /// The per-expert-quantized OLMoE stack.
 #[derive(Module, Debug)]
-pub struct OlmoeQ<B: Backend> {
-    pub embed_tokens: Embedding<B>,
-    pub layers: Vec<QDecoderLayer<B>>,
-    pub norm: RmsNorm<B>,
-    pub lm_head: Option<Linear<B>>,
+pub struct OlmoeQ {
+    pub embed_tokens: Embedding,
+    pub layers: Vec<QDecoderLayer>,
+    pub norm: RmsNorm,
+    pub lm_head: Option<Linear>,
 }
 
 /// A weight-loaded quantized OLMoE plus its config. With a `pool`, the
 /// experts in `model` are placeholders and every layer's expert compute
 /// goes through the tiered [`crate::nn::ExpertPool`] (P9 stage 3b); the
 /// router, attention, norms, embedding and head stay on `B`.
-pub struct LoadedOlmoeQ<B: Backend> {
-    pub model: OlmoeQ<B>,
+pub struct LoadedOlmoeQ {
+    pub model: OlmoeQ,
     pub config: OlmoeConfig,
     pub pool: Option<std::sync::Arc<crate::nn::ExpertPool>>,
 }
@@ -863,11 +862,11 @@ pub struct LoadedOlmoeQ<B: Backend> {
 /// members, and every member is **re-quantized independently** (its own
 /// block scales) per `policy`. Peak memory = the finished model plus one
 /// f32 bank.
-pub fn load_from_gguf_quantized<B: Backend>(
+pub fn load_from_gguf_quantized(
     path: &Path,
-    device: &B::Device,
+    device: &Device,
     policy: crate::quant::QuantPolicy,
-) -> Result<LoadedOlmoeQ<B>, ImportError> {
+) -> Result<LoadedOlmoeQ, ImportError> {
     use crate::nn::{ExpertWeights, SparseMoePerExpert};
     use burn::module::Param;
 
@@ -879,18 +878,18 @@ pub fn load_from_gguf_quantized<B: Backend>(
     let config = OlmoeConfig::from_gguf(&f).map_err(parse)?;
     let untied = f.tensor("output.weight").is_some();
 
-    let dtype = crate::backend::float_dtype::<B>();
+    let dtype = crate::backend::float_dtype();
     let dev_tensor2 = |values: Vec<f32>, shape: [usize; 2]| {
-        Tensor::<B, 2>::from_data(TensorData::new(values, shape), (device, dtype))
+        Tensor::<2>::from_data(TensorData::new(values, shape), (device, dtype))
     };
     let dev_tensor1 = |values: Vec<f32>, n: usize| {
-        Tensor::<B, 1>::from_data(TensorData::new(values, [n]), (device, dtype))
+        Tensor::<1>::from_data(TensorData::new(values, [n]), (device, dtype))
     };
     // Tiny placeholders; the completeness count below guarantees every one
     // is replaced before the model is returned.
-    let placeholder2 = || Param::from_tensor(Tensor::<B, 2>::zeros([1, 1], device));
+    let placeholder2 = || Param::from_tensor(Tensor::<2>::zeros([1, 1], device));
 
-    let norm = |dev: &B::Device| {
+    let norm = |dev: &Device| {
         RmsNormConfig::new(config.hidden_size)
             .with_epsilon(config.rms_norm_eps)
             .init(dev)
@@ -934,7 +933,7 @@ pub fn load_from_gguf_quantized<B: Backend>(
     };
 
     // A float linear weight from GGUF's [out, in] into Linear's [in, out].
-    let linear_f32 = |values: Vec<f32>, dims_rev: &[usize]| -> Result<Tensor<B, 2>, String> {
+    let linear_f32 = |values: Vec<f32>, dims_rev: &[usize]| -> Result<Tensor<2>, String> {
         let &[out, inp] = dims_rev else {
             return Err(format!("linear weight must be 2-D, got {dims_rev:?}"));
         };
@@ -1121,20 +1120,20 @@ pub fn pack_actions(info: &GgufTensorInfo) -> Option<crate::pack::ImportAction> 
 
 /// Load the per-expert-quantized OLMoE from a `.mummu` pack; `choose` picks
 /// each tensor's precision (experts are separate entries — the tiering hook).
-pub fn load_from_pack<B: Backend>(
+pub fn load_from_pack(
     dir: &Path,
-    device: &B::Device,
+    device: &Device,
     choose: &dyn Fn(&crate::pack::TensorEntry) -> crate::pack::Precision,
-) -> Result<LoadedOlmoeQ<B>, ImportError> {
-    load_from_pack_inner::<B>(dir, device, choose, true)
+) -> Result<LoadedOlmoeQ, ImportError> {
+    load_from_pack_inner(dir, device, choose, true)
 }
 
-fn load_from_pack_inner<B: Backend>(
+fn load_from_pack_inner(
     dir: &Path,
-    device: &B::Device,
+    device: &Device,
     choose: &dyn Fn(&crate::pack::TensorEntry) -> crate::pack::Precision,
     with_experts: bool,
-) -> Result<LoadedOlmoeQ<B>, ImportError> {
+) -> Result<LoadedOlmoeQ, ImportError> {
     use crate::nn::{ExpertWeights, SparseMoePerExpert};
     use crate::pack::{Pack, Role};
     use burn::module::Param;
@@ -1148,9 +1147,9 @@ fn load_from_pack_inner<B: Backend>(
     let config = OlmoeConfig::from_gguf(&header).map_err(parse)?;
     let untied = pack.entry("output.weight").is_some();
 
-    let dtype = crate::backend::float_dtype::<B>();
-    let placeholder2 = || Param::from_tensor(Tensor::<B, 2>::zeros([1, 1], device));
-    let norm = |dev: &B::Device| {
+    let dtype = crate::backend::float_dtype();
+    let placeholder2 = || Param::from_tensor(Tensor::<2>::zeros([1, 1], device));
+    let norm = |dev: &Device| {
         RmsNormConfig::new(config.hidden_size)
             .with_epsilon(config.rms_norm_eps)
             .init(dev)
@@ -1202,7 +1201,7 @@ fn load_from_pack_inner<B: Backend>(
         }
     };
     let vec1 = |values: Vec<f32>, n: usize| {
-        Tensor::<B, 1>::from_data(TensorData::new(values, [n]), (device, dtype))
+        Tensor::<1>::from_data(TensorData::new(values, [n]), (device, dtype))
     };
 
     let mut assigned = 0usize;
@@ -1213,7 +1212,7 @@ fn load_from_pack_inner<B: Backend>(
                 continue; // a pool serves them
             }
             // Experts are float-or-quantized 2-D [in, out] at the chosen level.
-            let t = pack.tensor::<B, 2>(entry, pick(entry), device).map_err(parse)?;
+            let t = pack.tensor::<2>(entry, pick(entry), device).map_err(parse)?;
             let slot = &mut model
                 .layers
                 .get_mut(*layer)
@@ -1232,9 +1231,9 @@ fn load_from_pack_inner<B: Backend>(
         let mapped = olmoe_gguf_name(&entry.name)
             .ok_or_else(|| parse(format!("unmapped pack tensor '{}'", entry.name)))?;
         // Attention/router/head stay float here; linears are already [in, out].
-        let lin = |entry: &crate::pack::TensorEntry| -> Result<Tensor<B, 2>, ImportError> {
-            pack.tensor::<B, 2>(entry, crate::pack::Precision::F32, device)
-                .or_else(|_| pack.tensor::<B, 2>(entry, crate::pack::Precision::F16, device))
+        let lin = |entry: &crate::pack::TensorEntry| -> Result<Tensor<2>, ImportError> {
+            pack.tensor::<2>(entry, crate::pack::Precision::F32, device)
+                .or_else(|_| pack.tensor::<2>(entry, crate::pack::Precision::F16, device))
                 .map_err(parse)
         };
         match mapped.as_str() {
@@ -1343,13 +1342,13 @@ pub fn pack_expert_costs(pack: &crate::pack::Pack) -> Result<Vec<crate::tier::Ex
 /// One expert's three projections from a pack at `precision`, on `device`,
 /// as a tier-tagged [`crate::nn::DeviceExpert`]. The planner's hot-swap
 /// path: load the replacement, then swap it into the pool.
-pub fn load_expert_from_pack<B: Backend>(
+pub fn load_expert_from_pack(
     pack: &crate::pack::Pack,
     layer: usize,
     index: usize,
     tier: crate::tier::Tier,
-    device: &B::Device,
-) -> Result<crate::nn::DeviceExpert<B>, String> {
+    device: &Device,
+) -> Result<crate::nn::DeviceExpert, String> {
     use crate::nn::ExpertWeights;
     use crate::pack::{Precision, Role};
     use burn::module::Param;
@@ -1374,7 +1373,7 @@ pub fn load_expert_from_pack<B: Backend>(
             Precision::Q4 | Precision::Q8 => blob.values_len + blob.scales_len,
             Precision::F16 | Precision::F32 => entry.shape.iter().product::<usize>() as u64 * 4,
         };
-        let t = Param::from_tensor(pack.tensor::<B, 2>(entry, precision, device)?);
+        let t = Param::from_tensor(pack.tensor::<2>(entry, precision, device)?);
         match proj.as_str() {
             "gate" => gate = Some(t),
             "up" => up = Some(t),
@@ -1396,14 +1395,14 @@ pub fn load_expert_from_pack<B: Backend>(
 /// Load everything **but** the experts from a pack (they stay `[1, 1]`
 /// placeholders) — the trunk of a pooled model. Attach the pool with
 /// [`LoadedOlmoeQ::with_pool`].
-pub fn load_trunk_from_pack<B: Backend>(
+pub fn load_trunk_from_pack(
     dir: &Path,
-    device: &B::Device,
-) -> Result<LoadedOlmoeQ<B>, ImportError> {
-    load_from_pack_inner::<B>(dir, device, &|_| crate::pack::Precision::F32, false)
+    device: &Device,
+) -> Result<LoadedOlmoeQ, ImportError> {
+    load_from_pack_inner(dir, device, &|_| crate::pack::Precision::F32, false)
 }
 
-impl<B: Backend> LoadedOlmoeQ<B> {
+impl LoadedOlmoeQ {
     /// Route every layer's expert compute through `pool`.
     #[must_use]
     pub fn with_pool(mut self, pool: std::sync::Arc<crate::nn::ExpertPool>) -> Self {
@@ -1422,8 +1421,8 @@ impl<B: Backend> LoadedOlmoeQ<B> {
     }
 }
 
-impl<B: Backend> CausalLm<B> for LoadedOlmoeQ<B> {
-    type Cache = Vec<LayerKv<B>>;
+impl CausalLm for LoadedOlmoeQ {
+    type Cache = Vec<LayerKv>;
 
     fn new_cache(&self) -> Self::Cache {
         (0..self.config.num_hidden_layers).map(|_| None).collect()
@@ -1438,8 +1437,8 @@ impl<B: Backend> CausalLm<B> for LoadedOlmoeQ<B> {
         new_ids: &[u32],
         past: usize,
         cache: &mut Self::Cache,
-        device: &B::Device,
-    ) -> Tensor<B, 2> {
+        device: &Device,
+    ) -> Tensor<2> {
         let t = new_ids.len();
         assert!(t >= 1, "OLMoE-Q forward: need at least one token");
         assert!(
@@ -1452,15 +1451,15 @@ impl<B: Backend> CausalLm<B> for LoadedOlmoeQ<B> {
         let hd = cfg.head_dim();
 
         let ids32: Vec<i32> = new_ids.iter().map(|&i| i as i32).collect();
-        let input = Tensor::<B, 1, Int>::from_data(
+        let input = Tensor::<1, Int>::from_data(
             TensorData::new(ids32, [t]),
-            (device, crate::backend::int_dtype::<B>()),
+            (device, crate::backend::int_dtype()),
         )
         .reshape([1, t]);
         let mut x = self.model.embed_tokens.forward(input);
 
-        let (cos, sin) = rope_tables::<B>(t, past, hd, cfg.rope_theta, device);
-        let mask = (t > 1).then(|| causal_mask::<B>(t, past, device));
+        let (cos, sin) = rope_tables(t, past, hd, cfg.rope_theta, device);
+        let mask = (t > 1).then(|| causal_mask(t, past, device));
 
         for (li, (layer, kv)) in self.model.layers.iter().zip(cache.iter_mut()).enumerate() {
             let h = layer.input_layernorm.forward(x.clone());

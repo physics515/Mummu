@@ -28,10 +28,13 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use burn::tensor::quantization::QuantScheme;
-use burn::tensor::{Tensor, TensorData, backend::Backend};
+use burn::tensor::{Device, Tensor, TensorData};
 
 use crate::gguf::{GgufFile, GgufTensorInfo};
 use crate::quant::QuantPolicy;
+// `scheme()` is an extension trait: the ladder lives in `mummu-mix`, which
+// has no burn dependency, so the burn binding is bolted on here.
+use crate::quant::SchemeExt;
 
 /// Pack format version (bump on any incompatible manifest/blob change).
 pub const PACK_VERSION: u32 = 1;
@@ -622,13 +625,13 @@ impl Pack {
     /// in order) as a tensor at `precision`: `[rows, Σ len]`. Quantized
     /// levels are sliced at block granularity (ranges must be block-aligned)
     /// straight from the stored bytes — no re-quantization.
-    pub fn tensor_cols<B: Backend>(
+    pub fn tensor_cols(
         &self,
         entry: &TensorEntry,
         precision: Precision,
         ranges: &[(usize, usize)],
-        device: &B::Device,
-    ) -> Result<Tensor<B, 2>, String> {
+        device: &Device,
+    ) -> Result<Tensor<2>, String> {
         let &[rows, cols] = entry.shape.as_slice() else {
             return Err(format!("'{}' is not 2-D", entry.name));
         };
@@ -659,7 +662,7 @@ impl Pack {
                         v.extend_from_slice(&all[r * cols + start..r * cols + start + len]);
                     }
                 }
-                let dtype = crate::backend::float_dtype::<B>();
+                let dtype = crate::backend::float_dtype();
                 Ok(Tensor::from_data(TensorData::new(v, [rows, width]), (device, dtype)))
             }
         }
@@ -667,13 +670,13 @@ impl Pack {
 
     /// A 2-D entry's **rows** `ranges` (concatenated) as a tensor at
     /// `precision`: `[Σ len, cols]`.
-    pub fn tensor_rows<B: Backend>(
+    pub fn tensor_rows(
         &self,
         entry: &TensorEntry,
         precision: Precision,
         ranges: &[(usize, usize)],
-        device: &B::Device,
-    ) -> Result<Tensor<B, 2>, String> {
+        device: &Device,
+    ) -> Result<Tensor<2>, String> {
         let &[_rows, cols] = entry.shape.as_slice() else {
             return Err(format!("'{}' is not 2-D", entry.name));
         };
@@ -697,7 +700,7 @@ impl Pack {
                 for &(start, len) in ranges {
                     v.extend_from_slice(&all[start * cols..(start + len) * cols]);
                 }
-                let dtype = crate::backend::float_dtype::<B>();
+                let dtype = crate::backend::float_dtype();
                 Ok(Tensor::from_data(TensorData::new(v, [height, cols]), (device, dtype)))
             }
         }
@@ -785,12 +788,12 @@ impl Pack {
     /// Build a device tensor for `entry` at `precision`. Quantized levels
     /// arrive through burn's canonical quantized `TensorData` (no
     /// re-quantization); float levels through the backend's float dtype.
-    pub fn tensor<B: Backend, const D: usize>(
+    pub fn tensor<const D: usize>(
         &self,
         entry: &TensorEntry,
         precision: Precision,
-        device: &B::Device,
-    ) -> Result<Tensor<B, D>, String> {
+        device: &Device,
+    ) -> Result<Tensor<D>, String> {
         let shape: [usize; D] = entry
             .shape
             .clone()
@@ -808,7 +811,7 @@ impl Pack {
             }
             Precision::F16 | Precision::F32 => {
                 let values = self.read_f32(entry)?;
-                let dtype = crate::backend::float_dtype::<B>();
+                let dtype = crate::backend::float_dtype();
                 Ok(Tensor::from_data(TensorData::new(values, shape), (device, dtype)))
             }
         }
@@ -818,7 +821,6 @@ impl Pack {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::Cpu;
 
     #[test]
     fn block_quantizer_roundtrips_within_half_scale() {
@@ -860,7 +862,7 @@ mod tests {
     /// burn tensor whose dequantized values match our own dequant exactly.
     #[test]
     fn canonical_quantized_tensor_data_roundtrip() {
-        let device = burn::tensor::Device::<Cpu>::default();
+        let device = crate::backend::cpu_device();
         for (p, rows, cols) in [
             (Precision::Q8, 32, 64),
             (Precision::Q4, 32, 64),
@@ -872,7 +874,7 @@ mod tests {
             let (q, scales) = quantize_blocks(&vals, cols, p);
             let scheme = p.policy().scheme().unwrap();
             let data = quantized_tensor_data(&q, &scales, [rows, cols], scheme);
-            let t = Tensor::<Cpu, 2>::from_data(data, &device);
+            let t = Tensor::<2>::from_data(data, &device);
             let back = t.dequantize().into_data().to_vec::<f32>().unwrap();
             assert_eq!(back.len(), n, "{p:?} [{rows}, {cols}]");
             for (i, (&qq, &b)) in q.iter().zip(&back).enumerate().step_by(97) {
@@ -926,10 +928,10 @@ mod tests {
         std::fs::write(dir.join("manifest.json"), serde_json::to_string(&manifest).unwrap()).unwrap();
         // No header.gguf here — construct Pack directly.
         let pack = Pack { dir: dir.clone(), manifest };
-        let device = burn::tensor::Device::<Cpu>::default();
+        let device = crate::backend::cpu_device();
         // Columns [32,32) and [96,32) of gate → [rows, 64].
         let ranges = [(32usize, 32usize), (96, 32)];
-        let cslab = pack.tensor_cols::<Cpu>(&ge, Precision::F32, &ranges, &device).unwrap();
+        let cslab = pack.tensor_cols(&ge, Precision::F32, &ranges, &device).unwrap();
         assert_eq!(cslab.dims(), [rows, 64]);
         let got = cslab.into_data().to_vec::<f32>().unwrap();
         for r in 0..rows {
@@ -942,7 +944,7 @@ mod tests {
             }
         }
         // Same ranges as rows of down → [64, rows].
-        let rslab = pack.tensor_rows::<Cpu>(&de, Precision::F32, &ranges, &device).unwrap();
+        let rslab = pack.tensor_rows(&de, Precision::F32, &ranges, &device).unwrap();
         assert_eq!(rslab.dims(), [64, rows]);
         let gotr = rslab.into_data().to_vec::<f32>().unwrap();
         for (k, &(start, len)) in ranges.iter().enumerate() {
@@ -955,7 +957,7 @@ mod tests {
             }
         }
         // Q8 column slice dequantizes close to the source.
-        let cq = pack.tensor_cols::<Cpu>(&ge, Precision::Q8, &ranges, &device).unwrap();
+        let cq = pack.tensor_cols(&ge, Precision::Q8, &ranges, &device).unwrap();
         let dq = cq.dequantize().into_data().to_vec::<f32>().unwrap();
         for r in 0..rows {
             for (k, &(start, len)) in ranges.iter().enumerate() {

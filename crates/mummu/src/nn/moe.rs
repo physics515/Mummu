@@ -13,28 +13,28 @@
 
 use burn::module::{Module, Param};
 use burn::nn::{Linear, LinearConfig};
-use burn::tensor::{DType, Distribution, Int, Tensor, activation, backend::Backend};
+use burn::tensor::{Device, DType, Distribution, Int, Tensor, activation};
 
 /// The expert bank: `num_experts` SwiGLU MLPs as three fused params in
 /// `[experts, out, in]` layout (the row-major twin of ggml's
 /// `ffn_*_exps.weight`). Forward transposes lazily; no per-expert modules.
 #[derive(Module, Debug)]
-pub struct MoeExperts<B: Backend> {
+pub struct MoeExperts {
     /// `[num_experts, intermediate, hidden]` — SiLU branch.
-    pub gate: Param<Tensor<B, 3>>,
+    pub gate: Param<Tensor<3>>,
     /// `[num_experts, intermediate, hidden]` — multiplicative branch.
-    pub up: Param<Tensor<B, 3>>,
+    pub up: Param<Tensor<3>>,
     /// `[num_experts, hidden, intermediate]` — back to the model width.
-    pub down: Param<Tensor<B, 3>>,
+    pub down: Param<Tensor<3>>,
 }
 
 /// Router + expert bank. Field names follow the HF `Olmoe` checkpoint layout
 /// (`mlp.gate` is the router Linear, `mlp.experts` the bank).
 #[derive(Module, Debug)]
-pub struct SparseMoe<B: Backend> {
+pub struct SparseMoe {
     /// The routing projection: `hidden -> num_experts`, no bias.
-    pub gate: Linear<B>,
-    pub experts: MoeExperts<B>,
+    pub gate: Linear,
+    pub experts: MoeExperts,
 }
 
 /// Shape config for [`SparseMoe`].
@@ -50,7 +50,7 @@ pub struct SparseMoeConfig {
 
 impl SparseMoeConfig {
     /// Initialize the module (random weights; real weights come from import).
-    pub fn init<B: Backend>(&self, device: &B::Device) -> SparseMoe<B> {
+    pub fn init(&self, device: &Device) -> SparseMoe {
         assert!(
             self.num_experts >= 2,
             "MoE: num_experts must be >= 2 (got {}); use SwiGluMlp for a dense FFN",
@@ -72,7 +72,7 @@ impl SparseMoeConfig {
             self.expert_intermediate_size,
         );
         // Linear-style uniform init, bound by each projection's fan-in.
-        let init = |out: usize, inp: usize, dev: &B::Device| {
+        let init = |out: usize, inp: usize, dev: &Device| {
             let bound = 1.0 / (inp as f64).sqrt();
             Param::from_tensor(Tensor::random(
                 [e, out, inp],
@@ -91,7 +91,7 @@ impl SparseMoeConfig {
     }
 }
 
-impl<B: Backend> SparseMoe<B> {
+impl SparseMoe {
     /// `[b, t, hidden]` → `[b, t, hidden]`.
     ///
     /// Router math mirrors HF `OlmoeSparseMoeBlock`: softmax over **all**
@@ -99,7 +99,7 @@ impl<B: Backend> SparseMoe<B> {
     /// weights (renormalized to sum 1 iff `norm_topk_prob` — OLMoE ships
     /// `false`). The f32 island matters on f16 backends (softmax of wide
     /// logits); every cast is a no-op on f32.
-    pub fn forward(&self, x: Tensor<B, 3>, top_k: usize, norm_topk_prob: bool) -> Tensor<B, 3> {
+    pub fn forward(&self, x: Tensor<3>, top_k: usize, norm_topk_prob: bool) -> Tensor<3> {
         let [b, t, h] = x.dims();
         let [e, _inter, h_in] = self.experts.gate.dims();
         assert!(
@@ -132,7 +132,7 @@ impl<B: Backend> SparseMoe<B> {
             vals
         };
         let classes =
-            Tensor::<B, 1, Int>::arange(0..e as i64, &xt.device()).reshape([1, 1, e as i32]);
+            Tensor::<1, Int>::arange(0..e as i64, &xt.device()).reshape([1, 1, e as i32]);
         let hit = idx
             .reshape([bt, top_k, 1])
             .equal(classes.expand([bt, top_k, e])); // [bt, k, e]
@@ -163,13 +163,13 @@ impl<B: Backend> SparseMoe<B> {
 /// (`[in, out]`), so each expert quantizes independently (its own block
 /// scales) and only routed experts are touched at all.
 #[derive(Module, Debug)]
-pub struct ExpertWeights<B: Backend> {
+pub struct ExpertWeights {
     /// `[hidden, intermediate]` — SiLU branch.
-    pub gate: Param<Tensor<B, 2>>,
+    pub gate: Param<Tensor<2>>,
     /// `[hidden, intermediate]` — multiplicative branch.
-    pub up: Param<Tensor<B, 2>>,
+    pub up: Param<Tensor<2>>,
     /// `[intermediate, hidden]` — back to the model width.
-    pub down: Param<Tensor<B, 2>>,
+    pub down: Param<Tensor<2>>,
 }
 
 /// The P9 MoE variant of [`SparseMoe`]: the same router, but experts as
@@ -180,18 +180,18 @@ pub struct ExpertWeights<B: Backend> {
 /// dense path's no-readback rationale trades away here for the k/E FLOPs
 /// and the per-expert weight independence quantization needs.
 #[derive(Module, Debug)]
-pub struct SparseMoePerExpert<B: Backend> {
+pub struct SparseMoePerExpert {
     /// The routing projection: `hidden -> num_experts`, no bias, float.
-    pub gate: Linear<B>,
-    pub experts: Vec<ExpertWeights<B>>,
+    pub gate: Linear,
+    pub experts: Vec<ExpertWeights>,
 }
 
-impl<B: Backend> SparseMoePerExpert<B> {
+impl SparseMoePerExpert {
     /// `[b, t, hidden]` → `[b, t, hidden]`. Router math identical to
     /// [`SparseMoe::forward`]; expert compute is gather → three 2-D
     /// matmuls (never reshaping the possibly-packed weights) →
     /// scatter-add of the weighted outputs.
-    pub fn forward(&self, x: Tensor<B, 3>, top_k: usize, norm_topk_prob: bool) -> Tensor<B, 3> {
+    pub fn forward(&self, x: Tensor<3>, top_k: usize, norm_topk_prob: bool) -> Tensor<3> {
         let [b, t, h] = x.dims();
         let xt = x.reshape([b * t, h]);
         let routing = self.route(xt.clone(), top_k, norm_topk_prob);
@@ -203,12 +203,12 @@ impl<B: Backend> SparseMoePerExpert<B> {
     /// stage 3b). Router math stays here on `B`; `layer` indexes the pool.
     pub fn forward_pooled(
         &self,
-        x: Tensor<B, 3>,
+        x: Tensor<3>,
         top_k: usize,
         norm_topk_prob: bool,
         pool: &ExpertPool,
         layer: usize,
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
         let [b, t, h] = x.dims();
         let xt = x.reshape([b * t, h]);
         let routing = self.route(xt.clone(), top_k, norm_topk_prob);
@@ -217,7 +217,7 @@ impl<B: Backend> SparseMoePerExpert<B> {
 
     /// Router: softmax → top-k → (optionally renormalized) weights, read back
     /// to the host as per-expert (token rows, weights) lists.
-    pub fn route(&self, xt: Tensor<B, 2>, top_k: usize, norm_topk_prob: bool) -> Routing {
+    pub fn route(&self, xt: Tensor<2>, top_k: usize, norm_topk_prob: bool) -> Routing {
         let [bt, _h] = xt.dims();
         let e = self.experts.len();
         assert!(
@@ -263,11 +263,11 @@ impl<B: Backend> SparseMoePerExpert<B> {
     /// Expert compute on this module's own (same-backend) experts: gather →
     /// three 2-D matmuls (never reshaping the possibly-packed weights) →
     /// scatter-add of the weighted outputs. `[bt, h]` → `[bt, h]`.
-    pub fn run_local(&self, xt: Tensor<B, 2>, routing: &Routing) -> Tensor<B, 2> {
+    pub fn run_local(&self, xt: Tensor<2>, routing: &Routing) -> Tensor<2> {
         let [bt, h] = xt.dims();
         let ambient = xt.dtype();
         let device = xt.device();
-        let mut out = Tensor::<B, 2>::zeros([bt, h], &device);
+        let mut out = Tensor::<2>::zeros([bt, h], &device);
         for (expert, (rows, weights)) in routing.per_expert.iter().enumerate() {
             if rows.is_empty() {
                 continue; // not in service this batch
@@ -275,18 +275,18 @@ impl<B: Backend> SparseMoePerExpert<B> {
             let n = rows.len();
             let rows = rows.clone();
             let weights = weights.clone();
-            let rows_t = Tensor::<B, 1, Int>::from_data(
+            let rows_t = Tensor::<1, Int>::from_data(
                 burn::tensor::TensorData::new(rows, [n]),
-                (&device, crate::backend::int_dtype::<B>()),
+                (&device, crate::backend::int_dtype()),
             );
             let x_e = xt.clone().select(0, rows_t.clone()); // [n, h]
             let w = &self.experts[expert];
             let acts = activation::silu(x_e.clone().matmul(w.gate.val()))
                 .mul(x_e.matmul(w.up.val()));
             let y = acts.matmul(w.down.val()); // [n, h]
-            let scale = Tensor::<B, 1>::from_data(
+            let scale = Tensor::<1>::from_data(
                 burn::tensor::TensorData::new(weights, [n]),
-                (&device, crate::backend::float_dtype::<B>()),
+                (&device, crate::backend::float_dtype()),
             )
             .reshape([n, 1])
             .cast(ambient);
@@ -326,7 +326,48 @@ pub trait ExpertExec: Send + Sync {
     /// Bytes it holds on its device.
     fn resident_bytes(&self) -> u64;
     /// SwiGLU on `rows × hidden` f32 (row-major) → `rows × hidden`.
+    ///
+    /// The host-buffer form. Prefer [`Self::run_tensor`], which keeps the
+    /// data on-device when the caller is already on this expert's device.
     fn run(&self, x: &[f32], rows: usize, hidden: usize) -> Vec<f32>;
+
+    /// Bring this expert's weights onto `device` (the working set's
+    /// prefetch). Default: nothing — an executor pinned to one device is
+    /// already where it will run, so staging it is a no-op rather than an
+    /// error.
+    fn stage(&self, _device: &Device) {}
+
+    /// Release a staged device copy (the working set's eviction). Default:
+    /// nothing, for the same reason.
+    fn evict(&self) {}
+
+    /// Is a device copy currently held? Pinned executors answer `true` —
+    /// they are always "resident" on their own device.
+    fn is_staged(&self) -> bool {
+        true
+    }
+
+    /// SwiGLU on `[rows, hidden]` **as a tensor**: burn 0.22 has one tensor
+    /// type across devices, so this moves data only when the caller's device
+    /// differs from the expert's — and not at all when they match, which is
+    /// the difference between a per-layer host round trip and none.
+    ///
+    /// The default keeps the old behavior for executors that only implement
+    /// the host form.
+    fn run_tensor(&self, x: Tensor<2>) -> Tensor<2> {
+        let [rows, hidden] = x.dims();
+        let device = x.device();
+        let host = x
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .expect("expert input read back");
+        let out = self.run(&host, rows, hidden);
+        Tensor::<2>::from_data(
+            burn::tensor::TensorData::new(out, [rows, hidden]),
+            (&device, crate::backend::float_dtype()),
+        )
+    }
     /// Per-row energy of this expert's gate activations, `Σ silu(x·g)²` —
     /// the training-free router signal for skipping (P9 stage 3c). Costs
     /// the gate matmul only. The default never skips.
@@ -338,17 +379,17 @@ pub trait ExpertExec: Send + Sync {
 /// [`ExpertWeights`] on a concrete backend's device, exposed as an
 /// [`ExpertExec`]. Generic over `B`, so a pool can mix CPU, wgpu and CUDA
 /// experts — each at its own precision — behind one trait object.
-pub struct DeviceExpert<B: Backend> {
-    pub weights: ExpertWeights<B>,
-    pub device: B::Device,
+pub struct DeviceExpert {
+    pub weights: ExpertWeights,
+    pub device: Device,
     pub tier: crate::tier::Tier,
     pub bytes: u64,
 }
 
-impl<B: Backend> ExpertExec for DeviceExpert<B>
+impl ExpertExec for DeviceExpert
 where
-    ExpertWeights<B>: Send + Sync,
-    B::Device: Send + Sync,
+    ExpertWeights: Send + Sync,
+    Device: Send + Sync,
 {
     fn tier(&self) -> crate::tier::Tier {
         self.tier
@@ -360,9 +401,9 @@ where
 
     fn run(&self, x: &[f32], rows: usize, hidden: usize) -> Vec<f32> {
         debug_assert_eq!(x.len(), rows * hidden);
-        let xt = Tensor::<B, 2>::from_data(
+        let xt = Tensor::<2>::from_data(
             burn::tensor::TensorData::new(x.to_vec(), [rows, hidden]),
-            (&self.device, crate::backend::float_dtype::<B>()),
+            (&self.device, crate::backend::float_dtype()),
         );
         let w = &self.weights;
         let acts = activation::silu(xt.clone().matmul(compute_weight(&w.gate)))
@@ -374,10 +415,21 @@ where
             .expect("expert output read back")
     }
 
+    fn run_tensor(&self, x: Tensor<2>) -> Tensor<2> {
+        // `to_device` is a no-op when the tensor is already here, so a
+        // cluster group living on the caller's device costs zero transfers.
+        let caller = x.device();
+        let xt = crate::backend::move_to(x, &self.device);
+        let w = &self.weights;
+        let acts = activation::silu(xt.clone().matmul(compute_weight(&w.gate)))
+            .mul(xt.matmul(compute_weight(&w.up)));
+        crate::backend::move_to(acts.matmul(compute_weight(&w.down)), &caller)
+    }
+
     fn gate_energy(&self, x: &[f32], rows: usize, hidden: usize) -> Vec<f32> {
-        let xt = Tensor::<B, 2>::from_data(
+        let xt = Tensor::<2>::from_data(
             burn::tensor::TensorData::new(x.to_vec(), [rows, hidden]),
-            (&self.device, crate::backend::float_dtype::<B>()),
+            (&self.device, crate::backend::float_dtype()),
         );
         activation::silu(xt.matmul(compute_weight(&self.weights.gate)))
             .powf_scalar(2.0)
@@ -389,19 +441,215 @@ where
     }
 }
 
-/// A pooled expert's weight ready for an `f32`-input matmul: a quantized
-/// weight (Q4/Q8, stored compactly) is **dequantized on its own device**
-/// first, so the matmul is always float×float. This keeps the storage
-/// savings while sidestepping the mixed f32-input × quantized-weight
-/// `q_matmul` — which burn 0.21's CUDA backend panics on ("Cast element
-/// count must match") and wgpu computes wrong. The dequantized tensor is
-/// transient (freed after the matmul); the `Param` stays quantized.
-fn compute_weight<B: Backend>(w: &Param<Tensor<B, 2>>) -> Tensor<B, 2> {
+/// A pooled expert's weight, ready to multiply.
+///
+/// A quantized weight is handed to `matmul` **as-is** when this device's
+/// backend multiplies it natively — that reads 4–8x fewer weight bytes and
+/// skips materializing an f32 copy. Where the native path is broken it is
+/// dequantized first instead (transient; the `Param` stays quantized).
+///
+/// Which backends work is a property of the burn version and the device, so
+/// it is **probed**, not hardcoded — see [`native_qmatmul_ok`].
+fn compute_weight(w: &Param<Tensor<2>>) -> Tensor<2> {
     let t = w.val();
-    if matches!(t.dtype(), DType::QFloat(_)) {
-        t.dequantize()
-    } else {
-        t
+    match t.dtype() {
+        DType::QFloat(_) if native_qmatmul_ok(&t.device(), t.dtype()) => t,
+        DType::QFloat(_) => t.dequantize(),
+        _ => t,
+    }
+}
+
+/// Does this device multiply a quantized weight natively — without panicking,
+/// and with the right answer?
+///
+/// Probed once per (device, scheme) and cached. Burn 0.21's CUDA `q_matmul`
+/// panicked in kernel expansion; 0.22 fixed CUDA but wgpu still panics on Q4,
+/// and upstream's own autotune candidates are documented as panicking "on the
+/// level rather than declining it". A capability that varies by version,
+/// backend and dtype is exactly the kind that should be measured on the
+/// machine in front of us rather than asserted from a table.
+///
+/// Conservative by construction: any panic, or an answer that disagrees with
+/// the dequantized path, means "no".
+fn native_qmatmul_ok(device: &Device, dtype: DType) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    static CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    let key = format!("{device:?}/{dtype:?}");
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(&hit) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return hit;
+    }
+
+    // Small enough to be free, wide enough to cross a quantization block.
+    let (k, n) = (64usize, 64usize);
+    let ok = std::panic::catch_unwind(|| {
+        let x = Tensor::<2>::from_data(
+            burn::tensor::TensorData::new(vec![0.5f32; k], [1, k]),
+            (device, crate::backend::float_dtype()),
+        );
+        let w = Tensor::<2>::from_data(
+            burn::tensor::TensorData::new(
+                (0..k * n).map(|i| ((i % 17) as f32 - 8.0) * 0.1).collect::<Vec<f32>>(),
+                [k, n],
+            ),
+            (device, crate::backend::float_dtype()),
+        );
+        let DType::QFloat(scheme) = dtype else {
+            return false;
+        };
+        let qw = w.clone().quantize_dynamic(&scheme);
+        let native = x.clone().matmul(qw.clone()).into_data().convert::<f32>().to_vec::<f32>();
+        let deq = x.matmul(qw.dequantize()).into_data().convert::<f32>().to_vec::<f32>();
+        match (native, deq) {
+            (Ok(a), Ok(b)) => {
+                // Agreement, not just absence of a panic: a native path that
+                // silently computes something else is worse than one that fails.
+                let scale = b.iter().map(|v| v.abs()).fold(1e-3, f32::max);
+                a.iter().zip(&b).all(|(x, y)| (x - y).abs() <= 0.05 * scale)
+            }
+            _ => false,
+        }
+    })
+    .unwrap_or(false);
+
+    if !ok {
+        // Worth saying once: it silently costs bandwidth on every matmul.
+        eprintln!(
+            "[mummu] {key}: no usable native quantized matmul — dequantizing before each matmul"
+        );
+    }
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, ok);
+    ok
+}
+
+/// An expert whose weights live in **host RAM**, staged onto a device only
+/// while it computes (P9 stage 4 — see [`crate::workingset`]).
+///
+/// [`DeviceExpert`] pins its weights to one device for the process's life,
+/// which is what caps how much of a model can ever run on the fast one.
+/// This type inverts that: the host copy is authoritative, the device copy
+/// is a cache entry the scheduler creates and drops. That is what lets a
+/// model larger than VRAM still execute every layer on the GPU.
+///
+/// `resident` is the staged device copy. `None` means "not staged": `run`
+/// then computes on the host, which is the overflow path — never a stall,
+/// because the host already holds the bytes.
+pub struct StagedExpert {
+    /// The authoritative copy, always present, on the host device.
+    host: ExpertWeights,
+    /// The host device the weights live on (where overflow computes).
+    host_device: Device,
+    /// The staged device copy, when the scheduler has brought it in.
+    resident: std::sync::RwLock<Option<(Device, ExpertWeights)>>,
+    tier: crate::tier::Tier,
+    bytes: u64,
+}
+
+impl StagedExpert {
+    /// Hold `weights` in host RAM, unstaged.
+    #[must_use]
+    pub fn new(weights: ExpertWeights, host_device: Device, tier: crate::tier::Tier, bytes: u64) -> Self {
+        Self {
+            host: weights,
+            host_device,
+            resident: std::sync::RwLock::new(None),
+            tier,
+            bytes,
+        }
+    }
+
+    /// Stage onto `device` (the scheduler's prefetch). Idempotent: staging
+    /// onto the device it already sits on does nothing, so a redundant
+    /// prefetch costs a comparison rather than a transfer.
+    fn stage_on(&self, device: &Device) {
+        {
+            let held = self.resident.read().unwrap_or_else(|e| e.into_inner());
+            if held.as_ref().is_some_and(|(d, _)| d == device) {
+                return;
+            }
+        }
+        let staged = ExpertWeights {
+            gate: burn::module::Param::from_tensor(self.host.gate.val().to_device(device)),
+            up: burn::module::Param::from_tensor(self.host.up.val().to_device(device)),
+            down: burn::module::Param::from_tensor(self.host.down.val().to_device(device)),
+        };
+        *self.resident.write().unwrap_or_else(|e| e.into_inner()) = Some((device.clone(), staged));
+    }
+
+    /// Drop the device copy (the scheduler's eviction), freeing its memory.
+    /// The host copy is untouched, so the expert stays runnable.
+    fn evict_copy(&self) {
+        *self.resident.write().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    fn staged(&self) -> bool {
+        self.resident
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+}
+
+impl ExpertExec for StagedExpert {
+    fn tier(&self) -> crate::tier::Tier {
+        self.tier
+    }
+
+    fn resident_bytes(&self) -> u64 {
+        // Device bytes only: the host copy is the backing store, not part of
+        // the working set the planner budgets.
+        if self.staged() { self.bytes } else { 0 }
+    }
+
+    fn stage(&self, device: &Device) {
+        self.stage_on(device);
+    }
+
+    fn evict(&self) {
+        self.evict_copy();
+    }
+
+    fn is_staged(&self) -> bool {
+        self.staged()
+    }
+
+    fn run(&self, x: &[f32], rows: usize, hidden: usize) -> Vec<f32> {
+        let device = self
+            .resident
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map_or_else(|| self.host_device.clone(), |(d, _)| d.clone());
+        let xt = Tensor::<2>::from_data(
+            burn::tensor::TensorData::new(x.to_vec(), [rows, hidden]),
+            (&device, crate::backend::float_dtype()),
+        );
+        self.run_tensor(xt)
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .expect("expert output read back")
+    }
+
+    fn run_tensor(&self, x: Tensor<2>) -> Tensor<2> {
+        let caller = x.device();
+        let held = self.resident.read().unwrap_or_else(|e| e.into_inner());
+        let (device, w) = match held.as_ref() {
+            // Staged: compute on the device the scheduler put it on.
+            Some((d, w)) => (d.clone(), w),
+            // Not staged — the overflow path. Compute on the host rather
+            // than stall waiting for a transfer that was never issued.
+            None => (self.host_device.clone(), &self.host),
+        };
+        let xt = crate::backend::move_to(x, &device);
+        let acts = activation::silu(xt.clone().matmul(compute_weight(&w.gate)))
+            .mul(xt.matmul(compute_weight(&w.up)));
+        crate::backend::move_to(acts.matmul(compute_weight(&w.down)), &caller)
     }
 }
 
@@ -483,6 +731,72 @@ impl ExpertPool {
 
     /// Replace one expert's executor (the hot-swap). The old one is
     /// returned so the caller controls when its device memory is freed.
+    /// Apply one layer's working-set decisions: evict what the schedule
+    /// gave up, stage what it prefetched. Both are cheap in-place calls on
+    /// the executors — no slot swap, because a [`StagedExpert`] owns its
+    /// host copy and its device copy at once.
+    ///
+    /// Called for layer `L` *while layer `L` computes*, so the transfers
+    /// overlap compute rather than sitting on the critical path. Nothing
+    /// here blocks: a stage that has not landed by the time its layer runs
+    /// simply computes on the host (see [`StagedExpert::run_tensor`]).
+    pub fn apply_schedule(
+        &self,
+        layer: usize,
+        sched: &crate::workingset::LayerSchedule,
+        device: &Device,
+    ) {
+        for &u in &sched.evict {
+            if let Some(e) = self.unit(layer, u) {
+                e.evict();
+            }
+        }
+        for &u in &sched.prefetch {
+            if let Some(e) = self.unit(layer, u) {
+                e.stage(device);
+            }
+        }
+    }
+
+    /// The executor for a flat unit id, if this pool holds it. Unit ids are
+    /// layer-major (`layer * experts_per_layer + index`), matching the
+    /// scheduler's numbering.
+    #[must_use]
+    pub fn unit(&self, layer: usize, unit: crate::workingset::UnitId) -> Option<std::sync::Arc<dyn ExpertExec>> {
+        let per = self.experts_per_layer();
+        let (l, i) = unit
+            .checked_div(per)
+            .map_or((layer, unit), |l| (l, unit % per));
+        // A unit id addresses its own layer; fall back to the caller's layer
+        // for pools whose rows are ragged (dense FFN groups).
+        let (l, i) = if self.slots.get(l).is_some_and(|r| i < r.len()) {
+            (l, i)
+        } else if self.slots.get(layer).is_some_and(|r| unit < r.len()) {
+            (layer, unit)
+        } else {
+            return None;
+        };
+        Some(
+            self.slots[l][i]
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+        )
+    }
+
+    /// Device bytes the working set currently holds — what the scheduler
+    /// budgets against, counting only staged copies.
+    #[must_use]
+    pub fn staged_bytes(&self) -> u64 {
+        (0..self.num_layers())
+            .flat_map(|l| (0..self.row_len(l)).map(move |e| (l, e)))
+            .map(|(l, e)| {
+                let x = self.get(l, e);
+                if x.is_staged() { x.resident_bytes() } else { 0 }
+            })
+            .sum()
+    }
+
     pub fn swap(
         &self,
         layer: usize,
@@ -534,24 +848,109 @@ impl ExpertPool {
     /// gate energy is below `tau` × the row's total energy (local + all
     /// remote) — the opt-in lossy mode; hit counters accumulate energy so
     /// the re-tier planner sees hot clusters.
-    pub fn run_dense<B: Backend>(
+    pub fn run_dense(
         &self,
         layer: usize,
-        xt: Tensor<B, 2>,
+        xt: Tensor<2>,
         skip: Option<(f32, &[f32])>,
-    ) -> Option<Tensor<B, 2>> {
+    ) -> Option<Tensor<2>> {
         let n = self.row_len(layer);
         if n == 0 {
             return None;
         }
         let [bt, h] = xt.dims();
         let device = xt.device();
+        let execs: Vec<std::sync::Arc<dyn ExpertExec>> = (0..n).map(|e| self.get(layer, e)).collect();
+
+        // Exact mode (no skipping): every cluster runs on every row, so there
+        // is nothing to gather — sum the groups as tensors and never touch
+        // the host. This is the path a dense model takes, and it removes the
+        // per-layer round trip that dominated the 27B's decode.
+        if skip.is_none() {
+            // Run the devices CONCURRENTLY, one thread per device, and sum
+            // what comes back. Sequentially the layer costs the SUM of every
+            // device's share, so adding a second GPU bought nothing: 885
+            // clusters moved from the CPU to the integrated GPU and decode
+            // measured 4.72 s/tok against 4.32 before, because an iGPU
+            // cluster (14.15 ms) is no faster than the CPU cluster it
+            // replaced (13.82 ms) and the move added a transfer. Run in
+            // parallel the layer costs the MAX instead, which is the entire
+            // reason to spread work across devices at all.
+            //
+            // One thread per DEVICE, never per executor. Thread-per-executor
+            // is what made cubecl-cuda open a stream per thread until a
+            // 64-layer forward exhausted VRAM (`CUDA_ERROR_OUT_OF_MEMORY`,
+            // "Can create a new stream"). Devices are bounded — three on this
+            // box — so the stream count is bounded with them.
+            let mut by_device: Vec<(String, Vec<usize>)> = Vec::new();
+            for (e, exec) in execs.iter().enumerate() {
+                let key = format!("{:?}", exec.tier().device);
+                match by_device.iter_mut().find(|(k, _)| *k == key) {
+                    Some((_, list)) => list.push(e),
+                    None => by_device.push((key, vec![e])),
+                }
+            }
+            for (e, _) in execs.iter().enumerate() {
+                self.hits[layer][e].fetch_add(bt as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.dense_rows[0].fetch_add(bt as u64, std::sync::atomic::Ordering::Relaxed);
+            self.dense_rows[1].fetch_add(bt as u64, std::sync::atomic::Ordering::Relaxed);
+
+            // One device: no threads, no join, exactly the old path.
+            if by_device.len() < 2 {
+                let mut out: Option<Tensor<2>> = None;
+                for exec in &execs {
+                    let y = exec.run_tensor(xt.clone());
+                    out = Some(match out {
+                        Some(acc) => acc.add(y),
+                        None => y,
+                    });
+                }
+                return out;
+            }
+
+            let partials: Vec<Tensor<2>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = by_device
+                    .iter()
+                    .map(|(_, members)| {
+                        let execs = &execs;
+                        let xt = xt.clone();
+                        scope.spawn(move || {
+                            let mut acc: Option<Tensor<2>> = None;
+                            for &e in members {
+                                let y = execs[e].run_tensor(xt.clone());
+                                acc = Some(match acc {
+                                    Some(a) => a.add(y),
+                                    None => y,
+                                });
+                            }
+                            acc
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .filter_map(|h| h.join().ok().flatten())
+                    .collect()
+            });
+
+            // Sum the per-device partials on the caller's device.
+            let mut out: Option<Tensor<2>> = None;
+            for p in partials {
+                let p = crate::backend::move_to(p, &device);
+                out = Some(match out {
+                    Some(acc) => acc.add(p),
+                    None => p,
+                });
+            }
+            return out;
+        }
+
         let host: Vec<f32> = xt
             .into_data()
             .convert::<f32>()
             .to_vec::<f32>()
             .expect("FFN input read back");
-        let execs: Vec<std::sync::Arc<dyn ExpertExec>> = (0..n).map(|e| self.get(layer, e)).collect();
         // Which rows each executor runs: all, or the rows where it matters.
         let rows_per_exec: Vec<Vec<i32>> = match skip {
             None => vec![(0..bt as i32).collect(); n],
@@ -614,9 +1013,9 @@ impl ExpertPool {
             self.dense_rows[0].fetch_add(rows.len() as u64, std::sync::atomic::Ordering::Relaxed);
             self.dense_rows[1].fetch_add(bt as u64, std::sync::atomic::Ordering::Relaxed);
         }
-        Some(Tensor::<B, 2>::from_data(
+        Some(Tensor::<2>::from_data(
             burn::tensor::TensorData::new(out, [bt, h]),
-            (&device, crate::backend::float_dtype::<B>()),
+            (&device, crate::backend::float_dtype()),
         ))
     }
 
@@ -632,7 +1031,7 @@ impl ExpertPool {
     /// Run one layer's routed experts: gather the routed rows on the host,
     /// execute every in-service expert concurrently on its own device,
     /// scatter-add the weighted outputs, upload once. `[bt, h]` → `[bt, h]`.
-    pub fn run_layer<B: Backend>(&self, layer: usize, xt: Tensor<B, 2>, routing: &Routing) -> Tensor<B, 2> {
+    pub fn run_layer(&self, layer: usize, xt: Tensor<2>, routing: &Routing) -> Tensor<2> {
         let [bt, h] = xt.dims();
         let device = xt.device();
         let host: Vec<f32> = xt
@@ -683,9 +1082,9 @@ impl ExpertPool {
                 }
             }
         }
-        Tensor::<B, 2>::from_data(
+        Tensor::<2>::from_data(
             burn::tensor::TensorData::new(out, [bt, h]),
-            (&device, crate::backend::float_dtype::<B>()),
+            (&device, crate::backend::float_dtype()),
         )
     }
 }
@@ -693,10 +1092,9 @@ impl ExpertPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::Cpu;
     use burn::tensor::TensorData;
 
-    type Dev = burn::tensor::Device<Cpu>;
+    type Dev = burn::tensor::Device;
 
     const HIDDEN: usize = 4;
     const INTER: usize = 3;
@@ -705,13 +1103,13 @@ mod tests {
 
     /// Deterministic weights: expert `e`'s matrices are small distinct
     /// sinusoids so every expert computes something different.
-    fn moe(device: &Dev) -> SparseMoe<Cpu> {
+    fn moe(device: &Dev) -> SparseMoe {
         let fill = |seed: f32, dims: [usize; 3]| {
             let n = dims[0] * dims[1] * dims[2];
             let data: Vec<f32> = (0..n)
                 .map(|i| ((i as f32) * 0.37 + seed).sin() * 0.5)
                 .collect();
-            Param::from_tensor(Tensor::<Cpu, 3>::from_data(
+            Param::from_tensor(Tensor::<3>::from_data(
                 TensorData::new(data, dims),
                 device,
             ))
@@ -725,9 +1123,9 @@ mod tests {
             num_experts: EXPERTS,
             num_experts_per_tok: TOP_K,
         }
-        .init::<Cpu>(device);
+        .init(device);
         // Burn Linear stores weight as [in, out].
-        m.gate.weight = Param::from_tensor(Tensor::<Cpu, 2>::from_data(
+        m.gate.weight = Param::from_tensor(Tensor::<2>::from_data(
             TensorData::new(router_data, [HIDDEN, EXPERTS]),
             device,
         ));
@@ -741,12 +1139,12 @@ mod tests {
     /// (same math, different data movement) — the P9 MoE gate.
     #[test]
     fn per_expert_routed_matches_dense_mask() {
-        let device = Dev::default();
+        let device = crate::backend::cpu_device();
         let dense = moe(&device);
         // Split the fused banks into per-expert Linear-layout triples.
-        let experts: Vec<ExpertWeights<Cpu>> = (0..EXPERTS)
+        let experts: Vec<ExpertWeights> = (0..EXPERTS)
             .map(|e| {
-                let slice = |bank: &Param<Tensor<Cpu, 3>>| -> Tensor<Cpu, 2> {
+                let slice = |bank: &Param<Tensor<3>>| -> Tensor<2> {
                     let [_, out, inp] = bank.val().dims();
                     bank.val()
                         .narrow(0, e, 1)
@@ -786,6 +1184,145 @@ mod tests {
         }
     }
 
+    /// The working set end to end: a scheduler plan drives real staging and
+    /// eviction in the pool, the device budget is respected, and the layer
+    /// still computes the right answer whether its experts were staged or
+    /// overflowed to the host.
+    #[test]
+    fn a_schedule_drives_staging_and_the_answer_is_unchanged() {
+        use crate::tier::{Precision, Tier};
+        use crate::workingset::{Budget, LayerDemand, schedule};
+        use std::sync::Arc;
+        let device = crate::backend::cpu_device();
+        let dense = moe(&device);
+        let split = |e: usize| -> ExpertWeights {
+            let slice = |bank: &Param<Tensor<3>>| -> Tensor<2> {
+                let [_, out, inp] = bank.val().dims();
+                bank.val().narrow(0, e, 1).reshape([out, inp]).swap_dims(0, 1)
+            };
+            ExpertWeights {
+                gate: Param::from_tensor(slice(&dense.experts.gate)),
+                up: Param::from_tensor(slice(&dense.experts.up)),
+                down: Param::from_tensor(slice(&dense.experts.down)),
+            }
+        };
+        let tier = Tier { device: 0, precision: Precision::F32 };
+        const UNIT_BYTES: u64 = 1_000;
+
+        // One layer holding every expert, each staged-capable.
+        let row: Vec<Arc<dyn ExpertExec>> = (0..EXPERTS)
+            .map(|e| {
+                Arc::new(StagedExpert::new(split(e), device.clone(), tier, UNIT_BYTES))
+                    as Arc<dyn ExpertExec>
+            })
+            .collect();
+        let pool = ExpertPool::new(vec![row]);
+
+        // Nothing staged yet: the working set costs no device memory.
+        assert_eq!(pool.staged_bytes(), 0, "an unstaged pool holds no device bytes");
+
+        // A schedule over two passes of this layer, with room for half the
+        // experts — so it must both stage and evict.
+        let demands: Vec<LayerDemand> = (0..2)
+            .map(|l| LayerDemand { layer: l, units: (0..EXPERTS).collect() })
+            .collect();
+        let budget = Budget {
+            device_bytes: UNIT_BYTES * (EXPERTS as u64 / 2),
+            unit_bytes: UNIT_BYTES,
+            stage_bytes_per_sec: (UNIT_BYTES as f64) * 2.0 / 0.010,
+            layer_compute_secs: 0.010,
+        };
+        let plan = schedule(&demands, &budget);
+
+        // Apply the first layer's decisions, as the runtime would.
+        pool.apply_schedule(0, &plan.layers[0], &device);
+        let staged = pool.staged_bytes();
+        assert!(
+            staged <= budget.device_bytes,
+            "the working set must respect the device budget: {staged} > {}",
+            budget.device_bytes
+        );
+        assert!(staged > 0, "a prefetching schedule must stage something");
+
+        // The layer's answer must match the unpooled reference regardless of
+        // which experts happened to be staged.
+        let local = SparseMoePerExpert {
+            gate: dense.gate.clone(),
+            experts: (0..EXPERTS).map(split).collect(),
+        };
+        let x = input(3, 5.0, &device);
+        let want = local.forward(x.clone(), TOP_K, true).into_data().to_vec::<f32>().unwrap();
+        let got = local
+            .forward_pooled(x, TOP_K, true, &pool, 0)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        for (i, (a, b)) in want.iter().zip(&got).enumerate() {
+            assert!((a - b).abs() < 1e-5, "elem {i}: {a} vs {b} (staging changed the answer)");
+        }
+    }
+
+    /// P9 stage 4: staging must move WHERE an expert computes without
+    /// changing WHAT it computes. Same weights, same input, same answer —
+    /// staged, evicted, and re-staged.
+    #[test]
+    fn staging_and_eviction_never_change_the_result() {
+        use crate::tier::{Precision, Tier};
+        let device = crate::backend::cpu_device();
+        let dense = moe(&device);
+        let split = |e: usize| -> ExpertWeights {
+            let slice = |bank: &Param<Tensor<3>>| -> Tensor<2> {
+                let [_, out, inp] = bank.val().dims();
+                bank.val().narrow(0, e, 1).reshape([out, inp]).swap_dims(0, 1)
+            };
+            ExpertWeights {
+                gate: Param::from_tensor(slice(&dense.experts.gate)),
+                up: Param::from_tensor(slice(&dense.experts.up)),
+                down: Param::from_tensor(slice(&dense.experts.down)),
+            }
+        };
+        let tier = Tier { device: 0, precision: Precision::F32 };
+        let staged = StagedExpert::new(split(0), device.clone(), tier, 0);
+        // A pinned reference on the same device, for comparison.
+        let pinned = DeviceExpert { weights: split(0), device: device.clone(), tier, bytes: 0 };
+
+        let x = Tensor::<2>::from_data(
+            TensorData::new((0..HIDDEN).map(|i| (i as f32) * 0.25 - 0.5).collect::<Vec<f32>>(), [1, HIDDEN]),
+            (&device, crate::backend::float_dtype()),
+        );
+        let want = pinned.run_tensor(x.clone()).into_data().to_vec::<f32>().unwrap();
+
+        // Unstaged (the overflow path: computes on the host).
+        assert!(!staged.is_staged(), "a fresh StagedExpert holds no device copy");
+        assert_eq!(staged.resident_bytes(), 0, "unstaged costs no device memory");
+        let overflow = staged.run_tensor(x.clone()).into_data().to_vec::<f32>().unwrap();
+
+        // Staged, then evicted, then staged again.
+        staged.stage(&device);
+        assert!(staged.is_staged());
+        let hot = staged.run_tensor(x.clone()).into_data().to_vec::<f32>().unwrap();
+        staged.stage(&device); // idempotent: no second transfer, same answer
+        let again = staged.run_tensor(x.clone()).into_data().to_vec::<f32>().unwrap();
+        staged.evict();
+        assert!(!staged.is_staged(), "eviction drops the device copy");
+        let after_evict = staged.run_tensor(x).into_data().to_vec::<f32>().unwrap();
+
+        for (i, w) in want.iter().enumerate() {
+            for (label, got) in [
+                ("overflow", &overflow),
+                ("staged", &hot),
+                ("re-staged", &again),
+                ("after evict", &after_evict),
+            ] {
+                assert!(
+                    (w - got[i]).abs() < 1e-5,
+                    "{label} elem {i}: {} vs pinned {w}",
+                    got[i]
+                );
+            }
+        }
+    }
+
     /// P9 stage 3b: the pooled path (experts behind `ExpertExec`, host
     /// round trip, concurrent execution, host scatter-add) equals the
     /// same-backend routed path — here with the pool holding Q8 experts
@@ -796,10 +1333,10 @@ mod tests {
     fn pooled_experts_match_local_and_hot_swap() {
         use crate::tier::{Precision, Tier};
         use std::sync::Arc;
-        let device = Dev::default();
+        let device = crate::backend::cpu_device();
         let dense = moe(&device);
-        let split = |e: usize| -> ExpertWeights<Cpu> {
-            let slice = |bank: &Param<Tensor<Cpu, 3>>| -> Tensor<Cpu, 2> {
+        let split = |e: usize| -> ExpertWeights {
+            let slice = |bank: &Param<Tensor<3>>| -> Tensor<2> {
                 let [_, out, inp] = bank.val().dims();
                 bank.val().narrow(0, e, 1).reshape([out, inp]).swap_dims(0, 1)
             };
@@ -813,10 +1350,12 @@ mod tests {
             gate: dense.gate.clone(),
             experts: (0..EXPERTS).map(split).collect(),
         };
+        // `Device` is a clonable runtime value in burn 0.22 (not a `Copy`
+        // marker type), so the closure clones per expert instead of copying.
         let exec = |e: usize, tier: Tier| -> Arc<dyn ExpertExec> {
-            Arc::new(DeviceExpert::<Cpu> {
+            Arc::new(DeviceExpert {
                 weights: split(e),
-                device,
+                device: device.clone(),
                 tier,
                 bytes: 0,
             })
@@ -860,40 +1399,52 @@ mod tests {
         }
     }
 
-    /// The P9-3c fix: a pooled expert with a **quantized** weight must run
-    /// through `compute_weight`'s on-device dequantize (never burn's mixed
-    /// f32-input × quantized-weight q_matmul, which the CUDA/wgpu backends
-    /// mishandle). Here on CPU we check the dequantize itself: an f32 param
-    /// passes through untouched; a Q8 param comes back float and ≈ the
-    /// original within block-32 quant error.
+    /// `compute_weight` hands `matmul` something that produces the RIGHT
+    /// ANSWER — either the quantized weight itself (where the backend
+    /// multiplies it natively) or a dequantized copy (where it does not).
+    ///
+    /// The test asserts the invariant, not the mechanism: which branch runs
+    /// depends on the backend, the burn version and the dtype, and is probed
+    /// at runtime. Asserting "it always dequantizes" would have to be
+    /// rewritten every time a backend gains a working kernel — and would
+    /// have failed the moment burn 0.22 fixed CUDA.
     #[test]
-    fn compute_weight_dequantizes_quantized_params() {
+    fn compute_weight_yields_a_matmul_ready_weight() {
         use crate::quant::{QuantPolicy, quantize_weight};
         use burn::tensor::TensorData;
-        let device = Dev::default();
+        let device = crate::backend::cpu_device();
         let vals: Vec<f32> = (0..32 * 64).map(|i| ((i as f32) * 0.05).sin()).collect();
-        let t = Tensor::<Cpu, 2>::from_data(TensorData::new(vals.clone(), [32, 64]), &device);
+        let t = Tensor::<2>::from_data(TensorData::new(vals.clone(), [32, 64]), &device);
 
-        // Float param: returned as-is (still float).
+        // Float param: returned as-is (still float, never re-quantized).
         let out_f32 = compute_weight(&Param::from_tensor(t.clone()));
         assert!(!matches!(out_f32.dtype(), DType::QFloat(_)), "float weight must stay float");
 
-        // Quantized param: really quantized, and compute_weight floats it back.
+        // Quantized param: whatever comes back must MULTIPLY correctly.
         let q = quantize_weight(QuantPolicy::Q8, t.clone());
         assert!(matches!(q.dtype(), DType::QFloat(_)), "weight should be quantized");
-        let out_q = compute_weight(&Param::from_tensor(q));
-        assert!(!matches!(out_q.dtype(), DType::QFloat(_)), "compute_weight must dequantize");
-        let back = out_q.into_data().to_vec::<f32>().unwrap();
-        for (i, (x, y)) in vals.iter().zip(&back).enumerate() {
-            assert!((x - y).abs() < 0.05, "Q8 dequant elem {i}: {x} vs {y}");
+        let ready = compute_weight(&Param::from_tensor(q));
+
+        let x = Tensor::<2>::from_data(
+            TensorData::new(vec![0.25f32; 32], [1, 32]),
+            (&device, crate::backend::float_dtype()),
+        );
+        let want = x.clone().matmul(t).into_data().to_vec::<f32>().unwrap();
+        let got = x.matmul(ready).into_data().to_vec::<f32>().unwrap();
+        let scale = want.iter().map(|v| v.abs()).fold(1e-3, f32::max);
+        for (i, (a, b)) in want.iter().zip(&got).enumerate() {
+            assert!(
+                (a - b).abs() <= 0.05 * scale,
+                "elem {i}: quantized path gave {b}, f32 gave {a}"
+            );
         }
     }
 
-    fn input(t: usize, seed: f32, device: &Dev) -> Tensor<Cpu, 3> {
+    fn input(t: usize, seed: f32, device: &Dev) -> Tensor<3> {
         let data: Vec<f32> = (0..t * HIDDEN)
             .map(|i| ((i as f32 + seed) * 0.9).sin())
             .collect();
-        Tensor::<Cpu, 1>::from_data(TensorData::new(data, [t * HIDDEN]), device)
+        Tensor::<1>::from_data(TensorData::new(data, [t * HIDDEN]), device)
             .reshape([1, t, HIDDEN])
     }
 
@@ -903,7 +1454,7 @@ mod tests {
 
     /// Hand-rolled f32 reference of the whole block (per token: router
     /// softmax, top-k, sparse weighted sum of per-expert SwiGLUs).
-    fn reference(m: &SparseMoe<Cpu>, x: &[f32], t: usize, norm: bool) -> Vec<f32> {
+    fn reference(m: &SparseMoe, x: &[f32], t: usize, norm: bool) -> Vec<f32> {
         let rw = m.gate.weight.val().into_data().to_vec::<f32>().unwrap(); // [h, e]
         let gw = m.experts.gate.val().into_data().to_vec::<f32>().unwrap(); // [e, inter, h]
         let uw = m.experts.up.val().into_data().to_vec::<f32>().unwrap();
@@ -955,7 +1506,7 @@ mod tests {
 
     #[test]
     fn forward_matches_the_hand_rolled_sparse_reference() {
-        let device = Dev::default();
+        let device = crate::backend::cpu_device();
         let m = moe(&device);
         // Both shapes the decoder actually runs: a multi-token prefill and
         // the single-token decode step.
@@ -984,7 +1535,7 @@ mod tests {
     fn top_k_equal_to_num_experts_uses_every_expert() {
         // With k == E and renorm the block degenerates to a full softmax
         // mixture — the reference covers it; this pins the k=E edge.
-        let device = Dev::default();
+        let device = crate::backend::cpu_device();
         let m = moe(&device);
         let x = input(3, 0.5, &device);
         let xv = x.clone().into_data().to_vec::<f32>().unwrap();
@@ -1009,7 +1560,7 @@ mod tests {
     }
 
     /// Full-mixture reference (every expert, softmax-weighted) for the k=E edge.
-    fn reference_all_experts(m: &SparseMoe<Cpu>, x: &[f32], t: usize) -> Vec<f32> {
+    fn reference_all_experts(m: &SparseMoe, x: &[f32], t: usize) -> Vec<f32> {
         let rw = m.gate.weight.val().into_data().to_vec::<f32>().unwrap();
         let gw = m.experts.gate.val().into_data().to_vec::<f32>().unwrap();
         let uw = m.experts.up.val().into_data().to_vec::<f32>().unwrap();
@@ -1051,7 +1602,7 @@ mod tests {
     fn norm_topk_weights_change_the_mixture() {
         // norm_topk_prob renormalizes the k weights to sum 1 — unless the
         // top-k already captured all the mass, outputs must differ.
-        let device = Dev::default();
+        let device = crate::backend::cpu_device();
         let m = moe(&device);
         let x = input(4, 7.0, &device);
         let a = m
@@ -1072,7 +1623,7 @@ mod tests {
     fn forward_is_position_independent() {
         // MoE acts per-token: the same row in different positions/batches
         // routes and computes identically.
-        let device = Dev::default();
+        let device = crate::backend::cpu_device();
         let m = moe(&device);
         let row = input(1, 11.0, &device);
         let double = Tensor::cat(vec![row.clone(), row.clone()], 1);
@@ -1093,9 +1644,9 @@ mod tests {
     #[test]
     fn zero_input_gives_zero_output() {
         // Bias-free SwiGLU experts map 0 to 0 regardless of routing.
-        let device = Dev::default();
+        let device = crate::backend::cpu_device();
         let m = moe(&device);
-        let x = Tensor::<Cpu, 3>::zeros([1, 2, HIDDEN], &device);
+        let x = Tensor::<3>::zeros([1, 2, HIDDEN], &device);
         let out = m
             .forward(x, TOP_K, false)
             .into_data()
@@ -1107,7 +1658,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "top_k")]
     fn forward_rejects_top_k_above_num_experts() {
-        let device = Dev::default();
+        let device = crate::backend::cpu_device();
         let m = moe(&device);
         let x = input(1, 0.0, &device);
         let _ = m.forward(x, EXPERTS + 1, false);
@@ -1116,13 +1667,13 @@ mod tests {
     #[test]
     #[should_panic(expected = "num_experts_per_tok")]
     fn config_rejects_zero_top_k() {
-        let device = Dev::default();
+        let device = crate::backend::cpu_device();
         let _ = SparseMoeConfig {
             hidden_size: 4,
             expert_intermediate_size: 3,
             num_experts: 4,
             num_experts_per_tok: 0,
         }
-        .init::<Cpu>(&device);
+        .init(&device);
     }
 }

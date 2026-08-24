@@ -36,7 +36,13 @@ cuda = ["burn/cuda"]
 jinja-template = ["dep:hf-chat-template"]
 
 [dependencies]
+# The async runtime: mummu's model runtime is async (burn 0.22 readbacks,
+# cancellable decode loops), so the library owns a tokio dependency rather
+# than leaving async to consumers.
+tokio = { workspace = true }
 burn = { workspace = true }
+mummu-mix = { workspace = true }
+mummu-schedule = { workspace = true }
 hf-chat-template = { workspace = true, optional = true }
 wgpu = { workspace = true }
 pollster = { workspace = true }

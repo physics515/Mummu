@@ -1,6 +1,13 @@
 [workspace]
 resolver = "3"
-members = ["crates/mummu", "crates/mummu-bench", "crates/mummu-serve"]
+members = [
+	"crates/mummu",
+	"crates/mummu-app",
+	"crates/mummu-mix",
+	"crates/mummu-schedule",
+	"crates/mummu-bench",
+	"crates/mummu-serve",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -17,9 +24,13 @@ repository = "https://github.com/physics515/Mummu"
 # `fusion` + `autotune` are the throughput levers: fusion compiles streams of tensor ops
 # into far fewer GPU kernels and autotune picks the fastest kernel variant; with `fusion`,
 # `Wgpu` transparently becomes `Fusion<Wgpu>`.
-burn = { version = "0.21", default-features = false, features = [
+burn = { version = "0.22.0-pre.2", default-features = false, features = [
 	"std",
 	"wgpu",
+	# burn 0.22 selects backends at runtime through `Device`, so the flex
+	# integration must be on for `Device::flex()` to exist (0.21 reached the
+	# CPU backend through the `burn_flex::Flex` type instead).
+	"flex",
 	"autotune",
 	"store",
 ] }
@@ -36,11 +47,16 @@ burn = { version = "0.21", default-features = false, features = [
 # (0.21 release notes); swapped in 2026-07-10 after the MiniLM Candle-parity
 # gate passed on it bit-for-bit-equivalent (cosine 0.99999994, max component
 # diff 1.3e-7) with all 80 unit tests green.
-burn-flex = "0.21"
+burn-flex = "0.22.0-pre.2"
+# The two schedulers, as their own crates: A divides work across devices,
+# B decides the precision of the weights on each. Both are dependency-free —
+# see their crate docs — which is why they are separate rather than modules.
+mummu-mix = { path = "crates/mummu-mix" }
+mummu-schedule = { path = "crates/mummu-schedule" }
 # Direct handle on burn-store (the same crate burn's `store` feature pulls) to
 # turn on its `pytorch` feature: .pth / pytorch_model.bin state-dict loading
 # for models never re-shipped as safetensors (feature-unified, no duplicate).
-burn-store = { version = "0.21", default-features = false, features = [
+burn-store = { version = "0.22.0-pre.2", default-features = false, features = [
 	"std",
 	"safetensors",
 	"pytorch",
@@ -51,11 +67,11 @@ burn-store = { version = "0.21", default-features = false, features = [
 # CubeCL itself discovers — `crate::tune` reports and clears it. Feature-
 # unified, so this adds no compile time; hardcoding the discovery rule instead
 # would drift from cubecl's the first time it changes.
-cubecl-runtime = "0.10"
+cubecl-runtime = "0.11.0-pre.2"
 
 # Direct handle on wgpu (the same version Burn resolves) for the cheap startup
 # adapter probe: enumerate GPUs to decide GPU vs CPU before building a backend.
-wgpu = "29"
+wgpu = "30"
 # Block on wgpu 29's async adapter enumeration from the sync startup probe.
 pollster = "1.0"
 # f16 element type for the GPU backend; the same `half` version Burn pulls.
@@ -80,9 +96,28 @@ ureq = "3"
 sha2 = "0.11"
 
 serde = { version = "1", features = ["derive"] }
-# The mummu-serve HTTP layer: a tiny sync server (threads, no async runtime),
-# matching the library's sync surface the same way ureq does on the client side.
-tiny_http = "0.12"
+# The async runtime. mummu is async end to end (not just the server): burn
+# 0.22 exposes real async readbacks (`into_data_async`), so a decode that
+# waits on the device yields its worker instead of parking it, and a
+# disconnected client's generation can actually be cancelled at an await
+# point. Multi-threaded flavor — the model runtime is CPU-bound work that
+# must spread across cores.
+tokio = { version = "1", features = [
+	"rt-multi-thread",
+	"macros",
+	"sync",
+	"time",
+	"fs",
+	"io-util",
+	"net",
+	"signal",
+] }
+# Async HTTP for mummu-serve, replacing tiny_http's thread-per-request model.
+axum = { version = "0.8", features = ["ws"] }
+tower = "0.5"
+futures = "0.3"
+async-stream = "0.3"
+tokio-stream = "0.1"
 # `preserve_order` (insertion-order maps) is deliberate and load-bearing for
 # prompt bytes: Python/transformers renders tool JSON in dict insertion order,
 # so our tool-bearing prompts only byte-match the reference stack's rendering

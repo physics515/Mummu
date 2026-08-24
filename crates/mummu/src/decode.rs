@@ -4,7 +4,7 @@
 
 use std::ops::ControlFlow;
 
-use burn::tensor::{Tensor, backend::Backend};
+use burn::tensor::Tensor;
 
 /// Hard ceiling on the vocab a sampled step will read back to the CPU
 /// (~4 MB of f32 at the bound); anything larger is a wiring bug, not a model.
@@ -18,11 +18,13 @@ const DEFAULT_TOP_K: usize = 1024;
 /// Greedy next-token id from `[1, vocab]` logits. The argmax runs
 /// **on-device** and only the single winning index is synced back — vs.
 /// copying a whole ~150k-logit vector to the CPU every decode step.
-pub fn argmax_id<B: Backend>(logits: Tensor<B, 2>) -> Result<u32, String> {
+pub async fn argmax_id(logits: Tensor<2>) -> Result<u32, String> {
     debug_assert!(logits.dims()[0] == 1, "argmax_id expects [1, vocab] logits");
     let data = logits
         .argmax(1)
-        .into_data()
+        .into_data_async()
+        .await
+        .map_err(|e| format!("argmax readback: {e:?}"))?
         .convert::<i64>()
         .to_vec::<i64>()
         .map_err(|e| format!("argmax readback: {e:?}"))?;
@@ -200,8 +202,8 @@ pub fn sample_id(logits: &[f32], opts: &SamplerOptions, rng: &mut Pcg32) -> u32 
 /// iteration. Emits each accepted token through `on_token`; a `Break` return
 /// cancels cooperatively *before* the next forward. EOS is never emitted.
 /// `step(new_ids, past)` returns `[1, vocab]` logits for the last position.
-pub fn generate_loop<B: Backend>(
-    mut step: impl FnMut(&[u32], usize) -> Tensor<B, 2>,
+pub async fn generate_loop(
+    mut step: impl FnMut(&[u32], usize) -> Tensor<2>,
     prompt_ids: &[u32],
     max_tokens: usize,
     opts: &SamplerOptions,
@@ -219,10 +221,12 @@ pub fn generate_loop<B: Backend>(
     for past in (prompt_ids.len()..).take(max_tokens) {
         let vocab = logits.dims()[1] as u32;
         let next = if greedy {
-            argmax_id(logits)?
+            argmax_id(logits).await?
         } else {
             let v = logits
-                .into_data()
+                .into_data_async()
+                .await
+                .map_err(|e| format!("logits readback: {e:?}"))?
                 .convert::<f32>()
                 .to_vec::<f32>()
                 .map_err(|e| format!("logits readback: {e:?}"))?;
@@ -243,6 +247,10 @@ pub fn generate_loop<B: Backend>(
         if on_token(next).is_break() {
             break;
         }
+        // Cooperative yield: a CPU-backend decode is a long stretch of
+        // blocking compute between awaits, and without this a single
+        // generation would monopolize its worker for the whole request.
+        tokio::task::yield_now().await;
         logits = step(&[next], past);
     }
     debug_assert!(out.len() <= max_tokens);
@@ -252,14 +260,13 @@ pub fn generate_loop<B: Backend>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::Cpu;
     use burn::tensor::Tensor;
 
-    #[test]
-    fn argmax_id_finds_the_peak() {
-        let device = burn::tensor::Device::<Cpu>::default();
-        let logits = Tensor::<Cpu, 1>::from_floats([0.1, -2.0, 7.5, 3.0], &device).reshape([1, 4]);
-        assert_eq!(argmax_id(logits).unwrap(), 2);
+    #[tokio::test]
+    async fn argmax_id_finds_the_peak() {
+        let device = crate::backend::cpu_device();
+        let logits = Tensor::<1>::from_floats([0.1, -2.0, 7.5, 3.0], &device).reshape([1, 4]);
+        assert_eq!(argmax_id(logits).await.unwrap(), 2);
     }
 
     #[test]
@@ -362,19 +369,19 @@ mod tests {
 
     /// A fixed toy vocab where the "model" always prefers id 2, then id 3
     /// after seeing 2 — enough to drive the loop without weights.
-    fn toy_step(device: &burn::tensor::Device<Cpu>) -> impl FnMut(&[u32], usize) -> Tensor<Cpu, 2> {
-        let device = *device;
+    fn toy_step(device: &burn::tensor::Device) -> impl FnMut(&[u32], usize) -> Tensor<2> {
+        let device = device.clone();
         move |new_ids: &[u32], _past: usize| {
             let peak = if new_ids.last() == Some(&2) { 3 } else { 2 };
             let mut v = vec![0.0f32; 8];
             v[peak] = 9.0;
-            Tensor::<Cpu, 1>::from_floats(v.as_slice(), &device).reshape([1, 8])
+            Tensor::<1>::from_floats(v.as_slice(), &device).reshape([1, 8])
         }
     }
 
-    #[test]
-    fn generate_loop_greedy_follows_argmax_and_stops_at_eos() {
-        let device = burn::tensor::Device::<Cpu>::default();
+    #[tokio::test]
+    async fn generate_loop_greedy_follows_argmax_and_stops_at_eos() {
+        let device = crate::backend::cpu_device();
         let out = generate_loop(
             toy_step(&device),
             &[1],
@@ -383,13 +390,13 @@ mod tests {
             |id| id == 3, // treat the follow-up token as EOS
             |_| std::ops::ControlFlow::Continue(()),
         )
-        .unwrap();
+        .await.unwrap();
         assert_eq!(out, vec![2], "one token, then EOS never emitted");
     }
 
-    #[test]
-    fn generate_loop_cancels_cooperatively_between_tokens() {
-        let device = burn::tensor::Device::<Cpu>::default();
+    #[tokio::test]
+    async fn generate_loop_cancels_cooperatively_between_tokens() {
+        let device = crate::backend::cpu_device();
         let mut streamed = Vec::new();
         let out = generate_loop(
             toy_step(&device),
@@ -406,6 +413,7 @@ mod tests {
                 }
             },
         )
+        .await
         .unwrap();
         assert_eq!(out.len(), 2, "break after the 2nd token stops the loop");
         assert_eq!(streamed, out, "every emitted token was streamed");
