@@ -135,6 +135,20 @@ fn main() {
         );
     }
 
+    // f16: half the real traffic of f32, and — unlike a quantized rung — no
+    // dequantize step for the kernel to undo the saving with. If the Q4 path
+    // materializes f32 regardless, f16 should beat BOTH, and it is reachable
+    // by the existing ladder without any new kernel.
+    {
+        let half = whole.clone().cast(burn::tensor::DType::F16);
+        let xh = x.clone().cast(burn::tensor::DType::F16);
+        let ms = timed(20, || {
+            let y = xh.clone().matmul(half.clone());
+            let _ = y.into_data().convert::<f32>().to_vec::<f32>().ok();
+        });
+        println!("  one full-width at F16            {ms:7.2} ms   ({:.2}x f32)", ms / one);
+    }
+
     // Per token this model does 64 layers x 3 projections of the above.
     let per_token_whole = one * 64.0 * 3.0;
     let per_token_split = split * 64.0 * 3.0;

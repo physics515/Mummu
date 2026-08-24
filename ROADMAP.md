@@ -500,6 +500,42 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       blocking pool, which would have turned the async decode loop back into blocking work. Pings then
       arrive at 16/31/46 s and hold a 544-second connection. `MissedTickBehavior::Delay` on the interval,
       because a burst of late pings proves nothing to a proxy that already timed out.
+- [ ] **The gap to a fused runtime is a KERNEL problem, not a placement one — measured, and the reason
+      scheduler tuning stops here.** *(2026-08-24)* Five measured iterations took the 27B from 4.88 to
+      **3.91 s/token** and moved the discrete GPU from 996 to **1784 of 2048 clusters**. Then the
+      measurements said to stop. `examples/cluster-overhead.rs`, one full-width FFN matmul on the 4070
+      Ti SUPER, warm:
+
+      | rung | ms | vs f32 |
+      |---|---|---|
+      | f32 | 1.68 | 1.00 |
+      | Q8 | 1.60 | 0.95 |
+      | Q4 | 1.64 | 0.98 |
+      | **F16** | **1.09** | **0.65** |
+
+      **Quantization buys capacity and no speed.** Decode is bandwidth-bound, so a 4-bit weight moving an
+      eighth of the bytes should be ~8x faster; it is not, because burn's quantized matmul materializes
+      f32 regardless. Effective bandwidth makes it plain: **221 GB/s** counting f32 bytes against
+      **34.6 GB/s** counting the Q4 bytes actually stored, on a 672 GB/s card.
+      That reproduces both sides of the comparison exactly. mummu moves 108 GB/token of f32-equivalent
+      traffic (~489 ms at 221 GB/s); ollama moves 16.9 GB/token of 4-bit traffic (~62 ms at 272 GB/s),
+      and 62 ms is what ollama measures. **So the entire model on the fast card with zero transfers is
+      still 7.7x short of ollama before placement enters the picture.** Scheduling was optimizing a term
+      that is not the bottleneck.
+      **F16 is faster but not exploitable while capacity binds**: 1.55x per matmul against 3.2x the
+      bytes, so all-Q4 (2048 clusters resident, 264 ms) beats all-F16 (1811 resident, 237 spilled,
+      272 ms). The scheduler already lands on the right side of that, and `mix`'s phase 2 promotes into
+      F16 automatically once a model fits — no change needed.
+      **What is left, ranked by measured size.** (1) A CubeCL matmul that reads packed weights directly,
+      the way llama.cpp's Q4_K kernels do — worth the 6.4x traffic ratio, and the only route to parity.
+      (2) Wider FFN clusters: 2 x 8704 costs 1.33x fused against 32 x 544's 2.36x, so ~1.8x, but cluster
+      width is a pack-time choice and needs a repack. (3) Everything else measures under 1.2x.
+- [ ] **Do NOT make the clustered path universal until a fits-on-one-device fast path exists.**
+      *(2026-08-24)* Partitioning earns its keep only when a model must span devices. Measured, the
+      split costs **2.4x** in dispatch (32 cluster matmuls 4.13 ms against 1.68 ms fused), so imposing it
+      on a model that fits one card would make every small model 2.4x slower to buy placement
+      flexibility it never uses. The generalization is right; it needs the planner to skip partitioning
+      when scheduler A puts everything on one device.
 
 ## Phases
 
