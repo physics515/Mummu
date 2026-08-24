@@ -87,10 +87,28 @@ mod nvml {
     unsafe impl Send for Api {}
     unsafe impl Sync for Api {}
 
-    /// Resolve NVML once. `None` on any machine without the NVIDIA driver.
+    /// Resolve NVML once, but only CACHE A SUCCESS.
+    ///
+    /// Caching a failure was a real bug: one transient miss made this return
+    /// `None` for the life of the process, `backend_budget` then fell back to
+    /// its configured ceiling unreduced, and the planner put 14.53 GiB of
+    /// weights on a 16 GiB card — every generation dying with `wgpu error:
+    /// Out of Memory` while a standalone probe read the card fine. A reading
+    /// this load-bearing must be allowed to recover.
     fn api() -> Option<&'static Api> {
-        static API: OnceLock<Option<Api>> = OnceLock::new();
-        API.get_or_init(|| {
+        static API: OnceLock<Api> = OnceLock::new();
+        if let Some(api) = API.get() {
+            return Some(api);
+        }
+        let resolved = resolve()?;
+        // A race just means two threads resolved it; both are equivalent.
+        let _ = API.set(resolved);
+        API.get()
+    }
+
+    /// One attempt at loading NVML and finding its entry points.
+    fn resolve() -> Option<Api> {
+        (|| {
             // SAFETY: literal, NUL-terminated names; every returned pointer
             // is null-checked before it is transmuted to a function pointer.
             unsafe {
@@ -119,8 +137,7 @@ mod nvml {
                     get_memory_info,
                 })
             }
-        })
-        .as_ref()
+        })()
     }
 
     pub fn memory() -> Option<Memory> {

@@ -1399,6 +1399,31 @@ impl CausalLm for LoadedQwen35 {
         let (cos, sin) = rope_tables(t, past, cfg.rope_dim, cfg.rope_theta, device);
         let mask = (t > 1).then(|| causal_mask(t, past, device));
 
+        // Per-stage timing, behind `MUMMU_PROFILE`. Off by default and costing
+        // a single env lookup when off. Meaningful because the trunk runs on
+        // burn-flex, which is synchronous — a GPU stage's queued work may land
+        // in whichever stage forces the next readback, so read the device
+        // totals as "where the sync happened", not as kernel time.
+        let profile = std::env::var("MUMMU_PROFILE").is_ok();
+        let mut t_norm = std::time::Duration::ZERO;
+        let mut t_attn = std::time::Duration::ZERO;
+        let mut t_local = std::time::Duration::ZERO;
+        let mut t_remote = std::time::Duration::ZERO;
+        let mut n_attn = 0usize;
+        let mut n_delta = 0usize;
+        macro_rules! stage {
+            ($acc:expr, $body:expr) => {{
+                if profile {
+                    let started = std::time::Instant::now();
+                    let out = $body;
+                    $acc += started.elapsed();
+                    out
+                } else {
+                    $body
+                }
+            }};
+        }
+
         for (li, (layer, kv)) in self.model.layers.iter().zip(cache.iter_mut()).enumerate() {
             // Layers may live on different devices (the dense placement puts
             // as many whole layers on the GPU as VRAM holds, the rest on the
@@ -1410,7 +1435,7 @@ impl CausalLm for LoadedQwen35 {
             if x.device() != layer_device {
                 x = x.to_device(&layer_device);
             }
-            let h = layer.input_norm.forward(x.clone());
+            let h = stage!(t_norm, layer.input_norm.forward(x.clone()));
             // The rope tables and mask were built once on the entry device;
             // an attention layer elsewhere needs them there too.
             let (cos_l, sin_l) = if cos.device() == layer_device {
@@ -1421,20 +1446,30 @@ impl CausalLm for LoadedQwen35 {
             let mask_l = mask
                 .as_ref()
                 .map(|m| if m.device() == layer_device { m.clone() } else { m.clone().to_device(&layer_device) });
-            let h = match (&layer.self_attn, &layer.linear_attn, kv) {
-                (Some(attn), None, Qwen35Kv::Attn(kv_state)) => {
-                    attn.forward(h, cfg, &cos_l, &sin_l, mask_l.as_ref(), kv_state)
+            let h = stage!(
+                t_attn,
+                match (&layer.self_attn, &layer.linear_attn, kv) {
+                    (Some(attn), None, Qwen35Kv::Attn(kv_state)) => {
+                        n_attn += 1;
+                        attn.forward(h, cfg, &cos_l, &sin_l, mask_l.as_ref(), kv_state)
+                    }
+                    (None, Some(delta), Qwen35Kv::Delta(state)) => {
+                        n_delta += 1;
+                        delta.forward(h, cfg, state)
+                    }
+                    _ => unreachable!("qwen35 forward: layer/cache kind mismatch"),
                 }
-                (None, Some(delta), Qwen35Kv::Delta(state)) => delta.forward(h, cfg, state),
-                _ => unreachable!("qwen35 forward: layer/cache kind mismatch"),
-            };
+            );
             x = x.add(h);
-            let h2 = layer.post_attn_norm.forward(x.clone());
+            let h2 = stage!(t_norm, layer.post_attn_norm.forward(x.clone()));
             // SwiGLU spelled through qlinear (the mlp's own forward would
             // reshape a packed quantized weight — see qlinear).
-            let gate = activation::silu(qlinear(&layer.mlp.gate_proj, h2.clone()));
-            let up = qlinear(&layer.mlp.up_proj, h2.clone());
-            let mut ffn = qlinear(&layer.mlp.down_proj, gate.clone().mul(up));
+            let (gate, mut ffn) = stage!(t_local, {
+                let gate = activation::silu(qlinear(&layer.mlp.gate_proj, h2.clone()));
+                let up = qlinear(&layer.mlp.up_proj, h2.clone());
+                let ffn = qlinear(&layer.mlp.down_proj, gate.clone().mul(up));
+                (gate, ffn)
+            });
             if let Some(pool) = &self.ffn_pool {
                 // Working set: issue THIS layer's staging decisions before
                 // its FFN runs, so the transfers for the next layer overlap
@@ -1460,11 +1495,21 @@ impl CausalLm for LoadedQwen35 {
                     Vec::new()
                 };
                 let skip = (self.ffn_skip_tau > 0.0).then_some((self.ffn_skip_tau, local_energy.as_slice()));
-                if let Some(remote) = pool.run_dense(li, h2.reshape([b * tt, hd]), skip) {
+                if let Some(remote) = stage!(t_remote, pool.run_dense(li, h2.reshape([b * tt, hd]), skip)) {
                     ffn = ffn.add(remote.reshape([b, tt, hd]));
                 }
             }
             x = x.add(ffn);
+        }
+        if profile {
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+            eprintln!(
+                "[mummu profile] norms {:.0} ms | attn {:.0} ms ({n_attn} full, {n_delta} delta) |                  local ffn {:.0} ms | remote ffn {:.0} ms",
+                ms(t_norm),
+                ms(t_attn),
+                ms(t_local),
+                ms(t_remote),
+            );
         }
         // The final norm and head may live elsewhere than the last layer.
         let head_device = self.model.norm.gamma.val().device();
