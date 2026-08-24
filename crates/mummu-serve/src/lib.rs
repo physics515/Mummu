@@ -600,6 +600,11 @@ struct ChatRequest {
     messages: Vec<ChatMessage>,
     #[serde(default)]
     options: ChatOptions,
+    /// Also accepted at the top level, OpenAI-style, because clients keep
+    /// putting it there and serde ignores unknown fields — a top-level cap
+    /// used to be silently dropped and the request generated up to
+    /// [`DEFAULT_MAX_TOKENS`]. `options.max_tokens` wins when both are set.
+    max_tokens: Option<usize>,
     /// Profile this generation: scope wall-times are collected during the
     /// run and the flame graph is published at `GET /api/profile` when it
     /// completes. The profiler is process-global, so profile one request at
@@ -607,6 +612,18 @@ struct ChatRequest {
     /// request.
     #[serde(default)]
     profile: bool,
+}
+
+impl ChatRequest {
+    /// The effective decode cap: `options.max_tokens`, then the top-level
+    /// `max_tokens`, then [`DEFAULT_MAX_TOKENS`]; clamped to the hard ceiling.
+    fn max_tokens(&self) -> usize {
+        self.options
+            .max_tokens
+            .or(self.max_tokens)
+            .unwrap_or(DEFAULT_MAX_TOKENS)
+            .clamp(1, MAX_MAX_TOKENS)
+    }
 }
 
 pub(crate) fn to_turns(messages: &[ChatMessage]) -> Result<Vec<Turn>, String> {
@@ -751,11 +768,7 @@ fn start_chat(
         Ok(o) => o,
         Err(e) => return Err(Box::new(json_response(400, json!({"error": e})))),
     };
-    let max_tokens = parsed
-        .options
-        .max_tokens
-        .unwrap_or(DEFAULT_MAX_TOKENS)
-        .clamp(1, MAX_MAX_TOKENS);
+    let max_tokens = parsed.max_tokens();
 
     let root = models_root();
     let manager = ModelManager::new(root.clone());
@@ -834,4 +847,53 @@ fn start_chat(
         let _ = tx.send(done);
     });
     Ok(rx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chat_request(body: &str) -> ChatRequest {
+        serde_json::from_str(body).expect("valid chat request")
+    }
+
+    /// The bug this guards against: a top-level `max_tokens` was an unknown
+    /// field serde silently dropped, so a request asking for 12 tokens
+    /// generated up to [`DEFAULT_MAX_TOKENS`]. Both endpoints share
+    /// `ChatRequest`, so this covers the SSE and WebSocket paths alike.
+    #[test]
+    fn top_level_max_tokens_is_honored() {
+        let parsed = chat_request(
+            r#"{"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 12}"#,
+        );
+        assert_eq!(parsed.max_tokens(), 12);
+    }
+
+    #[test]
+    fn options_max_tokens_still_works_and_wins() {
+        let parsed = chat_request(
+            r#"{"model": "m", "messages": [], "options": {"max_tokens": 7}}"#,
+        );
+        assert_eq!(parsed.max_tokens(), 7);
+
+        let parsed = chat_request(
+            r#"{"model": "m", "messages": [], "options": {"max_tokens": 7}, "max_tokens": 12}"#,
+        );
+        assert_eq!(parsed.max_tokens(), 7);
+    }
+
+    #[test]
+    fn absent_max_tokens_falls_back_to_default() {
+        let parsed = chat_request(r#"{"model": "m", "messages": []}"#);
+        assert_eq!(parsed.max_tokens(), DEFAULT_MAX_TOKENS);
+    }
+
+    #[test]
+    fn max_tokens_is_clamped_to_the_hard_ceiling() {
+        let parsed = chat_request(r#"{"model": "m", "messages": [], "max_tokens": 0}"#);
+        assert_eq!(parsed.max_tokens(), 1);
+
+        let parsed = chat_request(r#"{"model": "m", "messages": [], "max_tokens": 999999}"#);
+        assert_eq!(parsed.max_tokens(), MAX_MAX_TOKENS);
+    }
 }
