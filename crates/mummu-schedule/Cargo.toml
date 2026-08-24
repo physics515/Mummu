@@ -1,0 +1,13 @@
+[package]
+name = "mummu-schedule"
+description = "Scheduler A: divide work across heterogeneous devices to minimize makespan."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Deliberately dependency-free. Dividing work across devices is arithmetic
+# over throughputs and capacities — it needs no tensor library, and keeping
+# burn out means this compiles and tests in a second and can be reasoned
+# about (and fuzzed, and reused) without a GPU anywhere in sight.
+[dependencies]

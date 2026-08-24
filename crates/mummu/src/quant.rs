@@ -15,84 +15,54 @@
 //! - Norm gammas, biases, conv kernels, per-head vectors — tiny, and their
 //!   precision anchors the numerics.
 //!
-//! Scheme facts measured on this machine (2026-08-21, `quant-probe`):
-//! Q8S (tensor or block-32) is correct on flex CPU, wgpu AND CUDA (~0.04%
-//! matmul error). Q4S is correct on flex CPU and CUDA (~0.8%) but **wgpu's
-//! Q4 kernel returns garbage** (~98% error) — [`QuantPolicy::Q4`] must be
-//! refused on wgpu until that kernel is fixed upstream.
+//! The **ladder itself** — which rungs exist, how wide each is, which way
+//! demotion runs, and how far the source precision lets it climb — lives in
+//! the `mummu-mix` crate, together with the planner that chooses among them.
+//! None of that needs a tensor library. What is left here is the one part
+//! that does: turning a rung into a burn `QuantScheme`.
+//!
+//! Scheme facts measured on this machine along the path production takes
+//! (packed bytes from a pack onto the device, then multiplied — NOT a
+//! synthetic tensor quantized on-device, which measures the probe rather
+//! than the runtime): Q8S block-32 is correct on flex CPU, wgpu and CUDA
+//! (0.58% matmul error against the pack's own f32); Q4S likewise (9.97%).
+//! The long-standing "wgpu's Q4 kernel returns garbage" note is **withdrawn**
+//! — 2026-08-23, `examples/pack-precision-probe.rs`.
 
 use burn::tensor::quantization::{
     Calibration, QuantLevel, QuantParam, QuantScheme, QuantValue, compute_q_params, compute_range,
 };
 use burn::tensor::Tensor;
 
-/// Which quantization the keep-quantized path applies on import.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QuantPolicy {
-    /// No quantization — the classic f32 path.
-    Off,
-    /// 8-bit symmetric, block-32 scales: the proven default (≈4x smaller
-    /// than f32, ~0.04% matmul error on every backend).
-    Q8,
-    /// 4-bit symmetric, block-32 scales (≈8x smaller, ~0.8% matmul error).
-    /// Verified correct on flex CPU and CUDA; **wgpu's Q4 kernel returns
-    /// garbage** (quant-probe 2026-08-21: ~98% error) — consumers must
-    /// refuse Q4-on-wgpu loudly rather than run it.
-    Q4,
+pub use mummu_mix::QuantPolicy;
+
+/// The burn `QuantScheme` a rung denotes.
+///
+/// A trait rather than an inherent method because [`QuantPolicy`] belongs to
+/// `mummu-mix`, which has no burn dependency and should not gain one — this
+/// is the seam between the ladder (pure data) and the tensor library.
+pub trait SchemeExt {
+    /// `None` for the float rungs ([`QuantPolicy::Off`], [`QuantPolicy::F16`]),
+    /// which are not quantizations at all.
+    fn scheme(self) -> Option<QuantScheme>;
 }
 
-impl QuantPolicy {
-    /// Parse the `MUMMU_QUANT` convention: `q8` / `int8` → [`Self::Q8`],
-    /// `off`/empty/unset → [`Self::Off`]. Unknown values are a loud error.
-    pub fn from_env() -> Result<Self, String> {
-        match std::env::var("MUMMU_QUANT") {
-            Err(_) => Ok(Self::Off),
-            Ok(v) if v.is_empty() || v.eq_ignore_ascii_case("off") => Ok(Self::Off),
-            Ok(v) if v.eq_ignore_ascii_case("q8") || v.eq_ignore_ascii_case("int8") => {
-                Ok(Self::Q8)
-            }
-            Ok(v) if v.eq_ignore_ascii_case("q4") || v.eq_ignore_ascii_case("int4") => {
-                Ok(Self::Q4)
-            }
-            Ok(other) => Err(format!(
-                "unknown MUMMU_QUANT {other:?} (expected q8, q4, or off)"
-            )),
-        }
-    }
-
-    /// The burn scheme this policy denotes; `None` for [`Self::Off`].
-    #[must_use]
-    pub fn scheme(self) -> Option<QuantScheme> {
-        match self {
-            Self::Off => None,
-            Self::Q8 => Some(
-                QuantScheme::default()
-                    .with_value(QuantValue::Q8S)
-                    .with_level(QuantLevel::block([32]))
-                    .with_param(QuantParam::F32),
-            ),
-            Self::Q4 => Some(
-                QuantScheme::default()
-                    .with_value(QuantValue::Q4S)
-                    .with_level(QuantLevel::block([32]))
-                    .with_param(QuantParam::F32),
-            ),
-        }
-    }
-
-    /// Is a 2-D weight of `dims` worth quantizing? Small projections lose
-    /// more accuracy than the bytes they return; 256×256 (65k elements) is
-    /// the floor — everything matmul-heavy in a real LLM clears it. The
-    /// last dim must also divide by the block width: burn's block scales
-    /// run along rows and a non-divisible row (qwen35-27B's 48-wide β/α
-    /// projections) crashes the block-range reshape.
-    #[must_use]
-    pub fn eligible(self, dims: &[usize]) -> bool {
-        const BLOCK: usize = 32; // keep in sync with `scheme()`
-        self != Self::Off
-            && dims.len() == 2
-            && dims.iter().product::<usize>() >= (1 << 16)
-            && dims[1].is_multiple_of(BLOCK)
+impl SchemeExt for QuantPolicy {
+    fn scheme(self) -> Option<QuantScheme> {
+        // Block width must stay in step with `QuantPolicy::eligible`, which
+        // rejects rows that do not divide it.
+        let value = match self {
+            QuantPolicy::Off | QuantPolicy::F16 => return None,
+            QuantPolicy::Q8 => QuantValue::Q8S,
+            QuantPolicy::Q4 => QuantValue::Q4S,
+            QuantPolicy::Q2 => QuantValue::Q2S,
+        };
+        Some(
+            QuantScheme::default()
+                .with_value(value)
+                .with_level(QuantLevel::block([32]))
+                .with_param(QuantParam::F32),
+        )
     }
 }
 
@@ -113,6 +83,41 @@ pub fn quantize_weight<const D: usize>(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// `LADDER`, `bits`, `demote` and `promote` must describe the SAME order.
+    /// They are four separate matches over one enum and drifted once already.
+    #[test]
+    fn the_ladder_is_consistent_in_every_direction() {
+        let ladder = QuantPolicy::LADDER;
+        for pair in ladder.windows(2) {
+            let (hi, lo) = (pair[0], pair[1]);
+            assert!(hi.bits() > lo.bits(), "{hi:?} should be wider than {lo:?}");
+            assert_eq!(hi.demote(), Some(lo), "{hi:?} demotes to {lo:?}");
+            assert_eq!(lo.promote(), Some(hi), "{lo:?} promotes to {hi:?}");
+        }
+        assert_eq!(ladder[0].promote(), None, "nothing above the top rung");
+        assert_eq!(
+            ladder[ladder.len() - 1].demote(),
+            None,
+            "nothing below the bottom rung"
+        );
+    }
+
+    /// A quantized checkpoint never earns f32, and nothing ever earns more
+    /// than f32 — the cap is the source.
+    #[test]
+    fn the_ceiling_follows_the_source_precision() {
+        // Q4_K_S: 15.36 GB for ~27 G params.
+        assert_eq!(QuantPolicy::ceiling_for_source(4.55), QuantPolicy::F16);
+        assert_eq!(QuantPolicy::ceiling_for_source(8.0), QuantPolicy::F16);
+        assert_eq!(QuantPolicy::ceiling_for_source(16.0), QuantPolicy::F16);
+        // A genuinely f32 source is the only thing that earns f32.
+        assert_eq!(QuantPolicy::ceiling_for_source(32.0), QuantPolicy::Off);
+        // ...and the ladder has no rung above it to climb to.
+        assert_eq!(QuantPolicy::Off.promote(), None);
+    }
+
     use super::*;
     use burn::tensor::Distribution;
 

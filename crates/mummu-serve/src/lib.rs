@@ -19,6 +19,9 @@
 //! - `GET  /api/models`  the catalog with installed flags
 //! - `POST /api/pull`    download a catalog model (SSE progress)
 //! - `POST /api/chat`    stream a chat completion (SSE deltas)
+//! - `GET  /api/chat/ws` the same frames over a WebSocket — what the UI uses,
+//!   because a proxy that cuts a 100-second HTTP response cannot serve a model
+//!   that takes minutes to load (see `chat_ws`)
 //! - `POST /api/unload`  drop the resident model (frees VRAM/RAM)
 //!
 //! Configuration is the *caller's* job — addresses are arguments here, not
@@ -237,6 +240,9 @@ pub fn router() -> Router {
         .route("/api/models", get(models))
         .route("/api/pull", post(pull))
         .route("/api/chat", post(chat))
+        // Same frames as /api/chat, over a transport Cloudflare will not cut
+        // at 100 s — see `chat_ws`.
+        .route("/api/chat/ws", get(chat_ws))
         .route("/api/unload", post(unload))
         // The sync server matched on (method, path) and answered anything
         // else with the same 404 JSON — keep that, rather than axum's bare
@@ -472,6 +478,101 @@ async fn pull(body: Bytes) -> Response {
 }
 
 // ---------------------------------------------------------------------------
+// GET /api/chat/ws — the same stream over a WebSocket.
+
+/// Chat over a WebSocket, carrying exactly the frames [`chat`] sends over SSE.
+///
+/// This exists because of a proxy limit, not a protocol preference. Behind
+/// Cloudflare, an HTTP response that produces no bytes for 100 seconds is cut
+/// with a 524 — and a cold `/api/chat` produces none for **seven minutes**
+/// while a 27B is read from disk and placed across devices. SSE does not help:
+/// the clock runs from the request, and there is nothing to stream yet.
+/// Cloudflare does not apply that timeout to WebSockets.
+///
+/// The upgrade alone is not the fix, though. An idle WebSocket is still
+/// reaped, so this **heartbeats while the model loads** — without the ping
+/// below the connection dies at the same place, just with a different error.
+async fn chat_ws(upgrade: axum::extract::ws::WebSocketUpgrade) -> Response {
+    upgrade.on_upgrade(|socket| async move {
+        if let Err(e) = drive_chat_ws(socket).await {
+            eprintln!("[mummu-serve] chat ws: {e}");
+        }
+    })
+}
+
+async fn drive_chat_ws(mut socket: axum::extract::ws::WebSocket) -> Result<(), String> {
+    use axum::extract::ws::Message;
+    // `close` is `SinkExt::close`, not an inherent method on WebSocket.
+    use futures::SinkExt;
+
+    /// Well inside the ~100 s a proxy will tolerate, and cheap enough that
+    /// sending it through a seven-minute load costs nothing.
+    const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(15);
+
+    // The request arrives as the first text frame — same JSON body the POST
+    // endpoint takes, so a client can switch transports without changing it.
+    let request = loop {
+        match socket.recv().await {
+            Some(Ok(Message::Text(text))) => break text,
+            // A client may ping before sending; keep waiting for the body.
+            Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+            Some(Ok(Message::Close(_))) | None => return Ok(()),
+            Some(Ok(_)) => return Err("expected a text frame carrying the request".into()),
+            Some(Err(e)) => return Err(e.to_string()),
+        }
+    };
+    let parsed: ChatRequest = serde_json::from_str(&request).map_err(|e| e.to_string())?;
+
+    let mut rx = match start_chat(parsed) {
+        Ok(rx) => rx,
+        Err(response) => {
+            // Report the rejection in-band and close cleanly: a WebSocket
+            // client cannot read the HTTP status of a request it never made.
+            let status = response.status().as_u16();
+            let frame = json!({"type": "error", "status": status});
+            let _ = socket.send(Message::Text(frame.to_string().into())).await;
+            return Ok(());
+        }
+    };
+
+    let mut beat = tokio::time::interval(HEARTBEAT);
+    // Missed ticks are worthless: if we were not polled for a minute, sending
+    // four pings at once proves nothing to a proxy that already timed us out.
+    beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    beat.tick().await; // the first tick is immediate; skip it
+    loop {
+        tokio::select! {
+            event = rx.recv() => match event {
+                Some(frame) => {
+                    let done = frame.get("type").and_then(|t| t.as_str()) == Some("done")
+                        || frame.get("type").and_then(|t| t.as_str()) == Some("error");
+                    if socket.send(Message::Text(frame.to_string().into())).await.is_err() {
+                        return Ok(()); // client gone; the generation task sees the closed channel
+                    }
+                    if done {
+                        let _ = socket.close().await;
+                        return Ok(());
+                    }
+                }
+                None => {
+                    let _ = socket.close().await;
+                    return Ok(());
+                }
+            },
+            _ = beat.tick() => {
+                // Keeps the proxy from reaping a connection that is waiting on
+                // a model load rather than idling.
+                if socket.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    return Ok(());
+                }
+            }
+            // A client that closes mid-generation lands here through `recv`
+            // returning an error on the next send, which is handled above.
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // POST /api/chat — stream a completion as SSE `delta` frames.
 // ---------------------------------------------------------------------------
 
@@ -553,13 +654,27 @@ async fn chat(body: Bytes) -> Response {
         Ok(p) => p,
         Err(response) => return *response,
     };
+    match start_chat(parsed) {
+        Ok(rx) => sse_response(rx),
+        Err(response) => *response,
+    }
+}
+
+/// Validate a chat request and start generating, returning the stream of
+/// events. Shared by the SSE and WebSocket endpoints so the two cannot drift.
+///
+/// The generation outlives the caller: it runs as its own task and whoever
+/// holds the receiver drains it.
+fn start_chat(
+    parsed: ChatRequest,
+) -> Result<mpsc::UnboundedReceiver<serde_json::Value>, Box<Response>> {
     let turns = match to_turns(&parsed.messages) {
         Ok(t) => t,
-        Err(e) => return json_response(400, json!({"error": e})),
+        Err(e) => return Err(Box::new(json_response(400, json!({"error": e})))),
     };
     let opts = match sampler_options(&parsed.options) {
         Ok(o) => o,
-        Err(e) => return json_response(400, json!({"error": e})),
+        Err(e) => return Err(Box::new(json_response(400, json!({"error": e})))),
     };
     let max_tokens = parsed
         .options
@@ -575,18 +690,23 @@ async fn chat(body: Bytes) -> Response {
         .find(|s| s.name == parsed.model)
         .cloned()
     else {
-        return json_response(404, json!({"error": format!("unknown model {:?}", parsed.model)}));
+        return Err(Box::new(json_response(
+            404,
+            json!({"error": format!("unknown model {:?}", parsed.model)}),
+        )));
     };
     if !engine::is_installed(&spec, &root) {
-        return json_response(
+        return Err(Box::new(json_response(
             409,
             json!({"error": format!("{} is not installed — pull it first", spec.name)}),
-        );
+        )));
     }
 
     let (tx, rx) = mpsc::unbounded_channel::<serde_json::Value>();
-    // The generation outlives this handler: it runs as its own task and the
-    // response body below drains what it sends.
+    // A normal async task: the generation is mostly awaits. The one part
+    // that genuinely blocks — the model load — declares itself as blocking
+    // where it happens, in `mummu::cache`, rather than this pushing the whole
+    // future onto a blocking thread.
     tokio::spawn(async move {
         let started = std::time::Instant::now();
         let result = engine::run_chat(&spec, &root, &turns, &opts, max_tokens, |delta| {
@@ -619,5 +739,5 @@ async fn chat(body: Bytes) -> Response {
         };
         let _ = tx.send(done);
     });
-    sse_response(rx)
+    Ok(rx)
 }

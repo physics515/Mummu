@@ -21,6 +21,61 @@ pub fn gpu_device() -> burn::tensor::Device {
     burn::tensor::Device::wgpu(Default::default())
 }
 
+/// Move a tensor to `device`, staging through host memory when both ends are
+/// GPUs.
+///
+/// cubecl does not implement peer-to-peer transfer for wgpu: `comm_init` and
+/// `send` on its server trait are `unimplemented!()`, so a direct
+/// discrete-GPU -> integrated-GPU move panics with a bare "not implemented"
+/// (cubecl-runtime `server/base.rs`). Staging through the host is the only
+/// portable path, and it is what makes a placement spanning two GPUs work at
+/// all.
+///
+/// A same-device move is a no-op, and a move with the host at either end is a
+/// single transfer, so this costs nothing on the common paths.
+#[must_use]
+pub fn move_to<const D: usize>(
+    tensor: burn::tensor::Tensor<D>,
+    device: &burn::tensor::Device,
+) -> burn::tensor::Tensor<D> {
+    let from = tensor.device();
+    if from == *device {
+        return tensor;
+    }
+    if is_accelerator(&from) && is_accelerator(device) {
+        return tensor.to_device(&cpu_device()).to_device(device);
+    }
+    tensor.to_device(device)
+}
+
+/// Is this an accelerator (as opposed to the host)? burn 0.22 selects
+/// backends by runtime `Device` value and exposes no kind accessor, so the
+/// debug form is the handle available.
+fn is_accelerator(device: &burn::tensor::Device) -> bool {
+    let name = format!("{device:?}");
+    name.contains("Wgpu") || name.contains("Cuda")
+}
+
+/// The integrated GPU, when one exists.
+///
+/// Addressed explicitly because [`gpu_device`] resolves to wgpu's default,
+/// which is the *discrete* card on any machine that has one — so the
+/// integrated adapter is invisible to a placement that only ever asks for
+/// "the GPU", however much idle capacity it has.
+#[must_use]
+pub fn integrated_gpu_device() -> burn::tensor::Device {
+    burn::tensor::Device::wgpu(burn::tensor::DeviceKind::IntegratedGpu(0))
+}
+
+/// Does this machine expose an integrated GPU distinct from the discrete one?
+#[must_use]
+pub fn has_integrated_gpu() -> bool {
+    inventory()
+        .gpus
+        .iter()
+        .any(|g| g.device_type == wgpu::DeviceType::IntegratedGpu)
+}
+
 /// The CPU device (burn-flex: pure-Rust SIMD + gemm).
 #[must_use]
 pub fn cpu_device() -> burn::tensor::Device {
@@ -196,6 +251,55 @@ mod dxgi {
 
     pub const DXGI_ERROR_NOT_FOUND: i32 = 0x887A_0002_u32 as i32;
 
+    /// `IID_IDXGIAdapter3` = `{645967a4-1392-4310-a798-8053ce3e93fd}`. The
+    /// interface that reports the OS's *current* video-memory budget for
+    /// this process, which is what shrinks when another process takes VRAM.
+    pub const IID_IDXGI_ADAPTER3: Guid = Guid {
+        data1: 0x6459_67a4,
+        data2: 0x1392,
+        data3: 0x4310,
+        data4: [0xa7, 0x98, 0x80, 0x53, 0xce, 0x3e, 0x93, 0xfd],
+    };
+
+    /// `DXGI_MEMORY_SEGMENT_GROUP_LOCAL` — the adapter's own VRAM, as
+    /// opposed to system memory it may spill into.
+    pub const MEMORY_SEGMENT_LOCAL: u32 = 0;
+
+    /// `DXGI_QUERY_VIDEO_MEMORY_INFO`, verbatim layout.
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    pub struct QueryVideoMemoryInfo {
+        /// Bytes the OS is currently willing to let this process use.
+        pub budget: u64,
+        /// Bytes this process currently has resident.
+        pub current_usage: u64,
+        pub available_for_reservation: u64,
+        pub current_reservation: u64,
+    }
+
+    /// `IDXGIAdapter3`'s vtable. Slot arithmetic, in order: IUnknown (3),
+    /// IDXGIObject (4), IDXGIAdapter (3), IDXGIAdapter1 (1: GetDesc1),
+    /// IDXGIAdapter2 (1: GetDesc2), then IDXGIAdapter3's own six — of which
+    /// `QueryVideoMemoryInfo` is the third. Getting this count wrong calls
+    /// the wrong function pointer, so it is spelled out rather than padded.
+    #[repr(C)]
+    pub struct Adapter3Vtbl {
+        _query_interface: usize,
+        _add_ref: usize,
+        pub release: unsafe extern "system" fn(*mut c_void) -> u32,
+        _idxgi_object: [usize; 4],
+        _idxgi_adapter: [usize; 3],
+        _get_desc1: usize,
+        _get_desc2: usize,
+        _register_teardown: usize,
+        _unregister_teardown: usize,
+        pub query_video_memory_info:
+            unsafe extern "system" fn(*mut c_void, u32, u32, *mut QueryVideoMemoryInfo) -> i32,
+        _set_video_memory_reservation: usize,
+        _register_budget_change: usize,
+        _unregister_budget_change: usize,
+    }
+
     /// `DXGI_ADAPTER_DESC1`, verbatim layout.
     #[repr(C)]
     pub struct AdapterDesc1 {
@@ -228,7 +332,8 @@ mod dxgi {
     /// IDXGIAdapter (3) + IDXGIAdapter1 (1: GetDesc1).
     #[repr(C)]
     pub struct Adapter1Vtbl {
-        _query_interface: usize,
+        pub query_interface:
+            unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32,
         _add_ref: usize,
         pub release: unsafe extern "system" fn(*mut c_void) -> u32,
         _idxgi_object: [usize; 4],
@@ -323,6 +428,135 @@ fn vram_by_adapter_name() -> Vec<(String, u64)> {
 #[cfg(not(windows))]
 fn vram_by_adapter_name() -> Vec<(String, u64)> {
     Vec::new() // Linux (Vulkan memory heaps) and macOS are P6 follow-ups.
+}
+
+/// How much VRAM the OS is *currently* willing to give this process, and how
+/// much of it we already hold.
+///
+/// This is the external-pressure signal: `budget` is not the card's size, it
+/// is the driver's running allocation to this process, and it falls when
+/// another process (a game, a second model, a browser compositing video)
+/// takes memory. Placement uses it to decide how much of a model can stay
+/// resident, and at what precision — see [`crate::mix`].
+///
+/// Distinct from the total in [`GpuAdapter::vram_bytes`], which never moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VideoMemory {
+    /// Bytes the OS currently allows this process on the local segment.
+    pub budget: u64,
+    /// Bytes this process currently holds there.
+    pub current_usage: u64,
+}
+
+impl VideoMemory {
+    /// Headroom before the driver starts demoting our allocations. Saturating:
+    /// usage legitimately exceeds budget when the OS has just cut it, and that
+    /// means *zero* headroom, not a huge negative one.
+    #[must_use]
+    pub fn headroom(self) -> u64 {
+        self.budget.saturating_sub(self.current_usage)
+    }
+}
+
+/// Query the discrete GPU's current video-memory budget.
+///
+/// Two things to know about the numbers. **`current_usage` is this process
+/// only** — it reads 0 from a program that has allocated nothing, even while
+/// the card is full. Other processes do not appear there; they appear as a
+/// *smaller `budget`*, which is exactly the pressure signal we want.
+/// **Adapter choice is by dedicated VRAM, not by budget**: an integrated
+/// GPU's "local" segment is system RAM, so on this box the iGPU reports a
+/// ~101 GiB budget and would win any largest-budget contest.
+///
+/// `None` when the platform or driver will not say (non-Windows today, or a
+/// pre-DXGI-1.4 adapter). Callers must treat `None` as "no information" and
+/// hold their current placement rather than assuming either plenty or
+/// pressure — guessing in either direction is worse than not adapting.
+#[cfg(windows)]
+#[must_use]
+pub fn video_memory() -> Option<VideoMemory> {
+    use dxgi::{Adapter1Vtbl, Adapter3Vtbl, Factory1Vtbl};
+
+    const MAX_ADAPTERS: u32 = 64;
+    let mut factory: *mut core::ffi::c_void = core::ptr::null_mut();
+    // SAFETY: writes a factory pointer on success, checked via the HRESULT.
+    let hr = unsafe { dxgi::CreateDXGIFactory1(&dxgi::IID_IDXGI_FACTORY1, &mut factory) };
+    if hr < 0 || factory.is_null() {
+        return None;
+    }
+
+    // (dedicated VRAM, budget) — the largest dedicated wins, see the note above.
+    let mut best: Option<(u64, VideoMemory)> = None;
+    for index in 0..MAX_ADAPTERS {
+        let mut adapter: *mut core::ffi::c_void = core::ptr::null_mut();
+        // SAFETY: factory is the live IDXGIFactory1 created above.
+        let hr = unsafe {
+            ((*dxgi::vtbl::<Factory1Vtbl>(factory)).enum_adapters1)(factory, index, &mut adapter)
+        };
+        if hr == dxgi::DXGI_ERROR_NOT_FOUND {
+            break;
+        }
+        if hr < 0 || adapter.is_null() {
+            continue;
+        }
+        // SAFETY: `adapter` is a live IDXGIAdapter1. QueryInterface either
+        // hands back a live IDXGIAdapter3 or leaves the pointer null; both
+        // references are released before the loop continues.
+        let info = unsafe {
+            // The adapter's fixed VRAM, used only to tell discrete from
+            // integrated; the budget itself comes from IDXGIAdapter3.
+            let mut desc = core::mem::zeroed::<dxgi::AdapterDesc1>();
+            let dedicated =
+                if ((*dxgi::vtbl::<Adapter1Vtbl>(adapter)).get_desc1)(adapter, &mut desc) >= 0 {
+                    desc.dedicated_video_memory as u64
+                } else {
+                    0
+                };
+            let mut adapter3: *mut core::ffi::c_void = core::ptr::null_mut();
+            let hr = ((*dxgi::vtbl::<Adapter1Vtbl>(adapter)).query_interface)(
+                adapter,
+                &dxgi::IID_IDXGI_ADAPTER3,
+                &mut adapter3,
+            );
+            let info = if hr >= 0 && !adapter3.is_null() {
+                let mut info = dxgi::QueryVideoMemoryInfo::default();
+                let vt = dxgi::vtbl::<Adapter3Vtbl>(adapter3);
+                let hr = ((*vt).query_video_memory_info)(
+                    adapter3,
+                    0, // node 0: single-GPU adapters have exactly one
+                    dxgi::MEMORY_SEGMENT_LOCAL,
+                    &mut info,
+                );
+                ((*vt).release)(adapter3);
+                (hr >= 0).then_some(info)
+            } else {
+                None
+            };
+            ((*dxgi::vtbl::<Adapter1Vtbl>(adapter)).release)(adapter);
+            info.map(|i| (dedicated, i))
+        };
+
+        if let Some((dedicated, info)) = info {
+            let seen = VideoMemory {
+                budget: info.budget,
+                current_usage: info.current_usage,
+            };
+            if best.is_none_or(|(d, _)| dedicated > d) {
+                best = Some((dedicated, seen));
+            }
+        }
+    }
+    // SAFETY: `factory` is live and owned here; this balances its creation.
+    unsafe { ((*dxgi::vtbl::<Factory1Vtbl>(factory)).release)(factory) };
+    best.map(|(_, v)| v)
+}
+
+/// No portable budget query off Windows yet — Vulkan's
+/// `VK_EXT_memory_budget` is the equivalent and a P6 follow-up.
+#[cfg(not(windows))]
+#[must_use]
+pub fn video_memory() -> Option<VideoMemory> {
+    None
 }
 
 /// Total physical RAM, per platform. Kept syscall-thin — this runs once, at

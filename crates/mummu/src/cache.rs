@@ -90,7 +90,25 @@ impl<T> ModelSlot<T> {
         let hit = guard.as_ref().is_some_and(|e| e.key == key);
         if !hit {
             *guard = None; // free the old model before loading the new one
-            let value = load(key)?;
+            // Loading is the one genuinely blocking thing on this path:
+            // minutes of CPU-bound work with no await in it, reading weights
+            // off disk and placing them across devices. Left on an async
+            // worker it starves the runtime — measured, a WebSocket heartbeat
+            // elsewhere in the process was not polled ONCE in 557 seconds and
+            // then fired 38 missed pings at the end, by which point the
+            // connection it existed to keep alive would already be reaped.
+            //
+            // `block_in_place` hands this worker's other tasks to a sibling
+            // thread for the duration, so only this call blocks. Deliberately
+            // narrow: the decode loop around it stays async and awaits.
+            let value = match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+                Ok(tokio::runtime::RuntimeFlavor::MultiThread) => {
+                    tokio::task::block_in_place(|| load(key))?
+                }
+                // A current-thread runtime (tests) has no sibling worker to
+                // hand the other tasks to, and `block_in_place` panics there.
+                _ => load(key)?,
+            };
             *guard = Some(Entry {
                 key: key.to_path_buf(),
                 value,

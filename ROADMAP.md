@@ -360,6 +360,147 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       first busy minute produced. — https://github.com/tracel-ai/cubecl/pull/1423 ·
       https://github.com/tracel-ai/cubecl
 
+- [ ] **The 27B decode gap is still unexplained — but it is NOT a broken quantized matmul.**
+      *(2026-08-23)* Measured against native Windows ollama on the same box and checkpoint: ollama
+      **16.0 tok/s**, mummu **0.21 tok/s** (~76x). Five hypotheses tried, all **falsified**: host round
+      trips (fixed, no effect), trunk-on-GPU (24.7 s/tok, worse), layer-granular `n_gpu_layers`-style
+      placement (40.7 s/tok, worse), autotune-per-shape (`CUBECL_AUTOTUNE_LEVEL=minimal`, 31.8 s/tok),
+      and a suspected upstream defect in wgpu quantized matmul (**retracted, see below**).
+      **Retraction.** An earlier version of this entry claimed burn 0.22's wgpu quantized matmul was
+      nondeterministically wrong at k=n=8192. That was an artifact of the probe, not the runtime: the
+      probe **quantized GB-scale synthetic tensors on the device**, which production never does, and
+      ran the card out of memory — and OOM panics were read as kernel unreliability. Re-probed along
+      the real path (`examples/pack-precision-probe.rs`: packed bytes from `q4.bin`/`q8.bin` -> device
+      -> matmul) at this model's true dimensions (hidden 5120, FFN 17408), **both Q4 and Q8 are correct
+      and bit-identical across repeated rounds, native and dequantized alike, at 2.5-3 ms warm**:
+      Q4 relative error 0.062, Q8 0.0057 against the pack's own f32 bytes. The lesson is the same one
+      that cost this run four wrong turns — *a probe only proves what it measures*, and a synthetic
+      probe that does not reproduce the production path proves nothing about it.
+      What IS real from the server logs: under `fusion`, a fused autotune key
+      (`FusedMatmulAutotuneKey { m: 16, n: 32768, k: 8192, elem_rhs: U32, num_ops: 16 }`) has **all 17
+      candidate kernels fail to launch** — Cmma/Mma variants with "No tile size is available for the
+      problem" (the packed weight is `U32`, so no tensor-core tile applies), unit fallbacks with
+      "Shared memory budget exceeded: kernel requests 294912 bytes, hardware allows 49152". cubecl then
+      cannot pick a winner and panics. Those n=32768/k=8192 shapes are **mummu's own fused expert
+      slabs**, not the model's tensors. Related upstream: tracel-ai/burn#4949 (same "No tile size"
+      family, unfixed). Avoided today by building without `fusion` (below).
+      **Consequence:** the planner's `if policy == Q4 && backend == Wgpu { continue }` rule is a burn
+      0.21-era exclusion with no current evidence behind it, and it is what forces this model to Q8
+      (~13 GiB, which does not fit a 16 GiB card with activation headroom) when Q4 would be ~7.5 GiB
+      and fit whole. Lift it; then place precisions per tensor rather than per model (next item).
+- [ ] **`fusion` is a net negative on this path.** *(2026-08-23)* Built `mummu-serve` with
+      `--no-default-features --features vulkan-spirv`: **4.32 s/tok vs 4.80** with fusion, and fusion
+      additionally *killed whole requests* with `burn-fusion .../stream/execution/ordering.rs: Ordering
+      is bigger than operations: ordering len 10, operations len 0`. The host install is now the
+      no-fusion build. Fusion remains a default cargo feature for the library; revisit after the
+      quantized-matmul defect above is resolved, since fusion is what turns 16 separate ops into the
+      unlaunchable fused key.
+- [x] **The persistent autotune cache never worked on the host — a TOML escaping bug.** *(2026-08-23)*
+      `cubecl.toml` wrote the cache root as a TOML **basic** string containing a Windows path
+      (`"D:\Docker Containers\..."`), where backslashes are escape sequences. cubecl's response to a
+      parse error is to *ignore the file silently*: `Ignoring "...\CubeCL.toml", which doesn't have the
+      right format => TOML parse error at line 10, column 26`. The cache directory had **zero** entries.
+      Fixed by using a TOML *literal* string (single quotes, no escapes). Worth generalizing: any
+      Windows path in a config file needs `'...'`, and a config loader that ignores malformed input
+      without failing loudly will hide this class of bug indefinitely.
+- [x] **Mixed-precision residency: per-tensor Q8/Q4/Q2 on one device, sized to live VRAM.**
+      *(2026-08-23)* The fit planner used to pick ONE precision for a whole model, which is the coarsest
+      possible answer: this 27B needs ~13 GiB at Q8 (does not fit a 16 GiB card with headroom) and ~7 GiB
+      at Q4 (leaves ~6 GiB of budget unspent). New [`mummu::mix`] assigns a precision **per tensor**,
+      greedily demoting whichever tensor has the lowest `sensitivity x error-increase` per byte freed, so
+      attention projections, the LM head and the edge layers hold Q8 while the bulk FFN slabs sit at Q4.
+      The error model is measured, not assumed (`examples/ladder-probe.rs`, on a real 89 M-param pack
+      tensor against the pack's own f32 bytes): **Q8 0.0058, Q4 0.0997, Q2 0.6226** relative. That
+      steepness is why the planner spends budget keeping tensors off Q2 rather than spreading pain
+      evenly. Block scales are counted — at Q2 an f32 scale per 32 values is **37%** of the tensor, so
+      ignoring them overstates headroom by a third. 7 unit tests, including monotonicity (tightening the
+      budget must never *raise* a tensor's precision, or the rebalancer oscillates).
+      **`QuantPolicy` gained `Q2`** plus `demote`/`promote`/`LADDER`. Q2 is the bottom rung burn can hold
+      packed in VRAM (cubecl has `Q2S`; there is no 1-bit type, so **Q1 would need a custom CubeCL
+      kernel** and is not on this stack). No pack stores Q2 either — it is reachable only by requantizing
+      a tensor that is already resident, which is exactly the pressure response.
+      **Budget now tracks live VRAM.** New [`mummu::vram`] loads NVML at runtime (a missing DLL degrades
+      to `None`, never a failed process start) and reports the card's *global* used/free — verified
+      against nvidia-smi (16376/859/15516 vs 16376/541/15521, the delta being the probe's own
+      allocation). `MUMMU_GPU_BUDGET_GB` became a **ceiling**, capped by what is actually free. This
+      matters on a real desktop: Firefox, Discord, Steam, Docker and two driver overlays held enough of
+      this card that a 9.8 GiB placement well inside its configured budget died with `out of device
+      memory` mid-generation. Also added `backend::video_memory()` (DXGI `QueryVideoMemoryInfo`) —
+      useful as a per-process ceiling but **not** as a free-memory reading: Windows permits
+      oversubscription and reported a ~15 GiB budget while another process held 9 GiB of the card.
+- [ ] **Blocked: the layered GPU path OOMs well inside its budget, and it is the allocator, not the
+      weights.** *(2026-08-23)* With 10.03 GiB of weights planned onto a card with 15.2 GiB free and a
+      3 GiB activation reserve, generation dies with `failed to reserve 19660800 bytes ... out of device
+      memory allocating 263143424 bytes`. Tracing nvidia-smi through the load shows VRAM going
+      **451 -> 15958 MiB within 3 seconds** — before the 52 s load finishes — so that is cubecl
+      reserving its pool up front, not weights accumulating, and the failure is *inside* the pool.
+      Ruled out: dequantize-per-matmul (the native quantized path is active; the "no usable native
+      quantized matmul" line never appears). Next step is cubecl's memory-pool configuration
+      (chunk sizing / fragmentation), not another placement or precision change.
+- [ ] **Wire the mix to the running controller.** The pieces exist and are tested separately —
+      `mix::plan` (what precision each tensor should be), `vram::memory` (what changed), and
+      `adapt::Controller` (when to react, with its dwell and alloc-failure handling). Joining them is a
+      rebalance step that requantizes resident tensors down a rung under pressure and re-reads them from
+      the pack on the way back up. Note from the ladder probe: **promotion should re-read the pack, not
+      invert a demotion** — the pack's Q4 measured 0.0997 against 0.1090 for Q8-then-requantize, because
+      the pack quantized from the original f32 while a demotion compounds two roundings.
+- [x] **Use every device that helps: the integrated GPU joins the placement, and the CPU stops being
+      given quantized weights.** *(2026-08-23)* Measured first, on the decode shape with a real pack
+      weight (`examples/device-throughput.rs`, warm, 89 M params):
+
+      | device | ms | GB/s of weights |
+      |---|---|---|
+      | dGPU (RTX 4070 Ti SUPER, wgpu) | 1.59 | 35.1 |
+      | iGPU (Radeon, wgpu) | 14.15 | 3.9 |
+      | CPU (flex, f32) | 13.82 | 4.0 |
+      | CPU (flex, Q8 native) | 244 | 0.2 |
+      | CPU (flex, Q4 native) | 268 | 0.2 |
+      | CPU (flex, F16 from pack) | 13.26 | 4.2 |
+
+      Three findings, each of which changed the code. **(1) On burn-flex a quantized matmul is 18x
+      slower than a float one.** Quantization exists to fit a device short of memory; the host has
+      96 GiB and is short of speed. The CPU tier's ladder started at `Q8`, so a host given a large share
+      of the clusters was pushed into its slowest mode exactly when it had the most work — now
+      `[F32, Q8, Q4]`. Host-resident weights on the layered path load at **F16 straight from the pack**
+      (the pack already stores `f16.bin`), which is the same speed as f32 at half the bytes.
+      **(2) The iGPU is level with the CPU, not above it** — its value is that it is an *additional*
+      worker. Run concurrently it held 14.3 ms while the CPU ran flat out, so there is no measurable
+      contention for the memory controller. It now appears as `BackendChoice::IntegratedGpu` with a
+      bounded slice of system RAM **subtracted from the CPU tier's budget**, since it allocates from the
+      same pool. Placement on the 27B went from `996 dGPU + 1052 CPU` to **`996 dGPU + 885 iGPU +
+      167 CPU`** — 885 clusters moved off the slow path.
+      **(3) cubecl has no peer-to-peer transfer for wgpu**: `comm_init` and `send` on its server trait
+      are `unimplemented!()`, so a direct dGPU -> iGPU move panics with a bare "not implemented". Added
+      `backend::move_to`, which stages through host memory when both ends are accelerators and is a
+      no-op otherwise. Without it a two-GPU placement cannot run at all.
+- [x] **When the FFN is tiered, the trunk belongs on the host.** *(2026-08-23)* Lifting the stale Q4
+      exclusion let the fit planner put the trunk on the card, which *starved the clusters of the only
+      fast device*: a trunk on the GPU took 7.8 of its 9 GiB and left room for 302 of 2048 clusters,
+      against 996 when the trunk stayed on the host. Measured 6.2 s/tok against 4.32. This is the same
+      result as the earlier trunk-on-GPU experiment (24.7 against 4.8), now with a mechanism rather than
+      a mystery: every cluster runs on every token, so the card holding more of them beats the card
+      holding the trunk. The candidate order in the fit planner now tries the host first **when and only
+      when the FFN will be tiered** — without tiering the whole model goes to one device and the fastest
+      one that fits is simply right.
+- [x] **Chat over a WebSocket, so a cold load survives Cloudflare.** *(2026-08-23)* Behind Cloudflare an
+      HTTP response that produces no bytes for 100 seconds is cut with a 524 — and a cold `/api/chat`
+      produces none for **minutes** while a 27B is read from disk and placed across devices. SSE does not
+      help: the clock runs from the request and there is nothing to stream yet. Cloudflare does not apply
+      that timeout to WebSockets, so `GET /api/chat/ws` carries exactly the frames `POST /api/chat` sends
+      (`start_chat` is shared, so the two cannot drift) and the UI prefers it, falling back to POST+SSE
+      only if the socket never opens. Verified end to end: `101 Switching Protocols` with
+      `Server: cloudflare` and a `CF-RAY` header, deltas and a `done` frame.
+      **The upgrade alone was not the fix.** An idle WebSocket is reaped too, so the server pings every
+      15 s through the load — and the first implementation of that *did not work*: the heartbeat task was
+      not polled **once in 557 seconds**, then fired 38 missed pings in a burst when the load finished, by
+      which point the connection would already be gone. The load is minutes of CPU-bound work with no
+      await in it, and as a plain async task it starved the runtime. Fixed narrowly, in `mummu::cache`,
+      by wrapping **just the load** in `block_in_place` (guarded on a multi-thread runtime, since it
+      panics on the current-thread flavor the tests use) — not by pushing the whole generation onto the
+      blocking pool, which would have turned the async decode loop back into blocking work. Pings then
+      arrive at 16/31/46 s and hold a 544-second connection. `MissedTickBehavior::Delay` on the interval,
+      because a burst of late pings proves nothing to a proxy that already timed out.
+
 ## Phases
 
 ### P0 — Workspace scaffold

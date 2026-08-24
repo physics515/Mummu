@@ -234,38 +234,32 @@ async function send() {
   const div = addMsg("assistant", "");
   const body = div.querySelector(".body");
   let acc = "";
-  try {
-    const resp = await fetch("/api/chat", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: c.name,
-        messages,
-        options: {
-          temperature: parseFloat($("temp").value),
-          top_p: parseFloat($("topp").value),
-          max_tokens: parseInt($("maxtok").value, 10),
-        },
-      }),
-    });
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({ error: resp.statusText }));
-      throw new Error(err.error || resp.statusText);
+  const request = {
+    model: c.name,
+    messages,
+    options: {
+      temperature: parseFloat($("temp").value),
+      top_p: parseFloat($("topp").value),
+      max_tokens: parseInt($("maxtok").value, 10),
+    },
+  };
+  // Same frames either way; only the transport differs.
+  const onEvent = ev => {
+    if (ev.type === "delta") {
+      acc += ev.text;
+      renderBody(body, acc);
+      log.scrollTop = log.scrollHeight;
+    } else if (ev.type === "done") {
+      renderBody(body, ev.text || acc);
+      div.querySelector(".meta").textContent =
+        `${ev.tokens} tokens · ${ev.tokens_per_second} tok/s · ${ev.device}`;
+      history.push({ role: "assistant", content: ev.text || acc });
+    } else if (ev.type === "error") {
+      throw new Error(ev.error || `request rejected (${ev.status})`);
     }
-    await readSse(resp, ev => {
-      if (ev.type === "delta") {
-        acc += ev.text;
-        renderBody(body, acc);
-        log.scrollTop = log.scrollHeight;
-      } else if (ev.type === "done") {
-        renderBody(body, ev.text || acc);
-        div.querySelector(".meta").textContent =
-          `${ev.tokens} tokens · ${ev.tokens_per_second} tok/s · ${ev.device}`;
-        history.push({ role: "assistant", content: ev.text || acc });
-      } else if (ev.type === "error") {
-        throw new Error(ev.error);
-      }
-    });
+  };
+  try {
+    await chatOverSocket(request, onEvent);
   } catch (e) {
     body.innerHTML += `<div class="err">⚠ ${e.message}</div>`;
     // keep history consistent: a failed turn contributes no assistant message
@@ -274,6 +268,66 @@ async function send() {
     generating = false; $("send").disabled = false;
     log.scrollTop = log.scrollHeight;
   }
+}
+
+// Chat over a WebSocket rather than POST + SSE.
+//
+// Not a preference — a proxy limit. Behind Cloudflare an HTTP response that
+// sends no bytes for 100 s is cut with a 524, and a cold request here sends
+// none for MINUTES while a 27B model is read from disk and placed across
+// devices. Cloudflare does not apply that timeout to WebSockets, and the
+// server pings through the load so the connection is never idle either.
+//
+// Falls back to POST + SSE if the socket cannot be opened at all, so a proxy
+// or browser without WebSocket support still works — it just inherits the
+// timeout this is here to avoid.
+function chatOverSocket(request, onEvent) {
+  return new Promise((resolve, reject) => {
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    let socket;
+    try {
+      socket = new WebSocket(`${proto}//${location.host}/api/chat/ws`);
+    } catch (e) {
+      chatOverSse(request, onEvent).then(resolve, reject);
+      return;
+    }
+    // Only a failure BEFORE the stream opens is worth falling back on; once
+    // frames are flowing, a drop is a real error and retrying would replay
+    // the whole generation.
+    let opened = false;
+    socket.addEventListener("open", () => {
+      opened = true;
+      socket.send(JSON.stringify(request));
+    });
+    socket.addEventListener("message", ev => {
+      try {
+        onEvent(JSON.parse(ev.data));
+      } catch (e) {
+        socket.close();
+        reject(e);
+      }
+    });
+    socket.addEventListener("error", () => {
+      if (!opened) chatOverSse(request, onEvent).then(resolve, reject);
+    });
+    socket.addEventListener("close", () => {
+      if (opened) resolve();
+      else chatOverSse(request, onEvent).then(resolve, reject);
+    });
+  });
+}
+
+async function chatOverSse(request, onEvent) {
+  const resp = await fetch("/api/chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request),
+  });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({ error: resp.statusText }));
+    throw new Error(err.error || resp.statusText);
+  }
+  await readSse(resp, onEvent);
 }
 
 $("send").addEventListener("click", send);

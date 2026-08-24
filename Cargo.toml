@@ -3,6 +3,8 @@ resolver = "3"
 members = [
 	"crates/mummu",
 	"crates/mummu-app",
+	"crates/mummu-mix",
+	"crates/mummu-schedule",
 	"crates/mummu-bench",
 	"crates/mummu-serve",
 ]
@@ -46,6 +48,11 @@ burn = { version = "0.22.0-pre.2", default-features = false, features = [
 # gate passed on it bit-for-bit-equivalent (cosine 0.99999994, max component
 # diff 1.3e-7) with all 80 unit tests green.
 burn-flex = "0.22.0-pre.2"
+# The two schedulers, as their own crates: A divides work across devices,
+# B decides the precision of the weights on each. Both are dependency-free —
+# see their crate docs — which is why they are separate rather than modules.
+mummu-mix = { path = "crates/mummu-mix" }
+mummu-schedule = { path = "crates/mummu-schedule" }
 # Direct handle on burn-store (the same crate burn's `store` feature pulls) to
 # turn on its `pytorch` feature: .pth / pytorch_model.bin state-dict loading
 # for models never re-shipped as safetensors (feature-unified, no duplicate).
@@ -106,7 +113,7 @@ tokio = { version = "1", features = [
 	"signal",
 ] }
 # Async HTTP for mummu-serve, replacing tiny_http's thread-per-request model.
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 tower = "0.5"
 futures = "0.3"
 async-stream = "0.3"

@@ -419,11 +419,11 @@ where
         // `to_device` is a no-op when the tensor is already here, so a
         // cluster group living on the caller's device costs zero transfers.
         let caller = x.device();
-        let xt = x.to_device(&self.device);
+        let xt = crate::backend::move_to(x, &self.device);
         let w = &self.weights;
         let acts = activation::silu(xt.clone().matmul(compute_weight(&w.gate)))
             .mul(xt.matmul(compute_weight(&w.up)));
-        acts.matmul(compute_weight(&w.down)).to_device(&caller)
+        crate::backend::move_to(acts.matmul(compute_weight(&w.down)), &caller)
     }
 
     fn gate_energy(&self, x: &[f32], rows: usize, hidden: usize) -> Vec<f32> {
@@ -646,10 +646,10 @@ impl ExpertExec for StagedExpert {
             // than stall waiting for a transfer that was never issued.
             None => (self.host_device.clone(), &self.host),
         };
-        let xt = x.to_device(&device);
+        let xt = crate::backend::move_to(x, &device);
         let acts = activation::silu(xt.clone().matmul(compute_weight(&w.gate)))
             .mul(xt.matmul(compute_weight(&w.up)));
-        acts.matmul(compute_weight(&w.down)).to_device(&caller)
+        crate::backend::move_to(acts.matmul(compute_weight(&w.down)), &caller)
     }
 }
 
@@ -867,16 +867,81 @@ impl ExpertPool {
         // the host. This is the path a dense model takes, and it removes the
         // per-layer round trip that dominated the 27B's decode.
         if skip.is_none() {
-            let mut out: Option<Tensor<2>> = None;
+            // Run the devices CONCURRENTLY, one thread per device, and sum
+            // what comes back. Sequentially the layer costs the SUM of every
+            // device's share, so adding a second GPU bought nothing: 885
+            // clusters moved from the CPU to the integrated GPU and decode
+            // measured 4.72 s/tok against 4.32 before, because an iGPU
+            // cluster (14.15 ms) is no faster than the CPU cluster it
+            // replaced (13.82 ms) and the move added a transfer. Run in
+            // parallel the layer costs the MAX instead, which is the entire
+            // reason to spread work across devices at all.
+            //
+            // One thread per DEVICE, never per executor. Thread-per-executor
+            // is what made cubecl-cuda open a stream per thread until a
+            // 64-layer forward exhausted VRAM (`CUDA_ERROR_OUT_OF_MEMORY`,
+            // "Can create a new stream"). Devices are bounded — three on this
+            // box — so the stream count is bounded with them.
+            let mut by_device: Vec<(String, Vec<usize>)> = Vec::new();
             for (e, exec) in execs.iter().enumerate() {
-                let y = exec.run_tensor(xt.clone());
-                out = Some(match out {
-                    Some(acc) => acc.add(y),
-                    None => y,
-                });
+                let key = format!("{:?}", exec.tier().device);
+                match by_device.iter_mut().find(|(k, _)| *k == key) {
+                    Some((_, list)) => list.push(e),
+                    None => by_device.push((key, vec![e])),
+                }
+            }
+            for (e, _) in execs.iter().enumerate() {
                 self.hits[layer][e].fetch_add(bt as u64, std::sync::atomic::Ordering::Relaxed);
-                self.dense_rows[0].fetch_add(bt as u64, std::sync::atomic::Ordering::Relaxed);
-                self.dense_rows[1].fetch_add(bt as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.dense_rows[0].fetch_add(bt as u64, std::sync::atomic::Ordering::Relaxed);
+            self.dense_rows[1].fetch_add(bt as u64, std::sync::atomic::Ordering::Relaxed);
+
+            // One device: no threads, no join, exactly the old path.
+            if by_device.len() < 2 {
+                let mut out: Option<Tensor<2>> = None;
+                for exec in &execs {
+                    let y = exec.run_tensor(xt.clone());
+                    out = Some(match out {
+                        Some(acc) => acc.add(y),
+                        None => y,
+                    });
+                }
+                return out;
+            }
+
+            let partials: Vec<Tensor<2>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = by_device
+                    .iter()
+                    .map(|(_, members)| {
+                        let execs = &execs;
+                        let xt = xt.clone();
+                        scope.spawn(move || {
+                            let mut acc: Option<Tensor<2>> = None;
+                            for &e in members {
+                                let y = execs[e].run_tensor(xt.clone());
+                                acc = Some(match acc {
+                                    Some(a) => a.add(y),
+                                    None => y,
+                                });
+                            }
+                            acc
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .filter_map(|h| h.join().ok().flatten())
+                    .collect()
+            });
+
+            // Sum the per-device partials on the caller's device.
+            let mut out: Option<Tensor<2>> = None;
+            for p in partials {
+                let p = crate::backend::move_to(p, &device);
+                out = Some(match out {
+                    Some(acc) => acc.add(p),
+                    None => p,
+                });
             }
             return out;
         }

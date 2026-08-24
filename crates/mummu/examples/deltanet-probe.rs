@@ -6,7 +6,21 @@ use std::time::Instant;
 use burn::tensor::{Distribution, Tensor};
 
 fn main() {
-    let device = mummu::backend::cpu_device();
+    // Which device to probe: the recurrence is 48 of the 27B's 65 layers and
+    // is a SEQUENTIAL loop of small ops, so it is the least GPU-friendly part
+    // of the model — exactly what a matmul microbenchmark cannot see.
+    let device = match std::env::var("PROBE_DEVICE").as_deref() {
+        Ok("cuda") =>
+        {
+            #[cfg(feature = "cuda")]
+            { mummu::backend::cuda_device() }
+            #[cfg(not(feature = "cuda"))]
+            { mummu::backend::cpu_device() }
+        }
+        Ok("gpu") => mummu::backend::gpu_device(),
+        _ => mummu::backend::cpu_device(),
+    };
+    println!("device: {:?}", device);
     let (b, hv, ds) = (1usize, 24usize, 256usize);
     let n = 20;
     let rnd4 = |dims: [usize; 4]| Tensor::<4>::random(dims, Distribution::Default, &device);

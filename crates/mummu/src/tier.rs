@@ -172,7 +172,53 @@ pub fn plan_tiers(
         tiers.push(slot);
     }
 
-    // 2. Promotion, hottest first.
+    // 2a. Scheduler A: how many experts each device SHOULD hold.
+    //
+    // Admission below put everything on the slowest device and promotion
+    // pulls it up, fastest-slot-first — which fills the quick device and
+    // dumps the remainder on the slow ones. That is the right shape when
+    // devices run one after another, and the wrong one now that they run
+    // concurrently: the layer then costs the slowest device's share, so the
+    // objective is for every device to FINISH TOGETHER, not for the fast one
+    // to be busiest. Measured, fill-first put 996 experts on a device that
+    // takes 1.59 ms each and 1052 on devices taking ~14 ms — the slow side
+    // ran ~9x longer and decided the layer.
+    //
+    // `schedule::divide` gives the makespan-minimizing split; promotion
+    // treats it as a quota rather than a target, so a device is never filled
+    // past its share while a slower one still has work it could have taken.
+    let quota = {
+        let sched: Vec<crate::schedule::Device> = devices
+            .iter()
+            .map(|dev| {
+                // Cheapest an expert can be on this device, over the whole
+                // set — what its budget divides into.
+                let cheapest = costs
+                    .iter()
+                    .filter_map(|c| {
+                        dev.ladder.iter().filter_map(|p| c.bytes.get(p).copied()).min()
+                    })
+                    .max()
+                    .unwrap_or(u64::MAX);
+                crate::schedule::Device {
+                    name: dev.name.clone(),
+                    throughput: f64::from(dev.speed),
+                    capacity_units: if cheapest == 0 || cheapest == u64::MAX {
+                        0
+                    } else {
+                        (dev.budget_bytes / cheapest) as usize
+                    },
+                }
+            })
+            .collect();
+        crate::schedule::divide(&sched, costs.len()).units
+    };
+    let mut held = vec![0usize; devices.len()];
+    for t in &tiers {
+        held[t.device] += 1;
+    }
+
+    // 2b. Promotion, hottest first.
     let mut order: Vec<usize> = (0..costs.len()).collect();
     if !hotness.is_empty() {
         order.sort_by(|&a, &b| {
@@ -190,12 +236,22 @@ pub fn plan_tiers(
                 break; // already at the best slot it can hold
             }
             let Some(bytes) = cost_of(slot, e) else { continue };
+            // Scheduler A's quota: moving ONTO another device may not push it
+            // past its balanced share. Promoting in place (same device, finer
+            // precision) changes no counts and is always allowed.
+            if slot.device != cur.device && held[slot.device] >= quota[slot.device] {
+                continue;
+            }
             // Room on the target, counting what this expert frees if the
             // target is its current device.
             let freed = if slot.device == cur.device { cur_bytes } else { 0 };
             if used[slot.device] - freed + bytes <= devices[slot.device].budget_bytes {
                 used[cur.device] -= cur_bytes;
                 used[slot.device] += bytes;
+                if slot.device != cur.device {
+                    held[cur.device] -= 1;
+                    held[slot.device] += 1;
+                }
                 tiers[e] = slot;
                 break;
             }

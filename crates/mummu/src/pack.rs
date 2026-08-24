@@ -32,6 +32,9 @@ use burn::tensor::{Device, Tensor, TensorData};
 
 use crate::gguf::{GgufFile, GgufTensorInfo};
 use crate::quant::QuantPolicy;
+// `scheme()` is an extension trait: the ladder lives in `mummu-mix`, which
+// has no burn dependency, so the burn binding is bolted on here.
+use crate::quant::SchemeExt;
 
 /// Pack format version (bump on any incompatible manifest/blob change).
 pub const PACK_VERSION: u32 = 1;

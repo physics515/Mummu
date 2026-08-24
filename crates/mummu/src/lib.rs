@@ -20,6 +20,8 @@ mod gguf_iq_grids;
 pub mod hub;
 pub mod import;
 pub mod manage;
+/// Scheduler B — per-tensor precision placement (crate `mummu-mix`).
+pub use mummu_mix as mix;
 pub mod models;
 pub mod nn;
 pub mod pack;
@@ -28,11 +30,14 @@ pub mod plan;
 pub mod quant;
 pub mod registry;
 pub mod safetensors;
+/// Scheduler A — dividing work across devices (crate `mummu-schedule`).
+pub use mummu_schedule as schedule;
 /// Render a checkpoint's own imported chat template (feature `jinja-template`).
 #[cfg(feature = "jinja-template")]
 pub mod template;
 pub mod tier;
 pub mod tok_config;
+pub mod vram;
 pub mod workingset;
 pub mod tokenizer;
 pub mod tune;

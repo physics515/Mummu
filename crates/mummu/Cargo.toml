@@ -41,6 +41,8 @@ jinja-template = ["dep:hf-chat-template"]
 # than leaving async to consumers.
 tokio = { workspace = true }
 burn = { workspace = true }
+mummu-mix = { workspace = true }
+mummu-schedule = { workspace = true }
 hf-chat-template = { workspace = true, optional = true }
 wgpu = { workspace = true }
 pollster = { workspace = true }

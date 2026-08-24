@@ -64,6 +64,20 @@ pub enum BackendChoice {
     Cuda,
     /// wgpu (Vulkan/DX12/Metal) — the parity-validated GPU stack.
     Wgpu,
+    /// The integrated GPU, through wgpu. A separate choice from [`Self::Wgpu`]
+    /// because it is a different device with different economics: it has no
+    /// VRAM of its own (it allocates from system RAM) and it is far slower
+    /// than the discrete card — but it is a genuinely *additional* worker,
+    /// and it does not contend with the CPU for the memory controller.
+    /// Measured on this box for the decode shape, `device-throughput.rs`:
+    ///
+    ///   dGPU 1.59 ms | iGPU 14.15 ms | CPU (f32) 13.82 ms
+    ///
+    /// so the iGPU is ~8.9x slower than the discrete card and about level
+    /// with the CPU — its value is capacity beside the CPU, not speed over
+    /// it. Run concurrently, the iGPU held 14.3 ms while the CPU ran flat
+    /// out, i.e. no measurable contention.
+    IntegratedGpu,
     /// burn-flex.
     Cpu,
 }
@@ -110,6 +124,7 @@ pub fn device_label() -> &'static str {
         #[cfg(feature = "cuda")]
         BackendChoice::Cuda => "GPU (cuda)",
         BackendChoice::Wgpu => "GPU (wgpu)",
+        BackendChoice::IntegratedGpu => "iGPU (wgpu)",
         BackendChoice::Cpu => "CPU (flex)",
     }
 }
@@ -268,10 +283,33 @@ fn load_any(
                                     &pack_dir, device, backend, cpu_only, policy,
                                 )?)
                             }
-                            _ => AnyLm::Qwen35(
-                                qwen35::load_from_pack(&pack_dir, device, &|_| level)
-                                    .map_err(|e| e.to_string())?,
-                            ),
+                            _ => {
+                                // Per-tensor precision rather than one level
+                                // for the whole model — see `mixed_precision`.
+                                // The fit planner's policy is the *lowest*
+                                // precision that fits wholesale; the mix
+                                // starts from the best a pack stores and
+                                // demotes only as far as the budget forces,
+                                // so spare VRAM is spent rather than left.
+                                let ceiling = match policy {
+                                    mummu::quant::QuantPolicy::Off => {
+                                        mummu::quant::QuantPolicy::Off
+                                    }
+                                    _ => mummu::quant::QuantPolicy::Q8,
+                                };
+                                let mix = mummu::pack::Pack::open(&pack_dir)
+                                    .ok()
+                                    .map(|p| mixed_precision(&p, backend, ceiling, &|_| true));
+                                let choose = |e: &mummu::pack::TensorEntry| {
+                                    mix.as_ref()
+                                        .and_then(|m| m.get(&e.name).copied())
+                                        .unwrap_or(level)
+                                };
+                                AnyLm::Qwen35(
+                                    qwen35::load_from_pack(&pack_dir, device, &choose)
+                                        .map_err(|e| e.to_string())?,
+                                )
+                            }
                         }
                     } else {
                         // Streaming importer with the fit-planned policy.
@@ -363,6 +401,7 @@ pub(crate) fn device_of(backend: BackendChoice) -> Device {
         #[cfg(feature = "cuda")]
         BackendChoice::Cuda => mummu::backend::cuda_device(),
         BackendChoice::Wgpu => mummu::backend::gpu_device(),
+        BackendChoice::IntegratedGpu => mummu::backend::integrated_gpu_device(),
         BackendChoice::Cpu => mummu::backend::cpu_device(),
     }
 }
@@ -373,6 +412,7 @@ pub(crate) fn label_of(backend: BackendChoice) -> &'static str {
         #[cfg(feature = "cuda")]
         BackendChoice::Cuda => "GPU (cuda)",
         BackendChoice::Wgpu => "GPU (wgpu)",
+        BackendChoice::IntegratedGpu => "iGPU (wgpu)",
         BackendChoice::Cpu => "CPU (flex)",
     }
 }
@@ -552,21 +592,47 @@ fn tier_devices(
     // `MUMMU_TIER_SPEED=cpu-first` restores the old ordering for a host whose
     // GPU genuinely is slower (no working native quantized matmul, so every
     // matmul pays a dequantize — see `nn::compute_weight`).
-    let decode_speed = |gpu: bool| -> u32 {
+    // Three tiers now, ranked from the same decode-shape measurement
+    // (`examples/device-throughput.rs`, 2026-08-23, warm, real pack weight):
+    //
+    //   dGPU 1.59 ms | iGPU 14.15 ms | CPU 13.82 ms (f32)
+    //
+    // The iGPU is level with the CPU, not above it — its value is that it is
+    // an ADDITIONAL worker: run concurrently, it held 14.3 ms while the CPU
+    // ran flat out, so there is no measurable contention for the memory
+    // controller between them. It ranks just above the CPU so overflow
+    // spreads onto it first and the CPU takes what is left, rather than one
+    // device carrying everything while the other idles.
+    let decode_speed = |backend: BackendChoice| -> u32 {
         let cpu_first = std::env::var("MUMMU_TIER_SPEED")
             .ok()
             .as_deref()
             .is_some_and(|v| v.eq_ignore_ascii_case("cpu-first"));
-        if gpu == cpu_first { 1 } else { 10 }
+        let rank = match backend {
+            BackendChoice::Cpu => 1,
+            BackendChoice::IntegratedGpu => 2,
+            _ => 10,
+        };
+        if cpu_first { 11 - rank } else { rank }
     };
     let mut out = vec![(
         BackendChoice::Cpu,
         TierDevice {
             name: "cpu".into(),
             class: DeviceClass::Cpu,
-            ladder: vec![Precision::Q8, Precision::Q4],
+            // F32 FIRST, and it is not a memory-for-speed nicety: on
+            // burn-flex a quantized matmul is 18x slower than a float one.
+            // The same 89 M-param weight measured 268 ms at Q4 and 244 ms at
+            // Q8 against 13.3 ms at F16 / 13.8 ms dequantized to f32 — 0.2
+            // GB/s against 4.2 (`examples/device-throughput.rs`, 2026-08-23).
+            // Quantization exists to fit a device short of memory; the host
+            // has 96 GiB and is short of speed. The ladder previously started
+            // at Q8, so a host that took a large share of the clusters was
+            // pushed into its slowest mode precisely when it had the most
+            // work to do.
+            ladder: vec![Precision::F32, Precision::Q8, Precision::Q4],
             budget_bytes: budget(BackendChoice::Cpu),
-            speed: decode_speed(false),
+            speed: decode_speed(BackendChoice::Cpu),
         },
     )];
     if cpu_only {
@@ -587,7 +653,7 @@ fn tier_devices(
                 // clusters at Q4 than at F32, which is what makes a 27B fit.
                 ladder: vec![Precision::F32, Precision::Q8, Precision::Q4],
                 budget_bytes: budget(BackendChoice::Cuda),
-                speed: decode_speed(true),
+                speed: decode_speed(BackendChoice::Cuda),
             },
         ));
         return out;
@@ -598,11 +664,38 @@ fn tier_devices(
             TierDevice {
                 name: "wgpu".into(),
                 class: DeviceClass::DiscreteGpu,
-                ladder: vec![Precision::F32, Precision::Q8],
+                // Q4 is on this ladder as of 2026-08-23. It was withheld from
+                // wgpu because the kernel was believed to return garbage; that
+                // was a probe artifact (see `mixed_precision` / the pack
+                // probe), and along the production path Q4 measures 0.062
+                // relative error at 2.9 ms — the same speed as Q8 for half the
+                // bytes. On a device whose scarce resource is memory, half the
+                // bytes is twice the clusters, and every cluster runs on every
+                // token.
+                ladder: vec![Precision::F32, Precision::Q8, Precision::Q4],
                 budget_bytes: budget(BackendChoice::Wgpu),
-                speed: decode_speed(true),
+                speed: decode_speed(BackendChoice::Wgpu),
             },
         ));
+        // The integrated GPU, if this machine has one that is not already the
+        // main device. Left out until now, so on a box like this one it sat
+        // idle while the CPU carried every spilled cluster.
+        if mummu::backend::has_integrated_gpu() && main != BackendChoice::IntegratedGpu {
+            out.push((
+                BackendChoice::IntegratedGpu,
+                TierDevice {
+                    name: "igpu".into(),
+                    class: DeviceClass::IntegratedGpu,
+                    // Same ladder as the discrete card: this is a wgpu device,
+                    // so it runs the same cubecl kernels and a quantized
+                    // matmul costs it nothing (unlike burn-flex, where one is
+                    // 18x slower — which is why the CPU tier differs).
+                    ladder: vec![Precision::F32, Precision::Q8, Precision::Q4],
+                    budget_bytes: budget(BackendChoice::IntegratedGpu),
+                    speed: decode_speed(BackendChoice::IntegratedGpu),
+                },
+            ));
+        }
     }
     out
 }
@@ -768,7 +861,10 @@ fn pack_trunk_bytes(pack: &mummu::pack::Pack, level: mummu::pack::Precision) -> 
 
 /// Bytes one layer of a pack costs on a device at `level` — every tensor
 /// whose parameter path names that layer, trunk and FFN alike.
-fn pack_layer_bytes(pack: &mummu::pack::Pack, level: mummu::pack::Precision) -> Vec<u64> {
+fn pack_layer_bytes(
+    pack: &mummu::pack::Pack,
+    level: &dyn Fn(&mummu::pack::TensorEntry) -> mummu::pack::Precision,
+) -> Vec<u64> {
     use mummu::pack::{Precision, Role};
     let mut per_layer: std::collections::BTreeMap<usize, u64> = std::collections::BTreeMap::new();
     for t in &pack.manifest.tensors {
@@ -783,9 +879,10 @@ fn pack_layer_bytes(pack: &mummu::pack::Pack, level: mummu::pack::Precision) -> 
             continue;
         };
         let numel = t.shape.iter().product::<usize>() as u64;
-        let bytes = match (&t.role, t.precisions.get(&level)) {
+        let chosen = level(t);
+        let bytes = match (&t.role, t.precisions.get(&chosen)) {
             (Role::Linear | Role::Expert { .. }, Some(b))
-                if matches!(level, Precision::Q4 | Precision::Q8) =>
+                if matches!(chosen, Precision::Q4 | Precision::Q8) =>
             {
                 b.values_len + b.scales_len
             }
@@ -796,11 +893,20 @@ fn pack_layer_bytes(pack: &mummu::pack::Pack, level: mummu::pack::Precision) -> 
     per_layer.into_values().collect()
 }
 
+/// Device memory held back from weights for everything that is not a weight:
+/// activations, KV and recurrent state, dequantize temporaries, and the
+/// allocator's own chunking. Sized from the failure it prevents — see
+/// [`layers_that_fit`].
+const ACTIVATION_RESERVE: u64 = 3 << 30;
+
 /// How many whole layers fit `budget_bytes`, leaving room for activations.
 fn layers_that_fit(layer_bytes: &[u64], budget_bytes: u64) -> usize {
-    // Activations, KV/recurrent state and kernel workspaces are not weights;
-    // the fit planner's slack elsewhere uses the same 1 GiB reservation.
-    let usable = budget_bytes.saturating_sub(1 << 30);
+    // Activations, KV/recurrent state and kernel workspaces are not weights.
+    // 1 GiB was too little and produced `out of device memory` mid-generation
+    // with 12.03 GiB of weights placed on a card with 15.2 GiB free: a
+    // dequantize of one [5120, 17408] slab alone is 356 MB, several are live
+    // at once, and the pooled allocator reserves in ~1 GiB chunks on top.
+    let usable = budget_bytes.saturating_sub(ACTIVATION_RESERVE);
     let mut used = 0u64;
     let mut n = 0usize;
     for &b in layer_bytes {
@@ -833,7 +939,23 @@ fn build_layered_qwen35(
     use mummu::pack::Pack;
     let pack = Pack::open(pack_dir)?;
     let level = precision_for(policy);
-    let layer_bytes = pack_layer_bytes(&pack, level);
+    // Per-tensor precision, starting from the best a pack stores and demoting
+    // only as far as this device's live budget forces — so the layers that do
+    // land here carry as much precision as the card can hold, and more of them
+    // fit than a single-precision plan would allow. See `mixed_precision`.
+    let ceiling = match policy {
+        mummu::quant::QuantPolicy::Off => mummu::quant::QuantPolicy::Off,
+        _ => mummu::quant::QuantPolicy::Q8,
+    };
+    // The embedding goes to the host below (`embed_device`), so it must not
+    // be charged against this device's budget.
+    let mix = mixed_precision(&pack, main, ceiling, &|t| {
+        !matches!(t.role, mummu::pack::Role::Embedding)
+    });
+    // Precision the DEVICE gets. Sizing the split needs only this, since the
+    // split is decided by what fits on the device.
+    let device_choose = |e: &mummu::pack::TensorEntry| mix.get(&e.name).copied().unwrap_or(level);
+    let layer_bytes = pack_layer_bytes(&pack, &device_choose);
     if layer_bytes.is_empty() {
         return Err("pack has no per-layer tensors".into());
     }
@@ -864,7 +986,35 @@ fn build_layered_qwen35(
     // with the last layer so the final projection does not cross.
     let head = dev_for(layer_bytes.len().saturating_sub(1));
     let started = Instant::now();
-    let model = qwen35::load_from_pack_layered(pack_dir, &dev_for, &host, &head, &|_| level)
+    // A weight that lands on the HOST should not be quantized, because on
+    // burn-flex a quantized matmul is pathologically slow: the same 89 M-param
+    // weight measured 268 ms at Q4 and 244 ms at Q8 against **13.3 ms** read
+    // from the pack at F16 — an 18x difference, and 0.2 GB/s against 4.2
+    // (`examples/device-throughput.rs`, 2026-08-23). Quantization exists to
+    // fit a device that is short of memory; the host has 96 GiB and is short
+    // of speed, so paying 2 B/param there buys back an order of magnitude.
+    //
+    // Only Linear/Expert weights switch: the embedding is a gather and the
+    // norm vectors anchor the numerics, so both stay as `mixed_precision`
+    // left them.
+    let host_layers = on_device..layer_bytes.len();
+    let choose = |e: &mummu::pack::TensorEntry| {
+        let on_host = match layer_index(&e.name) {
+            Some(l) => host_layers.contains(&l),
+            // Trunk tensors (the head, the final norm) follow the head device.
+            None => on_device < layer_bytes.len(),
+        };
+        let quantizable = matches!(
+            e.role,
+            mummu::pack::Role::Linear | mummu::pack::Role::Expert { .. }
+        );
+        if on_host && quantizable && e.precisions.contains_key(&mummu::pack::Precision::F16) {
+            mummu::pack::Precision::F16
+        } else {
+            device_choose(e)
+        }
+    };
+    let model = qwen35::load_from_pack_layered(pack_dir, &dev_for, &host, &head, &choose)
         .map_err(|e| e.to_string())?;
     eprintln!(
         "[mummu-serve] layered model resident in {:.0}s",
@@ -1184,13 +1334,153 @@ fn rebalance_inner() -> Result<(), String> {
     Ok(())
 }
 
+/// Per-tensor precision for a pack about to be loaded onto `backend`.
+///
+/// The fit planner picks ONE precision for a whole model, which is the
+/// coarsest possible answer: at Q8 this 27B needs ~13 GiB and does not fit a
+/// 16 GiB card with activation headroom, while at Q4 it needs ~7 GiB and
+/// leaves ~6 GiB of the budget unspent. Neither is right. This spends that
+/// headroom where it buys the most accuracy — attention projections, the LM
+/// head, and the first and last layers ride at Q8 while the bulk FFN slabs
+/// sit at Q4 — so the card holds the whole model AND the tensors that need
+/// precision keep it. See [`mummu::mix`] for the ranking and its error model.
+///
+/// Returns a name -> precision map; names absent from it fall back to the
+/// planner's single policy, so a pack this cannot classify still loads.
+fn mixed_precision(
+    pack: &mummu::pack::Pack,
+    backend: BackendChoice,
+    ceiling: mummu::quant::QuantPolicy,
+    on_device: &dyn Fn(&mummu::pack::TensorEntry) -> bool,
+) -> std::collections::HashMap<String, mummu::pack::Precision> {
+    use mummu::mix::{Kind, TensorFacts};
+    use mummu::pack::Role;
+    use mummu::quant::QuantPolicy;
+
+    let layers = pack
+        .manifest
+        .tensors
+        .iter()
+        .filter_map(|t| layer_index(&t.name))
+        .max()
+        .map_or(0, |n| n + 1);
+
+    // Only tensors that will actually occupy this device may spend its
+    // budget. The embedding is the reason this matters rather than being a
+    // technicality: `token_embd.weight` is 1.27 G parameters and never
+    // quantized, so charging its 5.09 GiB of f32 against a 12 GiB card
+    // declared the model unfittable while the loader was putting it on the
+    // host all along.
+    let counted: Vec<&mummu::pack::TensorEntry> = pack
+        .manifest
+        .tensors
+        .iter()
+        .filter(|t| on_device(t))
+        .collect();
+
+    let facts: Vec<TensorFacts> = counted
+        .iter()
+        .map(|t| TensorFacts {
+            params: t.shape.iter().product(),
+            kind: match &t.role {
+                // The embedding is a gather and the vectors anchor the
+                // numerics; neither is ever quantized here.
+                Role::Embedding | Role::Vector | Role::Conv => Kind::Fixed,
+                // `output.weight` is the LM head — it writes the logits
+                // directly, so it is graded with attention rather than with
+                // the feed-forward bulk it superficially resembles.
+                Role::Linear if t.name.contains("attn") || t.name == "output.weight" => {
+                    Kind::Attention
+                }
+                Role::Linear | Role::Expert { .. } => Kind::Ffn,
+            },
+            layer: layer_index(&t.name),
+        })
+        .collect();
+
+    // Never store more precision than the SOURCE carries. `source_bytes` over
+    // the parameter count gives the checkpoint's bits/param — 4.55 for this
+    // 27B (Q4_K_S), so its f32 is an upcast of 4-bit data and f16 holds it
+    // exactly (measured 0.0000 relative error, `ladder-probe.rs`). Spending
+    // 4 B/param there would be twice the bytes for none of the information,
+    // which is also the answer to "why not f64": the ceiling is the source,
+    // and the source is nowhere near it.
+    let params: u64 = pack
+        .manifest
+        .tensors
+        .iter()
+        .map(|t| t.shape.iter().product::<usize>() as u64)
+        .sum();
+    let source_bits = if params > 0 {
+        pack.manifest.source_bytes as f64 * 8.0 / params as f64
+    } else {
+        f64::INFINITY
+    };
+    let source_cap = mummu::quant::QuantPolicy::ceiling_for_source(source_bits);
+    let ceiling = if ceiling.bits() > source_cap.bits() {
+        eprintln!(
+            "[mummu-serve] source is {source_bits:.2} bits/param — capping the ladder at {source_cap:?} (asked {ceiling:?})"
+        );
+        source_cap
+    } else {
+        ceiling
+    };
+
+    let budget = backend_budget(backend).saturating_sub(ACTIVATION_RESERVE);
+    // Floor at Q4: it is the least precise thing any pack stores, so it is as
+    // far as a *load* can go. Q2 exists below it but is reachable only by
+    // requantizing a resident tensor, which is the rebalancer's job.
+    let plan = mummu::mix::plan(&facts, layers, budget, ceiling, QuantPolicy::Q4);
+
+    let summary: Vec<String> = plan
+        .histogram()
+        .iter()
+        .map(|(p, n)| format!("{n} @ {p:?}"))
+        .collect();
+    eprintln!(
+        "[mummu-serve] precision mix on {}: {} — {:.2} GiB of {:.2} GiB budget{}",
+        label_of(backend),
+        summary.join(", "),
+        plan.bytes as f64 / f64::from(1u32 << 30),
+        budget as f64 / f64::from(1u32 << 30),
+        if plan.over_budget { " (OVER — will spill)" } else { "" },
+    );
+
+    let mut chosen: std::collections::HashMap<String, mummu::pack::Precision> = counted
+        .iter()
+        .zip(&plan.precision)
+        .map(|(t, &p)| (t.name.clone(), precision_for(p)))
+        .collect();
+    // Everything else lives on the host, where RAM is not the scarce
+    // resource: give it the ceiling rather than a pressure-driven rung.
+    for t in &pack.manifest.tensors {
+        chosen.entry(t.name.clone()).or_insert_with(|| {
+            if matches!(t.role, Role::Embedding | Role::Vector | Role::Conv) {
+                mummu::pack::Precision::F32
+            } else {
+                precision_for(ceiling)
+            }
+        });
+    }
+    chosen
+}
+
+/// The layer a GGUF tensor name belongs to (`blk.7.ffn_up.weight` -> 7).
+fn layer_index(name: &str) -> Option<usize> {
+    name.strip_prefix("blk.")?.split('.').next()?.parse().ok()
+}
+
 /// The pack precision a fit policy denotes.
 fn precision_for(policy: mummu::quant::QuantPolicy) -> mummu::pack::Precision {
     use mummu::pack::Precision;
     use mummu::quant::QuantPolicy;
     match policy {
-        QuantPolicy::Q4 => Precision::Q4,
+        // No pack stores 2-bit: Q2 is reached by requantizing a tensor that
+        // is already resident, never by reading one. Loading "at Q2" means
+        // loading the smallest thing on disk and demoting from there.
+        QuantPolicy::Q2 | QuantPolicy::Q4 => Precision::Q4,
         QuantPolicy::Q8 => Precision::Q8,
+        QuantPolicy::F16 => Precision::F16,
         QuantPolicy::Off => Precision::F32,
     }
 }
@@ -1324,10 +1614,13 @@ fn estimate_resident_bytes(f: &GgufFile, policy: mummu::quant::QuantPolicy) -> u
         bytes += if quantizable {
             match policy {
                 QuantPolicy::Off => n * 4,
+                QuantPolicy::F16 => n * 2,
                 // i8 + f32 scale per 32 on flex; packed layouts are smaller.
                 QuantPolicy::Q8 => n + n / 8,
                 // measured flex packing: ~0.75 B/element incl. scales
                 QuantPolicy::Q4 => (n * 3) / 4,
+                // 2 bits + an f32 scale per 32 values, which is a third of it.
+                QuantPolicy::Q2 => n / 4 + n / 8,
             }
         } else {
             n * 4
@@ -1397,34 +1690,88 @@ fn ensure_host_room(need: u64, keep: BackendChoice) {
     }
 }
 
+/// System RAM the integrated GPU may claim, when nothing says otherwise.
+/// Bounded because it shares that RAM with the CPU tier and with everything
+/// else on the machine; `MUMMU_IGPU_BUDGET_GB` overrides.
+const INTEGRATED_GPU_BUDGET: u64 = 8 << 30;
+
 fn backend_budget(backend: BackendChoice) -> u64 {
     let inv = mummu::backend::inventory();
     match backend {
         // RAM that is actually free right now (a shared VM's total lies):
         // 85% of MemAvailable on Linux, 3/4 of total elsewhere — whichever
         // is smaller when both are known.
+        // The integrated GPU has no memory of its own: it allocates from
+        // system RAM, the same pool the CPU tier budgets against. Give it a
+        // bounded slice rather than the ~101 GiB DXGI cheerfully reports for
+        // it, and subtract that slice from the CPU below so the two tiers do
+        // not both spend the same bytes.
+        BackendChoice::IntegratedGpu => std::env::var("MUMMU_IGPU_BUDGET_GB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map_or(INTEGRATED_GPU_BUDGET, |gb| gb << 30),
         BackendChoice::Cpu => {
             let total = inv.cpu.total_ram_bytes.map(|b| b / 4 * 3);
             let available = mem_available_bytes().map(|b| b / 100 * 85);
-            match (total, available) {
+            let ram = match (total, available) {
                 (Some(t), Some(a)) => t.min(a),
                 (Some(t), None) => t,
                 (None, Some(a)) => a,
                 (None, None) => 16 << 30,
+            };
+            // Whatever the integrated GPU may take is already spoken for.
+            if mummu::backend::has_integrated_gpu() {
+                ram.saturating_sub(backend_budget(BackendChoice::IntegratedGpu))
+            } else {
+                ram
             }
         }
-        _ => std::env::var("MUMMU_GPU_BUDGET_GB")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .map(|gb| gb << 30)
-            .or_else(|| {
-                inv.gpus
-                    .iter()
-                    .filter_map(|g| g.vram_bytes)
-                    .max()
-                    .map(|b| b / 8 * 7)
-            })
-            .unwrap_or(15 << 30),
+        // A GPU budget has to be what is free *now*, not what the card
+        // holds. This desktop runs Firefox, Discord, Steam, Docker and two
+        // driver overlays, which together took enough of a 16 GiB card that
+        // a 9.8 GiB placement — comfortably inside its configured budget —
+        // died with `out of device memory` mid-generation (2026-08-23).
+        //
+        // So the configured value is a CEILING, and the live reading from
+        // NVML caps it. `MUMMU_GPU_BUDGET_GB` still means "never use more
+        // than this", which is what an operator setting it wants; it just no
+        // longer means "this much is definitely available".
+        _ => {
+            let configured = std::env::var("MUMMU_GPU_BUDGET_GB")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(|gb| gb << 30)
+                .or_else(|| {
+                    inv.gpus
+                        .iter()
+                        .filter_map(|g| g.vram_bytes)
+                        .max()
+                        .map(|b| b / 8 * 7)
+                })
+                .unwrap_or(15 << 30);
+            match mummu::vram::memory() {
+                // Leave the desktop its working set. 2 GiB is what this box
+                // idles at with a browser and the usual tray software up;
+                // below that, compositing starts stuttering before we OOM.
+                Some(m) => {
+                    let live = m.headroom(2 << 30);
+                    if live < configured {
+                        eprintln!(
+                            "[mummu-serve] VRAM: {:.1} GiB free of {:.1} GiB                              ({:.1} GiB held elsewhere) — budget {:.1} -> {:.1} GiB",
+                            m.free as f64 / f64::from(1u32 << 30),
+                            m.total as f64 / f64::from(1u32 << 30),
+                            m.used as f64 / f64::from(1u32 << 30),
+                            configured as f64 / f64::from(1u32 << 30),
+                            live as f64 / f64::from(1u32 << 30),
+                        );
+                    }
+                    configured.min(live)
+                }
+                // No reading: hold the configured value rather than guess in
+                // either direction.
+                None => configured,
+            }
+        }
     }
 }
 
@@ -1492,24 +1839,49 @@ fn plan_fit(spec: &ModelSpec, models_root: &Path) -> Result<FitPlan, String> {
 
     let ladder = |from: QuantPolicy| -> Vec<QuantPolicy> {
         match from {
+            // Whole-model fallbacks only. Q2 is not on this ladder: it is a
+            // per-tensor pressure response (`mummu::mix`), not a precision
+            // any model should be planned into wholesale.
             QuantPolicy::Off => vec![QuantPolicy::Off, QuantPolicy::Q8, QuantPolicy::Q4],
+            QuantPolicy::F16 => vec![QuantPolicy::F16, QuantPolicy::Q8, QuantPolicy::Q4],
             QuantPolicy::Q8 => vec![QuantPolicy::Q8, QuantPolicy::Q4],
-            QuantPolicy::Q4 => vec![QuantPolicy::Q4],
+            QuantPolicy::Q4 | QuantPolicy::Q2 => vec![QuantPolicy::Q4],
         }
     };
     let mut candidates: Vec<(BackendChoice, QuantPolicy)> = Vec::new();
+    // When the FFN is going to be TIERED, accelerator memory is worth more as
+    // cluster capacity than as trunk capacity, so the trunk is tried on the
+    // host first. Measured twice on the 27B, both times the same way round:
+    // trunk on the GPU 24.7 s/tok against 4.8 for trunk on the host, and
+    // again on 2026-08-23, 6.2 s/tok against 4.32. The mechanism is visible
+    // in the placement — a trunk on the card took 7.8 of its 9 GiB and left
+    // room for 302 of 2048 clusters, where a trunk on the host left the whole
+    // budget for 996 of them. Every cluster runs on every token, so the card
+    // holding more of them beats the card holding the trunk.
+    //
+    // Without tiering this does not apply: the whole model goes to one device
+    // and the fastest one that fits is simply the right answer.
+    let tiering = tiered_pack.is_some();
+    if tiering && preferred != BackendChoice::Cpu {
+        for policy in ladder(base_policy) {
+            candidates.push((BackendChoice::Cpu, policy));
+        }
+    }
     for policy in ladder(base_policy) {
         candidates.push((preferred, policy));
     }
-    if preferred != BackendChoice::Cpu {
+    if !tiering && preferred != BackendChoice::Cpu {
         for policy in ladder(base_policy) {
             candidates.push((BackendChoice::Cpu, policy));
         }
     }
     for (backend, policy) in candidates {
-        if policy == QuantPolicy::Q4 && backend == BackendChoice::Wgpu {
-            continue; // wgpu Q4 kernel is broken — never plan it
-        }
+        // (The "wgpu Q4 kernel is broken" exclusion that used to live here
+        // was withdrawn 2026-08-23. It rested on a probe that quantized
+        // synthetic tensors on the device; along the path production takes —
+        // packed bytes from the pack onto the device, then multiplied — Q4 on
+        // wgpu is correct and bit-identical across repeated rounds at this
+        // model's dimensions. See `examples/pack-precision-probe.rs`.)
         let need = match &tiered_pack {
             Some(pack) => pack_trunk_bytes(pack, precision_for(policy)),
             None => estimate_resident_bytes(&f, policy),
