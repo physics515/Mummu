@@ -611,6 +611,35 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       ~3.3 ms/call, still ~4x off the traffic bound); (3) a real m<=64 packed GEMM for prefill;
       (4) the CPU trunk (delta.proj 13.8 ms/call is now the top scope) — relocation or Q8+GEMV;
       (5) MTP/NextN. The 62 ms/token ollama wall still requires the trunk off the host.
+- [x] **The 16.0 tok/s ollama baseline was stale, and the real gap is ~28x, not ~59x — plus ollama's
+      own placement is now measured, and it is the whole ballgame.** *(2026-08-25)* Re-ran ollama
+      0.32.15 on the SAME checkpoint it serves (`hf.co/unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_S`, 15 GB
+      resident) with mummu stopped so the box was uncontended. Decode, three warm runs off
+      `eval_count/eval_duration`: **7.81 / 8.15 / 8.23 tok/s = 128.0 / 122.6 / 121.5 ms/token** —
+      HALF the 16.0 tok/s this roadmap has quoted since 2026-08-23 and used as the denominator in
+      every gap calculation since. Against mummu's ~3.5-3.8 s/token that is **~28x, not the ~59x
+      reported earlier today**. The lesson is the one recorded two entries up, applied to the other
+      side of the comparison: a cross-session absolute is not evidence, and quoting a two-day-old
+      opponent number while carefully re-measuring your own is how a gap gets overstated 2x.
+      **`ollama ps` reports `13%/87% CPU/GPU` at 4096 context, holding 15161 MiB of the card's
+      16376.** Two structural facts fall out. (1) **ollama fills the card to 92.6%; mummu reaches
+      46%.** Our budget is `min(configured, live_headroom(2 GiB)) - ACTIVATION_RESERVE(3 GiB)` =
+      7.5 GiB of weights where ollama places ~11.2 GiB — we reserve 5 GiB of a 16 GiB card that
+      ollama runs on 1.2 GiB of headroom. The 3 GiB reserve was sized for dequantize transients the
+      packed GEMV deleted (pool panics 505-710/run -> 0), so it now guards nothing. (2) **ollama
+      splits by LAYER; mummu splits by tensor ROLE.** ollama runs 87% of whole layers on the GPU and
+      13% on the CPU. mummu puts the entire trunk — attention + delta-net, all 64 layers — on the
+      host and only tiers the FFN, so it pays host latency 64 times per token no matter how many
+      clusters land on the card. That is exactly the measured shape: trunk 58% of the token.
+      **Consequence: re-try layer-granular placement.** This roadmap records it as tried and worse
+      (40.7 s/tok, 2026-08-23) — but that was measured when every quantized matmul dequantized to
+      f32 (0.91 ms/cluster), before the packed GEMV, before the readback-fence and thread-priority
+      fixes, and before VRAM churn hit zero. The verdict was earned in a regime that no longer
+      exists, and it is now the single highest-value experiment on the list, ahead of the
+      `ACTIVATION_RESERVE` cut (which it also subsumes).
+      Also worth noting for both engines: available VRAM drives everything here. The 2026-08-23
+      ollama reading of 16.0 tok/s is plausibly a run where the desktop left it enough card to place
+      100% of layers; today it had to spill 13% to the host and halved.
 - [ ] **Do NOT make the clustered path universal until a fits-on-one-device fast path exists.**
       *(2026-08-24)* Partitioning earns its keep only when a model must span devices. Measured, the
       split costs **2.4x** in dispatch (32 cluster matmuls 4.13 ms against 1.68 ms fused), so imposing it
