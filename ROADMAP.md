@@ -640,6 +640,41 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       Also worth noting for both engines: available VRAM drives everything here. The 2026-08-23
       ollama reading of 16.0 tok/s is plausibly a run where the desktop left it enough card to place
       100% of layers; today it had to spill 13% to the host and halved.
+- [x] **Layer-granular placement was never actually tried, and it is ~2x the cluster path — but for a
+      reason that indicts the clustered decomposition rather than crediting the GPU.**
+      *(2026-08-25)* The 2026-08-23 verdict (40.7 s/tok, "worse") measured a degenerate
+      configuration: `plan_fit` prefers a HOST main whenever tiering is on — a rule earned by real
+      measurement, but one that prices the card in FFN CLUSTERS, which is the other path's currency.
+      Handed a CPU main, `build_layered_qwen35` places all 64 layers on the host: 90.72 GiB of f32
+      and an OOM on the embedding. Fixed by planning layered placement onto the accelerator (it
+      spills by construction, so "does the trunk fit?" was the wrong gate), plus a tunable
+      activation reserve (1.5 GiB default, `MUMMU_ACTIVATION_RESERVE_GB`), no float fallback rung on
+      an accelerator, and a quantized on-card ceiling.
+      Measured, same quiet box, 3 warm runs each: **layered 1.72-2.12 s/tok against cluster
+      3.35-3.77** — the fastest this model has decoded. **Read the mechanism carefully: the card is
+      still EMPTY during those runs** (VRAM flat at the desktop baseline). The win is therefore one
+      full-width 17408 matmul per projection on the host, instead of 32 narrow 544-wide cluster
+      matmuls plus cross-device merges. **The clustered decomposition currently costs more than it
+      buys**, which is the standing warning in the item below, now with a number against it.
+      **Also closed: a host-Q8 landmine.** A `Cpu @ Q8` fit plan decoded at **82-90 s/tok**, because
+      Q8 declined the Q4S-only packed GEMV and fell into burn-flex's dequantize-per-op path. The
+      packed GEMV now covers Q8S too (one comptime switch over values-per-word; GPU parity 3.7e-7
+      and 3.9e-7 at production shapes).
+      **OPEN, precisely characterized.** The layered load emits ~1000 identical
+      `failed to reserve 356515840 bytes` panics and the card ends up holding nothing while the
+      planner reports 44/64 layers placed. 356515840 = 5120*17408*4 — ONE FFN weight at f32, which
+      exceeds **wgpu's 256 MiB max buffer size**. So it is a buffer-size ceiling, not memory
+      exhaustion, and no budget tuning will move it. Ruled out by measurement, in order: the mix
+      ceiling (`Kind::Fixed` pins 353 tensors at Off regardless), the `unwrap_or(level)` float
+      fallback, and residency accounting (`pack_layer_bytes` already charges numel*4 for floats).
+      Remaining suspect is the loader materializing f32 on-device before quantizing — the failure
+      mode this roadmap already records twice — which wants the pre-quantized pack bytes
+      (`tensor_cols`/`tensor_rows`) the cluster path uses. Until then production stays on the
+      cluster path, because the layered cold request still returns zero tokens.
+      **What that implies for the ollama gap.** ollama runs 87% of layers on the card at
+      121.5-128 ms/token. Layered placement is the same shape and is already 2x our best hybrid
+      while using NO GPU at all. Getting its layers actually resident is the highest-value item on
+      this list by a wide margin.
 - [ ] **Do NOT make the clustered path universal until a fits-on-one-device fast path exists.**
       *(2026-08-24)* Partitioning earns its keep only when a model must span devices. Measured, the
       split costs **2.4x** in dispatch (32 cluster matmuls 4.13 ms against 1.68 ms fused), so imposing it

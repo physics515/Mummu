@@ -580,7 +580,7 @@ fn tier_devices(
         // allocator does not fail this way.
         match b {
             BackendChoice::Cpu => raw,
-            _ => raw.saturating_sub(ACTIVATION_RESERVE),
+            _ => raw.saturating_sub(activation_reserve()),
         }
     };
     // `speed` ranks devices for this workload. Measured on the reference box
@@ -934,7 +934,27 @@ fn pack_layer_bytes(
 /// activations, KV and recurrent state, dequantize temporaries, and the
 /// allocator's own chunking. Sized from the failure it prevents — see
 /// [`layers_that_fit`].
-const ACTIVATION_RESERVE: u64 = 3 << 30;
+/// Card bytes held back from weights for everything that is not a weight:
+/// activations, KV/recurrent state, and cubecl's ~1 GiB pool chunking.
+///
+/// Was a flat 3 GiB, sized for f32 dequantize transients — one
+/// `[5120, 17408]` slab dequantized is 356 MB and several were live at
+/// once. `nn::packed_gemv` deleted that whole class of allocation (VRAM
+/// pool panics went 505-710 per run to zero, 2026-08-25), so the reserve
+/// was guarding against something that no longer happens while ollama ran
+/// the same checkpoint on 1.2 GiB of headroom and reached 92.6% of the
+/// card to our 46%. 1.5 GiB keeps a full pool chunk plus prefill
+/// activations; `MUMMU_ACTIVATION_RESERVE_GB` tunes it without a rebuild.
+fn activation_reserve() -> u64 {
+    static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        std::env::var("MUMMU_ACTIVATION_RESERVE_GB")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|gb| *gb >= 0.0)
+            .map_or(3 << 29, |gb| (gb * f64::from(1u32 << 30)) as u64)
+    })
+}
 
 /// How many whole layers fit `budget_bytes`, leaving room for activations.
 fn layers_that_fit(layer_bytes: &[u64], budget_bytes: u64) -> usize {
@@ -943,7 +963,7 @@ fn layers_that_fit(layer_bytes: &[u64], budget_bytes: u64) -> usize {
     // with 12.03 GiB of weights placed on a card with 15.2 GiB free: a
     // dequantize of one [5120, 17408] slab alone is 356 MB, several are live
     // at once, and the pooled allocator reserves in ~1 GiB chunks on top.
-    let usable = budget_bytes.saturating_sub(ACTIVATION_RESERVE);
+    let usable = budget_bytes.saturating_sub(activation_reserve());
     let mut used = 0u64;
     let mut n = 0usize;
     for &b in layer_bytes {
@@ -980,8 +1000,14 @@ fn build_layered_qwen35(
     // only as far as this device's live budget forces — so the layers that do
     // land here carry as much precision as the card can hold, and more of them
     // fit than a single-precision plan would allow. See `mixed_precision`.
-    let ceiling = match policy {
-        mummu::quant::QuantPolicy::Off => mummu::quant::QuantPolicy::Off,
+    let ceiling = match (policy, main) {
+        // An accelerator is precisely the device whose scarce resource is
+        // memory, so it never gets the float rungs: at Off the mix kept 353
+        // tensors at f32 and returned 14.92 GiB against a 9.32 GiB budget,
+        // flagged "OVER — will spill". The spill then happened against a
+        // different budget and the card was handed more than it could hold.
+        (_, m) if m != BackendChoice::Cpu => mummu::quant::QuantPolicy::Q8,
+        (mummu::quant::QuantPolicy::Off, _) => mummu::quant::QuantPolicy::Off,
         _ => mummu::quant::QuantPolicy::Q8,
     };
     // The embedding goes to the host below (`embed_device`), so it must not
@@ -991,7 +1017,22 @@ fn build_layered_qwen35(
     });
     // Precision the DEVICE gets. Sizing the split needs only this, since the
     // split is decided by what fits on the device.
-    let device_choose = |e: &mummu::pack::TensorEntry| mix.get(&e.name).copied().unwrap_or(level);
+    // The fallback matters as much as the plan: `level` is a FLOAT rung
+    // (Off -> F16), and both flex and wgpu widen a half blob to f32 on load.
+    // A [5120, 17408] FFN weight at f32 is a single 340 MB buffer, which is
+    // over wgpu's 256 MiB max buffer size — so every such tensor failed to
+    // allocate during the layered load (1015 identical
+    // "failed to reserve 356515840 bytes" panics) and the card ended up
+    // holding nothing at all while the planner reported 45/64 layers placed.
+    // On an accelerator the fallback has to be a packed rung.
+    let accel_fallback = main != BackendChoice::Cpu;
+    let device_choose = |e: &mummu::pack::TensorEntry| {
+        mix.get(&e.name).copied().unwrap_or(if accel_fallback {
+            mummu::pack::Precision::Q4
+        } else {
+            level
+        })
+    };
     let layer_bytes = pack_layer_bytes(&pack, &device_choose);
     if layer_bytes.is_empty() {
         return Err("pack has no per-layer tensors".into());
@@ -1023,13 +1064,20 @@ fn build_layered_qwen35(
     // with the last layer so the final projection does not cross.
     let head = dev_for(layer_bytes.len().saturating_sub(1));
     let started = Instant::now();
-    // A weight that lands on the HOST should not be quantized, because on
-    // burn-flex a quantized matmul is pathologically slow: the same 89 M-param
-    // weight measured 268 ms at Q4 and 244 ms at Q8 against **13.3 ms** read
-    // from the pack at F16 — an 18x difference, and 0.2 GB/s against 4.2
-    // (`examples/device-throughput.rs`, 2026-08-23). Quantization exists to
-    // fit a device that is short of memory; the host has 96 GiB and is short
-    // of speed, so paying 2 B/param there buys back an order of magnitude.
+    // What precision a HOST layer carries.
+    //
+    // This used to be F16 unconditionally, because burn-flex's quantized
+    // matmul was pathologically slow — the same 89 M-param weight measured
+    // 268 ms at Q4 against 13.3 ms at F16 (`examples/device-throughput.rs`,
+    // 2026-08-23). That measured burn-flex's dequantize-PER-OP fallback at
+    // decode shape, and mummu no longer takes it: `nn::packed_gemv` reads
+    // flex's i8 storage directly at m=1 (measured 4.54 -> 3.34 ms/call on
+    // this model's mlp, at 3.6x less RAM). Large-m prefill still falls
+    // through to dequantize-then-gemm, which is the right shape there —
+    // one dequantize amortized over many rows rather than per token.
+    //
+    // Default stays F16 until that trade is measured on TTFT as well as
+    // decode; `MUMMU_HOST_LAYERS=q4` opts in.
     //
     // Only Linear/Expert weights switch: the embedding is a gather and the
     // norm vectors anchor the numerics, so both stay as `mixed_precision`
@@ -1045,8 +1093,16 @@ fn build_layered_qwen35(
             e.role,
             mummu::pack::Role::Linear | mummu::pack::Role::Expert { .. }
         );
-        if on_host && quantizable && e.precisions.contains_key(&mummu::pack::Precision::F16) {
+        if !(on_host && quantizable) {
+            return device_choose(e);
+        }
+        let want = if host_layers_q4() {
+            mummu::pack::Precision::Q4
+        } else {
             mummu::pack::Precision::F16
+        };
+        if e.precisions.contains_key(&want) {
+            want
         } else {
             device_choose(e)
         }
@@ -1522,7 +1578,7 @@ fn mixed_precision(
         ceiling
     };
 
-    let budget = backend_budget(backend).saturating_sub(ACTIVATION_RESERVE);
+    let budget = backend_budget(backend).saturating_sub(activation_reserve());
     // Floor at Q4: it is the least precise thing any pack stores, so it is as
     // far as a *load* can go. Q2 exists below it but is reachable only by
     // requantizing a resident tensor, which is the rebalancer's job.
@@ -1685,6 +1741,16 @@ fn host_slab_q4() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         std::env::var("MUMMU_HOST_SLAB").map_or(true, |v| !v.eq_ignore_ascii_case("f16"))
+    })
+}
+
+/// Load host-resident layers at Q4 instead of F16 (`MUMMU_HOST_LAYERS=q4`).
+/// Q4 is 1.125 B/param resident on flex against F16's 4 (flex widens the
+/// half blob to f32), and `nn::packed_gemv` reads it directly at decode.
+fn host_layers_q4() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("MUMMU_HOST_LAYERS").is_ok_and(|v| v.eq_ignore_ascii_case("q4"))
     })
 }
 
@@ -2109,7 +2175,20 @@ fn plan_fit(spec: &ModelSpec, models_root: &Path) -> Result<FitPlan, String> {
     // Without tiering this does not apply: the whole model goes to one device
     // and the fastest one that fits is simply the right answer.
     let tiering = tiered_pack.is_some();
-    if tiering && preferred != BackendChoice::Cpu {
+    // Layer-granular placement spills BY CONSTRUCTION: `layers_that_fit`
+    // decides how much of the model the card takes and the host carries the
+    // rest, so "does the whole trunk fit?" is the wrong question to gate it
+    // on — asking it sends the model to the host entire. Hand that path the
+    // fastest device and let it place. (No `note_resident` here: the placed
+    // byte count is not known until `build_layered_qwen35` has fitted the
+    // layers, same as the already-resident early return above.)
+    if tiering && !cluster_granular() && preferred != BackendChoice::Cpu {
+        return Ok(FitPlan {
+            backend: preferred,
+            policy: base_policy,
+        });
+    }
+    if tiering && cluster_granular() && preferred != BackendChoice::Cpu {
         for policy in ladder(base_policy) {
             candidates.push((BackendChoice::Cpu, policy));
         }
