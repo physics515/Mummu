@@ -258,10 +258,7 @@ fn build(cfg: &Qwen2Config, device: &Device) -> Qwen2 {
 /// `model.` prefix and rename RmsNorm `weight` → Burn's `gamma`
 /// (`PyTorchToBurnAdapter` renames Layer/Batch/Group norm params but NOT
 /// RmsNorm; it does transpose the Linear weights).
-pub fn load_from_dir(
-    dir: &Path,
-    device: &Device,
-) -> Result<LoadedQwen2, ImportError> {
+pub fn load_from_dir(dir: &Path, device: &Device) -> Result<LoadedQwen2, ImportError> {
     let cfg_path = required_file(dir, "config.json")?;
     let weights = required_file(dir, "model.safetensors")?;
     let cfg_bytes = std::fs::read(&cfg_path).map_err(|e| ImportError::Parse {
@@ -291,11 +288,10 @@ pub fn load_from_dir(
     );
 
     let mut model = build(&config, device);
-    // The backend's own float dtype (f32, or f16 on the GpuF16 alias), taken
-    // from the TYPE (`f32`), never from a probe tensor: unspecified-
-    // dtype tensor creation follows the per-DEVICE default policy, which
-    // another backend alias sharing the device may have flipped in-process.
-    let target_float = crate::backend::float_dtype();
+    // The float dtype comes from the DEVICE — burn 0.22 keeps the element
+    // type there as a runtime setting, not on a backend type. Creation sites
+    // still name it explicitly rather than riding the unspecified default.
+    let target_float = crate::backend::float_dtype(device);
     let mut store = SafetensorsStore::from_file(weights.clone())
         .with_from_adapter(PyTorchToBurnAdapter.chain(CastFloatAdapter::new(target_float)))
         .allow_partial(true)
@@ -350,10 +346,7 @@ fn qwen2_gguf_name(name: &str) -> Option<String> {
 /// suite covers — Q4_K_M, Q8_0, F16, …): hyperparameters from the GGUF
 /// metadata, weights dequantized to f32 and driven through the exact store
 /// pipeline (adapters + remaps + checked load) the safetensors path uses.
-pub fn load_from_gguf(
-    path: &Path,
-    device: &Device,
-) -> Result<LoadedQwen2, ImportError> {
+pub fn load_from_gguf(path: &Path, device: &Device) -> Result<LoadedQwen2, ImportError> {
     let parse = |reason: String| ImportError::Parse {
         file: path.to_path_buf(),
         reason,
@@ -362,7 +355,7 @@ pub fn load_from_gguf(
     let config = Qwen2Config::from_gguf(&f).map_err(parse)?;
     // The scratch guard (Some only when the payload went to disk) must
     // outlive `load_checked`: the store reads that file lazily.
-    let (base, _scratch) = gguf_store(&f, &gguf_tensor_to_hf, DequantSink::Auto)?;
+    let (base, _scratch) = gguf_store(&f, &gguf_tensor_to_hf, DequantSink::Auto, device)?;
 
     let mut model = build(&config, device);
     let mut store = base
@@ -412,7 +405,7 @@ impl CausalLm for LoadedQwen2 {
         let ids32: Vec<i32> = new_ids.iter().map(|&i| i as i32).collect();
         let input = Tensor::<1, Int>::from_data(
             TensorData::new(ids32, [t]),
-            (device, crate::backend::int_dtype()),
+            (device, crate::backend::int_dtype(device)),
         )
         .reshape([1, t]);
         let mut x = self.model.embed_tokens.forward(input); // [1, t, hidden]
@@ -460,8 +453,6 @@ impl CausalLm for LoadedQwen2 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    type Dev = burn::tensor::Device;
 
     /// A synthetic 2-layer toy config: everything runs without real weights.
     fn toy_config() -> Qwen2Config {
@@ -678,11 +669,17 @@ mod tests {
         // distribution — the smoke passes and reports a valid top id.
         let smoke = loaded
             .sanity_check(&[1, 2, 3], vocab, &device)
-            .await.expect("live toy model passes the smoke");
+            .await
+            .expect("live toy model passes the smoke");
         assert!((smoke.top_id as usize) < vocab, "top id in vocab range");
         assert!(smoke.spread > 0.0, "a live forward has positive spread");
         // The wrong expected vocab is caught as a mismatch, not a silent pass.
-        assert!(loaded.sanity_check(&[1, 2, 3], vocab + 1, &device).await.is_err());
+        assert!(
+            loaded
+                .sanity_check(&[1, 2, 3], vocab + 1, &device)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -696,13 +693,15 @@ mod tests {
         };
         let forwards = loaded
             .warm_up(&[1, 2, 3], 4, &device)
-            .await.expect("warm-up runs on a live toy model");
+            .await
+            .expect("warm-up runs on a live toy model");
         assert_eq!(forwards, 5, "one prefill plus four decode steps");
         // The warm-up cache is a throwaway: a generation after it starts from
         // an empty cache and still decodes (nothing leaked into the model).
         let out = loaded
             .greedy_generate(&[1, 2, 3], 2, &device)
-            .await.expect("decodes after a warm-up");
+            .await
+            .expect("decodes after a warm-up");
         assert!(!out.is_empty(), "generation after warm-up produces tokens");
     }
 
@@ -728,7 +727,10 @@ mod tests {
             config: cfg,
             tokenizer_config: None,
         };
-        let out = loaded.greedy_generate(&[1, 2, 3], 4, &device).await.unwrap();
+        let out = loaded
+            .greedy_generate(&[1, 2, 3], 4, &device)
+            .await
+            .unwrap();
         assert!(out.len() <= 4);
     }
 }

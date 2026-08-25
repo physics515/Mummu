@@ -70,6 +70,13 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
   runtime liveness a checked load can't see — NaN/Inf logits, a vocab-width mismatch, or a
   degenerate/dead forward. `CausalLm::sanity_check` is the post-`install` gate an app calls to catch a
   silently-broken import before trusting the model.
+- **Precision is a property of the device, not of a type** — `backend::float_dtype(&device)` reads
+  the element type back from the device burn 0.22 keeps it on, and `backend::gpu_device_f16()`
+  returns a GPU device configured to compute in f16. Device dtype settings lock on first use, so
+  `gpu_device_f16` is idempotent within a process and **returns an error rather than an f32 device
+  under an f16 name** — the one failure mode that turns a benchmark into fiction. One process can
+  hold an f16 accelerator beside an f32 host, which the old `Gpu`/`GpuF16` type aliases could not
+  express at all.
 - **Five architectures ported and running on real weights** — Qwen2/2.5, Qwen3 dense, the LFM2/2.5
   hybrid, **OLMoE** (sparse MoE), and the all-MiniLM sentence embedder; Qwen2.5-1.5B, Qwen3-0.6B, and
   LFM2.5-1.2B/230M load and greedy-decode correctly on the reference GPU (wgpu/Vulkan), and

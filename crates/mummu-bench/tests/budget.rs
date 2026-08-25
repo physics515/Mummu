@@ -14,7 +14,6 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use mummu::backend::Gpu;
 use mummu::decode::argmax_id;
 use mummu::models::CausalLm;
 use mummu::models::qwen2;
@@ -37,9 +36,9 @@ fn qwen2_dir() -> Option<PathBuf> {
     dir.is_dir().then_some(dir)
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "needs multi-GB local weights (MUMMU_QWEN2_DIR) + the reference GPU"]
-fn qwen2_stays_inside_its_perf_budgets() {
+async fn qwen2_stays_inside_its_perf_budgets() {
     let Some(dir) = qwen2_dir() else {
         panic!("set MUMMU_QWEN2_DIR to a dir with config.json/tokenizer.json/model.safetensors");
     };
@@ -48,26 +47,26 @@ fn qwen2_stays_inside_its_perf_budgets() {
     let ids = tok.encode(text, false).expect("encodes").get_ids().to_vec();
     assert!(ids.len() >= 16, "budget prompt suspiciously short");
 
-    let device = burn::tensor::Device::<Gpu>::default();
-    let loaded = qwen2::load_from_dir::<Gpu>(&dir, &device).expect("weights load checked");
+    let device = mummu::backend::gpu_device();
+    let loaded = qwen2::load_from_dir(&dir, &device).expect("weights load checked");
 
     // Warm-up: first-run autotune + pipeline compilation must not count.
     let mut cache = loaded.new_cache();
     let logits = loaded.forward(&ids, 0, &mut cache, &device);
-    let _ = argmax_id(logits).expect("warm-up argmax");
+    let _ = argmax_id(logits).await.expect("warm-up argmax");
 
     // TTFT: fresh cache, full prefill, first token (argmax readback = sync).
     let start = Instant::now();
     let mut cache = loaded.new_cache();
     let logits = loaded.forward(&ids, 0, &mut cache, &device);
-    let mut next = argmax_id(logits).expect("argmax");
+    let mut next = argmax_id(logits).await.expect("argmax");
     let ttft_ms = start.elapsed().as_secs_f64() * 1e3;
 
     // Decode throughput over a warm cache.
     let start = Instant::now();
     for past in (ids.len()..).take(DECODE_STEPS) {
         let logits = loaded.forward(&[next], past, &mut cache, &device);
-        next = argmax_id(logits).expect("argmax");
+        next = argmax_id(logits).await.expect("argmax");
     }
     let tok_per_s = DECODE_STEPS as f64 / start.elapsed().as_secs_f64();
 
@@ -80,11 +79,13 @@ fn qwen2_stays_inside_its_perf_budgets() {
         .collect();
     assert_eq!(long_ids.len(), LONG_PREFILL_TOKENS);
     let mut long_cache = loaded.new_cache();
-    let _ = argmax_id(loaded.forward(&long_ids, 0, &mut long_cache, &device)).expect("warm-up");
+    let _ = argmax_id(loaded.forward(&long_ids, 0, &mut long_cache, &device))
+        .await
+        .expect("warm-up");
     let start = Instant::now();
     let mut long_cache = loaded.new_cache();
     let logits = loaded.forward(&long_ids, 0, &mut long_cache, &device);
-    let _ = argmax_id(logits).expect("argmax");
+    let _ = argmax_id(logits).await.expect("argmax");
     let long_prefill_ms = start.elapsed().as_secs_f64() * 1e3;
 
     eprintln!(

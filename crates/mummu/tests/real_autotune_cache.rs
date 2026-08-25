@@ -15,7 +15,7 @@
 use std::time::{Duration, Instant};
 
 use burn::tensor::Tensor;
-use mummu::backend::{Gpu, use_gpu};
+use mummu::backend::use_gpu;
 use mummu::tune::{autotune_cache_report, clear_autotune_cache};
 
 /// Square matmul side. Big enough that CubeCL autotunes it (and small enough
@@ -52,10 +52,10 @@ fn autotune_picks_are_persisted_where_we_report_and_clearing_removes_them() {
 
     // Provoke autotuning with real GPU work: a few matmuls, each result read
     // back so the work is actually executed rather than queued.
-    let device = burn::tensor::Device::<Gpu>::default();
+    let device = mummu::backend::gpu_device();
     for round in 0..ROUNDS {
-        let a = Tensor::<Gpu, 2>::ones([N, N], &device).mul_scalar(1.0 + round as f32);
-        let b = Tensor::<Gpu, 2>::ones([N, N], &device);
+        let a = Tensor::<2>::ones([N, N], &device).mul_scalar(1.0 + round as f32);
+        let b = Tensor::<2>::ones([N, N], &device);
         let sum = a
             .matmul(b)
             .sum()

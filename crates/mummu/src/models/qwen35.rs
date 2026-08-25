@@ -34,14 +34,14 @@ use burn::nn::conv::{Conv1d, Conv1dConfig};
 use burn::nn::{
     Embedding, EmbeddingConfig, Linear, LinearConfig, PaddingConfig1d, RmsNorm, RmsNormConfig,
 };
-use burn::tensor::{Device, DType, Int, Tensor, TensorData, activation};
+use burn::tensor::{DType, Device, Int, Tensor, TensorData, activation};
 
 use crate::gguf::{GgufFile, GgufMap, GgufTensorInfo, GgufValue};
 use crate::import::ImportError;
 use crate::models::CausalLm;
 use crate::models::qwen2::EosIds;
-use crate::quant::QuantPolicy;
 use crate::nn::{LayerKv, SwiGluMlp, SwiGluMlpConfig, causal_mask, repeat_kv, rope_tables};
+use crate::quant::QuantPolicy;
 
 /// Architecture hyperparameters, read from a GGUF header's `qwen35.*`
 /// metadata (the family currently ships as GGUF; a safetensors `config.json`
@@ -344,12 +344,7 @@ pub struct DeltaState {
 }
 
 impl GatedDeltaNet {
-    fn forward(
-        &self,
-        x: Tensor<3>,
-        cfg: &Qwen35Config,
-        cache: &mut DeltaState,
-    ) -> Tensor<3> {
+    fn forward(&self, x: Tensor<3>, cfg: &Qwen35Config, cache: &mut DeltaState) -> Tensor<3> {
         let [b, t, _] = x.dims();
         let (hk, hv, ds) = (cfg.n_k_heads, cfg.n_v_heads, cfg.d_state);
         let key_dim = cfg.key_dim();
@@ -362,8 +357,7 @@ impl GatedDeltaNet {
         let z = qlinear(&self.z_proj, x.clone()); // [b, t, d_inner]
         let beta = activation::sigmoid(qlinear(&self.beta_proj, x.clone())); // [b, t, hv]
         // g = softplus(α + dt_bias) · a, with a = -exp(A_log) < 0.
-        let alpha =
-            qlinear(&self.alpha_proj, x).add(self.dt_bias.val().reshape([1, 1, hv]));
+        let alpha = qlinear(&self.alpha_proj, x).add(self.dt_bias.val().reshape([1, 1, hv]));
         let g = activation::softplus(alpha, 1.0).mul(self.a.val().reshape([1, 1, hv]));
 
         drop(_s_proj);
@@ -404,15 +398,13 @@ impl GatedDeltaNet {
         // Split into q/k/v and L2-normalize q/k per head: x / max(‖x‖, ε).
         let eps = cfg.rms_norm_eps as f32;
         let l2 = |x: Tensor<4>| -> Tensor<4> {
-            let norm = x
-                .clone()
-                .powi_scalar(2)
-                .sum_dim(3)
-                .sqrt()
-                .clamp_min(eps);
+            let norm = x.clone().powi_scalar(2).sum_dim(3).sqrt().clamp_min(eps);
             x.div(norm)
         };
-        let q = l2(conv_out.clone().narrow(2, 0, key_dim).reshape([b, t, hk, ds]));
+        let q = l2(conv_out
+            .clone()
+            .narrow(2, 0, key_dim)
+            .reshape([b, t, hk, ds]));
         let k = l2(conv_out
             .clone()
             .narrow(2, key_dim, key_dim)
@@ -441,22 +433,17 @@ impl GatedDeltaNet {
         // The recurrence, one token at a time. State S[b, h, i, j]:
         // i indexes the key dim, j the value dim.
         let scale = 1.0 / (ds as f32).sqrt();
-        let mut s = cache.state.take().unwrap_or_else(|| {
-            Tensor::<4>::zeros([b, hv, ds, ds], &device)
-        });
+        let mut s = cache
+            .state
+            .take()
+            .unwrap_or_else(|| Tensor::<4>::zeros([b, hv, ds, ds], &device));
         let mut outs: Vec<Tensor<4>> = Vec::with_capacity(t);
         for tau in 0..t {
             let q_t = q.clone().narrow(2, tau, 1).mul_scalar(scale); // [b, hv, 1, ds]
             let k_t = k.clone().narrow(2, tau, 1); // [b, hv, 1, ds]
             let v_t = v.clone().narrow(2, tau, 1); // [b, hv, 1, ds]
-            let g_t = g
-                .clone()
-                .narrow(1, tau, 1)
-                .reshape([b, hv, 1, 1]); // per-head decay logit
-            let b_t = beta
-                .clone()
-                .narrow(1, tau, 1)
-                .reshape([b, hv, 1, 1]);
+            let g_t = g.clone().narrow(1, tau, 1).reshape([b, hv, 1, 1]); // per-head decay logit
+            let b_t = beta.clone().narrow(1, tau, 1).reshape([b, hv, 1, 1]);
 
             s = s.mul(g_t.exp());
             // v̂[j] = Σ_i S[i, j]·k[i]  — k over the key axis.
@@ -665,10 +652,7 @@ fn qwen35_field(field: &str) -> Option<&'static str> {
 /// Load a qwen35 model straight from a GGUF file — the classic f32 path,
 /// which is [`load_from_gguf_quantized`] with quantization off. One import
 /// path serves every precision (P9's "single path" rule).
-pub fn load_from_gguf(
-    path: &Path,
-    device: &Device,
-) -> Result<LoadedQwen35, ImportError> {
+pub fn load_from_gguf(path: &Path, device: &Device) -> Result<LoadedQwen35, ImportError> {
     load_from_gguf_quantized(path, device, QuantPolicy::Off)
 }
 
@@ -707,9 +691,7 @@ pub fn load_from_gguf_quantized(
                     .map(|&d| d as usize)
                     .collect::<Vec<_>>(),
             ),
-            GgufMap::Reshape(name, shape) => {
-                (name, shape.iter().map(|&d| d as usize).collect())
-            }
+            GgufMap::Reshape(name, shape) => (name, shape.iter().map(|&d| d as usize).collect()),
         };
         let values = f
             .read_tensor_f32(&info.name)
@@ -763,7 +745,7 @@ fn device_tensor<const D: usize>(
     shape: [usize; D],
     device: &Device,
 ) -> Tensor<D> {
-    let dtype = crate::backend::float_dtype();
+    let dtype = crate::backend::float_dtype(device);
     Tensor::from_data(TensorData::new(values, shape), (device, dtype))
 }
 
@@ -869,7 +851,9 @@ fn assign_param(
     let (layer, field) = rest
         .split_once('.')
         .ok_or_else(|| format!("bad layer path '{name}'"))?;
-    let layer: usize = layer.parse().map_err(|_| format!("bad layer in '{name}'"))?;
+    let layer: usize = layer
+        .parse()
+        .map_err(|_| format!("bad layer in '{name}'"))?;
     let l = model
         .layers
         .get_mut(layer)
@@ -888,7 +872,8 @@ fn assign_param(
                 Param::from_tensor(take_linear(ready, values, shape, policy, device)?);
         }
         "mlp.up_proj.weight" => {
-            l.mlp.up_proj.weight = Param::from_tensor(take_linear(ready, values, shape, policy, device)?);
+            l.mlp.up_proj.weight =
+                Param::from_tensor(take_linear(ready, values, shape, policy, device)?);
         }
         "mlp.down_proj.weight" => {
             l.mlp.down_proj.weight =
@@ -992,8 +977,13 @@ pub fn pack_actions(
     }
     Some(match field {
         "ssm_conv1d.weight" => A::Conv,
-        "attn_norm.weight" | "post_attention_norm.weight" | "attn_q_norm.weight"
-        | "attn_k_norm.weight" | "ssm_dt.bias" | "ssm_a" | "ssm_norm.weight" => A::Vector,
+        "attn_norm.weight"
+        | "post_attention_norm.weight"
+        | "attn_q_norm.weight"
+        | "attn_k_norm.weight"
+        | "ssm_dt.bias"
+        | "ssm_a"
+        | "ssm_norm.weight" => A::Vector,
         _ => {
             qwen35_field(field)?; // known linear fields only
             A::Linear
@@ -1169,9 +1159,9 @@ pub fn load_from_pack_layered(
             }
         };
         let src = match entry.role {
-            Role::Linear | Role::Expert { .. } | Role::Embedding => ParamSrc::Ready2(
-                pack.tensor::<2>(entry, precision, &device).map_err(parse)?,
-            ),
+            Role::Linear | Role::Expert { .. } | Role::Embedding => {
+                ParamSrc::Ready2(pack.tensor::<2>(entry, precision, &device).map_err(parse)?)
+            }
             Role::Vector | Role::Conv => ParamSrc::F32 {
                 values: pack.read_f32(entry).map_err(parse)?,
                 shape: entry.shape.clone(),
@@ -1227,7 +1217,12 @@ pub fn load_ffn_clusters(
     let names = &part.names[layer];
     let ranges: Vec<(usize, usize)> = clusters
         .iter()
-        .map(|&c| spans.get(c).map(|s| (s.start, s.len)).ok_or_else(|| format!("cluster {c} out of range")))
+        .map(|&c| {
+            spans
+                .get(c)
+                .map(|s| (s.start, s.len))
+                .ok_or_else(|| format!("cluster {c} out of range"))
+        })
         .collect::<Result<_, _>>()?;
     if ranges.is_empty() {
         return Err(format!("layer {layer}: empty cluster set"));
@@ -1254,7 +1249,11 @@ impl LoadedQwen35 {
     /// Attach the remote FFN clusters (one pool row per layer, ragged).
     #[must_use]
     pub fn with_ffn_pool(mut self, pool: std::sync::Arc<crate::nn::ExpertPool>) -> Self {
-        assert_eq!(pool.num_layers(), self.config.num_layers, "FFN pool must have one row per layer");
+        assert_eq!(
+            pool.num_layers(),
+            self.config.num_layers,
+            "FFN pool must have one row per layer"
+        );
         self.ffn_pool = Some(pool);
         self
     }
@@ -1297,18 +1296,25 @@ fn load_from_pack_inner(
     let mut model = build(&config, device, untied);
 
     // Partitioned FFN entries → (layer, proj index) for the local-cluster path.
-    let ffn_index: std::collections::HashMap<&str, (usize, usize)> = match (&local, &pack.manifest.ffn_partition) {
-        (Some(_), Some(part)) => part
-            .names
-            .iter()
-            .enumerate()
-            .flat_map(|(l, n)| n.iter().enumerate().map(move |(i, name)| (name.as_str(), (l, i))))
-            .collect(),
-        (Some(_), None) => {
-            return Err(parse("partitioned load requested but the pack has no FFN partition".into()));
-        }
-        _ => std::collections::HashMap::new(),
-    };
+    let ffn_index: std::collections::HashMap<&str, (usize, usize)> =
+        match (&local, &pack.manifest.ffn_partition) {
+            (Some(_), Some(part)) => part
+                .names
+                .iter()
+                .enumerate()
+                .flat_map(|(l, n)| {
+                    n.iter()
+                        .enumerate()
+                        .map(move |(i, name)| (name.as_str(), (l, i)))
+                })
+                .collect(),
+            (Some(_), None) => {
+                return Err(parse(
+                    "partitioned load requested but the pack has no FFN partition".into(),
+                ));
+            }
+            _ => std::collections::HashMap::new(),
+        };
     let mut assigned = 0usize;
     for entry in &pack.manifest.tensors {
         let Some(path) = pack_param_path(&entry.name, trunk) else {
@@ -1328,11 +1334,17 @@ fn load_from_pack_inner(
                 })
                 .collect::<Result<_, _>>()?;
             if ranges.is_empty() {
-                return Err(parse(format!("layer {layer}: no local FFN cluster (every layer needs one)")));
+                return Err(parse(format!(
+                    "layer {layer}: no local FFN cluster (every layer needs one)"
+                )));
             }
             let precision = {
                 let p = choose(entry);
-                if entry.precisions.contains_key(&p) { p } else { *entry.precisions.keys().max().expect("stored level") }
+                if entry.precisions.contains_key(&p) {
+                    p
+                } else {
+                    *entry.precisions.keys().max().expect("stored level")
+                }
             };
             let t = if proj == 2 {
                 pack.tensor_rows(entry, precision, &ranges, device)
@@ -1340,7 +1352,14 @@ fn load_from_pack_inner(
                 pack.tensor_cols(entry, precision, &ranges, device)
             }
             .map_err(parse)?;
-            assign_param(&mut model, &path, ParamSrc::Ready2(t), QuantPolicy::Off, device).map_err(parse)?;
+            assign_param(
+                &mut model,
+                &path,
+                ParamSrc::Ready2(t),
+                QuantPolicy::Off,
+                device,
+            )
+            .map_err(parse)?;
             assigned += 1;
             continue;
         }
@@ -1364,9 +1383,9 @@ fn load_from_pack_inner(
                 pack.tensor::<2>(entry, precision, embed_device.unwrap_or(device))
                     .map_err(parse)?,
             ),
-            Role::Linear | Role::Expert { .. } => ParamSrc::Ready2(
-                pack.tensor::<2>(entry, precision, device).map_err(parse)?,
-            ),
+            Role::Linear | Role::Expert { .. } => {
+                ParamSrc::Ready2(pack.tensor::<2>(entry, precision, device).map_err(parse)?)
+            }
             Role::Vector | Role::Conv => ParamSrc::F32 {
                 values: pack.read_f32(entry).map_err(parse)?,
                 shape: entry.shape.clone(),
@@ -1440,7 +1459,7 @@ impl CausalLm for LoadedQwen35 {
         let ids32: Vec<i32> = new_ids.iter().map(|&i| i as i32).collect();
         let input = Tensor::<1, Int>::from_data(
             TensorData::new(ids32, [t]),
-            (&embed_device, crate::backend::int_dtype()),
+            (&embed_device, crate::backend::int_dtype(&embed_device)),
         )
         .reshape([1, t]);
         let _prof_forward = crate::prof::scope("forward");
@@ -1491,11 +1510,18 @@ impl CausalLm for LoadedQwen35 {
             let (cos_l, sin_l) = if cos.device() == layer_device {
                 (cos.clone(), sin.clone())
             } else {
-                (cos.clone().to_device(&layer_device), sin.clone().to_device(&layer_device))
+                (
+                    cos.clone().to_device(&layer_device),
+                    sin.clone().to_device(&layer_device),
+                )
             };
-            let mask_l = mask
-                .as_ref()
-                .map(|m| if m.device() == layer_device { m.clone() } else { m.clone().to_device(&layer_device) });
+            let mask_l = mask.as_ref().map(|m| {
+                if m.device() == layer_device {
+                    m.clone()
+                } else {
+                    m.clone().to_device(&layer_device)
+                }
+            });
             drop(_s_glue_rope);
             let kv = &mut cache[li];
             let h = match (&layer.self_attn, &layer.linear_attn, kv) {
@@ -1656,8 +1682,7 @@ impl CausalLm for LoadedQwen35 {
                         if na2 > 0.0 {
                             let sigma = 1.0 + dot / na2;
                             let bperp2 = (nb2 - dot * dot / na2).max(0.0);
-                            let alpha =
-                                sigma * (na2 / (na2 + nb2 + 2.0 * dot).max(1e-12)).sqrt();
+                            let alpha = sigma * (na2 / (na2 + nb2 + 2.0 * dot).max(1e-12)).sqrt();
                             eprintln!(
                                 "[residual-probe] layer={li} b_over_a={:.4} bperp_over_a={:.4} alpha_minus_1={:+.5}",
                                 (nb2 / na2).sqrt(),
@@ -1710,7 +1735,8 @@ impl CausalLm for LoadedQwen35 {
                 } else {
                     Vec::new()
                 };
-                let skip = (self.ffn_skip_tau > 0.0).then_some((self.ffn_skip_tau, local_energy.as_slice()));
+                let skip = (self.ffn_skip_tau > 0.0)
+                    .then_some((self.ffn_skip_tau, local_energy.as_slice()));
                 let remote = {
                     let _s = crate::prof::scope("ffn.remote");
                     pool.run_dense(li, h2.reshape([b * tt, hd]), skip)
@@ -1841,10 +1867,7 @@ mod tests {
         }
         assert_eq!(full.len(), last.len());
         for (i, (f, s)) in full.iter().zip(&last).enumerate() {
-            assert!(
-                (f - s).abs() < 1e-4,
-                "logit {i}: full {f} vs stepped {s}"
-            );
+            assert!((f - s).abs() < 1e-4, "logit {i}: full {f} vs stepped {s}");
         }
     }
 

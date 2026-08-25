@@ -22,7 +22,7 @@ mod llama_ref;
 use std::path::PathBuf;
 
 use gguf_compare::{compare_against_llama_cpp, next_port};
-use mummu::backend::{Cpu, Gpu};
+
 use mummu::gguf::GgufFile;
 use mummu::models::{lfm2, olmoe, qwen2, qwen3};
 
@@ -49,28 +49,30 @@ fn env_path(var: &str, what: &str) -> PathBuf {
     p
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "needs the Qwen2.5 Q4_K_M GGUF (MUMMU_GGUF_PATH) + llama-server (MUMMU_LLAMA_SERVER)"]
-fn qwen2_q4_gguf_matches_llama_cpp_on_the_same_file() {
+async fn qwen2_q4_gguf_matches_llama_cpp_on_the_same_file() {
     let gguf = env_path("MUMMU_GGUF_PATH", "the qwen2.5-1.5b-instruct q4_k_m gguf");
     compare_against_llama_cpp(
         "qwen2",
         &gguf,
         next_port(PORT_BASE),
         LOGPROB_ABS_TOLERANCE,
-        |p, d| qwen2::load_from_gguf::<Gpu>(p, d).expect("gguf load checked"),
+        &mummu::backend::gpu_device(),
+        |p, d| qwen2::load_from_gguf(p, d).expect("gguf load checked"),
         |user| {
             mummu::chat::ChatMl::qwen2().render(&[
                 mummu::chat::Turn::system("You are a helpful assistant."),
                 mummu::chat::Turn::user(user),
             ])
         },
-    );
+    )
+    .await;
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "needs a Qwen3 Q4_K_M GGUF (MUMMU_QWEN3_GGUF_PATH) + llama-server (MUMMU_LLAMA_SERVER)"]
-fn qwen3_q4_gguf_matches_llama_cpp_on_the_same_file() {
+async fn qwen3_q4_gguf_matches_llama_cpp_on_the_same_file() {
     // Qwen3 is a thinking model (emits <think>…) — the greedy leg still holds
     // byte-for-byte because both sides receive the IDENTICAL prompt-id array
     // and greedy-decode, so the reasoning tokens match too; no chat/template
@@ -81,19 +83,21 @@ fn qwen3_q4_gguf_matches_llama_cpp_on_the_same_file() {
         &gguf,
         next_port(PORT_BASE),
         LOGPROB_ABS_TOLERANCE,
-        |p, d| qwen3::load_from_gguf::<Gpu>(p, d).expect("gguf load checked"),
+        &mummu::backend::gpu_device(),
+        |p, d| qwen3::load_from_gguf(p, d).expect("gguf load checked"),
         |user| {
             mummu::chat::ChatMl::qwen2().render(&[
                 mummu::chat::Turn::system("You are a helpful assistant."),
                 mummu::chat::Turn::user(user),
             ])
         },
-    );
+    )
+    .await;
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "needs the LFM2.5 Q4_K_M GGUF (MUMMU_LFM2_GGUF_PATH) + llama-server (MUMMU_LLAMA_SERVER)"]
-fn lfm2_q4_gguf_matches_llama_cpp_on_the_same_file() {
+async fn lfm2_q4_gguf_matches_llama_cpp_on_the_same_file() {
     let gguf = env_path(
         "MUMMU_LFM2_GGUF_PATH",
         "the lfm2.5-1.2b-instruct q4_k_m gguf",
@@ -103,16 +107,18 @@ fn lfm2_q4_gguf_matches_llama_cpp_on_the_same_file() {
         &gguf,
         next_port(PORT_BASE),
         LOGPROB_ABS_TOLERANCE,
-        |p, d| lfm2::load_from_gguf::<Gpu>(p, d).expect("gguf load checked"),
+        &mummu::backend::gpu_device(),
+        |p, d| lfm2::load_from_gguf(p, d).expect("gguf load checked"),
         |user| mummu::chat::ChatMl::lfm2().render(&[mummu::chat::Turn::user(user)]),
-    );
+    )
+    .await;
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "needs the OLMoE Q4_K_M GGUF (MUMMU_OLMOE_GGUF_PATH), llama-server \
             (MUMMU_LLAMA_SERVER), ~30 GB free COMMIT and ~28 GB of scratch disk \
             beside the gguf (28 GB f32 build, CPU backend)"]
-fn olmoe_q4_gguf_matches_llama_cpp_on_the_same_file() {
+async fn olmoe_q4_gguf_matches_llama_cpp_on_the_same_file() {
     // The zoo's first MoE leg. Our side runs on the CPU backend — the ~28 GB
     // f32 resident-everything build does not fit a 16 GB card; parity is
     // backend-independent by construction (same weights, same math).
@@ -142,7 +148,10 @@ fn olmoe_q4_gguf_matches_llama_cpp_on_the_same_file() {
         &gguf,
         next_port(PORT_BASE),
         LOGPROB_ABS_TOLERANCE,
-        |p, d| olmoe::load_from_gguf::<Cpu>(p, d).expect("gguf load checked"),
+        // The host, not the card: the ~28 GB f32 build does not fit 16 GiB.
+        &mummu::backend::cpu_device(),
+        |p, d| olmoe::load_from_gguf(p, d).expect("gguf load checked"),
         move |user| format!("{bos}<|user|>\n{user}\n<|assistant|>\n"),
-    );
+    )
+    .await;
 }

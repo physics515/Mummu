@@ -12,7 +12,6 @@
 
 use std::path::PathBuf;
 
-use mummu::backend::Gpu;
 use mummu::chat::{ChatMl, ToolSpec, Turn, parse_tool_calls};
 use mummu::models::CausalLm;
 use mummu::models::qwen3;
@@ -24,9 +23,9 @@ fn qwen3_dir() -> Option<PathBuf> {
     dir.join("model.safetensors").is_file().then_some(dir)
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "needs the local Qwen3 checkpoint dir (MUMMU_QWEN3_DIR) + the reference GPU"]
-fn qwen3_emits_a_parseable_hermes_tool_call() {
+async fn qwen3_emits_a_parseable_hermes_tool_call() {
     let Some(dir) = qwen3_dir() else {
         panic!("set MUMMU_QWEN3_DIR to a Qwen3 checkpoint dir");
     };
@@ -66,11 +65,12 @@ fn qwen3_emits_a_parseable_hermes_tool_call() {
         .get_ids()
         .to_vec();
 
-    let device = burn::tensor::Device::<Gpu>::default();
-    let loaded = qwen3::load_from_dir::<Gpu>(&dir, &device).expect("weights load checked");
+    let device = mummu::backend::gpu_device();
+    let loaded = qwen3::load_from_dir(&dir, &device).expect("weights load checked");
     // Generous budget: Qwen3 may emit a <think>…</think> block before the call.
     let ids = loaded
         .greedy_generate(&prompt, 512, &device)
+        .await
         .expect("greedy decode");
     let text = tok.decode(&ids, false).expect("decode");
     eprintln!("[real_toolcall_qwen3] model emitted: {text:?}");

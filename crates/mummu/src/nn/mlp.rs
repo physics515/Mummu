@@ -60,8 +60,6 @@ mod tests {
     use super::*;
     use burn::tensor::TensorData;
 
-    type Dev = burn::tensor::Device;
-
     #[test]
     fn forward_preserves_shape() {
         let device = crate::backend::cpu_device();
@@ -101,8 +99,8 @@ mod tests {
         }
         .init(&device);
         let row: Vec<f32> = vec![0.3, -1.2, 0.8, 2.0];
-        let single = Tensor::<1>::from_data(TensorData::new(row.clone(), [4]), &device)
-            .reshape([1, 1, 4]);
+        let single =
+            Tensor::<1>::from_data(TensorData::new(row.clone(), [4]), &device).reshape([1, 1, 4]);
         let double =
             Tensor::<1>::from_data(TensorData::new([row.clone(), row].concat(), [8]), &device)
                 .reshape([1, 2, 4]);

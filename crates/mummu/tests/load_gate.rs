@@ -17,7 +17,6 @@
 
 use std::path::Path;
 
-use mummu::backend::Cpu;
 use mummu::import::ImportError;
 use mummu::models::qwen3;
 use tokenizers::Tokenizer;
@@ -62,8 +61,8 @@ fn load_from_dir_rejects_an_eos_mismatch_before_reading_weights() {
             "added_tokens_decoder": {"9": {"content": "<|end|>", "special": true}}
         }"#,
     );
-    let device = burn::tensor::Device::<Cpu>::default();
-    match qwen3::load_from_dir::<Cpu>(&dir, &device) {
+    let device = mummu::backend::cpu_device();
+    match qwen3::load_from_dir(&dir, &device) {
         Err(ImportError::Inconsistent { reason, .. }) => {
             assert!(
                 reason.contains('9'),
@@ -88,8 +87,8 @@ fn load_from_dir_rejects_a_foreign_tool_call_convention() {
             "added_tokens_decoder": {"5": {"content": "<|end|>", "special": true}}
         }"#,
     );
-    let device = burn::tensor::Device::<Cpu>::default();
-    match qwen3::load_from_dir::<Cpu>(&dir, &device) {
+    let device = mummu::backend::cpu_device();
+    match qwen3::load_from_dir(&dir, &device) {
         Err(ImportError::Inconsistent { .. }) => {}
         Err(other) => panic!("expected Inconsistent for a foreign convention, got {other:?}"),
         Ok(_) => panic!("expected the gate to reject, but the load succeeded"),
@@ -111,8 +110,8 @@ fn load_from_dir_passes_the_gate_when_metadata_agrees() {
             "added_tokens_decoder": {"5": {"content": "<|end|>", "special": true}}
         }"#,
     );
-    let device = burn::tensor::Device::<Cpu>::default();
-    match qwen3::load_from_dir::<Cpu>(&dir, &device) {
+    let device = mummu::backend::cpu_device();
+    match qwen3::load_from_dir(&dir, &device) {
         // The gate passed; the load then fails on the empty weights — any error
         // that is NOT Inconsistent proves the agreeing checkpoint cleared it.
         Err(ImportError::Inconsistent { .. }) => {
@@ -146,8 +145,8 @@ fn load_from_dir_rejects_a_foreign_convention_from_a_standalone_jinja_file() {
         b"<|im_start|>{{x}}<|tool_call_start|>[f(x=1)]<|tool_call_end|><|im_end|>",
     )
     .expect("write chat_template.jinja");
-    let device = burn::tensor::Device::<Cpu>::default();
-    match qwen3::load_from_dir::<Cpu>(&dir, &device) {
+    let device = mummu::backend::cpu_device();
+    match qwen3::load_from_dir(&dir, &device) {
         Err(ImportError::Inconsistent { .. }) => {}
         Err(other) => {
             panic!("expected Inconsistent for a foreign .jinja convention, got {other:?}")
@@ -196,8 +195,8 @@ fn load_from_dir_rejects_an_added_token_id_mismatch_before_reading_weights() {
         }"#,
     );
     write_tokenizer_json(&dir, &[("<|end|>", 5), ("<|extra|>", 999)]);
-    let device = burn::tensor::Device::<Cpu>::default();
-    match qwen3::load_from_dir::<Cpu>(&dir, &device) {
+    let device = mummu::backend::cpu_device();
+    match qwen3::load_from_dir(&dir, &device) {
         Err(ImportError::Inconsistent { reason, file }) => {
             assert!(
                 file.ends_with("tokenizer.json"),
@@ -231,8 +230,8 @@ fn load_from_dir_passes_the_gate_when_tokenizer_ids_agree() {
         }"#,
     );
     write_tokenizer_json(&dir, &[("<|end|>", 5), ("<|extra|>", 6)]);
-    let device = burn::tensor::Device::<Cpu>::default();
-    match qwen3::load_from_dir::<Cpu>(&dir, &device) {
+    let device = mummu::backend::cpu_device();
+    match qwen3::load_from_dir(&dir, &device) {
         Err(ImportError::Inconsistent { reason, .. }) => {
             panic!("agreeing tokenizer ids must clear the gate, but it was rejected: {reason}")
         }

@@ -32,7 +32,9 @@ fn main() {
         .tensors
         .iter()
         .filter(|t| matches!(t.role, Role::Linear | Role::Expert { .. }) && t.shape.len() == 2)
-        .filter(|t| t.precisions.contains_key(&Precision::Q4) && t.precisions.contains_key(&Precision::Q8))
+        .filter(|t| {
+            t.precisions.contains_key(&Precision::Q4) && t.precisions.contains_key(&Precision::Q8)
+        })
         .collect();
     // Cap the size: a 1.27 G-parameter tensor needs a 5 GB f32 reference on
     // the host, and this probe running out of memory looks exactly like a
@@ -61,46 +63,68 @@ fn main() {
         let want = {
             let x = Tensor::<2>::from_data(TensorData::new(xs.clone(), [1, k]), &cpu);
             let w = Tensor::<2>::from_data(TensorData::new(f32s, [k, n]), &cpu);
-            x.matmul(w).into_data().convert::<f32>().to_vec::<f32>().unwrap()
+            x.matmul(w)
+                .into_data()
+                .convert::<f32>()
+                .to_vec::<f32>()
+                .unwrap()
         };
         let scale = want.iter().map(|v| v.abs()).fold(1e-6, f32::max);
 
         for precision in [Precision::Q4, Precision::Q8] {
             for (path, deq) in [("native", false), ("dequantize", true)] {
-            for round in 1..=ROUNDS {
-                let xs = xs.clone();
-                let gpu = gpu.clone();
-                let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let w = pack.tensor::<2>(entry, precision, &gpu).ok()?;
-                    let w = if deq { w.dequantize() } else { w };
-                    let x = Tensor::<2>::from_data(
-                        TensorData::new(xs, [1, k]),
-                        (&gpu, backend::float_dtype()),
-                    );
-                    // Warm first (autotune), then time the second call.
-                    let first = x.clone().matmul(w.clone()).into_data().convert::<f32>().to_vec::<f32>().ok()?;
-                    let started = std::time::Instant::now();
-                    let _ = x.matmul(w).into_data().convert::<f32>().to_vec::<f32>().ok()?;
-                    Some((first, started.elapsed().as_secs_f32() * 1000.0))
-                }))
-                .ok()
-                .flatten();
-                let verdict = match got {
-                    None => {
-                        let msg = last.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                        // Only the last line carries the reason; the rest is
-                        // a file/line prefix that repeats.
-                        let reason = msg.lines().last().unwrap_or("?").trim().to_string();
-                        format!("PANIC: {}", &reason[..reason.len().min(110)])
-                    }
-                    Some((g, _)) if g.len() != want.len() => "WRONG SHAPE".to_string(),
-                    Some((g, ms)) => {
-                        let worst = g.iter().zip(&want).map(|(a, b)| (a - b).abs() / scale).fold(0.0f32, f32::max);
-                        format!("{} rel {worst:.4}, warm {ms:6.1} ms", if worst > 0.5 { "GARBAGE" } else { "ok" })
-                    }
-                };
-                println!("  {precision:?} {path:<10} round {round}/{ROUNDS}: {verdict}");
-            }
+                for round in 1..=ROUNDS {
+                    let xs = xs.clone();
+                    let gpu = gpu.clone();
+                    let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let w = pack.tensor::<2>(entry, precision, &gpu).ok()?;
+                        let w = if deq { w.dequantize() } else { w };
+                        let x = Tensor::<2>::from_data(
+                            TensorData::new(xs, [1, k]),
+                            (&gpu, backend::float_dtype(&gpu)),
+                        );
+                        // Warm first (autotune), then time the second call.
+                        let first = x
+                            .clone()
+                            .matmul(w.clone())
+                            .into_data()
+                            .convert::<f32>()
+                            .to_vec::<f32>()
+                            .ok()?;
+                        let started = std::time::Instant::now();
+                        let _ = x
+                            .matmul(w)
+                            .into_data()
+                            .convert::<f32>()
+                            .to_vec::<f32>()
+                            .ok()?;
+                        Some((first, started.elapsed().as_secs_f32() * 1000.0))
+                    }))
+                    .ok()
+                    .flatten();
+                    let verdict = match got {
+                        None => {
+                            let msg = last.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                            // Only the last line carries the reason; the rest is
+                            // a file/line prefix that repeats.
+                            let reason = msg.lines().last().unwrap_or("?").trim().to_string();
+                            format!("PANIC: {}", &reason[..reason.len().min(110)])
+                        }
+                        Some((g, _)) if g.len() != want.len() => "WRONG SHAPE".to_string(),
+                        Some((g, ms)) => {
+                            let worst = g
+                                .iter()
+                                .zip(&want)
+                                .map(|(a, b)| (a - b).abs() / scale)
+                                .fold(0.0f32, f32::max);
+                            format!(
+                                "{} rel {worst:.4}, warm {ms:6.1} ms",
+                                if worst > 0.5 { "GARBAGE" } else { "ok" }
+                            )
+                        }
+                    };
+                    println!("  {precision:?} {path:<10} round {round}/{ROUNDS}: {verdict}");
+                }
             }
         }
     }

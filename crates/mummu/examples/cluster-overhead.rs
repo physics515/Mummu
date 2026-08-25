@@ -27,7 +27,7 @@ fn timed(rounds: usize, mut f: impl FnMut()) -> f64 {
 
 fn main() {
     let device = Device::wgpu(DeviceKind::DiscreteGpu(0));
-    let dtype = backend::float_dtype();
+    let dtype = backend::float_dtype(&device);
 
     // This model's real geometry: hidden 5120, FFN 17408, clusters of 544.
     const HIDDEN: usize = 5120;
@@ -78,14 +78,19 @@ fn main() {
             let _ = a.into_data().convert::<f32>().to_vec::<f32>().ok();
         }
     });
-    println!("  {clusters} cluster matmuls           {split:7.2} ms   ({:.1}x)", split / one);
+    println!(
+        "  {clusters} cluster matmuls           {split:7.2} ms   ({:.1}x)",
+        split / one
+    );
 
     // How much of that 2.4x is recoverable by using FEWER, WIDER clusters?
     // Cluster width is a pack-time choice, and it trades placement
     // granularity against dispatch count — the one knob here that is genuine
     // tuning rather than a kernel change.
-    println!("
-  cluster width sweep (same total arithmetic):");
+    println!(
+        "
+  cluster width sweep (same total arithmetic):"
+    );
     for width in [544usize, 1088, 2176, 4352, 8704] {
         if INTER % width != 0 {
             continue;
@@ -112,7 +117,10 @@ fn main() {
                 let _ = a.into_data().convert::<f32>().to_vec::<f32>().ok();
             }
         });
-        println!("    {n:2} x {width:5}   {ms:7.2} ms   ({:.2}x fused)", ms / one);
+        println!(
+            "    {n:2} x {width:5}   {ms:7.2} ms   ({:.2}x fused)",
+            ms / one
+        );
     }
 
     // And the same full-width matmul with a QUANTIZED weight — what the
@@ -120,10 +128,7 @@ fn main() {
     // weights moving an eighth of the bytes ought to be much FASTER than
     // f32. Whether burn's kernel delivers that is the question that decides
     // whether the gap to a fused runtime is about placement or about kernels.
-    for policy in [
-        mummu::quant::QuantPolicy::Q8,
-        mummu::quant::QuantPolicy::Q4,
-    ] {
+    for policy in [mummu::quant::QuantPolicy::Q8, mummu::quant::QuantPolicy::Q4] {
         let qw = mummu::quant::quantize_weight(policy, whole.clone());
         let ms = timed(20, || {
             let y = x.clone().matmul(qw.clone());
@@ -146,7 +151,10 @@ fn main() {
             let y = xh.clone().matmul(half.clone());
             let _ = y.into_data().convert::<f32>().to_vec::<f32>().ok();
         });
-        println!("  one full-width at F16            {ms:7.2} ms   ({:.2}x f32)", ms / one);
+        println!(
+            "  one full-width at F16            {ms:7.2} ms   ({:.2}x f32)",
+            ms / one
+        );
     }
 
     // Per token this model does 64 layers x 3 projections of the above.

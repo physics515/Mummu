@@ -18,7 +18,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use burn::tensor::Tensor;
-use mummu::backend::Cpu;
 use mummu::models::CausalLm;
 use mummu::models::qwen35;
 use mummu::nn::{DeviceExpert, ExpertExec, ExpertPool};
@@ -36,8 +35,13 @@ const PROMPTS: &[&str] = &[
     "Give me a Python one-liner that reverses a string.",
 ];
 
-fn log_softmax(t: &Tensor<Cpu, 2>) -> Vec<f32> {
-    let v = t.clone().into_data().convert::<f32>().to_vec::<f32>().unwrap();
+fn log_softmax(t: &Tensor<2>) -> Vec<f32> {
+    let v = t
+        .clone()
+        .into_data()
+        .convert::<f32>()
+        .to_vec::<f32>()
+        .unwrap();
     let m = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let lse = m + v.iter().map(|x| (x - m).exp()).sum::<f32>().ln();
     v.iter().map(|x| x - lse).collect()
@@ -46,7 +50,9 @@ fn log_softmax(t: &Tensor<Cpu, 2>) -> Vec<f32> {
 fn argmax(v: &[f32]) -> usize {
     v.iter()
         .enumerate()
-        .fold((0usize, f32::NEG_INFINITY), |m, (i, &x)| if x > m.1 { (i, x) } else { m })
+        .fold((0usize, f32::NEG_INFINITY), |m, (i, &x)| {
+            if x > m.1 { (i, x) } else { m }
+        })
         .0
 }
 
@@ -66,7 +72,10 @@ fn main() {
         std::process::exit(1);
     });
     let Some(part) = pack.manifest.ffn_partition.clone() else {
-        eprintln!("{} is not partitioned (run pack-partition first)", dir.display());
+        eprintln!(
+            "{} is not partitioned (run pack-partition first)",
+            dir.display()
+        );
         std::process::exit(1);
     };
     let header = pack.header().expect("header");
@@ -75,7 +84,7 @@ fn main() {
     drop(header);
     let layers = part.layers.len();
     let epl = part.layers[0].len();
-    let device = burn::tensor::Device::<Cpu>::default();
+    let device = mummu::backend::cpu_device();
     let prompts: Vec<Vec<u32>> = PROMPTS
         .iter()
         .map(|p| {
@@ -86,7 +95,7 @@ fn main() {
 
     let started = Instant::now();
     // Reference: dense, exact.
-    let dense = qwen35::load_from_pack::<Cpu>(&dir, &device, &|_| Precision::F32).expect("dense load");
+    let dense = qwen35::load_from_pack(&dir, &device, &|_| Precision::F32).expect("dense load");
     let refs: Vec<Vec<f32>> = prompts
         .iter()
         .map(|p| {
@@ -95,29 +104,42 @@ fn main() {
         })
         .collect();
     drop(dense);
-    eprintln!("[calibrate] dense reference over {} prompts in {:.0}s", prompts.len(), started.elapsed().as_secs_f32());
+    eprintln!(
+        "[calibrate] dense reference over {} prompts in {:.0}s",
+        prompts.len(),
+        started.elapsed().as_secs_f32()
+    );
 
     // Measurement model: cluster 0 local, every other cluster remote at f32.
     let rows: Vec<Vec<Arc<dyn ExpertExec>>> = (0..layers)
         .map(|l| {
             (1..epl)
                 .map(|c| {
-                    let w = qwen35::load_ffn_clusters::<Cpu>(&pack, l, &[c], Precision::F32, &device).expect("cluster");
-                    Arc::new(DeviceExpert::<Cpu> {
+                    let w = qwen35::load_ffn_clusters(&pack, l, &[c], Precision::F32, &device)
+                        .expect("cluster");
+                    Arc::new(DeviceExpert {
                         weights: w,
-                        device,
-                        tier: Tier { device: 0, precision: Precision::F32 },
+                        device: device.clone(),
+                        tier: Tier {
+                            device: 0,
+                            precision: Precision::F32,
+                        },
                         bytes: 0,
+                        native_ok: std::sync::atomic::AtomicBool::new(true),
                     }) as Arc<dyn ExpertExec>
                 })
                 .collect()
         })
         .collect();
     let pool = Arc::new(ExpertPool::new(rows));
-    let mut model = qwen35::load_from_pack_partitioned::<Cpu>(&dir, &device, &|_| Precision::F32, &|_| vec![0])
-        .expect("partitioned load")
-        .with_ffn_pool(pool.clone());
-    eprintln!("[calibrate] measurement model loaded ({:.0}s)", started.elapsed().as_secs_f32());
+    let mut model =
+        qwen35::load_from_pack_partitioned(&dir, &device, &|_| Precision::F32, &|_| vec![0])
+            .expect("partitioned load")
+            .with_ffn_pool(pool.clone());
+    eprintln!(
+        "[calibrate] measurement model loaded ({:.0}s)",
+        started.elapsed().as_secs_f32()
+    );
 
     // Exact pass (tau = 0): sanity + hotness.
     let _ = pool.take_energy();
@@ -126,7 +148,12 @@ fn main() {
     for (p, r) in prompts.iter().zip(&refs) {
         let mut c = model.new_cache();
         let out = log_softmax(&model.forward(p, 0, &mut c, &device));
-        worst_exact = worst_exact.max(out.iter().zip(r).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max));
+        worst_exact = worst_exact.max(
+            out.iter()
+                .zip(r)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max),
+        );
     }
     eprintln!("[calibrate] exact tiered vs dense: max |Δlogprob| = {worst_exact:.3e}");
     let energy = pool.take_energy(); // flat: per layer, clusters 1..epl
@@ -135,7 +162,9 @@ fn main() {
         let remote = &energy[l * (epl - 1)..(l + 1) * (epl - 1)];
         let mean = remote.iter().sum::<f64>() / remote.len().max(1) as f64;
         // Cluster 0 ran locally (unmeasured): give it the mean share.
-        let mut row: Vec<f64> = std::iter::once(mean).chain(remote.iter().copied()).collect();
+        let mut row: Vec<f64> = std::iter::once(mean)
+            .chain(remote.iter().copied())
+            .collect();
         let total: f64 = row.iter().sum::<f64>().max(1e-12);
         row.iter_mut().for_each(|v| *v /= total);
         hotness.push(row.iter().map(|&v| v as f32).collect());
@@ -151,7 +180,12 @@ fn main() {
         for (p, r) in prompts.iter().zip(&refs) {
             let mut c = model.new_cache();
             let out = log_softmax(&model.forward(p, 0, &mut c, &device));
-            max_delta = max_delta.max(out.iter().zip(r).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max));
+            max_delta = max_delta.max(
+                out.iter()
+                    .zip(r)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max),
+            );
             agree += usize::from(argmax(&out) == argmax(r));
         }
         let (kept, offered) = pool.take_dense_rows();
@@ -159,7 +193,11 @@ fn main() {
             tau,
             max_delta_logprob: max_delta,
             argmax_agreement: agree as f32 / prompts.len() as f32,
-            kept_fraction: if offered > 0 { kept as f32 / offered as f32 } else { 1.0 },
+            kept_fraction: if offered > 0 {
+                kept as f32 / offered as f32
+            } else {
+                1.0
+            },
         };
         eprintln!(
             "[calibrate] tau={tau}: max |Δlogprob| {:.3}, argmax agreement {:.0}%, clusters kept {:.1}%",
