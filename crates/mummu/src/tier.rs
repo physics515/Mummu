@@ -143,7 +143,17 @@ pub fn plan_tiers(
         })
         .collect();
     // The admission order is the reverse: cheapest bytes on the slowest device.
-    let cost_of = |tier: Tier, e: usize| -> Option<u64> { costs[e].bytes.get(&tier.precision).copied() };
+    // Host residency differs from stored size for Q4: flex unpacks nibbles
+    // to one i8 per element at load (`q_from_data`), so a Q4 blob occupies
+    // 1.125 B/elem resident against 0.625 stored — exactly 9/5. Without
+    // this the planner overpacks the host by 1.8x and the commit charge,
+    // not the budget, becomes the limit.
+    let cost_of = |tier: Tier, e: usize| -> Option<u64> {
+        let stored = costs[e].bytes.get(&tier.precision).copied()?;
+        let host_q4 = devices[tier.device].class == DeviceClass::Cpu
+            && tier.precision == Precision::Q4;
+        Some(if host_q4 { stored * 9 / 5 } else { stored })
+    };
 
     let mut used = vec![0u64; devices.len()];
     let mut tiers: Vec<Tier> = Vec::with_capacity(costs.len());

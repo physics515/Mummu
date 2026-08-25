@@ -1100,7 +1100,15 @@ fn build_partitioned_qwen35(
         .position(|(b, _)| *b == main)
         .ok_or("main backend missing from the tier devices")?;
     // The local slab is one tensor per projection: a single level there.
-    devices[main_idx].1.ladder = vec![level];
+    // On a host main it plans at Q4: flex holds the slab as i8 (3.6x less
+    // RAM than the F16 blob widened to f32) and the packed flex GEMV reads
+    // it directly at decode. `MUMMU_HOST_SLAB=f16` restores the old slab.
+    let slab_level = if main == BackendChoice::Cpu && host_slab_q4() {
+        mummu::pack::Precision::Q4
+    } else {
+        level
+    };
+    devices[main_idx].1.ladder = vec![slab_level];
     let planner_devices: Vec<mummu::tier::TierDevice> = devices.iter().map(|(_, d)| d.clone()).collect();
     let hotness: Vec<f64> = if part.hotness.len() == layers && part.hotness.iter().all(|h| h.len() == epl) {
         part.hotness.iter().flatten().map(|&h| f64::from(h)).collect()
@@ -1123,7 +1131,10 @@ fn build_partitioned_qwen35(
                     ha.partial_cmp(&hb).unwrap_or(std::cmp::Ordering::Equal)
                 })
                 .unwrap_or(0);
-            plan.tiers[l * epl + c] = mummu::tier::Tier { device: main_idx, precision: level };
+            plan.tiers[l * epl + c] = mummu::tier::Tier {
+                device: main_idx,
+                precision: slab_level,
+            };
             forced += 1;
         }
     }
@@ -1150,7 +1161,11 @@ fn build_partitioned_qwen35(
         pack_dir,
         device,
         &host,
-        &|_| level,
+        &|e| {
+            // FFN-partition tensors follow the slab rung; the trunk keeps
+            // the fit level (its quality budget is not the slab's).
+            if e.name.contains(".ffn_") { slab_level } else { level }
+        },
         &|l| local[l].clone(),
     )
     .map_err(|e| e.to_string())?;
@@ -1226,6 +1241,10 @@ fn build_partitioned_qwen35(
         rows.push(row);
     }
     let pool = std::sync::Arc::new(mummu::nn::ExpertPool::new(rows));
+    // The cubecl device-server threads exist now (the load used every
+    // device); lift them above the gemm pools or every remote drain waits
+    // out scheduler quanta instead of GPU time.
+    mummu::backend::boost_device_server_threads();
     let used = pool.used_bytes(devices.len());
     eprintln!(
         "[mummu-serve] partitioned FFN resident in {:.0}s — remote {}",
@@ -1657,6 +1676,16 @@ fn cap_ladders_at_source(devices: &mut [(BackendChoice, mummu::tier::TierDevice)
 /// The layer a GGUF tensor name belongs to (`blk.7.ffn_up.weight` -> 7).
 fn layer_index(name: &str) -> Option<usize> {
     name.strip_prefix("blk.")?.split('.').next()?.parse().ok()
+}
+
+/// Host slab at Q4? (`MUMMU_HOST_SLAB`, default `q4`; `f16` restores the
+/// widened-float slab.) Q4-resident is 1.125 B/elem on flex against the
+/// f32-resident 4 — and the packed GEMV reads it without a dequant.
+fn host_slab_q4() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("MUMMU_HOST_SLAB").map_or(true, |v| !v.eq_ignore_ascii_case("f16"))
+    })
 }
 
 /// The pack precision a fit policy denotes.

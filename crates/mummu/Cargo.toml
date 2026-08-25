@@ -16,7 +16,13 @@ repository.workspace = true
 default = ["fusion", "vulkan-spirv"]
 # Compile streams of tensor ops into fewer GPU kernels (burn's `fusion`;
 # `Wgpu` transparently becomes `Fusion<Wgpu>`).
-fusion = ["burn/fusion"]
+fusion = [
+	"burn/fusion",
+	"burn-cubecl/fusion",
+	"dep:burn-fusion",
+	"dep:burn-ir",
+	"dep:derive-new",
+]
 # CubeCL compiles kernels as direct SPIR-V on Vulkan adapters instead of
 # WGSL/naga (decode 70.7 -> 54.3 ms/token, bench/BASELINE.md).
 vulkan-spirv = ["burn/vulkan"]
@@ -46,6 +52,11 @@ inferno = { version = "0.12", optional = true, default-features = false }
 # than leaving async to consumers.
 tokio = { workspace = true }
 burn = { workspace = true }
+burn-cubecl = { workspace = true }
+cubecl = { workspace = true }
+burn-fusion = { workspace = true, optional = true }
+burn-ir = { workspace = true, optional = true }
+derive-new = { workspace = true, optional = true }
 mummu-mix = { workspace = true }
 mummu-schedule = { workspace = true }
 hf-chat-template = { workspace = true, optional = true }
@@ -60,6 +71,7 @@ ureq = { workspace = true }
 sha2 = { workspace = true }
 once_cell = { workspace = true }
 burn-flex = { workspace = true }
+rayon = { workspace = true }
 burn-store = { workspace = true }
 cubecl-runtime = { workspace = true }
 

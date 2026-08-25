@@ -20,6 +20,7 @@ vulkan-spirv = ["mummu/vulkan-spirv"]
 cuda = ["mummu/cuda"]
 
 [dependencies]
+rayon = { workspace = true }
 mummu = { path = "../mummu", default-features = false, features = ["flamegraph"] }
 burn = { workspace = true }
 tokenizers = { workspace = true }

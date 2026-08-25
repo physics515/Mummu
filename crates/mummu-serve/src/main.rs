@@ -38,6 +38,38 @@ async fn main() -> ExitCode {
         }
     }
 
+    // Demote the gemm herd before flex ever touches the global rayon pool:
+    // the pool's spinners at NORMAL priority starved every microsecond-
+    // scale service thread in the process — cubecl's unnamed poll thread
+    // (which signals readback-map completions; measured 26.5 -> 8.7 ms of
+    // per-layer fence latency once only the named DSD threads were
+    // boosted), the device servers, and the drain workers. BELOW_NORMAL
+    // for the herd inverts that: services preempt, and an uncontended box
+    // still gives the pool every core.
+    {
+        #[cfg(windows)]
+        fn demote_current_thread() {
+            #[link(name = "kernel32.dll", kind = "raw-dylib", modifiers = "+verbatim")]
+            unsafe extern "system" {
+                fn GetCurrentThread() -> isize;
+                fn SetThreadPriority(handle: isize, priority: i32) -> i32;
+            }
+            // SAFETY: plain kernel32 calls on the current thread's pseudo
+            // handle; -1 = THREAD_PRIORITY_BELOW_NORMAL.
+            unsafe {
+                SetThreadPriority(GetCurrentThread(), -1);
+            }
+        }
+        #[cfg(not(windows))]
+        fn demote_current_thread() {}
+        if let Err(e) = rayon::ThreadPoolBuilder::new()
+            .start_handler(|_| demote_current_thread())
+            .build_global()
+        {
+            eprintln!("[mummu-serve] rayon pool was already initialized ({e}); gemm herd keeps default priority");
+        }
+    }
+
     let addr = std::env::var("MUMMU_ADDR")
         .unwrap_or_else(|_| mummu_serve::DEFAULT_ADDR.into());
     let shim_addr = std::env::var("MUMMU_OLLAMA_ADDR")

@@ -205,13 +205,26 @@ fn qlinear(l: &Linear, x: Tensor<3>) -> Tensor<3> {
     let [b, t, d_in] = x.dims();
     let w = l.weight.val(); // [in, out]
     let d_out = w.dims()[1];
-    x.reshape([b * t, d_in]).matmul(w).reshape([b, t, d_out])
+    let x2 = x.reshape([b * t, d_in]);
+    // Decode-shape quantized weights take the packed GEMV (reads the
+    // stored bytes directly; on flex that is the i8 slab at 1.125 B/elem
+    // against the 4 B/elem an f32 slab moves). Anything else — prefill,
+    // float weights — keeps the plain matmul.
+    let y = match crate::nn::try_q4s_gemv(&x2, &w) {
+        Some(y) => y,
+        None => x2.matmul(w),
+    };
+    y.reshape([b, t, d_out])
 }
 
 /// The 2-D twin of [`qlinear`] (the lm-head path).
 fn qlinear2(l: &Linear, x: Tensor<2>) -> Tensor<2> {
     debug_assert!(l.bias.is_none(), "qwen35 projections are bias-free");
-    x.matmul(l.weight.val())
+    let w = l.weight.val();
+    match crate::nn::try_q4s_gemv(&x, &w) {
+        Some(y) => y,
+        None => x.matmul(w),
+    }
 }
 
 /// Gated full attention (see the module docs). Field names are this port's

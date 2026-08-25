@@ -443,19 +443,30 @@ where
         // After a caught kernel-gap panic, `native_ok` is false and packed
         // weights are dequantized up front — the path that is correct at
         // every width, at measured-identical speed for a single group.
-        let ready = |p: &burn::module::Param<Tensor<2>>| -> Tensor<2> {
-            if self.native_ok.load(std::sync::atomic::Ordering::Relaxed) {
-                compute_weight(p)
+        let native = self.native_ok.load(std::sync::atomic::Ordering::Relaxed);
+        // At decode shape with a Q4S weight, the packed GEMV reads the
+        // stored nibbles directly — no dequant transient, no f32 weight
+        // traffic (nn/packed_gemv.rs). Its launch errors surface at the
+        // caller's readback, inside the same catch that guards q_matmul,
+        // so the downgrade contract is unchanged.
+        let mm = |xin: &Tensor<2>, p: &burn::module::Param<Tensor<2>>| -> Tensor<2> {
+            if native {
+                let wv = p.val();
+                if let Some(y) = crate::nn::packed_gemv::try_q4s_gemv(xin, &wv) {
+                    return y;
+                }
+                xin.clone().matmul(compute_weight(p))
             } else {
                 let t = p.val();
-                match t.dtype() {
+                let t = match t.dtype() {
                     DType::QFloat(_) => t.dequantize(),
                     _ => t,
-                }
+                };
+                xin.clone().matmul(t)
             }
         };
-        let acts = activation::silu(xt.clone().matmul(ready(&w.gate))).mul(xt.matmul(ready(&w.up)));
-        acts.matmul(ready(&w.down))
+        let acts = activation::silu(mm(&xt, &w.gate)).mul(mm(&xt, &w.up));
+        mm(&acts, &w.down)
     }
 
     fn disable_native(&self) {

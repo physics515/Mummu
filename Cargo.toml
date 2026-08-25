@@ -33,7 +33,23 @@ burn = { version = "0.22.0-pre.2", default-features = false, features = [
 	"flex",
 	"autotune",
 	"store",
+	# The sanctioned custom-op seam (`burn::backend::backend_extension` and
+	# the dispatch/primitive escape hatches) — carried by crates already in
+	# the graph, pulls nothing new. Added for the packed m=1 Q4 GEMV.
+	"extension",
 ] }
+# Kernel authoring for the packed Q4 GEMV: burn-cubecl for CubeTensor /
+# quantized_handles / empty_device, cubecl for the #[cube] macro. Exact `=`
+# pins: pre-release caret semantics would accept a -pre.3 that the burn
+# crates' own `=` pins then refuse to unify with.
+burn-cubecl = { version = "=0.22.0-pre.2", default-features = false }
+cubecl = { version = "=0.11.0-pre.2", default-features = false, features = ["wgpu"] }
+# The fusion wrapper for the same op (Fusion<B> re-enters the stream via
+# CustomOpIr) — only compiled under mummu's `fusion` feature.
+burn-fusion = { version = "=0.22.0-pre.2", default-features = false }
+burn-ir = { version = "=0.22.0-pre.2", default-features = false }
+derive-new = { version = "0.7", default-features = false }
+rayon = "1" 
 # `vulkan` switches CubeCL's kernel compiler on Vulkan adapters from
 # WGSL/naga to direct SPIR-V; other APIs keep WGSL in the same binary.
 # Adopted 2026-07-12: decode 70.7 -> 54.3 ms/token with parity
