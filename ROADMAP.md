@@ -563,6 +563,31 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       lever worth a planner experiment: clusters on the HOST are 2.3x cheaper than on the dGPU at
       m=1, so shifting remote clusters host-ward wins latency wherever host memory allows (Q4-on-host
       would clear the F16 budget wall); the real fix stays (1) in the ranked list above.
+- [x] **The packed m=1 GEMV shipped — on every backend — and it un-hid two more starved service
+      threads. Warm decode 4.03 -> 3.19 s/token; the pool churn is dead.** *(2026-08-25)*
+      `nn/packed_gemv.rs`: a `#[backend_extension]` op reading the stored quantization directly —
+      a `#[cube]` wgpu kernel (one unit per packed u32 word: one word + one shared scale + one x[k]
+      broadcast -> eight FMAs, no cross-unit reduction; parity 4e-7 against dequantize-then-matmul
+      at production shapes), a rayon i8 GEMV over flex's unpacked storage, and a Fusion CustomOpIr
+      wrapper. Wired into the cluster executor and `qlinear` under the existing downgrade contract
+      (`MUMMU_PACKED_GEMV=0/off/false` reverts). Prefill runs row-by-row through the same exact op,
+      so the dequantize-first fallback's ~260 MB transients never exist — VRAM pool panics went
+      505-710 per run -> **0**.
+      With real GPU work sub-millisecond, the residual ~26 ms fence decomposed into thread-priority
+      bugs, not device time: cubecl's `DSD-*` device server AND cubecl-wgpu's unnamed poll thread
+      (the one that signals readback-map completions) both starved at normal priority behind the
+      trunk's spinning gemm herd. `backend::boost_device_server_threads()` raises the named servers
+      after load; mummu-serve starts the global rayon pool with every gemm worker at BELOW_NORMAL,
+      so microsecond-scale service threads always preempt spinners. Fence 26.5 -> 8.7 ms/group.
+      Then the host slab flipped to Q4 (i8-resident, 3.6x less RAM than the F16-widened slab;
+      `MUMMU_HOST_SLAB=f16` reverts) with the planner pricing flex residency at its true 9/5 of
+      packed bytes. Measured sum on the 27B: warm **3.19-3.25 s/token** (from 4.03), cold request
+      **139 s** wall (from ~450), host RAM **-14 GiB**, plan 552 host + 1496 wgpu clusters.
+      Next, ranked: (1) the residual ~8.5 ms/group fence — suspected polling handoff, worth a
+      timeline pass now that priorities are clean; (2) SIMD the flex i8 inner loop (mlp.* is
+      ~3.3 ms/call, still ~4x off the traffic bound); (3) a real m<=64 packed GEMM for prefill;
+      (4) the CPU trunk (delta.proj 13.8 ms/call is now the top scope) — relocation or Q8+GEMV;
+      (5) MTP/NextN. The 62 ms/token ollama wall still requires the trunk off the host.
 - [ ] **Do NOT make the clustered path universal until a fits-on-one-device fast path exists.**
       *(2026-08-24)* Partitioning earns its keep only when a model must span devices. Measured, the
       split costs **2.4x** in dispatch (32 cluster matmuls 4.13 ms against 1.68 ms fused), so imposing it
