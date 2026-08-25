@@ -16,7 +16,7 @@ pub use conv::{ConvState, ShortConv, ShortConvConfig};
 pub use mlp::{SwiGluMlp, SwiGluMlpConfig};
 pub use moe::{
     DeviceExpert, ExpertExec, ExpertPool, ExpertWeights, MoeExperts, Routing, SparseMoe, SparseMoeConfig,
-    SparseMoePerExpert, StagedExpert,
+    SparseMoePerExpert, StagedExpert, trace_layer, trace_us,
 };
 pub use rope::{apply_rope, rope_tables, rotate_half};
 

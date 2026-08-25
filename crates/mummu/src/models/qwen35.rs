@@ -1008,6 +1008,37 @@ pub fn pack_actions(
 /// this is not a qwen35 fact. Kept as a path so existing callers do not move.
 pub use crate::partition::ffn_names;
 
+/// Verify-mode radial lookahead on? (`MUMMU_LOOKAHEAD=verify`). One env
+/// read per process; anything but `verify` is off — there is no commit mode
+/// until verify-mode acceptance earns it.
+fn lookahead_verify() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("MUMMU_LOOKAHEAD").is_ok_and(|v| v.eq_ignore_ascii_case("verify"))
+    })
+}
+
+/// Residual-geometry probe on? (`MUMMU_RESIDUAL_PROBE=1`).
+fn residual_probe() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MUMMU_RESIDUAL_PROBE").is_ok())
+}
+
+/// A scratch copy of one layer's decode state for speculation: tensor
+/// clones are refcounted handles, and burn ops never mutate buffers in
+/// place, so the speculative forward can freely reassign the scratch
+/// struct's fields while the real cache entry stays untouched. Cheap by
+/// construction — this is the "never pollute S" rule made structural.
+fn snapshot_kv(kv: &Qwen35Kv) -> Qwen35Kv {
+    match kv {
+        Qwen35Kv::Attn(k) => Qwen35Kv::Attn(k.clone()),
+        Qwen35Kv::Delta(d) => Qwen35Kv::Delta(DeltaState {
+            conv: d.conv.clone(),
+            state: d.state.clone(),
+        }),
+    }
+}
+
 /// Pack tensor name → parameter path (the pack keeps GGUF names).
 fn pack_param_path(name: &str, trunk_layers: usize) -> Option<String> {
     match name {
@@ -1427,7 +1458,18 @@ impl CausalLm for LoadedQwen35 {
         // guards never cross an await and wall time attributes cleanly;
         // device-queued work lands wherever the next readback syncs, so read
         // GPU bars as "where the sync happened", not as kernel time.
-        for (li, (layer, kv)) in self.model.layers.iter().zip(cache.iter_mut()).enumerate() {
+        let n_layers = self.model.layers.len();
+        // Radial-lookahead carry: layer li+1's speculative post-attn h2,
+        // produced during layer li's drain window on SCRATCH state, and
+        // verified against the exact h2 once li+1 computes it. Verify mode
+        // never uses the speculative value — it only measures how good it
+        // would have been, which is the data that decides whether a commit
+        // mode is ever legal.
+        let mut spec_carry: Option<(usize, Tensor<3>)> = None;
+        let (mut la_n, mut la_max) = (0u32, 0f32);
+        let (mut la_a1, mut la_a2, mut la_a3) = (0u32, 0u32, 0u32);
+        for li in 0..n_layers {
+            let layer = &self.model.layers[li];
             // Layers may live on different devices (the dense placement puts
             // as many whole layers on the GPU as VRAM holds, the rest on the
             // host). Moving `x` here is a no-op while the device does not
@@ -1455,6 +1497,7 @@ impl CausalLm for LoadedQwen35 {
                 .as_ref()
                 .map(|m| if m.device() == layer_device { m.clone() } else { m.clone().to_device(&layer_device) });
             drop(_s_glue_rope);
+            let kv = &mut cache[li];
             let h = match (&layer.self_attn, &layer.linear_attn, kv) {
                 (Some(attn), None, Qwen35Kv::Attn(kv_state)) => {
                     let _s = crate::prof::scope("attn.full");
@@ -1474,6 +1517,37 @@ impl CausalLm for LoadedQwen35 {
                 let _s = crate::prof::scope("norm2");
                 layer.post_attn_norm.forward(x.clone())
             };
+            // The exact h2 exists: score the speculative one from the
+            // previous layer's window. Pure measurement — the exact value
+            // is what flows onward, unconditionally.
+            if let Some((idx, spec_h2)) = spec_carry.take()
+                && idx == li
+            {
+                let _s = crate::prof::scope("spec.verify");
+                let read = |t: Tensor<3>| -> f32 {
+                    t.abs()
+                        .max()
+                        .into_data()
+                        .convert::<f32>()
+                        .to_vec::<f32>()
+                        .map(|v| v[0])
+                        .unwrap_or(f32::NAN)
+                };
+                let diff = read(spec_h2.sub(h2.clone()));
+                let scale = read(h2.clone()).max(1e-6);
+                let rel = diff / scale;
+                la_n += 1;
+                la_max = la_max.max(rel);
+                if rel < 1e-3 {
+                    la_a1 += 1;
+                }
+                if rel < 1e-2 {
+                    la_a2 += 1;
+                }
+                if rel < 5e-2 {
+                    la_a3 += 1;
+                }
+            }
             // ENQUEUE-FIRST: hand the remote FFN to the accelerators before
             // the local slab runs, so they work while the host does. The
             // profile that motivated this: the local mlp (0.67 s/token) ran
@@ -1490,6 +1564,9 @@ impl CausalLm for LoadedQwen35 {
                     }
                     let [b, tt, hd] = h2.dims();
                     let _s = crate::prof::scope("ffn.enqueue");
+                    if crate::nn::trace_layer() == Some(li) && tt == 1 {
+                        eprintln!("[tl] enqueue {}", crate::nn::trace_us());
+                    }
                     pool.run_dense_pending(li, h2.clone().reshape([b * tt, hd]))
                 }
                 _ => None,
@@ -1511,11 +1588,102 @@ impl CausalLm for LoadedQwen35 {
                 let _s = crate::prof::scope("mlp.down");
                 qlinear(&layer.mlp.down_proj, gate.clone().mul(up))
             };
+            // RADIAL LOOKAHEAD (MUMMU_LOOKAHEAD=verify): the dGPU is still
+            // draining this layer's remote FFN on its worker; the main
+            // thread's wait is the window. Run layer li+1's trunk on the
+            // known prefix a = x + local_ffn now, on SCRATCH state (tensor
+            // clones are refcounts; burn ops never mutate in place, and the
+            // real cache entry is untouched). The radial identity makes the
+            // parallel component of the late remote piece exact under a
+            // scalar; what this measures is how much the rest matters.
+            if lookahead_verify() && pending.is_some() && li + 1 < n_layers {
+                let [_, tt, _] = ffn.dims();
+                if tt == 1 {
+                    let _s = crate::prof::scope("spec.trunk");
+                    let a3 = x.clone().add(ffn.clone());
+                    let nxt = &self.model.layers[li + 1];
+                    let mut scratch = snapshot_kv(&cache[li + 1]);
+                    let sh = nxt.input_norm.forward(a3.clone());
+                    let sh = match (&nxt.self_attn, &nxt.linear_attn, &mut scratch) {
+                        (Some(attn), None, Qwen35Kv::Attn(kv_state)) => {
+                            attn.forward(sh, cfg, &cos, &sin, None, kv_state)
+                        }
+                        (None, Some(delta), Qwen35Kv::Delta(state)) => {
+                            delta.forward(sh, cfg, state)
+                        }
+                        _ => unreachable!("qwen35 lookahead: layer/cache kind mismatch"),
+                    };
+                    let spec_x = a3.add(sh);
+                    spec_carry = Some((li + 1, nxt.post_attn_norm.forward(spec_x)));
+                }
+            }
             if let Some(pending) = pending {
                 let _s = crate::prof::scope("glue.merge");
-                if let Some(remote) = pending.resolve() {
+                let tl = crate::nn::trace_layer() == Some(li) && ffn.dims()[1] == 1;
+                if tl {
+                    eprintln!("[tl] join-start {}", crate::nn::trace_us());
+                }
+                let resolved = {
+                    let _s = crate::prof::scope("merge.resolve_call");
+                    pending.resolve()
+                };
+                if tl {
+                    eprintln!("[tl] join-done {}", crate::nn::trace_us());
+                }
+                if let Some(remote) = resolved {
                     let [b, tt, hd] = ffn.dims();
-                    ffn = ffn.add(remote.reshape([b, tt, hd]));
+                    let remote = {
+                        let _s = crate::prof::scope("merge.reshape");
+                        remote.reshape([b, tt, hd])
+                    };
+                    // Residual-geometry probe (MUMMU_RESIDUAL_PROBE=1): the
+                    // radial split N(a+b) = alpha*N(a) + rstd(a+b)*(g.*b_perp)
+                    // is exact, so lookahead's commit-mode viability is the
+                    // size of b_perp against a — measured, not argued.
+                    if residual_probe() && tt == 1 {
+                        let a = x.clone().add(ffn.clone());
+                        let read = |t: Tensor<3>| -> f32 {
+                            t.sum()
+                                .into_data()
+                                .convert::<f32>()
+                                .to_vec::<f32>()
+                                .map(|v| v[0])
+                                .unwrap_or(f32::NAN)
+                        };
+                        let dot = read(a.clone().mul(remote.clone()));
+                        let na2 = read(a.clone().mul(a));
+                        let nb2 = read(remote.clone().mul(remote.clone()));
+                        if na2 > 0.0 {
+                            let sigma = 1.0 + dot / na2;
+                            let bperp2 = (nb2 - dot * dot / na2).max(0.0);
+                            let alpha =
+                                sigma * (na2 / (na2 + nb2 + 2.0 * dot).max(1e-12)).sqrt();
+                            eprintln!(
+                                "[residual-probe] layer={li} b_over_a={:.4} bperp_over_a={:.4} alpha_minus_1={:+.5}",
+                                (nb2 / na2).sqrt(),
+                                (bperp2 / na2).sqrt(),
+                                alpha - 1.0,
+                            );
+                        }
+                    }
+                    // Which operand carries the ~28 ms that lands on the
+                    // FIRST op after the worker cycle? Three scoped probes:
+                    // an op touching only the local ffn (ambient/first-op
+                    // effects), an op touching only the remote partial (its
+                    // first-use materialization), then the real add. The 28ms
+                    // lands in exactly one of these and names its class.
+                    {
+                        let _s = crate::prof::scope("merge.warm_local");
+                        let _ = ffn.clone().add_scalar(0.0);
+                    }
+                    {
+                        let _s = crate::prof::scope("merge.warm_remote");
+                        let _ = remote.clone().add_scalar(0.0);
+                    }
+                    {
+                        let _s = crate::prof::scope("merge.add");
+                        ffn = ffn.add(remote);
+                    }
                 }
             } else if let Some(pool) = &self.ffn_pool {
                 // Working set: issue THIS layer's staging decisions before
@@ -1556,6 +1724,15 @@ impl CausalLm for LoadedQwen35 {
                 let _s = crate::prof::scope("glue.resid2");
                 x = x.add(ffn);
             }
+        }
+        if la_n > 0 {
+            let pct = |k: u32| f64::from(k) * 100.0 / f64::from(la_n);
+            eprintln!(
+                "[lookahead] verified {la_n} layers: accept@1e-3 {:.0}% | @1e-2 {:.0}% | @5e-2 {:.0}% | worst rel {la_max:.4}",
+                pct(la_a1),
+                pct(la_a2),
+                pct(la_a3),
+            );
         }
         // The final norm and head may live elsewhere than the last layer.
         let head_device = self.model.norm.gamma.val().device();
