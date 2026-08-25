@@ -13,7 +13,7 @@
 
 use burn::module::{Module, Param};
 use burn::nn::{Linear, LinearConfig};
-use burn::tensor::{Device, DType, Distribution, Int, Tensor, activation};
+use burn::tensor::{Device, DType, Distribution, Int, Tensor, TensorData, activation};
 
 /// The expert bank: `num_experts` SwiGLU MLPs as three fused params in
 /// `[experts, out, in]` layout (the row-major twin of ggml's
@@ -923,6 +923,76 @@ impl ExpertPool {
 
 }
 
+/// Wall-clock in µs since first use, for the layer timeline trace.
+pub fn trace_us() -> u128 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_micros()
+}
+
+/// Which layer (if any) the timeline trace follows (`MUMMU_TRACE_LAYER`).
+pub fn trace_layer() -> Option<usize> {
+    static ON: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("MUMMU_TRACE_LAYER")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    })
+}
+
+/// Raise the calling worker thread above the trunk's gemm pool. The pool
+/// saturates every core through the local slab, and a default-priority
+/// worker measurably could not win a core even to SUBMIT its GPU work
+/// until the caller reached the join — zero overlap, the full device time
+/// exposed (merge.join 27.1 ms/layer with enqueue-first ordering in
+/// place). The worker needs microseconds of CPU to submit, then blocks on
+/// the fence; above-normal priority preempts one pool thread for exactly
+/// that sliver.
+fn boost_worker_priority() {
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32.dll", kind = "raw-dylib", modifiers = "+verbatim")]
+        unsafe extern "system" {
+            fn GetCurrentThread() -> isize;
+            fn SetThreadPriority(handle: isize, priority: i32) -> i32;
+        }
+        // SAFETY: plain kernel32 calls on the current thread's pseudo
+        // handle; 1 = THREAD_PRIORITY_ABOVE_NORMAL.
+        unsafe {
+            SetThreadPriority(GetCurrentThread(), 1);
+        }
+    }
+}
+
+/// Run one dense executor resident and read its result back as plain
+/// bytes, with the same catch-once-downgrade-retry contract as
+/// [`run_with_native_fallback`]. The catch MUST span the readback: on the
+/// wgpu path the native quantized matmul only enqueues at the op call —
+/// kernel expansion happens at the blocking read, where the device server
+/// re-raises its panic on the reading thread — so a catch around the
+/// compute alone can never see the width-dependent kernel-gap panic
+/// (`num_quants 4`/`8`) this fallback exists for. Any second panic — a
+/// genuine failure, OOM included — propagates loudly as ever.
+fn run_readback_with_fallback(
+    exec: &std::sync::Arc<dyn ExpertExec>,
+    xt: &Tensor<2>,
+) -> TensorData {
+    let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        exec.run_tensor_resident(xt.clone()).into_data()
+    }));
+    match attempt {
+        Ok(data) => data,
+        Err(_) => {
+            eprintln!(
+                "[mummu] native quantized matmul panicked for one expert group \
+                 (cubecl kernel gap; width-dependent) — group switched to \
+                 dequantize-first and retried"
+            );
+            exec.disable_native();
+            exec.run_tensor_resident(xt.clone()).into_data()
+        }
+    }
+}
+
 /// Run one dense executor with the adaptive native fallback: a panic from
 /// the width-dependent cubecl kernel gap (quant/view vector-size assert,
 /// `num_quants 4`/`8`) is caught ONCE, the group is switched to
@@ -958,23 +1028,48 @@ fn run_with_native_fallback(
 /// synchronous path did — and only the JOIN is deferred, so the caller's
 /// local slab runs while the devices chew.
 ///
-/// This is the second design. The first deferred the device sync itself
+/// This is the third design. The first deferred the device sync itself
 /// into [`Self::resolve`], and adversarial review proved against the
 /// burn-fusion sources that nothing executes at enqueue — the worker
 /// streams' queued IR first ran inside resolve's drain, and resolving
 /// partials one at a time serialized the devices where the old workers
 /// drained them in parallel (wall `local + T_a + T_b` instead of
-/// `local + max(T_a, T_b)`). Deferring only the join keeps the proven
-/// concurrent drains and still buys the overlap: per-layer wall becomes
-/// `max(local, T_a, T_b)` plus the join.
+/// `local + max(T_a, T_b)`). The second deferred only the join, with each
+/// worker building the caller-device result tensor from its readback — and
+/// every layer still paid ~27 ms SOMEWHERE, migrating between scopes as
+/// the code moved (worker build, join, a main-thread touch), because
+/// wgpu's `into_data` returns deferred-mapped bytes: it comes back in
+/// low ms while the FIRST CPU TOUCH of the bytes blocks on the GPU fence
+/// (`examples/mapped-wait-probe.rs` reproduces it standalone: into_data
+/// 1-4 ms, first touch 27.0-27.5 ms behind a queued GPU chain). The cost
+/// was never queues, scheduling, or allocation — it is the remote FFN's
+/// real GPU time surfacing at first byte access. So the third design
+/// makes the WORKER touch the bytes (`to_vec` in the accumulate): the
+/// fence wait lands here, concurrent with whatever the caller still has
+/// to do. The layer timeline (MUMMU_TRACE_LAYER) then showed how little
+/// that is: remote-heavy layers keep ~1 local cluster, so the caller
+/// reaches the join ~1 ms after the enqueue and ~26 ms of GPU time is
+/// exposed with nothing to overlap against. Measured per cluster at m=1:
+/// dGPU 0.91 ms vs CPU 0.40 ms — the GPU is 2.3x SLOWER than the host it
+/// is meant to relieve, because the quantized matmul dequantizes to f32.
+/// Shrinking that is a kernel problem (packed m=1 GEMV), not a
+/// scheduling one; every scheduling fix here is already in place.
 pub struct PendingRemote {
-    handles: Vec<std::thread::JoinHandle<Option<Tensor<2>>>>,
+    handles: Vec<std::thread::JoinHandle<Option<TensorData>>>,
+    /// The caller's device, captured at enqueue: partials come home to
+    /// wherever the trunk lives (wgpu-trunk placements exist), never to a
+    /// hardcoded CPU device.
+    home: Device,
 }
 
 impl PendingRemote {
-    /// Join the workers and sum their caller-resident partials. `merge.join`
-    /// in a profile is the residual wait after overlap; `merge.sum` the
-    /// additions.
+    /// Join the workers, then build and sum their partials on the CALLER's
+    /// thread, on the caller's own device, with each readback's own dtype.
+    /// The workers hand back plain FULLY-MATERIALIZED bytes: wgpu readback
+    /// bytes are deferred-mapped, and their first CPU touch blocks on the
+    /// GPU fence (~27 ms measured; see `mapped-wait-probe`), so the worker
+    /// touches them in its accumulate — concurrent with the local slab —
+    /// and everything on this thread is microseconds.
     #[must_use]
     pub fn resolve(self) -> Option<Tensor<2>> {
         let mut out: Option<Tensor<2>> = None;
@@ -988,8 +1083,10 @@ impl PendingRemote {
                     Err(payload) => std::panic::resume_unwind(payload),
                 }
             };
-            if let Some(p) = partial {
+            if let Some(data) = partial {
                 let _s = crate::prof::scope("merge.sum");
+                let dtype = data.dtype;
+                let p = Tensor::from_data(data, (&self.home, dtype));
                 out = Some(match out {
                     Some(acc) => acc.add(p),
                     None => p,
@@ -1034,34 +1131,64 @@ impl ExpertPool {
         self.dense_rows[0].fetch_add(bt as u64, std::sync::atomic::Ordering::Relaxed);
         self.dense_rows[1].fetch_add(bt as u64, std::sync::atomic::Ordering::Relaxed);
 
-        let handles: Vec<std::thread::JoinHandle<Option<Tensor<2>>>> = by_device
+        let handles: Vec<std::thread::JoinHandle<Option<TensorData>>> = by_device
             .into_iter()
             .map(|(key, members)| {
                 let xt = xt.clone();
+                let traced = trace_layer() == Some(layer);
                 std::thread::spawn(move || {
+                    boost_worker_priority();
+                    if traced {
+                        eprintln!("[tl] worker-run {}", trace_us());
+                    }
                     let _w = crate::prof::scope("ffn_worker");
                     let _d = crate::prof::scope(key);
-                    let mut acc: Option<Tensor<2>> = None;
+                    // Bytes only on this thread: per executor, one
+                    // compute-and-readback (the catch spans both — the
+                    // kernel-gap panic surfaces at the READ, see
+                    // run_readback_with_fallback) and a plain-f32
+                    // accumulate that needs no backend at all. The
+                    // accumulate's `to_vec` is deliberate: wgpu readback
+                    // bytes are deferred-mapped and their first CPU touch
+                    // blocks on the GPU fence (~27 ms measured), so THIS
+                    // thread absorbs that wait concurrent with the
+                    // caller's local slab instead of leaking it into the
+                    // merge. The caller rebuilds the tensor in resolve().
+                    let mut acc: Option<(Vec<f32>, burn::tensor::Shape)> = None;
                     for exec in &members {
-                        // The MOVING call via the fallback wrapper: the
-                        // trailing move_to is this worker's drain, concurrent
-                        // with the other workers and the caller's local slab;
-                        // a kernel-gap panic downgrades the group and retries
-                        // instead of killing the generation.
-                        let y = run_with_native_fallback(exec, &xt);
-                        acc = Some(match acc {
-                            Some(a) => a.add(y),
-                            None => y,
-                        });
+                        let data = {
+                            let _s = crate::prof::scope("compute");
+                            run_readback_with_fallback(exec, &xt)
+                        };
+                        if traced {
+                            eprintln!("[tl] readback-done {}", trace_us());
+                        }
+                        let shape = data.shape.clone();
+                        let vals = data
+                            .convert::<f32>()
+                            .to_vec::<f32>()
+                            .expect("remote FFN partial reads back as f32");
+                        match &mut acc {
+                            Some((a, s)) => {
+                                debug_assert_eq!(*s, shape);
+                                for (d, v) in a.iter_mut().zip(&vals) {
+                                    *d += v;
+                                }
+                            }
+                            None => acc = Some((vals, shape)),
+                        }
                     }
-                    // Force the accumulated partial to be DONE before the
-                    // join sees it: flex is eager, so the adds above already
-                    // ran; the executor's own move_to synced the device.
-                    acc
+                    if traced {
+                        eprintln!("[tl] touch-done {}", trace_us());
+                    }
+                    acc.map(|(vals, shape)| TensorData::new(vals, shape))
                 })
             })
             .collect();
-        Some(PendingRemote { handles })
+        Some(PendingRemote {
+            handles,
+            home: xt.device(),
+        })
     }
 }
 

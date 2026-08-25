@@ -530,6 +530,39 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       the way llama.cpp's Q4_K kernels do — worth the 6.4x traffic ratio, and the only route to parity.
       (2) Wider FFN clusters: 2 x 8704 costs 1.33x fused against 32 x 544's 2.36x, so ~1.8x, but cluster
       width is a pack-time choice and needs a repack. (3) Everything else measures under 1.2x.
+- [x] **The ~28 ms/layer merge wait was the GPU's real compute time, hidden behind wgpu's
+      deferred-mapped readbacks — found after seven falsified theories, and it re-ranks nothing:
+      the packed kernel was already the answer.** *(2026-08-25)* wgpu's `into_data` returns in 1-4 ms
+      while the FIRST CPU TOUCH of the returned bytes blocks on the GPU fence
+      (`examples/mapped-wait-probe.rs`: first touch 27.0-27.5 ms behind a queued GPU chain, three
+      rounds). So every drain design paid the remote FFN's device time at whatever op first read the
+      bytes — which is why the cost was thread-agnostic, migrated between profiler scopes as code
+      moved, and ignored VRAM budgets (13 vs 15 GiB both churn and both stall), timer resolution,
+      thread priorities, and every queue theory. Falsified along the way, each by measurement or
+      source reading: GPU-wait-at-join (worker clocks), lazy cross-backend moves (`read_sync` in
+      dispatch), flex laziness (type-level), stderr/backtrace locks (quiet run), pool-panic churn
+      (zero-panic run stalls identically), Windows timer quanta (`timeBeginPeriod(1)` changed
+      nothing), cubecl's bounded 32-slot device queue (burn-flex has no cubecl channel — its ops are
+      inline on the calling thread), and worker core starvation (an above-normal-priority worker
+      submits at +0.5 ms and the join still waits the full fence).
+      The layer timeline (`MUMMU_TRACE_LAYER`) closed it: on remote-heavy layers the planner keeps
+      ~1 local cluster, the caller reaches the join at **+1.2 ms**, and the GPU needs **~26.5 ms**
+      for its 28-29 clusters — nothing exists to overlap against. Per-cluster at m=1: **dGPU
+      0.91 ms vs host 0.40 ms** — the discrete GPU is 2.3x SLOWER per cluster than the CPU it
+      relieves, the latency-side face of the 7.7x bandwidth measurement above. Scheduling is DONE:
+      enqueue-first ordering, deferred join, fence absorbed on the worker, priority boost — all in
+      place, all correct, all irrelevant next to the kernel. What ships from the hunt: the
+      third-design drain in `nn/moe.rs` (per-executor readback INSIDE the kernel-gap catch — the
+      panic surfaces at the read, so the old catch around the compute could never see it; plain-f32
+      accumulate on the worker; bytes built on the caller's captured device with the readback's
+      dtype), `mapped-wait-probe` + the timeline trace as permanent instruments, and a corrected
+      account in the drain's design doc. The radial-lookahead alternative (start layer L+1 on the
+      known prefix during L's drain; exact for the parallel component under RMSNorm's radial split)
+      was built flag-gated in verify mode and retired on its own kill criterion: acceptance 0% at
+      1e-2, worst rel err 0.71, ||b_perp||/||a|| 0.17-0.75 against a ~0.05 viability bar. Interim
+      lever worth a planner experiment: clusters on the HOST are 2.3x cheaper than on the dGPU at
+      m=1, so shifting remote clusters host-ward wins latency wherever host memory allows (Q4-on-host
+      would clear the F16 budget wall); the real fix stays (1) in the ranked list above.
 - [ ] **Do NOT make the clustered path universal until a fits-on-one-device fast path exists.**
       *(2026-08-24)* Partitioning earns its keep only when a model must span devices. Measured, the
       split costs **2.4x** in dispatch (32 cluster matmuls 4.13 ms against 1.68 ms fused), so imposing it
