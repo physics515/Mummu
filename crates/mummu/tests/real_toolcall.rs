@@ -8,7 +8,6 @@
 
 use std::path::PathBuf;
 
-use mummu::backend::Gpu;
 use mummu::chat::{ChatMl, ToolSpec, Turn, parse_tool_calls};
 use mummu::models::CausalLm;
 use mummu::models::qwen2;
@@ -19,9 +18,9 @@ fn qwen2_dir() -> Option<PathBuf> {
     dir.is_dir().then_some(dir)
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "needs multi-GB local weights (MUMMU_QWEN2_DIR) + the reference GPU"]
-fn qwen2_emits_a_parseable_tool_call() {
+async fn qwen2_emits_a_parseable_tool_call() {
     let Some(dir) = qwen2_dir() else {
         panic!("set MUMMU_QWEN2_DIR to a dir with config.json/tokenizer.json/model.safetensors");
     };
@@ -49,10 +48,11 @@ fn qwen2_emits_a_parseable_tool_call() {
         .get_ids()
         .to_vec();
 
-    let device = burn::tensor::Device::<Gpu>::default();
-    let loaded = qwen2::load_from_dir::<Gpu>(&dir, &device).expect("weights load checked");
+    let device = mummu::backend::gpu_device();
+    let loaded = qwen2::load_from_dir(&dir, &device).expect("weights load checked");
     let ids = loaded
         .greedy_generate(&prompt, 64, &device)
+        .await
         .expect("greedy decode");
     let text = tok.decode(&ids, false).expect("decode");
     eprintln!("[real_toolcall] model emitted: {text:?}");

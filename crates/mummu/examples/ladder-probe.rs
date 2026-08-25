@@ -35,14 +35,22 @@ fn main() {
         .expect("a 2-D weight");
     let [k, n] = [entry.shape[0], entry.shape[1]];
     let params = k * n;
-    println!("{} [{k}, {n}] = {:.1} M params\n", entry.name, params as f64 / 1e6);
+    println!(
+        "{} [{k}, {n}] = {:.1} M params\n",
+        entry.name,
+        params as f64 / 1e6
+    );
 
     let xs: Vec<f32> = (0..k).map(|i| ((i % 13) as f32 - 6.0) / 6.0).collect();
     let want = {
         let f32s = pack.read_f32(entry).expect("read f32");
         let x = Tensor::<2>::from_data(TensorData::new(xs.clone(), [1, k]), &cpu);
         let w = Tensor::<2>::from_data(TensorData::new(f32s, [k, n]), &cpu);
-        x.matmul(w).into_data().convert::<f32>().to_vec::<f32>().unwrap()
+        x.matmul(w)
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .unwrap()
     };
     let scale = want.iter().map(|v| v.abs()).fold(1e-6, f32::max);
 
@@ -58,17 +66,24 @@ fn main() {
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                     let x = Tensor::<2>::from_data(
                         TensorData::new(xs, [1, k]),
-                        (&gpu, backend::float_dtype()),
+                        (&gpu, backend::float_dtype(&gpu)),
                     );
-                    x.matmul(w).into_data().convert::<f32>().to_vec::<f32>().ok()
+                    x.matmul(w)
+                        .into_data()
+                        .convert::<f32>()
+                        .to_vec::<f32>()
+                        .ok()
                 }))
                 .ok()
                 .flatten()
                 {
                     None => "PANIC".to_string(),
                     Some(g) => {
-                        let worst =
-                            g.iter().zip(&want).map(|(a, b)| (a - b).abs() / scale).fold(0.0f32, f32::max);
+                        let worst = g
+                            .iter()
+                            .zip(&want)
+                            .map(|(a, b)| (a - b).abs() / scale)
+                            .fold(0.0f32, f32::max);
                         format!("rel {worst:.4}")
                     }
                 }
@@ -78,7 +93,10 @@ fn main() {
         // "16x smaller" claim for Q2 is a third off.
         // f16 carries no block scales; the quantized rungs do.
         let bytes = params * bits / 8 + if bits >= 16 { 0 } else { (params / 32) * 4 };
-        println!("  {how:<28} {verdict:<14} resident {:>6.1} MiB", bytes as f64 / (1 << 20) as f64);
+        println!(
+            "  {how:<28} {verdict:<14} resident {:>6.1} MiB",
+            bytes as f64 / (1 << 20) as f64
+        );
     };
 
     for precision in [Precision::F16, Precision::Q8, Precision::Q4] {

@@ -14,7 +14,6 @@
 
 use std::path::PathBuf;
 
-use mummu::backend::Cpu;
 use mummu::gguf::{GgufFile, GgufValue};
 use mummu::models::CausalLm;
 use mummu::models::olmoe;
@@ -86,10 +85,10 @@ fn olmoe_gguf_tokenizer_matches_the_hf_tokenizer() {
 /// The end-to-end proof: the ONE .gguf file loads (checked, every tensor
 /// mapped) and greedy-decodes a correct answer through the MoE stack on the
 /// CPU backend.
-#[test]
+#[tokio::test]
 #[ignore = "needs network (MUMMU_HUB_DEST; ~4.2 GB), ~30 GB free COMMIT and ~28 GB \
             of scratch disk beside the gguf (CPU backend)"]
-fn olmoe_gguf_loads_and_decodes_on_cpu() {
+async fn olmoe_gguf_loads_and_decodes_on_cpu() {
     let path = fetch_olmoe();
     let f = GgufFile::open(&path).expect("valid GGUF");
     assert_eq!(f.architecture(), Some("olmoe"), "wrong architecture");
@@ -120,9 +119,9 @@ fn olmoe_gguf_loads_and_decodes_on_cpu() {
         .to_vec();
     assert!(prompt.len() >= 8, "rendered prompt suspiciously short");
 
-    let device = burn::tensor::Device::<Cpu>::default();
+    let device = mummu::backend::cpu_device();
     let start = std::time::Instant::now();
-    let loaded = olmoe::load_from_gguf::<Cpu>(&path, &device).expect("checked load");
+    let loaded = olmoe::load_from_gguf(&path, &device).expect("checked load");
     eprintln!(
         "[real_olmoe] loaded {} layers x {} experts in {:.1}s",
         loaded.config.num_hidden_layers,
@@ -133,12 +132,14 @@ fn olmoe_gguf_loads_and_decodes_on_cpu() {
     // Liveness first: finite, vocab-wide, non-degenerate logits.
     let smoke = loaded
         .sanity_check(&prompt, loaded.config.vocab_size, &device)
+        .await
         .expect("sanity smoke");
     eprintln!("[real_olmoe] sanity: {smoke:?}");
 
     let start = std::time::Instant::now();
     let ids = loaded
         .greedy_generate(&prompt, 24, &device)
+        .await
         .expect("greedy decode");
     let secs = start.elapsed().as_secs_f64();
     assert!(!ids.is_empty(), "decode produced no tokens before EOS");

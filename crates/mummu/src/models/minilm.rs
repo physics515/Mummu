@@ -157,10 +157,7 @@ const KEY_REMAPS: &[(&str, &str)] = &[
 /// RmsNorm in the decoder models, where the rename is manual — the asymmetry
 /// is intentional; `PytorchStore` applies that adapter internally).
 /// `pooler.*` stays unused (masked-mean pooling instead).
-pub fn load_from_dir(
-    dir: &Path,
-    device: &Device,
-) -> Result<LoadedMiniLm, ImportError> {
+pub fn load_from_dir(dir: &Path, device: &Device) -> Result<LoadedMiniLm, ImportError> {
     let cfg_path = required_file(dir, "config.json")?;
     let cfg_bytes = std::fs::read(&cfg_path).map_err(|e| ImportError::Parse {
         file: cfg_path.clone(),
@@ -172,10 +169,10 @@ pub fn load_from_dir(
     })?;
 
     let mut model = build(&config, device);
-    // Type-level float dtype (`f32`) — a probe tensor would follow
-    // the per-DEVICE default policy, which another backend alias sharing the
-    // device (Gpu vs GpuF16) may have flipped in this process.
-    let target_float = crate::backend::float_dtype();
+    // The float dtype comes from the DEVICE — burn 0.22 keeps the element
+    // type there as a runtime setting, not on a backend type. Creation sites
+    // still name it explicitly rather than riding the unspecified default.
+    let target_float = crate::backend::float_dtype(device);
     match weights_file(dir)? {
         WeightsFile::Safetensors(weights) => {
             let mut store = SafetensorsStore::from_file(weights.clone())
@@ -200,11 +197,7 @@ pub fn load_from_dir(
     Ok(LoadedMiniLm { model, config })
 }
 
-fn embeddings_forward(
-    e: &Embeddings,
-    ids: &Tensor<2, Int>,
-    device: &Device,
-) -> Tensor<3> {
+fn embeddings_forward(e: &Embeddings, ids: &Tensor<2, Int>, device: &Device) -> Tensor<3> {
     let [b, n] = ids.dims();
     let w = e.word_embeddings.forward(ids.clone()); // [b, n, h]
     let pos = Tensor::<1, Int>::arange(0..n as i64, device).reshape([1, n]);
@@ -281,12 +274,12 @@ impl LoadedMiniLm {
         // Dtypes pinned to the backend TYPE, never the per-device policy.
         let id_t = Tensor::<1, Int>::from_data(
             TensorData::new(ids32, [n]),
-            (device, crate::backend::int_dtype()),
+            (device, crate::backend::int_dtype(device)),
         )
         .reshape([1, n]);
         let mask_t = Tensor::<1>::from_data(
             TensorData::new(mask.to_vec(), [n]),
-            (device, crate::backend::float_dtype()),
+            (device, crate::backend::float_dtype(device)),
         )
         .reshape([1, n]);
 
@@ -323,8 +316,6 @@ impl LoadedMiniLm {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    type Dev = burn::tensor::Device;
 
     fn toy_config() -> BertConfig {
         BertConfig {

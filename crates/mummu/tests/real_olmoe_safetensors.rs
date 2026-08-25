@@ -21,12 +21,11 @@
 
 use std::path::PathBuf;
 
-use mummu::backend::Cpu;
 use mummu::models::{CausalLm, olmoe};
 use mummu::registry;
 use mummu::safetensors::{SafetensorsHeader, checkpoint_shards};
 
-type Dev = burn::tensor::Device<Cpu>;
+type Dev = burn::tensor::Device;
 
 const SPEC: &str = "olmoe-1b-7b-0125-instruct";
 
@@ -53,9 +52,9 @@ fn checkpoint_dir() -> Option<PathBuf> {
 }
 
 /// The whole path: sharded fetch -> fuse -> checked load -> real decode.
-#[test]
+#[tokio::test]
 #[ignore = "needs 13.8 GB of weights + ~28 GB RAM (MUMMU_HUB_DEST)"]
-fn olmoe_safetensors_fuses_and_decodes_on_cpu() {
+async fn olmoe_safetensors_fuses_and_decodes_on_cpu() {
     let Some(dir) = checkpoint_dir() else {
         eprintln!("set MUMMU_HUB_DEST to run this test");
         return;
@@ -69,7 +68,7 @@ fn olmoe_safetensors_fuses_and_decodes_on_cpu() {
 
     let device = Dev::default();
     let started = std::time::Instant::now();
-    let loaded = olmoe::load_from_dir::<Cpu>(&dir, &device).expect("fused safetensors load");
+    let loaded = olmoe::load_from_dir(&dir, &device).expect("fused safetensors load");
     println!(
         "loaded {} layers x {} experts in {:.1} s",
         loaded.config.num_hidden_layers,
@@ -92,11 +91,13 @@ fn olmoe_safetensors_fuses_and_decodes_on_cpu() {
     let probe: Vec<u32> = vec![100, 200, 300, 400];
     let smoke = loaded
         .sanity_check(&probe, loaded.config.vocab_size, &device)
+        .await
         .expect("a fused load computes a live distribution");
     println!("sanity: top {} spread {:.1}", smoke.top_id, smoke.spread);
 
     let out = loaded
         .greedy_generate(&probe, 8, &device)
+        .await
         .expect("greedy decode runs");
     println!("decoded {} tokens: {out:?}", out.len());
     assert!(!out.is_empty(), "the model emits tokens");
@@ -142,7 +143,7 @@ fn fused_expert_slot_is_bit_exact_against_the_raw_shard_bytes() {
 
     // What the loader produced, read back out of the loaded module.
     let device = Dev::default();
-    let loaded = olmoe::load_from_dir::<Cpu>(&dir, &device).expect("fused safetensors load");
+    let loaded = olmoe::load_from_dir(&dir, &device).expect("fused safetensors load");
     let bank = loaded.model.layers[LAYER].mlp.experts.gate.val();
     let dims = bank.dims();
     println!("fused bank dims {dims:?}");

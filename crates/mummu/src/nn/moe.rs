@@ -13,7 +13,7 @@
 
 use burn::module::{Module, Param};
 use burn::nn::{Linear, LinearConfig};
-use burn::tensor::{Device, DType, Distribution, Int, Tensor, TensorData, activation};
+use burn::tensor::{DType, Device, Distribution, Int, Tensor, TensorData, activation};
 
 /// The expert bank: `num_experts` SwiGLU MLPs as three fused params in
 /// `[experts, out, in]` layout (the row-major twin of ggml's
@@ -131,8 +131,7 @@ impl SparseMoe {
         } else {
             vals
         };
-        let classes =
-            Tensor::<1, Int>::arange(0..e as i64, &xt.device()).reshape([1, 1, e as i32]);
+        let classes = Tensor::<1, Int>::arange(0..e as i64, &xt.device()).reshape([1, 1, e as i32]);
         let hit = idx
             .reshape([bt, top_k, 1])
             .equal(classes.expand([bt, top_k, e])); // [bt, k, e]
@@ -277,27 +276,22 @@ impl SparseMoePerExpert {
             let weights = weights.clone();
             let rows_t = Tensor::<1, Int>::from_data(
                 burn::tensor::TensorData::new(rows, [n]),
-                (&device, crate::backend::int_dtype()),
+                (&device, crate::backend::int_dtype(&device)),
             );
             let x_e = xt.clone().select(0, rows_t.clone()); // [n, h]
             let w = &self.experts[expert];
-            let acts = activation::silu(x_e.clone().matmul(w.gate.val()))
-                .mul(x_e.matmul(w.up.val()));
+            let acts =
+                activation::silu(x_e.clone().matmul(w.gate.val())).mul(x_e.matmul(w.up.val()));
             let y = acts.matmul(w.down.val()); // [n, h]
             let scale = Tensor::<1>::from_data(
                 burn::tensor::TensorData::new(weights, [n]),
-                (&device, crate::backend::float_dtype()),
+                (&device, crate::backend::float_dtype(&device)),
             )
             .reshape([n, 1])
             .cast(ambient);
             // select_assign accumulates (scatter-add) — a token served by
             // several experts sums their weighted outputs.
-            out = out.select_assign(
-                0,
-                rows_t,
-                y.mul(scale),
-                burn::tensor::IndexingUpdateOp::Add,
-            );
+            out = out.select_assign(0, rows_t, y.mul(scale), burn::tensor::IndexingUpdateOp::Add);
         }
         out
     }
@@ -382,7 +376,7 @@ pub trait ExpertExec: Send + Sync {
         let out = self.run(&host, rows, hidden);
         Tensor::<2>::from_data(
             burn::tensor::TensorData::new(out, [rows, hidden]),
-            (&device, crate::backend::float_dtype()),
+            (&device, crate::backend::float_dtype(&device)),
         )
     }
     /// Per-row energy of this expert's gate activations, `Σ silu(x·g)²` —
@@ -424,7 +418,7 @@ where
         debug_assert_eq!(x.len(), rows * hidden);
         let xt = Tensor::<2>::from_data(
             burn::tensor::TensorData::new(x.to_vec(), [rows, hidden]),
-            (&self.device, crate::backend::float_dtype()),
+            (&self.device, crate::backend::float_dtype(&self.device)),
         );
         let w = &self.weights;
         let acts = activation::silu(xt.clone().matmul(compute_weight(&w.gate)))
@@ -483,7 +477,7 @@ where
     fn gate_energy(&self, x: &[f32], rows: usize, hidden: usize) -> Vec<f32> {
         let xt = Tensor::<2>::from_data(
             burn::tensor::TensorData::new(x.to_vec(), [rows, hidden]),
-            (&self.device, crate::backend::float_dtype()),
+            (&self.device, crate::backend::float_dtype(&self.device)),
         );
         activation::silu(xt.matmul(compute_weight(&self.weights.gate)))
             .powf_scalar(2.0)
@@ -578,21 +572,32 @@ fn native_qmatmul_ok(device: &Device, dtype: DType) -> bool {
     let ok = std::panic::catch_unwind(|| {
         let x = Tensor::<2>::from_data(
             burn::tensor::TensorData::new(vec![0.5f32; k], [1, k]),
-            (device, crate::backend::float_dtype()),
+            (device, crate::backend::float_dtype(device)),
         );
         let w = Tensor::<2>::from_data(
             burn::tensor::TensorData::new(
-                (0..k * n).map(|i| ((i % 17) as f32 - 8.0) * 0.1).collect::<Vec<f32>>(),
+                (0..k * n)
+                    .map(|i| ((i % 17) as f32 - 8.0) * 0.1)
+                    .collect::<Vec<f32>>(),
                 [k, n],
             ),
-            (device, crate::backend::float_dtype()),
+            (device, crate::backend::float_dtype(device)),
         );
         let DType::QFloat(scheme) = dtype else {
             return false;
         };
         let qw = w.clone().quantize_dynamic(&scheme);
-        let native = x.clone().matmul(qw.clone()).into_data().convert::<f32>().to_vec::<f32>();
-        let deq = x.matmul(qw.dequantize()).into_data().convert::<f32>().to_vec::<f32>();
+        let native = x
+            .clone()
+            .matmul(qw.clone())
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>();
+        let deq = x
+            .matmul(qw.dequantize())
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>();
         match (native, deq) {
             (Ok(a), Ok(b)) => {
                 // Agreement, not just absence of a panic: a native path that
@@ -644,7 +649,12 @@ pub struct StagedExpert {
 impl StagedExpert {
     /// Hold `weights` in host RAM, unstaged.
     #[must_use]
-    pub fn new(weights: ExpertWeights, host_device: Device, tier: crate::tier::Tier, bytes: u64) -> Self {
+    pub fn new(
+        weights: ExpertWeights,
+        host_device: Device,
+        tier: crate::tier::Tier,
+        bytes: u64,
+    ) -> Self {
         Self {
             host: weights,
             host_device,
@@ -718,7 +728,7 @@ impl ExpertExec for StagedExpert {
             .map_or_else(|| self.host_device.clone(), |(d, _)| d.clone());
         let xt = Tensor::<2>::from_data(
             burn::tensor::TensorData::new(x.to_vec(), [rows, hidden]),
-            (&device, crate::backend::float_dtype()),
+            (&device, crate::backend::float_dtype(&device)),
         );
         self.run_tensor(xt)
             .into_data()
@@ -763,7 +773,11 @@ impl ExpertPool {
         let counters = || -> Vec<Vec<std::sync::atomic::AtomicU64>> {
             slots
                 .iter()
-                .map(|l| (0..l.len()).map(|_| std::sync::atomic::AtomicU64::new(0)).collect())
+                .map(|l| {
+                    (0..l.len())
+                        .map(|_| std::sync::atomic::AtomicU64::new(0))
+                        .collect()
+                })
                 .collect()
         };
         let hits = counters();
@@ -775,7 +789,10 @@ impl ExpertPool {
                 .collect(),
             hits,
             energy,
-            dense_rows: [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)],
+            dense_rows: [
+                std::sync::atomic::AtomicU64::new(0),
+                std::sync::atomic::AtomicU64::new(0),
+            ],
         }
     }
 
@@ -784,7 +801,10 @@ impl ExpertPool {
     pub fn take_energy(&self) -> Vec<f64> {
         self.energy
             .iter()
-            .flat_map(|l| l.iter().map(|e| e.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e3))
+            .flat_map(|l| {
+                l.iter()
+                    .map(|e| e.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e3)
+            })
             .collect()
     }
 
@@ -853,7 +873,11 @@ impl ExpertPool {
     /// layer-major (`layer * experts_per_layer + index`), matching the
     /// scheduler's numbering.
     #[must_use]
-    pub fn unit(&self, layer: usize, unit: crate::workingset::UnitId) -> Option<std::sync::Arc<dyn ExpertExec>> {
+    pub fn unit(
+        &self,
+        layer: usize,
+        unit: crate::workingset::UnitId,
+    ) -> Option<std::sync::Arc<dyn ExpertExec>> {
         let per = self.experts_per_layer();
         let (l, i) = unit
             .checked_div(per)
@@ -930,13 +954,15 @@ impl ExpertPool {
         }
         used
     }
-
 }
 
 /// Wall-clock in µs since first use, for the layer timeline trace.
 pub fn trace_us() -> u128 {
     static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_micros()
+    EPOCH
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_micros()
 }
 
 /// Which layer (if any) the timeline trace follows (`MUMMU_TRACE_LAYER`).
@@ -982,10 +1008,7 @@ fn boost_worker_priority() {
 /// compute alone can never see the width-dependent kernel-gap panic
 /// (`num_quants 4`/`8`) this fallback exists for. Any second panic — a
 /// genuine failure, OOM included — propagates loudly as ever.
-fn run_readback_with_fallback(
-    exec: &std::sync::Arc<dyn ExpertExec>,
-    xt: &Tensor<2>,
-) -> TensorData {
+fn run_readback_with_fallback(exec: &std::sync::Arc<dyn ExpertExec>, xt: &Tensor<2>) -> TensorData {
     let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         exec.run_tensor_resident(xt.clone()).into_data()
     }));
@@ -1012,13 +1035,9 @@ fn run_readback_with_fallback(
 /// The catch is sound here for the same reason `native_qmatmul_ok` could
 /// probe this panic: it fires at kernel expand on the calling thread, before
 /// submission, and the device server measurably survives it.
-fn run_with_native_fallback(
-    exec: &std::sync::Arc<dyn ExpertExec>,
-    xt: &Tensor<2>,
-) -> Tensor<2> {
-    let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        exec.run_tensor(xt.clone())
-    }));
+fn run_with_native_fallback(exec: &std::sync::Arc<dyn ExpertExec>, xt: &Tensor<2>) -> Tensor<2> {
+    let attempt =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| exec.run_tensor(xt.clone())));
     match attempt {
         Ok(y) => y,
         Err(_) => {
@@ -1223,7 +1242,8 @@ impl ExpertPool {
         }
         let [bt, h] = xt.dims();
         let device = xt.device();
-        let execs: Vec<std::sync::Arc<dyn ExpertExec>> = (0..n).map(|e| self.get(layer, e)).collect();
+        let execs: Vec<std::sync::Arc<dyn ExpertExec>> =
+            (0..n).map(|e| self.get(layer, e)).collect();
 
         // Exact mode (no skipping): every cluster runs on every row, so there
         // is nothing to gather — sum the groups as tensors and never touch
@@ -1338,8 +1358,10 @@ impl ExpertPool {
                 // forward would exhaust VRAM creating them (CUDA_ERROR_OUT_OF_MEMORY
                 // "Can create a new stream"). The calling thread already owns a
                 // stream; reuse it.
-                let energies: Vec<Vec<f32>> =
-                    execs.iter().map(|exec| exec.gate_energy(&host, bt, h)).collect();
+                let energies: Vec<Vec<f32>> = execs
+                    .iter()
+                    .map(|exec| exec.gate_energy(&host, bt, h))
+                    .collect();
                 let mut total: Vec<f32> = local_energy.to_vec();
                 total.resize(bt, 0.0);
                 for e in &energies {
@@ -1386,14 +1408,18 @@ impl ExpertPool {
                 }
             }
             // Energy-weighted "hits": what the planner treats as hotness.
-            self.hits[layer][e].fetch_add((energy * 1e3) as u64 + rows.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            self.energy[layer][e].fetch_add((energy * 1e3) as u64, std::sync::atomic::Ordering::Relaxed);
+            self.hits[layer][e].fetch_add(
+                (energy * 1e3) as u64 + rows.len() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            self.energy[layer][e]
+                .fetch_add((energy * 1e3) as u64, std::sync::atomic::Ordering::Relaxed);
             self.dense_rows[0].fetch_add(rows.len() as u64, std::sync::atomic::Ordering::Relaxed);
             self.dense_rows[1].fetch_add(bt as u64, std::sync::atomic::Ordering::Relaxed);
         }
         Some(Tensor::<2>::from_data(
             burn::tensor::TensorData::new(out, [bt, h]),
-            (&device, crate::backend::float_dtype()),
+            (&device, crate::backend::float_dtype(&device)),
         ))
     }
 
@@ -1402,7 +1428,10 @@ impl ExpertPool {
     pub fn take_hits(&self) -> Vec<u64> {
         self.hits
             .iter()
-            .flat_map(|l| l.iter().map(|h| h.swap(0, std::sync::atomic::Ordering::Relaxed)))
+            .flat_map(|l| {
+                l.iter()
+                    .map(|h| h.swap(0, std::sync::atomic::Ordering::Relaxed))
+            })
             .collect()
     }
 
@@ -1462,7 +1491,7 @@ impl ExpertPool {
         }
         Tensor::<2>::from_data(
             burn::tensor::TensorData::new(out, [bt, h]),
-            (&device, crate::backend::float_dtype()),
+            (&device, crate::backend::float_dtype(&device)),
         )
     }
 }
@@ -1487,10 +1516,7 @@ mod tests {
             let data: Vec<f32> = (0..n)
                 .map(|i| ((i as f32) * 0.37 + seed).sin() * 0.5)
                 .collect();
-            Param::from_tensor(Tensor::<3>::from_data(
-                TensorData::new(data, dims),
-                device,
-            ))
+            Param::from_tensor(Tensor::<3>::from_data(TensorData::new(data, dims), device))
         };
         let router_data: Vec<f32> = (0..HIDDEN * EXPERTS)
             .map(|i| ((i as f32) * 0.61 + 1.0).cos() * 0.5)
@@ -1576,7 +1602,10 @@ mod tests {
         let split = |e: usize| -> ExpertWeights {
             let slice = |bank: &Param<Tensor<3>>| -> Tensor<2> {
                 let [_, out, inp] = bank.val().dims();
-                bank.val().narrow(0, e, 1).reshape([out, inp]).swap_dims(0, 1)
+                bank.val()
+                    .narrow(0, e, 1)
+                    .reshape([out, inp])
+                    .swap_dims(0, 1)
             };
             ExpertWeights {
                 gate: Param::from_tensor(slice(&dense.experts.gate)),
@@ -1584,25 +1613,39 @@ mod tests {
                 down: Param::from_tensor(slice(&dense.experts.down)),
             }
         };
-        let tier = Tier { device: 0, precision: Precision::F32 };
+        let tier = Tier {
+            device: 0,
+            precision: Precision::F32,
+        };
         const UNIT_BYTES: u64 = 1_000;
 
         // One layer holding every expert, each staged-capable.
         let row: Vec<Arc<dyn ExpertExec>> = (0..EXPERTS)
             .map(|e| {
-                Arc::new(StagedExpert::new(split(e), device.clone(), tier, UNIT_BYTES))
-                    as Arc<dyn ExpertExec>
+                Arc::new(StagedExpert::new(
+                    split(e),
+                    device.clone(),
+                    tier,
+                    UNIT_BYTES,
+                )) as Arc<dyn ExpertExec>
             })
             .collect();
         let pool = ExpertPool::new(vec![row]);
 
         // Nothing staged yet: the working set costs no device memory.
-        assert_eq!(pool.staged_bytes(), 0, "an unstaged pool holds no device bytes");
+        assert_eq!(
+            pool.staged_bytes(),
+            0,
+            "an unstaged pool holds no device bytes"
+        );
 
         // A schedule over two passes of this layer, with room for half the
         // experts — so it must both stage and evict.
         let demands: Vec<LayerDemand> = (0..2)
-            .map(|l| LayerDemand { layer: l, units: (0..EXPERTS).collect() })
+            .map(|l| LayerDemand {
+                layer: l,
+                units: (0..EXPERTS).collect(),
+            })
             .collect();
         let budget = Budget {
             device_bytes: UNIT_BYTES * (EXPERTS as u64 / 2),
@@ -1629,14 +1672,21 @@ mod tests {
             experts: (0..EXPERTS).map(split).collect(),
         };
         let x = input(3, 5.0, &device);
-        let want = local.forward(x.clone(), TOP_K, true).into_data().to_vec::<f32>().unwrap();
+        let want = local
+            .forward(x.clone(), TOP_K, true)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
         let got = local
             .forward_pooled(x, TOP_K, true, &pool, 0)
             .into_data()
             .to_vec::<f32>()
             .unwrap();
         for (i, (a, b)) in want.iter().zip(&got).enumerate() {
-            assert!((a - b).abs() < 1e-5, "elem {i}: {a} vs {b} (staging changed the answer)");
+            assert!(
+                (a - b).abs() < 1e-5,
+                "elem {i}: {a} vs {b} (staging changed the answer)"
+            );
         }
     }
 
@@ -1651,7 +1701,10 @@ mod tests {
         let split = |e: usize| -> ExpertWeights {
             let slice = |bank: &Param<Tensor<3>>| -> Tensor<2> {
                 let [_, out, inp] = bank.val().dims();
-                bank.val().narrow(0, e, 1).reshape([out, inp]).swap_dims(0, 1)
+                bank.val()
+                    .narrow(0, e, 1)
+                    .reshape([out, inp])
+                    .swap_dims(0, 1)
             };
             ExpertWeights {
                 gate: Param::from_tensor(slice(&dense.experts.gate)),
@@ -1659,28 +1712,65 @@ mod tests {
                 down: Param::from_tensor(slice(&dense.experts.down)),
             }
         };
-        let tier = Tier { device: 0, precision: Precision::F32 };
+        let tier = Tier {
+            device: 0,
+            precision: Precision::F32,
+        };
         let staged = StagedExpert::new(split(0), device.clone(), tier, 0);
         // A pinned reference on the same device, for comparison.
-        let pinned = DeviceExpert { weights: split(0), device: device.clone(), tier, bytes: 0, native_ok: std::sync::atomic::AtomicBool::new(true) };
+        let pinned = DeviceExpert {
+            weights: split(0),
+            device: device.clone(),
+            tier,
+            bytes: 0,
+            native_ok: std::sync::atomic::AtomicBool::new(true),
+        };
 
         let x = Tensor::<2>::from_data(
-            TensorData::new((0..HIDDEN).map(|i| (i as f32) * 0.25 - 0.5).collect::<Vec<f32>>(), [1, HIDDEN]),
-            (&device, crate::backend::float_dtype()),
+            TensorData::new(
+                (0..HIDDEN)
+                    .map(|i| (i as f32) * 0.25 - 0.5)
+                    .collect::<Vec<f32>>(),
+                [1, HIDDEN],
+            ),
+            (&device, crate::backend::float_dtype(&device)),
         );
-        let want = pinned.run_tensor(x.clone()).into_data().to_vec::<f32>().unwrap();
+        let want = pinned
+            .run_tensor(x.clone())
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
 
         // Unstaged (the overflow path: computes on the host).
-        assert!(!staged.is_staged(), "a fresh StagedExpert holds no device copy");
-        assert_eq!(staged.resident_bytes(), 0, "unstaged costs no device memory");
-        let overflow = staged.run_tensor(x.clone()).into_data().to_vec::<f32>().unwrap();
+        assert!(
+            !staged.is_staged(),
+            "a fresh StagedExpert holds no device copy"
+        );
+        assert_eq!(
+            staged.resident_bytes(),
+            0,
+            "unstaged costs no device memory"
+        );
+        let overflow = staged
+            .run_tensor(x.clone())
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
 
         // Staged, then evicted, then staged again.
         staged.stage(&device);
         assert!(staged.is_staged());
-        let hot = staged.run_tensor(x.clone()).into_data().to_vec::<f32>().unwrap();
+        let hot = staged
+            .run_tensor(x.clone())
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
         staged.stage(&device); // idempotent: no second transfer, same answer
-        let again = staged.run_tensor(x.clone()).into_data().to_vec::<f32>().unwrap();
+        let again = staged
+            .run_tensor(x.clone())
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
         staged.evict();
         assert!(!staged.is_staged(), "eviction drops the device copy");
         let after_evict = staged.run_tensor(x).into_data().to_vec::<f32>().unwrap();
@@ -1716,7 +1806,10 @@ mod tests {
         let split = |e: usize| -> ExpertWeights {
             let slice = |bank: &Param<Tensor<3>>| -> Tensor<2> {
                 let [_, out, inp] = bank.val().dims();
-                bank.val().narrow(0, e, 1).reshape([out, inp]).swap_dims(0, 1)
+                bank.val()
+                    .narrow(0, e, 1)
+                    .reshape([out, inp])
+                    .swap_dims(0, 1)
             };
             ExpertWeights {
                 gate: Param::from_tensor(slice(&dense.experts.gate)),
@@ -1739,20 +1832,30 @@ mod tests {
                 bytes: 0,
             })
         };
-        let f32_tier = Tier { device: 0, precision: Precision::F32 };
+        let f32_tier = Tier {
+            device: 0,
+            precision: Precision::F32,
+        };
         let pool = ExpertPool::new(vec![(0..EXPERTS).map(|e| exec(e, f32_tier)).collect()]);
         assert_eq!((pool.num_layers(), pool.experts_per_layer()), (1, EXPERTS));
 
         for (t, seed, norm) in [(1usize, 2.0f32, false), (5, 7.0, true)] {
             let x = input(t, seed, &device);
-            let a = local.forward(x.clone(), TOP_K, norm).into_data().to_vec::<f32>().unwrap();
+            let a = local
+                .forward(x.clone(), TOP_K, norm)
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap();
             let b = local
                 .forward_pooled(x, TOP_K, norm, &pool, 0)
                 .into_data()
                 .to_vec::<f32>()
                 .unwrap();
             for (i, (da, db)) in a.iter().zip(&b).enumerate() {
-                assert!((da - db).abs() < 1e-5, "t={t} elem {i}: local {da} vs pooled {db}");
+                assert!(
+                    (da - db).abs() < 1e-5,
+                    "t={t} elem {i}: local {da} vs pooled {db}"
+                );
             }
         }
         // Hits were counted: t=1 and t=5 with top-2 → 12 routed rows total.
@@ -1762,12 +1865,19 @@ mod tests {
 
         // Hot-swap expert 1 onto a different tier (same weights): output
         // unchanged, tier bookkeeping updated, old executor handed back.
-        let q_tier = Tier { device: 1, precision: Precision::Q8 };
+        let q_tier = Tier {
+            device: 1,
+            precision: Precision::Q8,
+        };
         let old = pool.swap(0, 1, exec(1, q_tier));
         assert_eq!(old.tier(), f32_tier);
         assert_eq!(pool.tiers()[1], q_tier);
         let x = input(5, 7.0, &device);
-        let a = local.forward(x.clone(), TOP_K, true).into_data().to_vec::<f32>().unwrap();
+        let a = local
+            .forward(x.clone(), TOP_K, true)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
         let b = local
             .forward_pooled(x, TOP_K, true, &pool, 0)
             .into_data()
@@ -1797,16 +1907,22 @@ mod tests {
 
         // Float param: returned as-is (still float, never re-quantized).
         let out_f32 = compute_weight(&Param::from_tensor(t.clone()));
-        assert!(!matches!(out_f32.dtype(), DType::QFloat(_)), "float weight must stay float");
+        assert!(
+            !matches!(out_f32.dtype(), DType::QFloat(_)),
+            "float weight must stay float"
+        );
 
         // Quantized param: whatever comes back must MULTIPLY correctly.
         let q = quantize_weight(QuantPolicy::Q8, t.clone());
-        assert!(matches!(q.dtype(), DType::QFloat(_)), "weight should be quantized");
+        assert!(
+            matches!(q.dtype(), DType::QFloat(_)),
+            "weight should be quantized"
+        );
         let ready = compute_weight(&Param::from_tensor(q));
 
         let x = Tensor::<2>::from_data(
             TensorData::new(vec![0.25f32; 32], [1, 32]),
-            (&device, crate::backend::float_dtype()),
+            (&device, crate::backend::float_dtype(&device)),
         );
         let want = x.clone().matmul(t).into_data().to_vec::<f32>().unwrap();
         let got = x.matmul(ready).into_data().to_vec::<f32>().unwrap();
@@ -1836,10 +1952,13 @@ mod tests {
         let vals: Vec<f32> = (0..64 * 64).map(|i| ((i as f32) * 0.03).sin()).collect();
         let t = Tensor::<2>::from_data(
             burn::tensor::TensorData::new(vals, [64, 64]),
-            (&device, crate::backend::float_dtype()),
+            (&device, crate::backend::float_dtype(&device)),
         );
         let q = crate::quant::quantize_weight(crate::quant::QuantPolicy::Q8, t);
-        assert!(matches!(q.dtype(), DType::QFloat(_)), "setup: weight quantized");
+        assert!(
+            matches!(q.dtype(), DType::QFloat(_)),
+            "setup: weight quantized"
+        );
         let ready = compute_weight(&Param::from_tensor(q));
         assert!(
             !matches!(ready.dtype(), DType::QFloat(_)),
@@ -1851,8 +1970,7 @@ mod tests {
         let data: Vec<f32> = (0..t * HIDDEN)
             .map(|i| ((i as f32 + seed) * 0.9).sin())
             .collect();
-        Tensor::<1>::from_data(TensorData::new(data, [t * HIDDEN]), device)
-            .reshape([1, t, HIDDEN])
+        Tensor::<1>::from_data(TensorData::new(data, [t * HIDDEN]), device).reshape([1, t, HIDDEN])
     }
 
     fn silu(x: f32) -> f32 {

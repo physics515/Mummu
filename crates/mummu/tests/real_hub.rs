@@ -7,7 +7,6 @@
 
 use std::path::PathBuf;
 
-use mummu::backend::Cpu;
 use mummu::hub;
 use mummu::models::minilm;
 use tokenizers::Tokenizer;
@@ -51,8 +50,8 @@ fn hub_download_then_load_then_embed() {
     }
 
     // Checked load + a real embedding: the downloaded artifacts are usable.
-    let device = burn::tensor::Device::<Cpu>::default();
-    let loaded = minilm::load_from_dir::<Cpu>(&dir, &device).expect("checked load");
+    let device = mummu::backend::cpu_device();
+    let loaded = minilm::load_from_dir(&dir, &device).expect("checked load");
     let tok = Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer loads");
     let enc = tok
         .encode("Downloads that verify themselves.", true)
@@ -202,9 +201,9 @@ fn hub_fetches_the_cpu_tier_qwen() {
 /// `lfm2` architecture the zoo already covers, so the catalog entry alone
 /// makes it installable — this proof fetches it, checked-loads it on the CPU
 /// backend, and greedy-decodes real text end-to-end.
-#[test]
+#[tokio::test]
 #[ignore = "needs network (MUMMU_HUB_DEST names the download dir; ~470 MB)"]
-fn hub_fetches_and_runs_lfm2_230m_on_cpu() {
+async fn hub_fetches_and_runs_lfm2_230m_on_cpu() {
     use mummu::models::CausalLm;
     let Some(dest) = std::env::var_os("MUMMU_HUB_DEST").map(PathBuf::from) else {
         panic!("set MUMMU_HUB_DEST to a scratch dir for the ~470 MB download");
@@ -218,8 +217,8 @@ fn hub_fetches_and_runs_lfm2_230m_on_cpu() {
         assert!(dir.join(f).is_file(), "{f} must exist after fetch");
     }
 
-    let device = burn::tensor::Device::<Cpu>::default();
-    let loaded = mummu::models::lfm2::load_from_dir::<Cpu>(&dir, &device).expect("checked load");
+    let device = mummu::backend::cpu_device();
+    let loaded = mummu::models::lfm2::load_from_dir(&dir, &device).expect("checked load");
     let tok = Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer loads");
     let raw = mummu::chat::ChatMl::lfm2().render(&[mummu::chat::Turn::user(
         "What is 2 + 2? Answer in one short sentence.",
@@ -231,6 +230,7 @@ fn hub_fetches_and_runs_lfm2_230m_on_cpu() {
         .to_vec();
     let out = loaded
         .greedy_generate(&ids, 16, &device)
+        .await
         .expect("greedy decode");
     let text = tok.decode(&out, true).expect("decode");
     eprintln!("[real_hub/230m] {} tokens: {text:?}", out.len());

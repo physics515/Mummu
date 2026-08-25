@@ -17,7 +17,6 @@
 use std::path::PathBuf;
 
 use burn::tensor::Tensor;
-use mummu::backend::Cpu;
 use mummu::models::CausalLm;
 use mummu::models::qwen35;
 use mummu::pack::{Pack, Precision};
@@ -28,15 +27,22 @@ fn gguf_path() -> Option<PathBuf> {
     p.is_file().then_some(p)
 }
 
-fn max_abs_diff(a: &Tensor<Cpu, 2>, b: &Tensor<Cpu, 2>) -> f32 {
+fn max_abs_diff(a: &Tensor<2>, b: &Tensor<2>) -> f32 {
     a.clone().sub(b.clone()).abs().max().into_scalar()
 }
 
-fn argmax(t: &Tensor<Cpu, 2>) -> u32 {
-    let v = t.clone().into_data().convert::<f32>().to_vec::<f32>().unwrap();
+fn argmax(t: &Tensor<2>) -> u32 {
+    let v = t
+        .clone()
+        .into_data()
+        .convert::<f32>()
+        .to_vec::<f32>()
+        .unwrap();
     v.iter()
         .enumerate()
-        .fold((0usize, f32::NEG_INFINITY), |m, (i, &x)| if x > m.1 { (i, x) } else { m })
+        .fold((0usize, f32::NEG_INFINITY), |m, (i, &x)| {
+            if x > m.1 { (i, x) } else { m }
+        })
         .0 as u32
 }
 
@@ -59,7 +65,7 @@ fn qwen35_pack_round_trips_every_level() {
         .expect("prompt encodes")
         .get_ids()
         .to_vec();
-    let device = burn::tensor::Device::<Cpu>::default();
+    let device = mummu::backend::cpu_device();
 
     // Import beside the fixture (reused across runs when already complete).
     let pack_dir = path.parent().unwrap().join("pack-gate");
@@ -87,51 +93,69 @@ fn qwen35_pack_round_trips_every_level() {
     let pack = Pack::open(&pack_dir).expect("pack opens");
     let sizes: Vec<(Precision, u64)> = Precision::ALL
         .iter()
-        .map(|&p| (p, std::fs::metadata(pack_dir.join(p.blob_name())).map_or(0, |m| m.len())))
+        .map(|&p| {
+            (
+                p,
+                std::fs::metadata(pack_dir.join(p.blob_name())).map_or(0, |m| m.len()),
+            )
+        })
         .collect();
     eprintln!("[pack-gate] blobs: {sizes:?}");
     assert_eq!(pack.manifest.precisions, Precision::ALL.to_vec());
     drop(pack);
 
-    let logits_of = |m: &qwen35::LoadedQwen35<Cpu>| {
+    let logits_of = |m: &qwen35::LoadedQwen35| {
         let mut cache = m.new_cache();
         m.forward(&prompt, 0, &mut cache, &device)
     };
 
     // 1. F32: the pack is a copy of the source.
     let ref_logits = {
-        let m = qwen35::load_from_gguf::<Cpu>(&path, &device).expect("gguf f32 load");
+        let m = qwen35::load_from_gguf(&path, &device).expect("gguf f32 load");
         logits_of(&m)
     };
     let ref_top = argmax(&ref_logits);
     let f32_logits = {
-        let m = qwen35::load_from_pack::<Cpu>(&pack_dir, &device, &|_| Precision::F32)
-            .expect("pack f32 load");
+        let m =
+            qwen35::load_from_pack(&pack_dir, &device, &|_| Precision::F32).expect("pack f32 load");
         logits_of(&m)
     };
     let d = max_abs_diff(&ref_logits, &f32_logits);
     eprintln!("[pack-gate] F32 pack vs GGUF f32: max |Δlogit| = {d:.3e}, top {ref_top}");
-    assert!(d <= 1e-3, "pack F32 must reproduce the GGUF f32 logits (Δ={d})");
+    assert!(
+        d <= 1e-3,
+        "pack F32 must reproduce the GGUF f32 logits (Δ={d})"
+    );
 
     // F16: every linear stored at half precision; must still pick the same token.
     let f16_logits = {
-        let m = qwen35::load_from_pack::<Cpu>(&pack_dir, &device, &|_| Precision::F16)
-            .expect("pack f16 load");
+        let m =
+            qwen35::load_from_pack(&pack_dir, &device, &|_| Precision::F16).expect("pack f16 load");
         logits_of(&m)
     };
     let d = max_abs_diff(&ref_logits, &f16_logits);
-    eprintln!("[pack-gate] F16 pack vs f32: max |Δlogit| = {d:.3e}, top {}", argmax(&f16_logits));
-    assert_eq!(argmax(&f16_logits), ref_top, "F16 pack changes the first token");
+    eprintln!(
+        "[pack-gate] F16 pack vs f32: max |Δlogit| = {d:.3e}, top {}",
+        argmax(&f16_logits)
+    );
+    assert_eq!(
+        argmax(&f16_logits),
+        ref_top,
+        "F16 pack changes the first token"
+    );
 
     // 2. Q8 / Q4: stored quantization ≡ streaming re-quantization.
-    for (precision, policy) in [(Precision::Q8, QuantPolicy::Q8), (Precision::Q4, QuantPolicy::Q4)] {
+    for (precision, policy) in [
+        (Precision::Q8, QuantPolicy::Q8),
+        (Precision::Q4, QuantPolicy::Q4),
+    ] {
         let stream = {
-            let m = qwen35::load_from_gguf_quantized::<Cpu>(&path, &device, policy)
+            let m = qwen35::load_from_gguf_quantized(&path, &device, policy)
                 .expect("streaming quantized load");
             logits_of(&m)
         };
         let packed = {
-            let m = qwen35::load_from_pack::<Cpu>(&pack_dir, &device, &|_| precision)
+            let m = qwen35::load_from_pack(&pack_dir, &device, &|_| precision)
                 .expect("pack quantized load");
             logits_of(&m)
         };
@@ -146,6 +170,9 @@ fn qwen35_pack_round_trips_every_level() {
             argmax(&stream),
             "{precision:?} pack diverges from the streaming loader on the first token"
         );
-        assert!(d <= 5e-2, "{precision:?} pack vs streaming Δ={d} — same quantizer expected");
+        assert!(
+            d <= 5e-2,
+            "{precision:?} pack vs streaming Δ={d} — same quantizer expected"
+        );
     }
 }

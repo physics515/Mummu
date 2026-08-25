@@ -19,7 +19,6 @@ mod llama_ref;
 use std::path::PathBuf;
 
 use llama_ref::{LlamaServer, logprobs_at};
-use mummu::backend::Gpu;
 use mummu::models::CausalLm;
 use mummu::models::qwen35::{self, LoadedQwen35};
 use tokenizers::Tokenizer;
@@ -27,13 +26,16 @@ use tokenizers::Tokenizer;
 /// One model for both legs (the real_inference pattern): a 2B at f32 is
 /// ~7.5 GB and CubeCL retains freed pool memory per device, so two
 /// independent loads in one sequential run exceed the 16 GB reference card.
-static QWEN35_SLOT: mummu::cache::ModelSlot<LoadedQwen35<Gpu>> = mummu::cache::ModelSlot::new();
+static QWEN35_SLOT: mummu::cache::ModelSlot<LoadedQwen35> = mummu::cache::ModelSlot::new();
 
 /// Run `f` with the shared GPU model (loading it on first use).
-fn with_gpu_model<R>(gguf: &std::path::Path, f: impl FnOnce(&LoadedQwen35<Gpu>) -> R) -> R {
-    let device = burn::tensor::Device::<Gpu>::default();
+/// The shared GPU model as a guard the caller awaits through — `ModelSlot::with`
+/// takes a sync closure, and generation is a future under burn 0.22.
+async fn gpu_model(gguf: &std::path::Path) -> mummu::cache::SlotGuard<'static, LoadedQwen35> {
+    let device = mummu::backend::gpu_device();
     QWEN35_SLOT
-        .with(gguf, |p| qwen35::load_from_gguf::<Gpu>(p, &device), f)
+        .acquire(gguf, |p| qwen35::load_from_gguf(p, &device))
+        .await
         .expect("weights load checked")
 }
 
@@ -72,8 +74,7 @@ fn server(gguf: &std::path::Path) -> LlamaServer {
 fn prompt_ids(gguf: &std::path::Path) -> (Tokenizer, Vec<u32>) {
     let f = mummu::gguf::GgufFile::open(gguf).expect("gguf opens");
     let tok = mummu::tokenizer::tokenizer_from_gguf(&f).expect("tokenizer from gguf");
-    let rendered =
-        mummu::chat::ChatMl::qwen3().render(&[mummu::chat::Turn::user(PROMPT)]);
+    let rendered = mummu::chat::ChatMl::qwen3().render(&[mummu::chat::Turn::user(PROMPT)]);
     let ids = tok
         .encode(rendered.as_str(), false)
         .expect("encodes")
@@ -84,9 +85,9 @@ fn prompt_ids(gguf: &std::path::Path) -> (Tokenizer, Vec<u32>) {
 }
 
 /// Leg 1 — the first forward's top-k must match the reference in order.
-#[test]
+#[tokio::test]
 #[ignore = "needs a qwen35 BF16 GGUF (MUMMU_QWEN35_GGUF) + llama-server (MUMMU_LLAMA_SERVER)"]
-fn qwen35_first_forward_topk_matches_llama_cpp() {
+async fn qwen35_first_forward_topk_matches_llama_cpp() {
     let gguf = reference_gguf();
     let (_tok, ids) = prompt_ids(&gguf);
 
@@ -96,10 +97,15 @@ fn qwen35_first_forward_topk_matches_llama_cpp() {
         .expect("reference completion");
     assert_eq!(reference.steps.len(), 1, "asked for exactly one position");
     let ref_top: Vec<(u32, f64)> = reference.steps[0].iter().copied().take(TOP_K).collect();
-    assert_eq!(ref_top.len(), TOP_K, "reference returned fewer than top-{TOP_K}");
+    assert_eq!(
+        ref_top.len(),
+        TOP_K,
+        "reference returned fewer than top-{TOP_K}"
+    );
 
-    let device = burn::tensor::Device::<Gpu>::default();
-    let logits = with_gpu_model(&gguf, |loaded| {
+    let device = mummu::backend::gpu_device();
+    let logits = {
+        let loaded = gpu_model(&gguf).await;
         let mut cache = loaded.new_cache();
         loaded
             .forward(&ids, 0, &mut cache, &device)
@@ -107,7 +113,7 @@ fn qwen35_first_forward_topk_matches_llama_cpp() {
             .convert::<f32>()
             .to_vec::<f32>()
             .expect("logits readback")
-    });
+    };
 
     let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
     indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
@@ -136,9 +142,9 @@ fn qwen35_first_forward_topk_matches_llama_cpp() {
 }
 
 /// Leg 2 — a 24-token greedy sequence must match the reference token by token.
-#[test]
+#[tokio::test]
 #[ignore = "needs a qwen35 BF16 GGUF (MUMMU_QWEN35_GGUF) + llama-server (MUMMU_LLAMA_SERVER)"]
-fn qwen35_greedy_sequence_matches_llama_cpp() {
+async fn qwen35_greedy_sequence_matches_llama_cpp() {
     let gguf = reference_gguf();
     let (tok, ids) = prompt_ids(&gguf);
 
@@ -152,12 +158,12 @@ fn qwen35_greedy_sequence_matches_llama_cpp() {
         .map(|step| step.first().expect("every step has a winner").0)
         .collect();
 
-    let device = burn::tensor::Device::<Gpu>::default();
-    let ours = with_gpu_model(&gguf, |loaded| {
-        loaded
-            .greedy_generate(&ids, MAX_TOKENS, &device)
-            .expect("greedy decode")
-    });
+    let device = mummu::backend::gpu_device();
+    let ours = gpu_model(&gguf)
+        .await
+        .greedy_generate(&ids, MAX_TOKENS, &device)
+        .await
+        .expect("greedy decode");
 
     eprintln!(
         "[parity/qwen35] ours: {:?}",

@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use burn::tensor::DType;
-use mummu::backend::{GpuF16, inventory};
+use mummu::backend::inventory;
 use mummu::decode::argmax_id;
 use mummu::models::CausalLm;
 use mummu::models::qwen2;
@@ -37,9 +37,9 @@ fn qwen2_dir() -> Option<PathBuf> {
     dir.is_dir().then_some(dir)
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "needs multi-GB local weights (MUMMU_QWEN2_DIR) + a SHADER_F16 GPU"]
-fn warm_up_puts_the_first_burst_at_steady_state() {
+async fn warm_up_puts_the_first_burst_at_steady_state() {
     let Some(dir) = qwen2_dir() else {
         panic!("set MUMMU_QWEN2_DIR to a dir with config.json/tokenizer.json/model.safetensors");
     };
@@ -52,13 +52,15 @@ fn warm_up_puts_the_first_burst_at_steady_state() {
     let ids = tok.encode(text, false).expect("encodes").get_ids().to_vec();
     assert!(ids.len() >= 16, "warm-up prompt suspiciously short");
 
-    let device = burn::tensor::Device::<GpuF16>::default();
-    let loaded = qwen2::load_from_dir::<GpuF16>(&dir, &device).expect("weights load checked");
+    let device =
+        mummu::backend::gpu_device_f16().expect("f16 device settings lock once per process");
+    let loaded = qwen2::load_from_dir(&dir, &device).expect("weights load checked");
 
     // The API under test — the whole cold cost is meant to land here.
     let warm_start = Instant::now();
     let forwards = loaded
         .warm_up(&ids, WARM_UP_STEPS, &device)
+        .await
         .expect("warm-up runs");
     let warm_s = warm_start.elapsed().as_secs_f64();
     assert_eq!(
@@ -77,11 +79,11 @@ fn warm_up_puts_the_first_burst_at_steady_state() {
             "this harness must measure f16: a device policy locked by another alias would \
              silently make these f32 numbers"
         );
-        let mut next = argmax_id(logits).expect("argmax");
+        let mut next = argmax_id(logits).await.expect("argmax");
         let start = Instant::now();
         for past in (ids.len()..).take(BURST_TOKENS) {
             let logits = loaded.forward(&[next], past, &mut cache, &device);
-            next = argmax_id(logits).expect("argmax");
+            next = argmax_id(logits).await.expect("argmax");
         }
         let elapsed = start.elapsed().as_secs_f64();
         assert!(elapsed > 0.0, "a burst cannot take zero time");

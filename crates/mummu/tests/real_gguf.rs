@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use mummu::backend::{Gpu, use_gpu};
+use mummu::backend::use_gpu;
 use mummu::gguf::{GgmlType, GgufFile, GgufValue};
 use mummu::models::CausalLm;
 use mummu::models::qwen2;
@@ -335,16 +335,16 @@ fn real_lfm2_gguf_tokenizer_matches_the_hf_tokenizer() {
 /// model on the GPU (conv layers, attention layers, per-head norms — all
 /// mapped from llama.cpp naming), greedy-decodes a correct answer, and its
 /// first-token logits agree with the bf16 safetensors build.
-#[test]
+#[tokio::test]
 #[ignore = "needs the local LFM2.5 GGUF (MUMMU_LFM2_GGUF_PATH) + safetensors dir (MUMMU_LFM2_DIR) + GPU"]
-fn real_lfm2_gguf_loads_and_decodes_on_gpu() {
+async fn real_lfm2_gguf_loads_and_decodes_on_gpu() {
     use mummu::models::lfm2;
     let Some(path) = lfm2_gguf_path() else {
         panic!("set MUMMU_LFM2_GGUF_PATH to the lfm2.5-1.2b q4_k_m gguf");
     };
     let dir = lfm2_dir().expect("set MUMMU_LFM2_DIR to the safetensors dir");
     assert!(use_gpu(), "this proof wants the real GPU");
-    let device = burn::tensor::Device::<Gpu>::default();
+    let device = mummu::backend::gpu_device();
 
     let header = GgufFile::open(&path).expect("header parses");
     let tok = mummu::tokenizer::tokenizer_from_gguf(&header).expect("tokenizer from metadata");
@@ -360,7 +360,7 @@ fn real_lfm2_gguf_loads_and_decodes_on_gpu() {
         .get_ids()
         .to_vec();
 
-    let gguf_model = lfm2::load_from_gguf::<Gpu>(&path, &device).expect("gguf load is checked");
+    let gguf_model = lfm2::load_from_gguf(&path, &device).expect("gguf load is checked");
     assert_eq!(gguf_model.config.num_hidden_layers, 16);
     assert_eq!(
         gguf_model
@@ -374,12 +374,13 @@ fn real_lfm2_gguf_loads_and_decodes_on_gpu() {
     );
     let ids = gguf_model
         .greedy_generate(&prompt, 32, &device)
+        .await
         .expect("decode");
     let text = tok.decode(&ids, true).expect("ids decode");
     eprintln!("[real_gguf/lfm2] Q4_K_M greedy: {text:?}");
     assert!(text.contains('4'), "expected the answer 4 in: {text:?}");
 
-    let logits_of = |m: &lfm2::LoadedLfm2<Gpu>| -> Vec<f32> {
+    let logits_of = |m: &lfm2::LoadedLfm2| -> Vec<f32> {
         let mut cache = m.new_cache();
         m.forward(&prompt, 0, &mut cache, &device)
             .into_data()
@@ -388,7 +389,7 @@ fn real_lfm2_gguf_loads_and_decodes_on_gpu() {
     };
     let gguf_logits = logits_of(&gguf_model);
     drop(gguf_model);
-    let st_model = lfm2::load_from_dir::<Gpu>(&dir, &device).expect("safetensors load");
+    let st_model = lfm2::load_from_dir(&dir, &device).expect("safetensors load");
     let st_logits = logits_of(&st_model);
     drop(st_model);
 
@@ -419,9 +420,9 @@ fn real_lfm2_gguf_loads_and_decodes_on_gpu() {
 /// checkpoint (top-1 identical, high cosine; small drift IS the quantization).
 /// The models load sequentially — the second only after the first is dropped
 /// — so peak VRAM stays one-model-sized.
-#[test]
+#[tokio::test]
 #[ignore = "needs the local GGUF (MUMMU_GGUF_PATH) + safetensors dir (MUMMU_QWEN2_DIR) + GPU"]
-fn real_qwen2_gguf_loads_and_decodes_on_gpu() {
+async fn real_qwen2_gguf_loads_and_decodes_on_gpu() {
     let Some(path) = gguf_path() else {
         panic!("set MUMMU_GGUF_PATH to the qwen2.5-1.5b-instruct q4_k_m gguf");
     };
@@ -430,7 +431,7 @@ fn real_qwen2_gguf_loads_and_decodes_on_gpu() {
         .filter(|d| d.join("tokenizer.json").is_file())
         .expect("set MUMMU_QWEN2_DIR to the same model's safetensors dir (tokenizer.json)");
     assert!(use_gpu(), "this proof wants the real GPU");
-    let device = burn::tensor::Device::<Gpu>::default();
+    let device = mummu::backend::gpu_device();
 
     // The tokenizer comes from the GGUF itself — the whole model is ONE file
     // (byte-verified against tokenizer.json by the sibling test).
@@ -448,17 +449,18 @@ fn real_qwen2_gguf_loads_and_decodes_on_gpu() {
         .to_vec();
 
     // Leg 1: the GGUF-loaded model decodes a coherent, correct answer.
-    let gguf_model = qwen2::load_from_gguf::<Gpu>(&path, &device).expect("gguf load is checked");
+    let gguf_model = qwen2::load_from_gguf(&path, &device).expect("gguf load is checked");
     assert_eq!(gguf_model.config.vocab_size, 151_936);
     assert_eq!(gguf_model.config.num_hidden_layers, 28);
     let ids = gguf_model
         .greedy_generate(&prompt, 32, &device)
+        .await
         .expect("decode");
     let text = tok.decode(&ids, true).expect("ids decode");
     eprintln!("[real_gguf] Q4_K_M greedy: {text:?}");
     assert!(text.contains('4'), "expected the answer 4 in: {text:?}");
 
-    let logits_of = |m: &qwen2::LoadedQwen2<Gpu>| -> Vec<f32> {
+    let logits_of = |m: &qwen2::LoadedQwen2| -> Vec<f32> {
         let mut cache = m.new_cache();
         m.forward(&prompt, 0, &mut cache, &device)
             .into_data()
@@ -479,7 +481,7 @@ fn real_qwen2_gguf_loads_and_decodes_on_gpu() {
     // loads (drop first) keep peak VRAM at one model.
     let gguf_logits = logits_of(&gguf_model);
     drop(gguf_model);
-    let st_model = qwen2::load_from_dir::<Gpu>(&dir, &device).expect("safetensors load");
+    let st_model = qwen2::load_from_dir(&dir, &device).expect("safetensors load");
     let st_logits = logits_of(&st_model);
     drop(st_model);
 

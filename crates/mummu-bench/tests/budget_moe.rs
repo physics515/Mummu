@@ -16,7 +16,6 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use mummu::backend::Cpu;
 use mummu::decode::argmax_id;
 use mummu::gguf::{GgufFile, GgufValue};
 use mummu::models::CausalLm;
@@ -33,10 +32,10 @@ const DECODE_STEPS: usize = 4;
 /// pathological one.
 const LOAD_BUDGET_SECS: f64 = 300.0;
 
-#[test]
+#[tokio::test]
 #[ignore = "needs the OLMoE Q4_K_M GGUF (MUMMU_OLMOE_GGUF_PATH), ~30 GB free COMMIT \
             and ~28 GB of scratch disk beside the gguf"]
-fn olmoe_moe_cpu_decode_stays_inside_its_budget() {
+async fn olmoe_moe_cpu_decode_stays_inside_its_budget() {
     let Some(path) = std::env::var_os("MUMMU_OLMOE_GGUF_PATH").map(PathBuf::from) else {
         panic!("set MUMMU_OLMOE_GGUF_PATH to the OLMoE-1B-7B q4_k_m gguf");
     };
@@ -67,21 +66,21 @@ fn olmoe_moe_cpu_decode_stays_inside_its_budget() {
         .get_ids()
         .to_vec();
 
-    let device = burn::tensor::Device::<Cpu>::default();
+    let device = mummu::backend::cpu_device();
     let start = Instant::now();
-    let loaded = olmoe::load_from_gguf::<Cpu>(&path, &device).expect("gguf load checked");
+    let loaded = olmoe::load_from_gguf(&path, &device).expect("gguf load checked");
     let load_secs = start.elapsed().as_secs_f64();
 
     // Prefill (uncounted warm-up), then time the decode steps.
     let mut cache = loaded.new_cache();
     let logits = loaded.forward(&ids, 0, &mut cache, &device);
-    let mut next = argmax_id(logits).expect("argmax");
+    let mut next = argmax_id(logits).await.expect("argmax");
 
     let start = Instant::now();
     let mut out = Vec::with_capacity(DECODE_STEPS);
     for past in (ids.len()..).take(DECODE_STEPS) {
         let logits = loaded.forward(&[next], past, &mut cache, &device);
-        next = argmax_id(logits).expect("argmax");
+        next = argmax_id(logits).await.expect("argmax");
         out.push(next);
     }
     let secs_per_token = start.elapsed().as_secs_f64() / DECODE_STEPS as f64;

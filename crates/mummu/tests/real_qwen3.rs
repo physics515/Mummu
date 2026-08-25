@@ -11,7 +11,7 @@
 
 use std::path::PathBuf;
 
-use mummu::backend::{Gpu, use_gpu};
+use mummu::backend::use_gpu;
 use mummu::gguf::GgufFile;
 use mummu::models::CausalLm;
 use mummu::models::qwen3;
@@ -53,12 +53,12 @@ fn argmax(v: &[f32]) -> usize {
 /// no qkv bias, decoupled head_dim) loads real weights and greedy-decodes a
 /// coherent, correct answer on the GPU. The tokenizer is the checkpoint's own
 /// `tokenizer.json`; the prompt uses the Qwen ChatML template.
-#[test]
+#[tokio::test]
 #[ignore = "needs the local Qwen3 safetensors dir (MUMMU_QWEN3_DIR) + GPU"]
-fn real_qwen3_safetensors_loads_and_decodes_on_gpu() {
+async fn real_qwen3_safetensors_loads_and_decodes_on_gpu() {
     let dir = dir().expect("set MUMMU_QWEN3_DIR to a Qwen3 safetensors dir");
     assert!(use_gpu(), "this proof wants the real GPU");
-    let device = burn::tensor::Device::<Gpu>::default();
+    let device = mummu::backend::gpu_device();
 
     let tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer.json");
     let chat = mummu::chat::ChatMl::qwen2(); // Qwen3 shares Qwen2's ChatML
@@ -72,7 +72,7 @@ fn real_qwen3_safetensors_loads_and_decodes_on_gpu() {
         .get_ids()
         .to_vec();
 
-    let model = qwen3::load_from_dir::<Gpu>(&dir, &device).expect("safetensors load is checked");
+    let model = qwen3::load_from_dir(&dir, &device).expect("safetensors load is checked");
     // The decoupled shape holds on the real weights.
     assert!(
         model.config.num_attention_heads * model.config.head_dim != model.config.hidden_size
@@ -114,6 +114,7 @@ fn real_qwen3_safetensors_loads_and_decodes_on_gpu() {
     // app runs right after install).
     let smoke = model
         .sanity_check(&prompt, model.config.vocab_size, &device)
+        .await
         .expect("real weights pass the import sanity smoke");
     eprintln!(
         "[real_qwen3] sanity smoke: top_id {} · top_logit {:.3} · spread {:.3}",
@@ -121,7 +122,10 @@ fn real_qwen3_safetensors_loads_and_decodes_on_gpu() {
     );
     assert!((smoke.top_id as usize) < model.config.vocab_size);
 
-    let ids = model.greedy_generate(&prompt, 48, &device).expect("decode");
+    let ids = model
+        .greedy_generate(&prompt, 48, &device)
+        .await
+        .expect("decode");
     let text = tok.decode(&ids, true).expect("ids decode");
     eprintln!("[real_qwen3] safetensors greedy: {text:?}");
     assert!(text.contains('4'), "expected the answer 4 in: {text:?}");
@@ -133,13 +137,13 @@ fn real_qwen3_safetensors_loads_and_decodes_on_gpu() {
 /// quantization; a layout/qk-norm-mapping bug reads as disagreement / ≈0 cosine).
 /// Loads sequentially (drop the GGUF model before the safetensors one) so peak
 /// VRAM stays one-model-sized.
-#[test]
+#[tokio::test]
 #[ignore = "needs the Qwen3 GGUF (MUMMU_QWEN3_GGUF_PATH) + safetensors dir (MUMMU_QWEN3_DIR) + GPU"]
-fn real_qwen3_gguf_loads_and_agrees_with_safetensors() {
+async fn real_qwen3_gguf_loads_and_agrees_with_safetensors() {
     let path = gguf_path().expect("set MUMMU_QWEN3_GGUF_PATH to a Qwen3 q4_k_m gguf");
     let dir = dir().expect("set MUMMU_QWEN3_DIR to the same model's safetensors dir");
     assert!(use_gpu(), "this proof wants the real GPU");
-    let device = burn::tensor::Device::<Gpu>::default();
+    let device = mummu::backend::gpu_device();
 
     // Tokenizer straight from the GGUF metadata — the whole model is ONE file.
     let header = GgufFile::open(&path).expect("header parses");
@@ -169,7 +173,7 @@ fn real_qwen3_gguf_loads_and_agrees_with_safetensors() {
         "tokenizer-from-GGUF diverges from tokenizer.json"
     );
 
-    let gguf_model = qwen3::load_from_gguf::<Gpu>(&path, &device).expect("gguf load is checked");
+    let gguf_model = qwen3::load_from_gguf(&path, &device).expect("gguf load is checked");
     // A GGUF is self-contained — the load path reads no sibling
     // tokenizer_config.json, so the surfaced field is None (EOS still rides
     // config.eos_token_id, derived from GGUF metadata).
@@ -179,6 +183,7 @@ fn real_qwen3_gguf_loads_and_agrees_with_safetensors() {
     );
     let ids = gguf_model
         .greedy_generate(&prompt, 48, &device)
+        .await
         .expect("decode");
     let text = tok.decode(&ids, true).expect("ids decode");
     eprintln!("[real_qwen3] Q4_K_M greedy: {text:?}");
@@ -194,7 +199,7 @@ fn real_qwen3_gguf_loads_and_agrees_with_safetensors() {
     };
     drop(gguf_model);
 
-    let st_model = qwen3::load_from_dir::<Gpu>(&dir, &device).expect("safetensors load");
+    let st_model = qwen3::load_from_dir(&dir, &device).expect("safetensors load");
     let st_logits = {
         let mut cache = st_model.new_cache();
         st_model

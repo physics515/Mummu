@@ -28,7 +28,7 @@ mod llama_ref;
 use std::path::PathBuf;
 
 use gguf_compare::{compare_against_llama_cpp, next_port};
-use mummu::backend::{GpuF16, inventory};
+use mummu::backend::inventory;
 use mummu::models::{qwen2, qwen3};
 
 /// Max |Δlogprob| for the f16 legs. The f32 legs run at 7.5e-1 against
@@ -50,57 +50,75 @@ fn env_path(var: &str, what: &str) -> PathBuf {
     p
 }
 
-/// Skip (rather than fail) on a machine whose GPU cannot do f16 at all.
-fn shader_f16_or_skip(tag: &str) -> bool {
-    if inventory().any_shader_f16() {
-        return true;
+/// The f16 GPU device, or `None` on a machine whose GPU cannot do f16 at all.
+///
+/// Both legs in this binary share one process, so they share one device-dtype
+/// lock; `gpu_device_f16` is idempotent and will only ever hand back a device
+/// that genuinely reads F16.
+fn f16_device_or_skip(tag: &str) -> Option<burn::tensor::Device> {
+    if !inventory().any_shader_f16() {
+        eprintln!("[parity/gguf/{tag}] no SHADER_F16 adapter — skipping");
+        return None;
     }
-    eprintln!("[parity/gguf/{tag}] no SHADER_F16 adapter — skipping");
-    false
+    match mummu::backend::gpu_device_f16() {
+        Ok(device) => {
+            assert_eq!(
+                mummu::backend::float_dtype(&device),
+                burn::tensor::DType::F16,
+                "[parity/gguf/{tag}] refusing to report an f16 number from an f32 device"
+            );
+            Some(device)
+        }
+        Err(e) => panic!("[parity/gguf/{tag}] cannot configure an f16 GPU device: {e:?}"),
+    }
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "needs the Qwen2.5 Q4_K_M GGUF (MUMMU_GGUF_PATH), llama-server \
             (MUMMU_LLAMA_SERVER), and a SHADER_F16 GPU"]
-fn qwen2_q4_gguf_matches_llama_cpp_in_f16() {
-    if !shader_f16_or_skip("qwen2-f16") {
+async fn qwen2_q4_gguf_matches_llama_cpp_in_f16() {
+    let Some(f16) = f16_device_or_skip("qwen2-f16") else {
         return;
-    }
+    };
     let gguf = env_path("MUMMU_GGUF_PATH", "the qwen2.5-1.5b-instruct q4_k_m gguf");
     compare_against_llama_cpp(
         "qwen2-f16",
         &gguf,
         next_port(PORT_BASE),
         LOGPROB_ABS_TOLERANCE,
-        |p, d| qwen2::load_from_gguf::<GpuF16>(p, d).expect("gguf load checked"),
+        &f16,
+        |p, d| qwen2::load_from_gguf(p, d).expect("gguf load checked"),
         |user| {
             mummu::chat::ChatMl::qwen2().render(&[
                 mummu::chat::Turn::system("You are a helpful assistant."),
                 mummu::chat::Turn::user(user),
             ])
         },
-    );
+    )
+    .await;
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "needs a Qwen3 Q4_K_M GGUF (MUMMU_QWEN3_GGUF_PATH), llama-server \
             (MUMMU_LLAMA_SERVER), and a SHADER_F16 GPU"]
-fn qwen3_q4_gguf_matches_llama_cpp_in_f16() {
-    if !shader_f16_or_skip("qwen3-f16") {
+async fn qwen3_q4_gguf_matches_llama_cpp_in_f16() {
+    let Some(f16) = f16_device_or_skip("qwen3-f16") else {
         return;
-    }
+    };
     let gguf = env_path("MUMMU_QWEN3_GGUF_PATH", "a qwen3 q4_k_m gguf");
     compare_against_llama_cpp(
         "qwen3-f16",
         &gguf,
         next_port(PORT_BASE),
         LOGPROB_ABS_TOLERANCE,
-        |p, d| qwen3::load_from_gguf::<GpuF16>(p, d).expect("gguf load checked"),
+        &f16,
+        |p, d| qwen3::load_from_gguf(p, d).expect("gguf load checked"),
         |user| {
             mummu::chat::ChatMl::qwen2().render(&[
                 mummu::chat::Turn::system("You are a helpful assistant."),
                 mummu::chat::Turn::user(user),
             ])
         },
-    );
+    )
+    .await;
 }

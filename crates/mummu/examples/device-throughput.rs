@@ -26,15 +26,27 @@ fn time_matmul(device: &Device, w: &Tensor<2>, k: usize, m: usize, rounds: usize
         let xs: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32 - 6.0) / 6.0).collect();
         let x = Tensor::<2>::from_data(
             TensorData::new(xs, [m, k]),
-            (&device, backend::float_dtype()),
+            (&device, backend::float_dtype(&device)),
         );
         // Warm: first call pays kernel compilation and autotune.
-        let _ = x.clone().matmul(w.clone()).into_data().convert::<f32>().to_vec::<f32>().ok()?;
+        let _ = x
+            .clone()
+            .matmul(w.clone())
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .ok()?;
         let started = Instant::now();
         for _ in 0..rounds {
             // `into_data` forces a readback, so the timing cannot be fooled
             // by an async queue that has not actually run yet.
-            let _ = x.clone().matmul(w.clone()).into_data().convert::<f32>().to_vec::<f32>().ok()?;
+            let _ = x
+                .clone()
+                .matmul(w.clone())
+                .into_data()
+                .convert::<f32>()
+                .to_vec::<f32>()
+                .ok()?;
         }
         Some(started.elapsed().as_secs_f64() * 1000.0 / rounds as f64)
     }))
@@ -103,16 +115,26 @@ fn main() {
     // on the CPU alone. Host RAM is not the scarce resource here (96 GiB), so
     // if float is faster then CPU-resident tensors should simply be stored
     // dequantized.
-    println!("
-CPU only, by storage (m=1):");
+    println!(
+        "
+CPU only, by storage (m=1):"
+    );
     {
         let cpu = backend::cpu_device();
         for (label, w) in [
-            ("Q4 native", pack.tensor::<2>(entry, Precision::Q4, &cpu).ok()),
-            ("Q8 native", pack.tensor::<2>(entry, Precision::Q8, &cpu).ok()),
+            (
+                "Q4 native",
+                pack.tensor::<2>(entry, Precision::Q4, &cpu).ok(),
+            ),
+            (
+                "Q8 native",
+                pack.tensor::<2>(entry, Precision::Q8, &cpu).ok(),
+            ),
             (
                 "Q4 -> dequantized f32",
-                pack.tensor::<2>(entry, Precision::Q4, &cpu).ok().map(Tensor::dequantize),
+                pack.tensor::<2>(entry, Precision::Q4, &cpu)
+                    .ok()
+                    .map(Tensor::dequantize),
             ),
             // f32 on the host costs 4 B/param; f16 halves that. Worth it only
             // if burn-flex is not slower at it.
@@ -122,7 +144,10 @@ CPU only, by storage (m=1):");
                     .ok()
                     .map(|w| w.dequantize().cast(burn::tensor::DType::F16)),
             ),
-            ("F16 from pack", pack.tensor::<2>(entry, Precision::F16, &cpu).ok()),
+            (
+                "F16 from pack",
+                pack.tensor::<2>(entry, Precision::F16, &cpu).ok(),
+            ),
         ] {
             match w.and_then(|w| time_matmul(&cpu, &w, k, 1, 3)) {
                 None => println!("  {label:<20} FAILED"),
