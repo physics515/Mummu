@@ -40,7 +40,7 @@ use burn::tensor::quantization::{QuantLevel, QuantParam, QuantScheme, QuantStore
 
 /// Is a weight tensor in the one packed format this module reads?
 fn scheme_supported(scheme: &QuantScheme) -> bool {
-    matches!(scheme.value, QuantValue::Q4S)
+    matches!(scheme.value, QuantValue::Q4S | QuantValue::Q8S)
         && matches!(scheme.level, QuantLevel::Block(b) if b.to_dim_vec(1) == [32])
         && matches!(scheme.param, QuantParam::F32)
         // PackedU32(0) is what accelerators hold; flex re-tags Native after
@@ -135,11 +135,12 @@ mod cube_impl {
     /// mul-adds into private accumulators. No cross-unit reduction; the
     /// unit writes its 8 output columns at the end.
     #[cube(launch)]
-    fn q4s_gemv_kernel(
+    fn packed_gemv_kernel(
         w_packed: &Tensor<u32>,
         scales: &Tensor<f32>,
         x: &Tensor<f32>,
         out: &mut Tensor<f32>,
+        #[comptime] per_word: usize,
     ) {
         let wc = ABSOLUTE_POS;
         let n_words = w_packed.shape(1);
@@ -147,29 +148,35 @@ mod cube_impl {
             let k_len = x.shape(1);
             let stride_w = w_packed.stride(0);
             let stride_s = scales.stride(0);
-            let sc_col = wc / 4;
-            let mut acc = Array::<f32>::new(8usize);
+            // 32 values per scale block, `per_word` of them per u32 word, and
+            // words never straddle a block — so every value this unit decodes
+            // shares one scale.
+            let sc_col = wc / comptime!(32 / per_word);
+            let bits = comptime!(32u32 / per_word as u32);
+            let mask = comptime!((1u32 << (32u32 / per_word as u32)) - 1);
+            let sign = comptime!(1u32 << (32u32 / per_word as u32 - 1));
+            let span = comptime!(1i32 << (32u32 / per_word as u32));
+            let mut acc = Array::<f32>::new(per_word);
             #[unroll]
-            for j in 0..8 {
+            for j in 0..per_word {
                 acc[j] = 0.0f32;
             }
             for k in 0..k_len {
                 let word = w_packed[k * stride_w + wc];
                 let xs = x[k] * scales[k * stride_s + sc_col];
                 #[unroll]
-                for j in 0..8 {
-                    let shift = u32::cast_from(j * 4);
-                    let raw = (word >> shift) & 0xFu32;
+                for j in 0..per_word {
+                    let raw = (word >> (u32::cast_from(j) * bits)) & mask;
                     let mut q = i32::cast_from(raw);
-                    if raw >= 8u32 {
-                        q -= 16i32;
+                    if raw >= sign {
+                        q -= span;
                     }
                     acc[j] += f32::cast_from(q) * xs;
                 }
             }
-            let base = wc * 8;
+            let base = wc * per_word;
             #[unroll]
-            for j in 0..8 {
+            for j in 0..per_word {
                 out[base + j] = acc[j];
             }
         }
@@ -179,6 +186,13 @@ mod cube_impl {
         x: CubeTensor<R>,
         w: CubeTensor<R>,
     ) -> CubeTensor<R> {
+        // Values per u32 word, straight off the scheme: 8 nibbles for Q4S,
+        // 4 bytes for Q8S. Derived, not assumed — the values view's own
+        // shape below must agree with it.
+        let per_word: usize = match w.dtype {
+            burn::tensor::DType::QFloat(scheme) => 32 / scheme.value.size_bits() as usize,
+            other => unreachable!("packed gemv on a non-quantized weight: {other:?}"),
+        };
         let x = into_contiguous(x);
         let (w_vals, w_scales) = w
             .quantized_handles()
@@ -190,7 +204,12 @@ mod cube_impl {
         let out = empty_device::<R, f32>(client.clone(), device, Shape::new([1, n]));
         let cube_dim = CubeDim { x: 256, y: 1, z: 1 };
         let cubes = (n_words as u32).div_ceil(256);
-        q4s_gemv_kernel::launch::<R>(
+        debug_assert_eq!(
+            n_words * per_word,
+            n,
+            "packed values view must cover exactly the logical width"
+        );
+        packed_gemv_kernel::launch::<R>(
             &client,
             CubeCount::Static(cubes, 1, 1),
             cube_dim,
@@ -198,6 +217,7 @@ mod cube_impl {
             w_scales.into_tensor_arg(),
             x.into_tensor_arg(),
             out.clone().into_tensor_arg(),
+            per_word,
         );
         out
     }

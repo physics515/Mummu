@@ -29,7 +29,10 @@ fn main() {
     for (k, n, label) in [(5120usize, w_width, "gate/up"), (w_width, 5120usize, "down")] {
         println!("[{label}] W [{k}, {n}] Q4S, x [1, {k}] f32");
         let w = Tensor::<2>::random([k, n], Distribution::Uniform(-0.5, 0.5), &gpu);
-        let wq = quantize_weight(QuantPolicy::Q4, w);
+        let wq = quantize_weight(
+            if std::env::var("PROBE_Q8").is_ok() { QuantPolicy::Q8 } else { QuantPolicy::Q4 },
+            w,
+        );
         let x = Tensor::<2>::random([1, k], Distribution::Uniform(-1.0, 1.0), &gpu);
 
         let got = try_q4s_gemv(&x, &wq).expect("packed path must engage");
