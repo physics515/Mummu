@@ -10,7 +10,6 @@
 
 use std::path::PathBuf;
 
-use mummu::backend::Cpu;
 use mummu::hub;
 use mummu::models::minilm;
 use tokenizers::Tokenizer;
@@ -19,8 +18,8 @@ const REPO: &str = "sentence-transformers/all-MiniLM-L6-v2";
 const SENTENCE: &str = "Two formats, one set of weights.";
 
 fn embed_from(dir: &std::path::Path) -> Vec<f32> {
-    let device = burn::tensor::Device::<Cpu>::default();
-    let loaded = minilm::load_from_dir::<Cpu>(dir, &device).expect("checked load");
+    let device = mummu::backend::cpu_device();
+    let loaded = minilm::load_from_dir(dir, &device).expect("checked load");
     let tok = Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer loads");
     let enc = tok.encode(SENTENCE, true).expect("encodes");
     let mask: Vec<f32> = enc.get_attention_mask().iter().map(|&m| m as f32).collect();

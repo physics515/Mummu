@@ -90,19 +90,71 @@ pub fn cuda_device() -> burn::tensor::Device {
     burn::tensor::Device::cuda(0)
 }
 
-/// The float dtype mummu pins at tensor-creation sites (burn 0.22 would
-/// otherwise take the device default from `DeviceSettings`). Explicitness
-/// keeps mixed-precision processes defined behavior, same rationale as the
-/// 0.21 per-backend helper this replaces.
+/// The float dtype mummu creates tensors with **on `device`**.
+///
+/// burn 0.22 moved the element type off the backend type and onto the device
+/// as a runtime setting ([`burn::tensor::Device::configure`]), so the precision
+/// a model runs in is a property of the device it was handed - not of a type
+/// alias, and not of a process-wide constant. Reading it back here is what lets
+/// one process hold an f16 GPU device beside an f32 host device, which the 0.21
+/// `Gpu`/`GpuF16` alias split could not express at all.
+///
+/// Tensor-creation sites still name a dtype **explicitly** - the 0.21 rationale
+/// is unchanged. What changed is where the answer comes from.
 #[must_use]
-pub fn float_dtype() -> burn::tensor::DType {
-    burn::tensor::DType::F32
+pub fn float_dtype(device: &burn::tensor::Device) -> burn::tensor::DType {
+    let dtype: burn::tensor::DType = device.settings().float_dtype.into();
+    debug_assert!(
+        dtype.is_float(),
+        "a device's float setting must be a float dtype, got {dtype:?}"
+    );
+    dtype
 }
 
-/// Int dtype counterpart of [`float_dtype`].
+/// Int dtype counterpart of [`float_dtype`], read from the same device.
 #[must_use]
-pub fn int_dtype() -> burn::tensor::DType {
-    burn::tensor::DType::I32
+pub fn int_dtype(device: &burn::tensor::Device) -> burn::tensor::DType {
+    let dtype: burn::tensor::DType = device.settings().int_dtype.into();
+    debug_assert!(
+        dtype.is_int(),
+        "a device's int setting must be an int dtype, got {dtype:?}"
+    );
+    dtype
+}
+
+/// A GPU device configured to compute in **f16**.
+///
+/// The 0.22 replacement for the `GpuF16` type alias. Device settings lock on
+/// first use and cannot be changed afterwards, so this must run before any
+/// tensor exists on the discrete GPU - which is why every f16 gate lives in its
+/// own test binary, exactly as it did under the one-alias-per-process rule.
+///
+/// # Errors
+///
+/// `AlreadyInitialized` when the device has already computed something, and an
+/// unsupported-dtype error when the adapter cannot do f16 at all (check
+/// [`DeviceInventory::any_shader_f16`] first).
+pub fn gpu_device_f16() -> Result<burn::tensor::Device, burn::tensor::DeviceError> {
+    let mut device = gpu_device();
+    match device.configure((burn::tensor::FloatDType::F16, burn::tensor::IntDType::I32)) {
+        Ok(()) => {}
+        // Idempotent on purpose: several f16 gates share one process, and the
+        // second caller must get the same device rather than an error - but
+        // ONLY when the lock actually landed on f16. An f32-locked device is
+        // reported, never handed back wearing an f16 label (the 2026-07-11
+        // mislabelling bug is exactly this branch going the other way).
+        Err(e) => {
+            if float_dtype(&device) != burn::tensor::DType::F16 {
+                return Err(e);
+            }
+        }
+    }
+    assert_eq!(
+        float_dtype(&device),
+        burn::tensor::DType::F16,
+        "gpu_device_f16 must return an f16 device or an error, never an f32 device"
+    );
+    Ok(device)
 }
 
 /// One enumerated GPU adapter, as reported by wgpu.
@@ -170,7 +222,7 @@ impl DeviceInventory {
         !self.gpus.is_empty()
     }
 
-    /// Does any adapter advertise `SHADER_F16`? Gates the [`GpuF16`] backend.
+    /// Does any adapter advertise `SHADER_F16`? Gates [`gpu_device_f16`].
     #[must_use]
     pub fn any_shader_f16(&self) -> bool {
         self.gpus.iter().any(|g| g.shader_f16)

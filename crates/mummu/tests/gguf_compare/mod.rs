@@ -32,20 +32,20 @@ pub fn next_port(base: u16) -> u16 {
 
 /// One quantized-reference comparison: `load` builds our model from the GGUF,
 /// `render` wraps the prompt in the model's chat template, and `tolerance`
-/// bounds |Δlogprob| over the top-k. Generic over the backend — the dense
-/// tiers compare on `Gpu`, OLMoE's ~28 GB f32 build only fits the CPU backend,
-/// and the f16 leg runs `GpuF16` from its own binary (one dtype alias per
-/// process). Panics (test style) on any divergence.
-pub fn compare_against_llama_cpp<B, M, C>(
+/// bounds |Δlogprob| over the top-k. The caller supplies the `device` — the
+/// dense tiers compare on the GPU, OLMoE's ~28 GB f32 build only fits the host,
+/// and the f16 leg configures an f16 GPU device from its own binary (device
+/// dtype settings lock once per process). Panics (test style) on any divergence.
+pub async fn compare_against_llama_cpp<M, C>(
     tag: &str,
     gguf: &std::path::Path,
     port: u16,
     tolerance: f64,
-    load: impl FnOnce(&std::path::Path, &burn::tensor::Device<B>) -> M,
+    device: &burn::tensor::Device,
+    load: impl FnOnce(&std::path::Path, &burn::tensor::Device) -> M,
     render: impl FnOnce(&str) -> String,
 ) where
-    B: burn::tensor::backend::Backend,
-    M: CausalLm<B, Cache = C>,
+    M: CausalLm<Cache = C>,
 {
     let exe = server_exe().expect("set MUMMU_LLAMA_SERVER to a llama.cpp llama-server binary");
 
@@ -77,11 +77,11 @@ pub fn compare_against_llama_cpp<B, M, C>(
         "reference returned fewer than top-{TOP_K}"
     );
 
-    let device = burn::tensor::Device::<B>::default();
-    let loaded = load(gguf, &device);
+    // `device` is the caller's; nothing is defaulted here any more.
+    let loaded = load(gguf, device);
     let mut cache = loaded.new_cache();
     let logits = loaded
-        .forward(&ids, 0, &mut cache, &device)
+        .forward(&ids, 0, &mut cache, device)
         .into_data()
         .convert::<f32>()
         .to_vec::<f32>()
@@ -100,7 +100,8 @@ pub fn compare_against_llama_cpp<B, M, C>(
         .fold(0.0_f64, f64::max);
 
     let out_ids = loaded
-        .greedy_generate(&ids, MAX_TOKENS, &device)
+        .greedy_generate(&ids, MAX_TOKENS, device)
+        .await
         .expect("greedy decode");
     let ours = tok.decode(&out_ids, true).expect("decode");
 

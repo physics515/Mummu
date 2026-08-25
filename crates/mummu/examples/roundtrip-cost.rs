@@ -28,13 +28,16 @@ fn main() {
     let dgpu = Device::wgpu(DeviceKind::DiscreteGpu(0));
     let igpu = Device::wgpu(DeviceKind::IntegratedGpu(0));
     let cpu = backend::cpu_device();
-    let dtype = backend::float_dtype();
+    let dtype = backend::float_dtype(&cpu);
 
     let host = Tensor::<2>::from_data(
         TensorData::new(vec![0.5f32; HIDDEN], [1, HIDDEN]),
         (&cpu, dtype),
     );
-    println!("one decode activation: [1, {HIDDEN}] f32 = {} KiB\n", HIDDEN * 4 / 1024);
+    println!(
+        "one decode activation: [1, {HIDDEN}] f32 = {} KiB\n",
+        HIDDEN * 4 / 1024
+    );
 
     // A single crossing, host -> device.
     let up = timed(50, || {
@@ -89,8 +92,10 @@ fn main() {
             }
             let _ = x.into_data().convert::<f32>().to_vec::<f32>().ok();
         });
-        println!("
-  {ops} small elementwise ops on flex  {ms:7.2} ms/token");
+        println!(
+            "
+  {ops} small elementwise ops on flex  {ms:7.2} ms/token"
+        );
         let g = Tensor::<2>::from_data(
             TensorData::new(vec![0.5f32; HIDDEN], [1, HIDDEN]),
             (&dgpu, dtype),

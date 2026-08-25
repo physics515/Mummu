@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use burn::tensor::DType;
-use mummu::backend::{GpuF16, inventory};
+use mummu::backend::inventory;
 use mummu::decode::argmax_id;
 use mummu::models::CausalLm;
 use mummu::models::qwen2;
@@ -49,9 +49,9 @@ fn qwen2_dir() -> Option<PathBuf> {
     dir.is_dir().then_some(dir)
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "needs multi-GB local weights (MUMMU_QWEN2_DIR) + a SHADER_F16 GPU"]
-fn f16_decode_warms_up_within_a_bounded_number_of_tokens() {
+async fn f16_decode_warms_up_within_a_bounded_number_of_tokens() {
     let Some(dir) = qwen2_dir() else {
         panic!("set MUMMU_QWEN2_DIR to a dir with config.json/tokenizer.json/model.safetensors");
     };
@@ -64,9 +64,10 @@ fn f16_decode_warms_up_within_a_bounded_number_of_tokens() {
     let ids = tok.encode(text, false).expect("encodes").get_ids().to_vec();
     assert!(ids.len() >= 16, "warm-up prompt suspiciously short");
 
-    let device = burn::tensor::Device::<GpuF16>::default();
+    let device =
+        mummu::backend::gpu_device_f16().expect("f16 device settings lock once per process");
     let load_start = Instant::now();
-    let loaded = qwen2::load_from_dir::<GpuF16>(&dir, &device).expect("weights load checked");
+    let loaded = qwen2::load_from_dir(&dir, &device).expect("weights load checked");
     let load_s = load_start.elapsed().as_secs_f64();
 
     // NO warm-up pass: the cold cost is the measurement. The first prefill is
@@ -81,7 +82,7 @@ fn f16_decode_warms_up_within_a_bounded_number_of_tokens() {
         "this harness must measure f16: a device policy locked by another alias would \
          silently make these f32 numbers"
     );
-    let cold_top_id = argmax_id(logits).expect("argmax");
+    let cold_top_id = argmax_id(logits).await.expect("argmax");
     let cold_ttft_ms = start.elapsed().as_secs_f64() * 1e3;
 
     // Each burst reproduces criterion's `decode_32_tokens` sample exactly:
@@ -93,7 +94,7 @@ fn f16_decode_warms_up_within_a_bounded_number_of_tokens() {
     for _ in 0..BURSTS {
         let mut cache = loaded.new_cache();
         let logits = loaded.forward(&ids, 0, &mut cache, &device);
-        let mut next = argmax_id(logits).expect("argmax");
+        let mut next = argmax_id(logits).await.expect("argmax");
         assert_eq!(
             next, cold_top_id,
             "every burst prefills the same prompt, so its first token must not change"
@@ -102,7 +103,7 @@ fn f16_decode_warms_up_within_a_bounded_number_of_tokens() {
         let mut past = ids.len();
         for _ in 0..BURST_TOKENS {
             let logits = loaded.forward(&[next], past, &mut cache, &device);
-            next = argmax_id(logits).expect("argmax");
+            next = argmax_id(logits).await.expect("argmax");
             past += 1;
         }
         let elapsed = start.elapsed().as_secs_f64();

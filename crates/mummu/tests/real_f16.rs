@@ -17,7 +17,7 @@
 
 use std::path::PathBuf;
 
-use mummu::backend::{GpuF16, inventory};
+use mummu::backend::inventory;
 use mummu::models::CausalLm;
 use mummu::models::{qwen2, qwen3};
 use tokenizers::Tokenizer;
@@ -33,9 +33,9 @@ fn qwen3_dir() -> Option<PathBuf> {
         .filter(|d| d.join("model.safetensors").is_file())
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "needs multi-GB local weights (MUMMU_QWEN2_DIR) + a SHADER_F16 GPU"]
-fn qwen2_decodes_coherently_in_f16_on_gpu() {
+async fn qwen2_decodes_coherently_in_f16_on_gpu() {
     let Some(dir) = qwen2_dir() else {
         panic!("set MUMMU_QWEN2_DIR to a dir with config.json/tokenizer.json/model.safetensors");
     };
@@ -57,13 +57,15 @@ fn qwen2_decodes_coherently_in_f16_on_gpu() {
 
     // Claim 1 (no crash): building the backend + loading casts bf16 -> f16 via
     // CastFloatAdapter (load_from_dir targets the backend float dtype).
-    let device = burn::tensor::Device::<GpuF16>::default();
-    let loaded = qwen2::load_from_dir::<GpuF16>(&dir, &device).expect("f16 weights load checked");
+    let device =
+        mummu::backend::gpu_device_f16().expect("f16 device settings lock once per process");
+    let loaded = qwen2::load_from_dir(&dir, &device).expect("f16 weights load checked");
 
     // Claim 3 (coherent output): greedy still answers arithmetic.
     let start = std::time::Instant::now();
     let ids = loaded
         .greedy_generate(&prompt, 32, &device)
+        .await
         .expect("f16 greedy decode");
     let secs = start.elapsed().as_secs_f64();
     assert!(!ids.is_empty(), "f16 decode produced no tokens before EOS");
@@ -88,15 +90,16 @@ fn qwen2_decodes_coherently_in_f16_on_gpu() {
 /// precision milestone (P6) cover the new architecture, not just Qwen2.
 /// (Moved here from `real_qwen3.rs` for the process isolation the module
 /// docs describe.)
-#[test]
+#[tokio::test]
 #[ignore = "needs the Qwen3 safetensors dir (MUMMU_QWEN3_DIR) + a SHADER_F16 GPU"]
-fn real_qwen3_decodes_coherently_in_f16() {
+async fn real_qwen3_decodes_coherently_in_f16() {
     let dir = qwen3_dir().expect("set MUMMU_QWEN3_DIR to a Qwen3 safetensors dir");
     assert!(
         inventory().any_shader_f16(),
         "no adapter advertises SHADER_F16 — cannot validate f16 here"
     );
-    let device = burn::tensor::Device::<GpuF16>::default();
+    let device =
+        mummu::backend::gpu_device_f16().expect("f16 device settings lock once per process");
 
     let tok = Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer.json");
     let prompt_text = mummu::chat::ChatMl::qwen2().render(&[
@@ -110,9 +113,10 @@ fn real_qwen3_decodes_coherently_in_f16() {
         .to_vec();
 
     // bf16 -> f16 on load; the build must not NaN through the qk-norm + softmax.
-    let model = qwen3::load_from_dir::<GpuF16>(&dir, &device).expect("f16 weights load checked");
+    let model = qwen3::load_from_dir(&dir, &device).expect("f16 weights load checked");
     let smoke = model
         .sanity_check(&prompt, model.config.vocab_size, &device)
+        .await
         .expect("f16 forward is finite and non-degenerate (no overflow to NaN)");
     eprintln!(
         "[real_f16/qwen3] sanity smoke: top_id {} · spread {:.3}",
@@ -121,6 +125,7 @@ fn real_qwen3_decodes_coherently_in_f16() {
 
     let ids = model
         .greedy_generate(&prompt, 48, &device)
+        .await
         .expect("f16 decode");
     let text = tok.decode(&ids, true).expect("ids decode");
     eprintln!("[real_f16/qwen3] greedy: {text:?}");
@@ -137,9 +142,9 @@ fn real_qwen3_decodes_coherently_in_f16() {
 /// dequant blob is transient host RAM), and greedy-emits a parseable Hermes
 /// `<tool_call>` from a `ChatMl::qwen3()` prompt. The same "download + FC
 /// decode" the 0.6B tier proved, at the BFCL-relevant size.
-#[test]
+#[tokio::test]
 #[ignore = "needs network (MUMMU_HUB_DEST; ~2.5 GB), a SHADER_F16 GPU, and ~9 GB free VRAM"]
-fn qwen3_4b_gguf_downloads_and_emits_a_tool_call_in_f16() {
+async fn qwen3_4b_gguf_downloads_and_emits_a_tool_call_in_f16() {
     use mummu::chat::{ChatMl, ToolSpec, Turn, parse_tool_calls};
 
     let Some(dest) = std::env::var_os("MUMMU_HUB_DEST").map(PathBuf::from) else {
@@ -189,12 +194,13 @@ fn qwen3_4b_gguf_downloads_and_emits_a_tool_call_in_f16() {
         .get_ids()
         .to_vec();
 
-    let device = burn::tensor::Device::<GpuF16>::default();
-    let model =
-        mummu::models::qwen3::load_from_gguf::<GpuF16>(&path, &device).expect("checked f16 load");
+    let device =
+        mummu::backend::gpu_device_f16().expect("f16 device settings lock once per process");
+    let model = mummu::models::qwen3::load_from_gguf(&path, &device).expect("checked f16 load");
     // Generous budget: the 4B thinks before calling the tool.
     let ids = model
         .greedy_generate(&prompt, 512, &device)
+        .await
         .expect("f16 greedy decode");
     let text = tok.decode(&ids, false).expect("decode");
     eprintln!("[real_f16/qwen3-4b] emitted: {text:?}");

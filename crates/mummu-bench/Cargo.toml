@@ -14,6 +14,10 @@ burn = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 tokenizers = { workspace = true }
+# The budget gates read logits back through `decode::argmax_id`, which is a
+# future under burn 0.22 - the gates are `#[tokio::test]`, the same idiom as
+# the library's own unit tests.
+tokio = { workspace = true }
 
 [[bench]]
 name = "runner"

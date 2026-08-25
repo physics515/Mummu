@@ -13,7 +13,6 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use mummu::backend::Gpu;
 use mummu::models::CausalLm;
 use mummu::models::qwen2;
 use tokenizers::Tokenizer;
@@ -110,8 +109,8 @@ fn qwen2_first_forward_top_k_matches_candle_reference() {
         .collect();
     assert_eq!(prompt_ids, fixture_ids, "tokenizations diverge");
 
-    let device = burn::tensor::Device::<Gpu>::default();
-    let loaded = qwen2::load_from_dir::<Gpu>(&dir, &device).expect("weights load checked");
+    let device = mummu::backend::gpu_device();
+    let loaded = qwen2::load_from_dir(&dir, &device).expect("weights load checked");
     let mut cache = loaded.new_cache();
     let logits = loaded
         .forward(&prompt_ids, 0, &mut cache, &device)
@@ -158,9 +157,9 @@ fn qwen2_first_forward_top_k_matches_candle_reference() {
     );
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "needs local Qwen2.5 weights (MUMMU_QWEN2_DIR) + a running Ollama with qwen2.5:1.5b-instruct-fp16"]
-fn qwen2_greedy_sequence_matches_ollama_reference() {
+async fn qwen2_greedy_sequence_matches_ollama_reference() {
     let Some(dir) = qwen2_dir() else {
         panic!("set MUMMU_QWEN2_DIR to a dir with config.json/tokenizer.json/model.safetensors");
     };
@@ -180,10 +179,11 @@ fn qwen2_greedy_sequence_matches_ollama_reference() {
         .get_ids()
         .to_vec();
 
-    let device = burn::tensor::Device::<Gpu>::default();
-    let loaded = qwen2::load_from_dir::<Gpu>(&dir, &device).expect("weights load checked");
+    let device = mummu::backend::gpu_device();
+    let loaded = qwen2::load_from_dir(&dir, &device).expect("weights load checked");
     let ids = loaded
         .greedy_generate(&prompt_ids, MAX_TOKENS, &device)
+        .await
         .expect("greedy decode");
     let ours = tok.decode(&ids, true).expect("decode");
 

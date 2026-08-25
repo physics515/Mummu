@@ -8,7 +8,6 @@
 
 use std::path::PathBuf;
 
-use mummu::backend::Cpu;
 use mummu::models::minilm;
 use tokenizers::Tokenizer;
 
@@ -29,8 +28,8 @@ fn minilm_embeds_similar_sentences_closer_than_dissimilar() {
         panic!("set MUMMU_MINILM_DIR to a dir with config.json/tokenizer.json/model.safetensors");
     };
     let tok = Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer.json loads");
-    let device = burn::tensor::Device::<Cpu>::default();
-    let loaded = minilm::load_from_dir::<Cpu>(&dir, &device).expect("weights load checked");
+    let device = mummu::backend::cpu_device();
+    let loaded = minilm::load_from_dir(&dir, &device).expect("weights load checked");
 
     let embed = |text: &str| -> Vec<f32> {
         let enc = tok.encode(text, true).expect("encodes");
@@ -90,8 +89,8 @@ fn minilm_embedding_matches_candle_reference() {
     assert_eq!(ids, fixture_ids, "tokenizations diverge");
 
     let mask: Vec<f32> = enc.get_attention_mask().iter().map(|&m| m as f32).collect();
-    let device = burn::tensor::Device::<Cpu>::default();
-    let loaded = minilm::load_from_dir::<Cpu>(&dir, &device).expect("weights load checked");
+    let device = mummu::backend::cpu_device();
+    let loaded = minilm::load_from_dir(&dir, &device).expect("weights load checked");
     let ours = loaded.embed_ids(&ids, &mask, &device).expect("embeds");
 
     let reference: Vec<f32> = fixture["embedding"]

@@ -27,7 +27,6 @@ mod llama_ref;
 use std::path::PathBuf;
 
 use llama_ref::{LlamaServer, logprobs_at};
-use mummu::backend::Gpu;
 use mummu::models::CausalLm;
 use mummu::models::lfm2;
 use tokenizers::Tokenizer;
@@ -137,8 +136,8 @@ fn first_forward_leg(tier: &Tier) {
         "reference returned fewer than top-{TOP_K}"
     );
 
-    let device = burn::tensor::Device::<Gpu>::default();
-    let loaded = lfm2::load_from_dir::<Gpu>(&dir, &device).expect("weights load checked");
+    let device = mummu::backend::gpu_device();
+    let loaded = lfm2::load_from_dir(&dir, &device).expect("weights load checked");
     let mut cache = loaded.new_cache();
     let logits = loaded
         .forward(&ids, 0, &mut cache, &device)
@@ -174,7 +173,7 @@ fn first_forward_leg(tier: &Tier) {
 }
 
 /// Leg 2 — a short greedy sequence must match the reference token-for-token.
-fn greedy_leg(tier: &Tier) {
+async fn greedy_leg(tier: &Tier) {
     let dir = model_dir(tier);
     let (tok, ids) = prompt_ids(&dir);
     let tag = tier.tag;
@@ -184,10 +183,11 @@ fn greedy_leg(tier: &Tier) {
         .greedy_completion(&ids, MAX_TOKENS, 0)
         .expect("reference completion");
 
-    let device = burn::tensor::Device::<Gpu>::default();
-    let loaded = lfm2::load_from_dir::<Gpu>(&dir, &device).expect("weights load checked");
+    let device = mummu::backend::gpu_device();
+    let loaded = lfm2::load_from_dir(&dir, &device).expect("weights load checked");
     let out_ids = loaded
         .greedy_generate(&ids, MAX_TOKENS, &device)
+        .await
         .expect("greedy decode");
     let ours = tok.decode(&out_ids, true).expect("decode");
 
@@ -214,10 +214,10 @@ fn lfm2_first_forward_top_k_matches_llama_cpp_reference() {
     first_forward_leg(&LFM2_1_2B);
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "needs LFM2.5-1.2B weights (MUMMU_LFM2_DIR), its BF16 GGUF (MUMMU_LFM2_BF16_GGUF) + llama-server (MUMMU_LLAMA_SERVER)"]
-fn lfm2_greedy_sequence_matches_llama_cpp_reference() {
-    greedy_leg(&LFM2_1_2B);
+async fn lfm2_greedy_sequence_matches_llama_cpp_reference() {
+    greedy_leg(&LFM2_1_2B).await;
 }
 
 #[test]
@@ -226,8 +226,8 @@ fn lfm2_230m_first_forward_top_k_matches_llama_cpp_reference() {
     first_forward_leg(&LFM2_230M);
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "needs LFM2.5-230M weights (MUMMU_LFM2_230M_DIR), its BF16 GGUF (MUMMU_LFM2_230M_BF16_GGUF) + llama-server (MUMMU_LLAMA_SERVER)"]
-fn lfm2_230m_greedy_sequence_matches_llama_cpp_reference() {
-    greedy_leg(&LFM2_230M);
+async fn lfm2_230m_greedy_sequence_matches_llama_cpp_reference() {
+    greedy_leg(&LFM2_230M).await;
 }

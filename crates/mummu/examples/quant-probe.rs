@@ -5,12 +5,12 @@
 //! `cargo run --release -p mummu --example quant-probe`
 
 use burn::tensor::quantization::{Calibration, QuantLevel, QuantParam, QuantValue};
-use burn::tensor::{Distribution, Tensor, backend::Backend};
+use burn::tensor::{Distribution, Tensor};
 
-fn probe<B: Backend>(label: &str, device: &B::Device) {
+fn probe(label: &str, device: &burn::tensor::Device) {
     let [m, k, n] = [8usize, 2048, 2048];
-    let x = Tensor::<B, 2>::random([m, k], Distribution::Default, device);
-    let w = Tensor::<B, 2>::random([k, n], Distribution::Default, device);
+    let x = Tensor::<2>::random([m, k], Distribution::Default, device);
+    let w = Tensor::<2>::random([k, n], Distribution::Default, device);
     let reference = x.clone().matmul(w.clone());
     let ref_host = reference
         .into_data()
@@ -28,11 +28,10 @@ fn probe<B: Backend>(label: &str, device: &B::Device) {
     for (name, value, level) in schemes {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             use burn::tensor::quantization::{compute_q_params, compute_range};
-            let scheme =
-                burn::tensor::quantization::QuantScheme::default()
-                    .with_value(value)
-                    .with_level(level)
-                    .with_param(QuantParam::F32);
+            let scheme = burn::tensor::quantization::QuantScheme::default()
+                .with_value(value)
+                .with_level(level)
+                .with_param(QuantParam::F32);
             let range = compute_range(&scheme, &w, &Calibration::MinMax);
             let qparams = compute_q_params(&scheme, range);
             let wq = w.clone().quantize(&scheme, qparams);
@@ -65,15 +64,15 @@ fn probe<B: Backend>(label: &str, device: &B::Device) {
 }
 
 fn main() {
-    let cpu = burn::tensor::Device::<mummu::backend::Cpu>::default();
-    probe::<mummu::backend::Cpu>("cpu/flex", &cpu);
+    let cpu = mummu::backend::cpu_device();
+    probe("cpu/flex", &cpu);
     if mummu::backend::use_gpu() {
-        let gpu = burn::tensor::Device::<mummu::backend::Gpu>::default();
-        probe::<mummu::backend::Gpu>("gpu/wgpu", &gpu);
+        let gpu = mummu::backend::gpu_device();
+        probe("gpu/wgpu", &gpu);
     }
     #[cfg(feature = "cuda")]
     {
-        let cuda = burn::tensor::Device::<mummu::backend::Cuda>::default();
-        probe::<mummu::backend::Cuda>("gpu/cuda", &cuda);
+        let cuda = mummu::backend::cuda_device();
+        probe("gpu/cuda", &cuda);
     }
 }

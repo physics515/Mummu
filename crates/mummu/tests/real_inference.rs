@@ -14,13 +14,13 @@
 
 use std::path::PathBuf;
 
-use mummu::backend::{Cpu, Gpu, use_gpu};
+use mummu::backend::use_gpu;
 use mummu::models::CausalLm;
 use mummu::models::qwen2::{self, LoadedQwen2};
 use tokenizers::Tokenizer;
 
 /// One model for the whole suite (see the module docs).
-static QWEN2_SLOT: mummu::cache::ModelSlot<LoadedQwen2<Gpu>> = mummu::cache::ModelSlot::new();
+static QWEN2_SLOT: mummu::cache::ModelSlot<LoadedQwen2> = mummu::cache::ModelSlot::new();
 
 fn qwen2_dir() -> Option<PathBuf> {
     let dir = PathBuf::from(std::env::var_os("MUMMU_QWEN2_DIR")?);
@@ -28,10 +28,17 @@ fn qwen2_dir() -> Option<PathBuf> {
 }
 
 /// Run `f` with the shared GPU model (loading it on first use).
-fn with_gpu_model<R>(dir: &std::path::Path, f: impl FnOnce(&LoadedQwen2<Gpu>) -> R) -> R {
-    let device = burn::tensor::Device::<Gpu>::default();
+/// The shared GPU model, as a guard the caller can await through.
+///
+/// `ModelSlot::with` takes a sync closure and every interesting thing a model
+/// does is a future under burn 0.22, so the guard form is the one that works:
+/// hold it, await, drop it to release the slot (which is what serializes
+/// generations and keeps one checkpoint in VRAM).
+async fn gpu_model(dir: &std::path::Path) -> mummu::cache::SlotGuard<'static, LoadedQwen2> {
+    let device = mummu::backend::gpu_device();
     QWEN2_SLOT
-        .with(dir, |d| qwen2::load_from_dir::<Gpu>(d, &device), f)
+        .acquire(dir, |d| qwen2::load_from_dir(d, &device))
+        .await
         .expect("weights load checked")
 }
 
@@ -55,9 +62,9 @@ fn decode(dir: &std::path::Path, ids: &[u32]) -> String {
     tok.decode(ids, true).expect("ids decode")
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "needs multi-GB local weights (MUMMU_QWEN2_DIR)"]
-fn qwen2_greedy_decodes_coherent_text_on_default_device() {
+async fn qwen2_greedy_decodes_coherent_text_on_default_device() {
     let Some(dir) = qwen2_dir() else {
         panic!("set MUMMU_QWEN2_DIR to a dir with config.json/tokenizer.json/model.safetensors");
     };
@@ -70,19 +77,22 @@ fn qwen2_greedy_decodes_coherent_text_on_default_device() {
     );
 
     let (ids, label) = if use_gpu() {
-        let device = burn::tensor::Device::<Gpu>::default();
+        let device = mummu::backend::gpu_device();
         (
-            with_gpu_model(&dir, |m| {
-                m.greedy_generate(&prompt, 32, &device).expect("decode")
-            }),
+            gpu_model(&dir)
+                .await
+                .greedy_generate(&prompt, 32, &device)
+                .await
+                .expect("decode"),
             "GPU",
         )
     } else {
-        let device = burn::tensor::Device::<Cpu>::default();
-        let loaded = qwen2::load_from_dir::<Cpu>(&dir, &device).expect("weights load checked");
+        let device = mummu::backend::cpu_device();
+        let loaded = qwen2::load_from_dir(&dir, &device).expect("weights load checked");
         (
             loaded
                 .greedy_generate(&prompt, 32, &device)
+                .await
                 .expect("decode"),
             "CPU",
         )
@@ -102,15 +112,19 @@ fn qwen2_greedy_decodes_coherent_text_on_default_device() {
     );
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "needs multi-GB local weights (MUMMU_QWEN2_DIR)"]
-fn qwen2_first_token_probe_reports_top5() {
+async fn qwen2_first_token_probe_reports_top5() {
     let Some(dir) = qwen2_dir() else {
         panic!("set MUMMU_QWEN2_DIR to a dir with config.json/tokenizer.json/model.safetensors");
     };
     let prompt = encode(&dir, &chatml("You are a helpful assistant.", "Say hello."));
-    let device = burn::tensor::Device::<Gpu>::default();
-    let top5 = with_gpu_model(&dir, |m| m.first_token(&prompt, 5, &device).expect("probe"));
+    let device = mummu::backend::gpu_device();
+    let top5 = gpu_model(&dir)
+        .await
+        .first_token(&prompt, 5, &device)
+        .await
+        .expect("probe");
     assert_eq!(top5.len(), 5);
     eprintln!(
         "[real_inference] top-5 next-token ids: {top5:?} → {:?}",
@@ -118,9 +132,9 @@ fn qwen2_first_token_probe_reports_top5() {
     );
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "needs multi-GB local weights (MUMMU_QWEN2_DIR)"]
-fn qwen2_sampled_streaming_is_seeded_deterministic_and_cancellable() {
+async fn qwen2_sampled_streaming_is_seeded_deterministic_and_cancellable() {
     let Some(dir) = qwen2_dir() else {
         panic!("set MUMMU_QWEN2_DIR to a dir with config.json/tokenizer.json/model.safetensors");
     };
@@ -128,7 +142,7 @@ fn qwen2_sampled_streaming_is_seeded_deterministic_and_cancellable() {
         &dir,
         &chatml("You are a poet.", "Write one line about the sea."),
     );
-    let device = burn::tensor::Device::<Gpu>::default();
+    let device = mummu::backend::gpu_device();
 
     let opts = mummu::decode::SamplerOptions {
         temperature: 0.7,
@@ -137,7 +151,8 @@ fn qwen2_sampled_streaming_is_seeded_deterministic_and_cancellable() {
         ..mummu::decode::SamplerOptions::default()
     };
 
-    let (cancelled, streamed, replay) = with_gpu_model(&dir, |loaded| {
+    let (cancelled, streamed, replay) = {
+        let loaded = gpu_model(&dir).await;
         // Leg 1: streaming + cooperative cancellation after 8 tokens.
         let mut streamed = Vec::new();
         let cancelled = loaded
@@ -149,6 +164,7 @@ fn qwen2_sampled_streaming_is_seeded_deterministic_and_cancellable() {
                     std::ops::ControlFlow::Continue(())
                 }
             })
+            .await
             .expect("sampled decode");
 
         // Leg 2: the same seed replays the same sampled prefix.
@@ -156,9 +172,10 @@ fn qwen2_sampled_streaming_is_seeded_deterministic_and_cancellable() {
             .generate(&prompt, 8, &opts, &device, |_| {
                 std::ops::ControlFlow::Continue(())
             })
+            .await
             .expect("replay decode");
         (cancelled, streamed, replay)
-    });
+    };
 
     assert_eq!(cancelled.len(), 8, "cancel after 8 streamed tokens");
     assert_eq!(cancelled, streamed, "returned ids == streamed ids");
@@ -172,13 +189,13 @@ fn qwen2_sampled_streaming_is_seeded_deterministic_and_cancellable() {
     assert!(!text.trim().is_empty(), "sampled text should be non-empty");
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "needs multi-GB local weights (MUMMU_QWEN2_DIR)"]
-fn qwen2_model_slot_reuses_the_loaded_model() {
+async fn qwen2_model_slot_reuses_the_loaded_model() {
     let Some(dir) = qwen2_dir() else {
         panic!("set MUMMU_QWEN2_DIR to a dir with config.json/tokenizer.json/model.safetensors");
     };
-    let device = burn::tensor::Device::<Gpu>::default();
+    let device = mummu::backend::gpu_device();
     let prompt = encode(
         &dir,
         "<|im_start|>user\nSay hi.<|im_end|>\n<|im_start|>assistant\n",
@@ -190,17 +207,17 @@ fn qwen2_model_slot_reuses_the_loaded_model() {
     let mut loads_after_warm = 0;
     for round in 0..2 {
         let ids = QWEN2_SLOT
-            .with(
-                &dir,
-                |d| {
-                    if round > 0 {
-                        loads_after_warm += 1;
-                    }
-                    qwen2::load_from_dir::<Gpu>(d, &device)
-                },
-                |m| m.greedy_generate(&prompt, 4, &device).expect("decode"),
-            )
-            .expect("slot load");
+            .acquire(&dir, |d| {
+                if round > 0 {
+                    loads_after_warm += 1;
+                }
+                qwen2::load_from_dir(d, &device)
+            })
+            .await
+            .expect("slot load")
+            .greedy_generate(&prompt, 4, &device)
+            .await
+            .expect("decode");
         assert!(!ids.is_empty(), "cached model must still decode");
     }
     assert_eq!(loads_after_warm, 0, "a warm slot must never reload");

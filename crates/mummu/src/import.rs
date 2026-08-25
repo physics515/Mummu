@@ -337,21 +337,21 @@ impl Drop for ScratchFile {
 ///
 /// This is the one place the four GGUF ports share: the sink choice, the
 /// adapter chain, and — the part worth centralizing — taking the target float
-/// dtype from the TYPE (`f32`) rather than from a probe tensor.
-/// Unspecified-dtype tensor creation follows the per-DEVICE default policy,
-/// which another backend alias sharing the device (`Gpu` vs `GpuF16`) may have
-/// flipped in this process.
+/// dtype from `device`. Under burn 0.22 the float element type is a per-device
+/// runtime setting rather than a backend type parameter, so the dtype a load
+/// casts to is decided by the device the caller hands in.
 pub fn gguf_store(
     f: &GgufFile,
     map: &dyn Fn(&GgufTensorInfo) -> Option<GgufMap>,
     sink: DequantSink,
+    device: &burn::tensor::Device,
 ) -> Result<(SafetensorsStore, Option<ScratchFile>), ImportError> {
     let parse = |reason: String| ImportError::Parse {
         file: f.path.clone(),
         reason,
     };
     let total_f32_bytes: u64 = f.tensors.iter().map(|t| t.element_count() * 4).sum();
-    let target_float = crate::backend::float_dtype();
+    let target_float = crate::backend::float_dtype(device);
     let adapter = PyTorchToBurnAdapter.chain(CastFloatAdapter::new(target_float));
 
     match sink.resolve(total_f32_bytes) {

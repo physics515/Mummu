@@ -42,7 +42,9 @@ pub const PACK_VERSION: u32 = 1;
 pub const BLOCK: usize = 32;
 
 /// A stored precision level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Precision {
     Q4,
@@ -109,7 +111,11 @@ pub enum Role {
     /// A depthwise conv kernel `[channels, 1, k]`.
     Conv,
     /// One member of a split MoE expert bank, stored `[in, out]`.
-    Expert { layer: usize, index: usize, proj: String },
+    Expert {
+        layer: usize,
+        index: usize,
+        proj: String,
+    },
 }
 
 /// Where one precision of one tensor lives inside its blob.
@@ -214,7 +220,11 @@ pub enum ImportAction {
 /// Quantize a row-major tensor whose LAST dim is a multiple of [`BLOCK`]:
 /// returns (i8 values, f32 scale per block). Blocks run along rows — a
 /// block never straddles two rows.
-pub fn quantize_blocks(values: &[f32], last_dim: usize, precision: Precision) -> (Vec<i8>, Vec<f32>) {
+pub fn quantize_blocks(
+    values: &[f32],
+    last_dim: usize,
+    precision: Precision,
+) -> (Vec<i8>, Vec<f32>) {
     assert!(
         last_dim.is_multiple_of(BLOCK) && values.len().is_multiple_of(last_dim),
         "quantize_blocks: last dim {last_dim} must divide by {BLOCK} and the length"
@@ -231,9 +241,11 @@ pub fn quantize_blocks(values: &[f32], last_dim: usize, precision: Precision) ->
         let scale = if alpha > 0.0 { alpha / range_max } else { 1.0 };
         scales.push(scale);
         let inv = 1.0 / scale;
-        q.extend(block.iter().map(|&x| {
-            (x * inv).round().clamp(-range_max, range_max) as i8
-        }));
+        q.extend(
+            block
+                .iter()
+                .map(|&x| (x * inv).round().clamp(-range_max, range_max) as i8),
+        );
     }
     (q, scales)
 }
@@ -259,7 +271,11 @@ fn unpack_nibbles(bytes: &[u8], n: usize) -> Vec<i8> {
                 break;
             }
             // 4-bit two's complement sign extension.
-            out.push(if nib & 0x8 != 0 { (nib | 0xF0) as i8 } else { nib as i8 });
+            out.push(if nib & 0x8 != 0 {
+                (nib | 0xF0) as i8
+            } else {
+                nib as i8
+            });
         }
     }
     out
@@ -319,7 +335,8 @@ pub fn import_gguf(
     {
         let mut src = std::fs::File::open(gguf_path).map_err(|e| e.to_string())?;
         let mut header = vec![0u8; usize::try_from(f.data_offset).expect("header fits")];
-        src.read_exact(&mut header).map_err(|e| format!("read header: {e}"))?;
+        src.read_exact(&mut header)
+            .map_err(|e| format!("read header: {e}"))?;
         std::fs::write(out_dir.join("header.gguf"), &header).map_err(|e| e.to_string())?;
     }
 
@@ -375,9 +392,17 @@ pub fn import_gguf(
             ImportAction::Skip => unreachable!(),
             ImportAction::Linear => {
                 let &[out, inp] = dims_rev.as_slice() else {
-                    return Err(format!("'{}' linear must be 2-D, got {dims_rev:?}", info.name));
+                    return Err(format!(
+                        "'{}' linear must be 2-D, got {dims_rev:?}",
+                        info.name
+                    ));
                 };
-                items.push((info.name.clone(), Role::Linear, vec![inp, out], transpose(&values, out, inp)));
+                items.push((
+                    info.name.clone(),
+                    Role::Linear,
+                    vec![inp, out],
+                    transpose(&values, out, inp),
+                ));
             }
             ImportAction::Embedding => {
                 items.push((info.name.clone(), Role::Embedding, dims_rev.clone(), values));
@@ -388,13 +413,19 @@ pub fn import_gguf(
             ImportAction::Conv => {
                 // ggml ne = [k, ch] ⇒ row-major [ch, k] == checkpoint [ch, 1, k] bytes.
                 let &[ch, k] = dims_rev.as_slice() else {
-                    return Err(format!("'{}' conv must be 2-D squeezed, got {dims_rev:?}", info.name));
+                    return Err(format!(
+                        "'{}' conv must be 2-D squeezed, got {dims_rev:?}",
+                        info.name
+                    ));
                 };
                 items.push((info.name.clone(), Role::Conv, vec![ch, 1, k], values));
             }
             ImportAction::ExpertBank { layer, proj } => {
                 let &[e, out, inp] = dims_rev.as_slice() else {
-                    return Err(format!("'{}' expert bank must be 3-D, got {dims_rev:?}", info.name));
+                    return Err(format!(
+                        "'{}' expert bank must be 3-D, got {dims_rev:?}",
+                        info.name
+                    ));
                 };
                 let stride = out * inp;
                 for expert in 0..e {
@@ -419,7 +450,9 @@ pub fn import_gguf(
             let mut per: BTreeMap<Precision, Blob> = BTreeMap::new();
             for &p in &all_levels {
                 let stored = match p {
-                    Precision::F32 | Precision::F16 => float_levels.contains(&p) || !quantizable && p == Precision::F32,
+                    Precision::F32 | Precision::F16 => {
+                        float_levels.contains(&p) || !quantizable && p == Precision::F32
+                    }
                     Precision::Q4 | Precision::Q8 => quantizable && precisions.contains(&p),
                 };
                 if !stored {
@@ -430,7 +463,12 @@ pub fn import_gguf(
                     Precision::F32 => {
                         let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
                         let (o, l) = w.append(&bytes).map_err(|e| e.to_string())?;
-                        Blob { values_offset: o, values_len: l, scales_offset: 0, scales_len: 0 }
+                        Blob {
+                            values_offset: o,
+                            values_len: l,
+                            scales_offset: 0,
+                            scales_len: 0,
+                        }
                     }
                     Precision::F16 => {
                         let bytes: Vec<u8> = data
@@ -438,7 +476,12 @@ pub fn import_gguf(
                             .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
                             .collect();
                         let (o, l) = w.append(&bytes).map_err(|e| e.to_string())?;
-                        Blob { values_offset: o, values_len: l, scales_offset: 0, scales_len: 0 }
+                        Blob {
+                            values_offset: o,
+                            values_len: l,
+                            scales_offset: 0,
+                            scales_len: 0,
+                        }
                     }
                     Precision::Q8 | Precision::Q4 => {
                         let last = *shape.last().expect("non-empty shape");
@@ -451,7 +494,12 @@ pub fn import_gguf(
                         let (vo, vl) = w.append(&vbytes).map_err(|e| e.to_string())?;
                         let sbytes: Vec<u8> = scales.iter().flat_map(|s| s.to_le_bytes()).collect();
                         let (so, sl) = w.append(&sbytes).map_err(|e| e.to_string())?;
-                        Blob { values_offset: vo, values_len: vl, scales_offset: so, scales_len: sl }
+                        Blob {
+                            values_offset: vo,
+                            values_len: vl,
+                            scales_offset: so,
+                            scales_len: sl,
+                        }
                     }
                 };
                 per.insert(p, blob);
@@ -471,7 +519,9 @@ pub fn import_gguf(
 
     let manifest = Manifest {
         version: PACK_VERSION,
-        source_file: gguf_path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
+        source_file: gguf_path
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
         source_bytes: std::fs::metadata(gguf_path).map(|m| m.len()).unwrap_or(0),
         architecture: f.architecture().unwrap_or("").to_string(),
         precisions: all_levels,
@@ -507,7 +557,12 @@ fn transpose(values: &[f32], out: usize, inp: usize) -> Vec<f32> {
 /// what every backend's `q_from_data` consumes. (`TensorData::quantized`
 /// itself only handles 8-bit values under the default `PackedU32` store:
 /// its Q4 reader unpacks nibbles the constructor never packed.)
-pub fn quantized_tensor_data(values: &[i8], scales: &[f32], shape: impl Into<burn::tensor::Shape>, scheme: QuantScheme) -> TensorData {
+pub fn quantized_tensor_data(
+    values: &[i8],
+    scales: &[f32],
+    shape: impl Into<burn::tensor::Shape>,
+    scheme: QuantScheme,
+) -> TensorData {
     use burn::tensor::quantization::QuantValue;
     let shape: burn::tensor::Shape = shape.into();
     let bits = match scheme.value {
@@ -548,7 +603,8 @@ impl Pack {
     pub fn open(dir: &Path) -> Result<Self, String> {
         let json = std::fs::read_to_string(dir.join("manifest.json"))
             .map_err(|e| format!("read manifest: {e}"))?;
-        let manifest: Manifest = serde_json::from_str(&json).map_err(|e| format!("parse manifest: {e}"))?;
+        let manifest: Manifest =
+            serde_json::from_str(&json).map_err(|e| format!("parse manifest: {e}"))?;
         if manifest.version != PACK_VERSION {
             return Err(format!(
                 "pack version {} is not the supported {PACK_VERSION}",
@@ -576,14 +632,25 @@ impl Pack {
     pub fn rewrite_entry(&self, entry: &TensorEntry, values: &[f32]) -> Result<(), String> {
         let numel: usize = entry.shape.iter().product();
         if values.len() != numel {
-            return Err(format!("rewrite '{}': {} values for shape {:?}", entry.name, values.len(), entry.shape));
+            return Err(format!(
+                "rewrite '{}': {} values for shape {:?}",
+                entry.name,
+                values.len(),
+                entry.shape
+            ));
         }
         let last = *entry.shape.last().expect("non-empty shape");
         for (&p, blob) in &entry.precisions {
             let (vbytes, sbytes): (Vec<u8>, Vec<u8>) = match p {
-                Precision::F32 => (values.iter().flat_map(|v| v.to_le_bytes()).collect(), Vec::new()),
+                Precision::F32 => (
+                    values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                    Vec::new(),
+                ),
                 Precision::F16 => (
-                    values.iter().flat_map(|&v| half::f16::from_f32(v).to_le_bytes()).collect(),
+                    values
+                        .iter()
+                        .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
+                        .collect(),
                     Vec::new(),
                 ),
                 Precision::Q8 | Precision::Q4 => {
@@ -610,10 +677,12 @@ impl Pack {
                 .write(true)
                 .open(self.dir.join(p.blob_name()))
                 .map_err(|e| format!("open {} for write: {e}", p.blob_name()))?;
-            file.seek(SeekFrom::Start(blob.values_offset)).map_err(|e| e.to_string())?;
+            file.seek(SeekFrom::Start(blob.values_offset))
+                .map_err(|e| e.to_string())?;
             file.write_all(&vbytes).map_err(|e| e.to_string())?;
             if !sbytes.is_empty() {
-                file.seek(SeekFrom::Start(blob.scales_offset)).map_err(|e| e.to_string())?;
+                file.seek(SeekFrom::Start(blob.scales_offset))
+                    .map_err(|e| e.to_string())?;
                 file.write_all(&sbytes).map_err(|e| e.to_string())?;
             }
             file.sync_data().map_err(|e| e.to_string())?;
@@ -638,7 +707,10 @@ impl Pack {
         let width: usize = ranges.iter().map(|r| r.1).sum();
         match precision {
             Precision::Q4 | Precision::Q8 => {
-                if ranges.iter().any(|&(s, l)| !s.is_multiple_of(BLOCK) || !l.is_multiple_of(BLOCK)) {
+                if ranges
+                    .iter()
+                    .any(|&(s, l)| !s.is_multiple_of(BLOCK) || !l.is_multiple_of(BLOCK))
+                {
                     return Err("column ranges must be block-aligned for quantized levels".into());
                 }
                 let (values, scales) = self.read_quant(entry, precision)?;
@@ -648,11 +720,16 @@ impl Pack {
                 for r in 0..rows {
                     for &(start, len) in ranges {
                         v.extend_from_slice(&values[r * cols + start..r * cols + start + len]);
-                        s.extend_from_slice(&scales[r * bpr + start / BLOCK..r * bpr + (start + len) / BLOCK]);
+                        s.extend_from_slice(
+                            &scales[r * bpr + start / BLOCK..r * bpr + (start + len) / BLOCK],
+                        );
                     }
                 }
                 let scheme = precision.policy().scheme().expect("quantized level");
-                Ok(Tensor::from_data(quantized_tensor_data(&v, &s, [rows, width], scheme), device))
+                Ok(Tensor::from_data(
+                    quantized_tensor_data(&v, &s, [rows, width], scheme),
+                    device,
+                ))
             }
             Precision::F16 | Precision::F32 => {
                 let all = self.read_floats(entry, precision)?;
@@ -662,8 +739,11 @@ impl Pack {
                         v.extend_from_slice(&all[r * cols + start..r * cols + start + len]);
                     }
                 }
-                let dtype = crate::backend::float_dtype();
-                Ok(Tensor::from_data(TensorData::new(v, [rows, width]), (device, dtype)))
+                let dtype = crate::backend::float_dtype(device);
+                Ok(Tensor::from_data(
+                    TensorData::new(v, [rows, width]),
+                    (device, dtype),
+                ))
             }
         }
     }
@@ -692,7 +772,10 @@ impl Pack {
                     s.extend_from_slice(&scales[start * bpr..(start + len) * bpr]);
                 }
                 let scheme = precision.policy().scheme().expect("quantized level");
-                Ok(Tensor::from_data(quantized_tensor_data(&v, &s, [height, cols], scheme), device))
+                Ok(Tensor::from_data(
+                    quantized_tensor_data(&v, &s, [height, cols], scheme),
+                    device,
+                ))
             }
             Precision::F16 | Precision::F32 => {
                 let all = self.read_floats(entry, precision)?;
@@ -700,8 +783,11 @@ impl Pack {
                 for &(start, len) in ranges {
                     v.extend_from_slice(&all[start * cols..(start + len) * cols]);
                 }
-                let dtype = crate::backend::float_dtype();
-                Ok(Tensor::from_data(TensorData::new(v, [height, cols]), (device, dtype)))
+                let dtype = crate::backend::float_dtype(device);
+                Ok(Tensor::from_data(
+                    TensorData::new(v, [height, cols]),
+                    (device, dtype),
+                ))
             }
         }
     }
@@ -719,9 +805,11 @@ impl Pack {
     fn read_range(&self, precision: Precision, offset: u64, len: u64) -> Result<Vec<u8>, String> {
         let mut file = std::fs::File::open(self.dir.join(precision.blob_name()))
             .map_err(|e| format!("open {}: {e}", precision.blob_name()))?;
-        file.seek(SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|e| e.to_string())?;
         let mut buf = vec![0u8; usize::try_from(len).expect("blob fits")];
-        file.read_exact(&mut buf).map_err(|e| format!("read {}: {e}", precision.blob_name()))?;
+        file.read_exact(&mut buf)
+            .map_err(|e| format!("read {}: {e}", precision.blob_name()))?;
         Ok(buf)
     }
 
@@ -736,11 +824,7 @@ impl Pack {
     /// used to funnel through `read_f32`, which prefers f32 — so every
     /// "F16" load silently read `f32.bin`, including the probe that once
     /// "measured" F16 speed on flex.
-    pub fn read_floats(
-        &self,
-        entry: &TensorEntry,
-        prefer: Precision,
-    ) -> Result<Vec<f32>, String> {
+    pub fn read_floats(&self, entry: &TensorEntry, prefer: Precision) -> Result<Vec<f32>, String> {
         if prefer == Precision::F16
             && let Some(b) = entry.precisions.get(&Precision::F16)
         {
@@ -790,7 +874,11 @@ impl Pack {
     }
 
     /// The (i8 values, f32 block scales) of a quantized level.
-    pub fn read_quant(&self, entry: &TensorEntry, precision: Precision) -> Result<(Vec<i8>, Vec<f32>), String> {
+    pub fn read_quant(
+        &self,
+        entry: &TensorEntry,
+        precision: Precision,
+    ) -> Result<(Vec<i8>, Vec<f32>), String> {
         let b = entry
             .precisions
             .get(&precision)
@@ -824,11 +912,13 @@ impl Pack {
         precision: Precision,
         device: &Device,
     ) -> Result<Tensor<D>, String> {
-        let shape: [usize; D] = entry
-            .shape
-            .clone()
-            .try_into()
-            .map_err(|_| format!("'{}' is rank {}, asked for {D}", entry.name, entry.shape.len()))?;
+        let shape: [usize; D] = entry.shape.clone().try_into().map_err(|_| {
+            format!(
+                "'{}' is rank {}, asked for {D}",
+                entry.name,
+                entry.shape.len()
+            )
+        })?;
         match precision {
             Precision::Q4 | Precision::Q8 => {
                 let (values, scales) = self.read_quant(entry, precision)?;
@@ -841,8 +931,11 @@ impl Pack {
             }
             Precision::F16 | Precision::F32 => {
                 let values = self.read_floats(entry, precision)?;
-                let dtype = crate::backend::float_dtype();
-                Ok(Tensor::from_data(TensorData::new(values, shape), (device, dtype)))
+                let dtype = crate::backend::float_dtype(device);
+                Ok(Tensor::from_data(
+                    TensorData::new(values, shape),
+                    (device, dtype),
+                ))
             }
         }
     }
@@ -922,11 +1015,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let (rows, cols) = (64usize, 128usize); // both dims multiples of BLOCK
-        let gate: Vec<f32> = (0..rows * cols).map(|i| ((i as f32) * 0.017).sin()).collect();
-        let down: Vec<f32> = (0..cols * rows).map(|i| ((i as f32) * 0.023).cos()).collect();
+        let gate: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i as f32) * 0.017).sin())
+            .collect();
+        let down: Vec<f32> = (0..cols * rows)
+            .map(|i| ((i as f32) * 0.023).cos())
+            .collect();
         // Write f32 and Q8 blobs with two entries.
-        let mut f32w = BlobWriter { file: std::io::BufWriter::new(std::fs::File::create(dir.join("f32.bin")).unwrap()), len: 0, unsynced: 0 };
-        let mut q8w = BlobWriter { file: std::io::BufWriter::new(std::fs::File::create(dir.join("q8.bin")).unwrap()), len: 0, unsynced: 0 };
+        let mut f32w = BlobWriter {
+            file: std::io::BufWriter::new(std::fs::File::create(dir.join("f32.bin")).unwrap()),
+            len: 0,
+            unsynced: 0,
+        };
+        let mut q8w = BlobWriter {
+            file: std::io::BufWriter::new(std::fs::File::create(dir.join("q8.bin")).unwrap()),
+            len: 0,
+            unsynced: 0,
+        };
         let mut entry = |name: &str, vals: &[f32], shape: Vec<usize>| -> TensorEntry {
             let last = *shape.last().unwrap();
             let fbytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -941,9 +1046,27 @@ mod tests {
                 role: Role::Linear,
                 shape,
                 precisions: [
-                    (Precision::F32, Blob { values_offset: fo, values_len: fl, scales_offset: 0, scales_len: 0 }),
-                    (Precision::Q8, Blob { values_offset: qo, values_len: ql, scales_offset: so, scales_len: sl }),
-                ].into_iter().collect(),
+                    (
+                        Precision::F32,
+                        Blob {
+                            values_offset: fo,
+                            values_len: fl,
+                            scales_offset: 0,
+                            scales_len: 0,
+                        },
+                    ),
+                    (
+                        Precision::Q8,
+                        Blob {
+                            values_offset: qo,
+                            values_len: ql,
+                            scales_offset: so,
+                            scales_len: sl,
+                        },
+                    ),
+                ]
+                .into_iter()
+                .collect(),
             }
         };
         let ge = entry("gate", &gate, vec![rows, cols]);
@@ -951,17 +1074,30 @@ mod tests {
         f32w.file.flush().unwrap();
         q8w.file.flush().unwrap();
         let manifest = Manifest {
-            version: PACK_VERSION, source_file: String::new(), source_bytes: 0,
-            architecture: "test".into(), precisions: vec![Precision::F32, Precision::Q8],
-            tensors: vec![ge.clone(), de.clone()], ffn_partition: None,
+            version: PACK_VERSION,
+            source_file: String::new(),
+            source_bytes: 0,
+            architecture: "test".into(),
+            precisions: vec![Precision::F32, Precision::Q8],
+            tensors: vec![ge.clone(), de.clone()],
+            ffn_partition: None,
         };
-        std::fs::write(dir.join("manifest.json"), serde_json::to_string(&manifest).unwrap()).unwrap();
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
         // No header.gguf here — construct Pack directly.
-        let pack = Pack { dir: dir.clone(), manifest };
+        let pack = Pack {
+            dir: dir.clone(),
+            manifest,
+        };
         let device = crate::backend::cpu_device();
         // Columns [32,32) and [96,32) of gate → [rows, 64].
         let ranges = [(32usize, 32usize), (96, 32)];
-        let cslab = pack.tensor_cols(&ge, Precision::F32, &ranges, &device).unwrap();
+        let cslab = pack
+            .tensor_cols(&ge, Precision::F32, &ranges, &device)
+            .unwrap();
         assert_eq!(cslab.dims(), [rows, 64]);
         let got = cslab.into_data().to_vec::<f32>().unwrap();
         for r in 0..rows {
@@ -969,12 +1105,17 @@ mod tests {
                 let base: usize = ranges[..k].iter().map(|x| x.1).sum();
                 for j in 0..len {
                     let want = gate[r * cols + start + j];
-                    assert!((got[r * 64 + base + j] - want).abs() < 1e-6, "col f32 r{r} j{j}");
+                    assert!(
+                        (got[r * 64 + base + j] - want).abs() < 1e-6,
+                        "col f32 r{r} j{j}"
+                    );
                 }
             }
         }
         // Same ranges as rows of down → [64, rows].
-        let rslab = pack.tensor_rows(&de, Precision::F32, &ranges, &device).unwrap();
+        let rslab = pack
+            .tensor_rows(&de, Precision::F32, &ranges, &device)
+            .unwrap();
         assert_eq!(rslab.dims(), [64, rows]);
         let gotr = rslab.into_data().to_vec::<f32>().unwrap();
         for (k, &(start, len)) in ranges.iter().enumerate() {
@@ -982,19 +1123,27 @@ mod tests {
             for i in 0..len {
                 for c in 0..rows {
                     let want = down[(start + i) * rows + c];
-                    assert!((gotr[(base + i) * rows + c] - want).abs() < 1e-6, "row f32 i{i} c{c}");
+                    assert!(
+                        (gotr[(base + i) * rows + c] - want).abs() < 1e-6,
+                        "row f32 i{i} c{c}"
+                    );
                 }
             }
         }
         // Q8 column slice dequantizes close to the source.
-        let cq = pack.tensor_cols(&ge, Precision::Q8, &ranges, &device).unwrap();
+        let cq = pack
+            .tensor_cols(&ge, Precision::Q8, &ranges, &device)
+            .unwrap();
         let dq = cq.dequantize().into_data().to_vec::<f32>().unwrap();
         for r in 0..rows {
             for (k, &(start, len)) in ranges.iter().enumerate() {
                 let base: usize = ranges[..k].iter().map(|x| x.1).sum();
                 for j in 0..len {
                     let want = gate[r * cols + start + j];
-                    assert!((dq[r * 64 + base + j] - want).abs() < 0.05, "col q8 r{r} j{j}");
+                    assert!(
+                        (dq[r * 64 + base + j] - want).abs() < 0.05,
+                        "col q8 r{r} j{j}"
+                    );
                 }
             }
         }

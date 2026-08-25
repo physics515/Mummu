@@ -4,7 +4,7 @@
 
 use burn::module::Module;
 use burn::nn::{Linear, LinearConfig, RmsNorm, RmsNormConfig};
-use burn::tensor::{Device, DType, Tensor, TensorData, activation};
+use burn::tensor::{DType, Device, Tensor, TensorData, activation};
 
 use super::MAX_CONTEXT_TOKENS;
 use super::rope::apply_rope;
@@ -31,9 +31,10 @@ pub fn causal_mask(t: usize, past: usize, device: &Device) -> Tensor<4> {
             m[i * kcols + j] = -1e4;
         }
     }
-    // Dtype pinned to the backend TYPE: unspecified-dtype creation follows
-    // the per-DEVICE policy another alias sharing the device may have locked.
-    let dtype = crate::backend::float_dtype();
+    // The float dtype comes from the DEVICE — burn 0.22 keeps the element
+    // type there as a runtime setting, not on a backend type. Creation sites
+    // still name it explicitly rather than riding the unspecified default.
+    let dtype = crate::backend::float_dtype(device);
     Tensor::<2>::from_data(TensorData::new(m, [t, kcols]), (device, dtype))
         .reshape([1, 1, t, kcols])
 }
@@ -279,8 +280,7 @@ mod tests {
         let data: Vec<f32> = (0..t * HIDDEN)
             .map(|i| ((i as f32 + seed) * 0.7).sin())
             .collect();
-        Tensor::<2>::from_data(TensorData::new(data, [t, HIDDEN]), device)
-            .reshape([1, t, HIDDEN])
+        Tensor::<2>::from_data(TensorData::new(data, [t, HIDDEN]), device).reshape([1, t, HIDDEN])
     }
 
     /// Full forward over `t` positions in one call (prefill-style).

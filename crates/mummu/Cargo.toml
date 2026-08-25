@@ -40,7 +40,7 @@ jinja-template = ["dep:hf-chat-template"]
 flamegraph = ["dep:inferno"]
 
 [dependencies]
-inferno = { version = "0.11", optional = true, default-features = false }
+inferno = { version = "0.12", optional = true, default-features = false }
 # The async runtime: mummu's model runtime is async (burn 0.22 readbacks,
 # cancellable decode loops), so the library owns a tokio dependency rather
 # than leaving async to consumers.

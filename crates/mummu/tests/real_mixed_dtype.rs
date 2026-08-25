@@ -23,7 +23,7 @@
 use std::path::PathBuf;
 
 use burn::tensor::DType;
-use mummu::backend::{Gpu, GpuF16, inventory};
+use mummu::backend::inventory;
 use mummu::models::{CausalLm, qwen3};
 use tokenizers::Tokenizer;
 
@@ -33,9 +33,9 @@ fn qwen3_dir() -> Option<PathBuf> {
         .filter(|d| d.join("model.safetensors").is_file())
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "needs the Qwen3 safetensors dir (MUMMU_QWEN3_DIR) + a SHADER_F16 GPU"]
-fn f32_model_survives_an_f16_model_having_locked_the_device_policy() {
+async fn f32_model_survives_an_f16_model_having_locked_the_device_policy() {
     let dir = qwen3_dir().expect("set MUMMU_QWEN3_DIR to a Qwen3 safetensors dir");
     assert!(
         inventory().any_shader_f16(),
@@ -56,9 +56,9 @@ fn f32_model_survives_an_f16_model_having_locked_the_device_policy() {
     // Leg 1 — f16 FIRST: its first tensor touch locks the shared device
     // policy to F16 (the historically poisonous order).
     let f16_top = {
-        let device = burn::tensor::Device::<GpuF16>::default();
-        let model =
-            qwen3::load_from_dir::<GpuF16>(&dir, &device).expect("f16 weights load checked");
+        let device =
+            mummu::backend::gpu_device_f16().expect("f16 device settings lock once per process");
+        let model = qwen3::load_from_dir(&dir, &device).expect("f16 weights load checked");
         let mut cache = model.new_cache();
         let logits = model.forward(&prompt, 0, &mut cache, &device);
         assert_eq!(
@@ -68,6 +68,7 @@ fn f32_model_survives_an_f16_model_having_locked_the_device_policy() {
         );
         let smoke = model
             .sanity_check(&prompt, model.config.vocab_size, &device)
+            .await
             .expect("f16 forward is finite and non-degenerate");
         eprintln!(
             "[mixed_dtype/f16] sanity smoke: top_id {} · spread {:.3}",
@@ -80,8 +81,8 @@ fn f32_model_survives_an_f16_model_having_locked_the_device_policy() {
     // Leg 2 — f32 in the SAME process, with the policy locked to F16: every
     // pinned creation site must still produce f32 tensors, and the strict
     // f32 readback that used to die TypeMismatch must succeed.
-    let device = burn::tensor::Device::<Gpu>::default();
-    let model = qwen3::load_from_dir::<Gpu>(&dir, &device).expect("f32 weights load checked");
+    let device = mummu::backend::gpu_device();
+    let model = qwen3::load_from_dir(&dir, &device).expect("f32 weights load checked");
     let mut cache = model.new_cache();
     let logits = model.forward(&prompt, 0, &mut cache, &device);
     assert_eq!(
@@ -96,6 +97,7 @@ fn f32_model_survives_an_f16_model_having_locked_the_device_policy() {
     assert_eq!(strict.len(), model.config.vocab_size, "full logit row");
     let smoke = model
         .sanity_check(&prompt, model.config.vocab_size, &device)
+        .await
         .expect("f32 forward is finite and non-degenerate");
     eprintln!(
         "[mixed_dtype/f32] sanity smoke: top_id {} · spread {:.3}",
@@ -112,6 +114,7 @@ fn f32_model_survives_an_f16_model_having_locked_the_device_policy() {
     // Qwen3-0.6B spends tokens on a <think> block before the answer.
     let ids = model
         .greedy_generate(&prompt, 128, &device)
+        .await
         .expect("f32 greedy decode with a poisoned device policy");
     assert!(!ids.is_empty(), "decode produced no tokens before EOS");
     let text = tok.decode(&ids, true).expect("decode");

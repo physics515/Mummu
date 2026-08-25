@@ -395,6 +395,18 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       no-fusion build. Fusion remains a default cargo feature for the library; revisit after the
       quantized-matmul defect above is resolved, since fusion is what turns 16 separate ops into the
       unlaunchable fused key.
+      *(2026-08-25) Sharper, and it is now a **correctness** statement, not a perf one: with `fusion`
+      on — mummu's DEFAULT feature set — the Qwen2.5-1.5B parity gate cannot run at all. The first
+      forward dies on the same defect, `burn-fusion 0.22.0-pre.2
+      stream/execution/ordering.rs:49 — Ordering is bigger than operations: ordering len 3,
+      operations len 0, num_executed 0, optimization len 3`, raised on the `DSU-4-0` device runner and
+      surfacing on the caller as `client.rs:200` unwrapping a `CallError`. The SAME gate on the SAME
+      weights with `--no-default-features --features vulkan-spirv` passes: top-5 ids exact in order
+      (785, 16, 32, 1249, 8420) against the committed Candle fixture, max |Δlogit| **1.0681152e-4**
+      (bound 1e-3). So `fusion` in the default set is currently shipping a configuration whose parity
+      is **unverifiable**, and every recorded parity number in this file was measured on a stack that
+      no longer runs it. Two follow-ups, both `[ ]` below: decide whether `fusion` stays a default
+      before 0.22 stabilizes, and run the gates on BOTH feature sets so this cannot hide again.
 - [x] **The persistent autotune cache never worked on the host — a TOML escaping bug.** *(2026-08-23)*
       `cubecl.toml` wrote the cache root as a TOML **basic** string containing a Windows path
       (`"D:\Docker Containers\..."`), where backslashes are escape sequences. cubecl's response to a
@@ -2089,6 +2101,74 @@ that fits the model AND uses every device to the fullest.
       remains the right choice for the logits leg regardless (no template stack in the loop). Also:
       LiquidAI officially publishes LFM2.5-1.2B GGUFs (incl. F16) — the same-weights reference artifact
       this leg needs — https://github.com/ggml-org/llama.cpp/issues/23838
+- [x] **Every gate compiles again: the burn 0.22 migration had left 35 of them behind.**
+      *(2026-08-25)* `cargo check --all-targets` was **red on `main`** — the library and
+      `mummu-serve` had been migrated off the 0.21 backend generic, but **every parity gate, every
+      budget gate, every real-model proof, the load gate and three examples had not**. So the whole
+      shipping discipline this file rests on — "parity or it didn't ship", "never ship red", the
+      `bench/BASELINE.md` budgets — had been unenforceable since the migration, and nothing said so,
+      because a target that does not compile reports nothing at all. Four API shifts, all mechanical
+      once named: the `Gpu`/`Cpu`/`GpuF16` aliases became `Device` **values** (`backend::gpu_device()`
+      / `cpu_device()`), `Tensor<B, D>` lost its backend parameter, `generate` / `first_token` /
+      `sanity_check` / `warm_up` / `decode::argmax_id` became futures (gates are `#[tokio::test]`,
+      the library's own idiom), and two structs had grown fields (`DeviceExpert::native_ok`,
+      `TierDevice::preload_units`). Three places needed a real decision rather than a rename:
+      `ModelSlot::with` takes a *sync* closure and generation is a future, so the gates that held a
+      model across a decode moved to the `acquire` guard the cache already exposes for exactly this;
+      criterion's closures are sync, so the bench blocks on a runtime built once per group (the wait
+      measured is still the device's fence); and `gguf_store` / `compare_against_llama_cpp` now take
+      the device explicitly, which is what moved the OLMoE parity leg back onto the host where its
+      ~28 GB f32 build actually fits.
+      **Both restored gates were then RUN on real weights**, on `--no-default-features --features
+      vulkan-spirv` (see the fusion item above for why not the default set): `parity_qwen2`'s logits
+      leg matches the committed Candle fixture top-5 **exactly in order** (785, 16, 32, 1249, 8420) at
+      max |Δlogit| **1.0681152e-4** against a 1e-3 bound, and `parity_gguf`'s qwen3 leg matches
+      llama.cpp on the identical Q4_K_M file — top-5 exact in order (151667, 151644, 151645, 99966,
+      131545), the 24-token greedy sequence **byte-identical** including the `<think>` tokens, max
+      |Δlogprob| **4.0152457458654034e-1** against the recorded **4.015608155114805e-1**. Those two
+      agreeing to four decimals is the evidence that reading the dtype off the device changed nothing
+      at F32; the fifth-decimal drift is burn 0.21 -> 0.22, not this change. 312 unit tests green.
+      `parity_qwen2`'s Ollama greedy leg could not run — the `qwen2.5:1.5b-instruct-fp16` tag is not
+      pulled on this machine (own `[ ]` below).
+- [x] **...and the migration had silently dropped f16 — the gates that would have caught it were
+      among the 35.** `backend::float_dtype()` returned the constant `DType::F32` and 28
+      tensor-creation sites in the library called it, so a device configured for f16 would have been
+      overridden back to f32 at every creation site. burn 0.22 keeps the element type on the device
+      as a runtime setting (`Device::configure`), so the fix is to read it there:
+      **`float_dtype(&device)` / `int_dtype(&device)`**, plus **`backend::gpu_device_f16()`** as the
+      `GpuF16` alias's replacement. Device settings lock on first use and cannot be changed, which is
+      the 0.21 one-alias-per-process rule now enforced by burn itself — `gpu_device_f16` is therefore
+      idempotent within a process, and **returns an error rather than an f32 device wearing an f16
+      label**, the exact shape of the 2026-07-11 mislabelling bug. The bench arm carries the same
+      guard: it asserts the device's dtype against the row's name before believing a number, and runs
+      the f16 arm FIRST because whichever arm runs first locks the process.
+      Default behaviour is unchanged by construction (a wgpu device defaults to F32), which is what
+      the re-run f32 parity numbers are evidence for.
+- [ ] **`cargo fmt --check` is red across the tree — ~330 hunks in ~50 files**, concentrated in the
+      newest modules (`nn/moe.rs` 41, `pack.rs` 39, `mummu-serve/src/engine.rs` 45, `models/qwen35.rs`
+      24). There is no `rustfmt.toml`, so this is default-rustfmt drift accumulated over many runs,
+      not a house style. Deliberately NOT bundled into the 2026-08-25 migration commit — a 6 800-line
+      reformat would have buried a 57-file semantic change. Land it as its OWN commit, touching
+      nothing else, and then the guardrail is checkable again on every later run. *(2026-08-25.)*
+- [ ] **The parity and budget gates need a compile-only CI leg.** The 35-target breakage above
+      survived several runs precisely because `cargo test` (which compiles only what it runs) and
+      `cargo build` (default targets) both stayed green while `--all-targets` was red. A cheap
+      `cargo check --all-targets --keep-going` in the run's verify step would have caught it the day
+      it landed; it is now the first thing this routine runs. Worth making it a checked-in CI job so
+      it does not depend on a routine remembering. *(2026-08-25.)*
+- [ ] **Run every gate on BOTH feature sets — `fusion` on and off.** The 2026-08-25 parity re-run
+      found the default (`fusion`) build cannot complete a single forward on burn 0.22.0-pre.2 while
+      the `--no-default-features --features vulkan-spirv` build passes byte-for-byte. A gate that only
+      ever runs one feature set cannot see that, and `fusion` is the set consumers get by default. The
+      cheap version is a second invocation of the same gates with the flag flipped; the honest version
+      records both numbers in `bench/BASELINE.md` so a divergence between them is itself a regression.
+      *(2026-08-25.)*
+- [ ] **The Ollama greedy leg has no fixture on this machine** — `parity_qwen2`'s second leg fails
+      with `model 'qwen2.5:1.5b-instruct-fp16' not found` while its logits leg passes. That is the
+      missing-fixture-vs-wrong-answer confusion the P3 item above is about, hit in the field: the run
+      summary says FAILED for a tag that was never pulled. Pull the tag (`ollama pull
+      qwen2.5:1.5b-instruct-fp16`) or let the leg report a summarized skip — but not both silently.
+      *(2026-08-25.)*
 - [ ] Wire the perf suite (above) into the parity harness so a correctness *or* budget regression fails CI.
 
 ### P8 — Model management API

@@ -13,7 +13,6 @@
 use std::io::Write as _;
 use std::time::Instant;
 
-use mummu::backend::{Cpu, Gpu};
 use mummu::models::CausalLm;
 use mummu::models::qwen35;
 use mummu::quant::QuantPolicy;
@@ -22,14 +21,18 @@ use mummu::quant::QuantPolicy;
 /// float side alone (5 GB embedding) plus quantized linears outgrows a
 /// 16 GB card, so the big tiers need the CPU explicitly.
 fn use_gpu() -> bool {
-    let forced_cpu = std::env::var("MUMMU_FORCE_CPU")
-        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let forced_cpu =
+        std::env::var("MUMMU_FORCE_CPU").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
     !forced_cpu && mummu::backend::use_gpu()
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let mut args = std::env::args().skip(1);
-    let path = std::path::PathBuf::from(args.next().expect("usage: qwen35-generate <gguf> <off|q8|q4> [max_tokens] [prompt…]"));
+    let path = std::path::PathBuf::from(
+        args.next()
+            .expect("usage: qwen35-generate <gguf> <off|q8|q4> [max_tokens] [prompt…]"),
+    );
     let policy = match args.next().as_deref() {
         Some("off") | None => QuantPolicy::Off,
         Some("q8") => QuantPolicy::Q8,
@@ -61,53 +64,59 @@ fn main() {
 
     eprintln!(
         "[qwen35-generate] {policy:?} | {} | prompt {} tokens",
-        if use_gpu() { "GPU (wgpu)" } else { "CPU (flex)" },
+        if use_gpu() {
+            "GPU (wgpu)"
+        } else {
+            "CPU (flex)"
+        },
         ids.len()
     );
 
-    if use_gpu() {
-        run::<Gpu>(&path, policy, &ids, max_tokens, &tok);
+    // The device is a runtime value under burn 0.22, so the two arms differ by
+    // which device they pass rather than by a backend type parameter.
+    let device = if use_gpu() {
+        mummu::backend::gpu_device()
     } else {
-        run::<Cpu>(&path, policy, &ids, max_tokens, &tok);
-    }
+        mummu::backend::cpu_device()
+    };
+    run(&path, policy, &ids, max_tokens, &tok, &device).await;
 }
 
-fn run<B: burn::tensor::backend::Backend>(
+async fn run(
     path: &std::path::Path,
     policy: QuantPolicy,
     ids: &[u32],
     max_tokens: usize,
     tok: &tokenizers::Tokenizer,
+    device: &burn::tensor::Device,
 ) {
-    let device = burn::tensor::Device::<B>::default();
     let t0 = Instant::now();
-    let loaded =
-        qwen35::load_from_gguf_quantized::<B>(path, &device, policy).expect("model loads");
-    eprintln!("[qwen35-generate] loaded in {:.1}s", t0.elapsed().as_secs_f32());
+    let loaded = qwen35::load_from_gguf_quantized(path, device, policy).expect("model loads");
+    eprintln!(
+        "[qwen35-generate] loaded in {:.1}s",
+        t0.elapsed().as_secs_f32()
+    );
 
     let t1 = Instant::now();
     let mut emitted = String::new();
     let mut out_ids: Vec<u32> = Vec::new();
-    let result = loaded.generate(
-        ids,
-        max_tokens,
-        &mummu::decode::SamplerOptions::greedy(),
-        &device,
-        |id| {
-            out_ids.push(id);
-            if let Ok(text) = tok.decode(&out_ids, true)
-                && !text.ends_with('\u{FFFD}')
-                && text.len() > emitted.len()
-            {
-                print!("{}", &text[emitted.len()..]);
-                let _ = std::io::stdout().flush();
-                emitted = text;
-            }
-            std::ops::ControlFlow::Continue(())
-        },
-    );
+    // The options must outlive the future, so own them here rather than
+    // passing a temporary that dies at the end of this statement.
+    let opts = mummu::decode::SamplerOptions::greedy();
+    let result = loaded.generate(ids, max_tokens, &opts, device, |id| {
+        out_ids.push(id);
+        if let Ok(text) = tok.decode(&out_ids, true)
+            && !text.ends_with('\u{FFFD}')
+            && text.len() > emitted.len()
+        {
+            print!("{}", &text[emitted.len()..]);
+            let _ = std::io::stdout().flush();
+            emitted = text;
+        }
+        std::ops::ControlFlow::Continue(())
+    });
     println!();
-    let n = result.expect("decode").len();
+    let n = result.await.expect("decode").len();
     let secs = t1.elapsed().as_secs_f32();
     eprintln!(
         "[qwen35-generate] {n} tokens in {secs:.1}s ({:.2} tok/s)",

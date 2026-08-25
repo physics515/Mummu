@@ -41,9 +41,10 @@ pub fn rope_tables(
             sin[i * head_dim + k + half] = s;
         }
     }
-    // Dtype pinned to the backend TYPE: unspecified-dtype creation follows
-    // the per-DEVICE policy another alias sharing the device may have locked.
-    let dtype = crate::backend::float_dtype();
+    // The float dtype comes from the DEVICE — burn 0.22 keeps the element
+    // type there as a runtime setting, not on a backend type. Creation sites
+    // still name it explicitly rather than riding the unspecified default.
+    let dtype = crate::backend::float_dtype(device);
     let cos = Tensor::<2>::from_data(TensorData::new(cos, [t, head_dim]), (device, dtype))
         .reshape([1, 1, t, head_dim]);
     let sin = Tensor::<2>::from_data(TensorData::new(sin, [t, head_dim]), (device, dtype))
@@ -67,11 +68,7 @@ pub fn rotate_half(x: Tensor<4>) -> Tensor<4> {
 
 /// Apply RoPE: `x*cos + rotate_half(x)*sin`. `cos`/`sin` come from
 /// [`rope_tables`] and must cover the same `t` and `head_dim` as `x`.
-pub fn apply_rope(
-    x: Tensor<4>,
-    cos: &Tensor<4>,
-    sin: &Tensor<4>,
-) -> Tensor<4> {
+pub fn apply_rope(x: Tensor<4>, cos: &Tensor<4>, sin: &Tensor<4>) -> Tensor<4> {
     let (xd, cd) = (x.dims(), cos.dims());
     assert!(
         xd[2] == cd[2] && xd[3] == cd[3],
@@ -88,8 +85,6 @@ pub fn apply_rope(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    type Dev = burn::tensor::Device;
 
     fn to_vec(t: Tensor<4>) -> Vec<f32> {
         t.into_data().to_vec::<f32>().unwrap()

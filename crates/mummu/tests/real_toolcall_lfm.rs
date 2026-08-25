@@ -8,7 +8,6 @@
 
 use std::path::PathBuf;
 
-use mummu::backend::Gpu;
 use mummu::chat::{ChatMl, ToolSpec, Turn, parse_tool_calls_lfm};
 use mummu::models::CausalLm;
 use mummu::models::lfm2;
@@ -19,9 +18,9 @@ fn lfm2_dir() -> Option<PathBuf> {
     dir.is_dir().then_some(dir)
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "needs multi-GB local weights (MUMMU_LFM2_DIR) + the reference GPU"]
-fn lfm2_emits_a_parseable_pythonic_tool_call() {
+async fn lfm2_emits_a_parseable_pythonic_tool_call() {
     let Some(dir) = lfm2_dir() else {
         panic!("set MUMMU_LFM2_DIR to a dir with config.json/tokenizer.json/model.safetensors");
     };
@@ -49,10 +48,11 @@ fn lfm2_emits_a_parseable_pythonic_tool_call() {
         .get_ids()
         .to_vec();
 
-    let device = burn::tensor::Device::<Gpu>::default();
-    let loaded = lfm2::load_from_dir::<Gpu>(&dir, &device).expect("weights load checked");
+    let device = mummu::backend::gpu_device();
+    let loaded = lfm2::load_from_dir(&dir, &device).expect("weights load checked");
     let ids = loaded
         .greedy_generate(&prompt, 128, &device)
+        .await
         .expect("greedy decode");
     // Special tokens stay in: the <|tool_call_start|> markers ARE the format.
     let text = tok.decode(&ids, false).expect("decode");
