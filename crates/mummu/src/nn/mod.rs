@@ -14,6 +14,8 @@ mod rope;
 pub use attention::{GqaAttention, GqaAttentionConfig, LayerKv, causal_mask, repeat_kv};
 pub use conv::{ConvState, ShortConv, ShortConvConfig};
 pub use mlp::{SwiGluMlp, SwiGluMlpConfig};
+pub mod packed_gemv;
+pub use packed_gemv::{Q4GemvOps, packed_gemv_enabled, try_q4s_gemv};
 pub use moe::{
     DeviceExpert, ExpertExec, ExpertPool, ExpertWeights, MoeExperts, Routing, SparseMoe, SparseMoeConfig,
     SparseMoePerExpert, StagedExpert, trace_layer, trace_us,

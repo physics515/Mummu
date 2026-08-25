@@ -17,6 +17,93 @@ use once_cell::sync::OnceCell;
 /// backends at runtime through [`burn::tensor::Device`]; with the workspace
 /// `fusion` feature, fusion applies to supporting devices automatically.
 #[must_use]
+/// Raise every cubecl device-server thread ("DSD-*") above the compute
+/// pools. Those threads encode command buffers, submit to the driver, and
+/// signal readback-map completions — microseconds of CPU each — but at
+/// normal priority they starve behind the trunk's spinning gemm workers:
+/// measured, a remote FFN group whose kernels total well under 1 ms still
+/// held its caller ~26 ms at the fence, and the wait tracked scheduler
+/// quanta, not GPU time. Call after model load (the servers spawn on first
+/// device use); repeat calls are cheap and idempotent.
+pub fn boost_device_server_threads() {
+    #[cfg(windows)]
+    unsafe {
+        #[link(name = "kernel32.dll", kind = "raw-dylib", modifiers = "+verbatim")]
+        unsafe extern "system" {
+            fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> isize;
+            fn Thread32First(snap: isize, entry: *mut ThreadEntry32) -> i32;
+            fn Thread32Next(snap: isize, entry: *mut ThreadEntry32) -> i32;
+            fn OpenThread(access: u32, inherit: i32, tid: u32) -> isize;
+            fn GetThreadDescription(handle: isize, desc: *mut *mut u16) -> i32;
+            fn SetThreadPriority(handle: isize, priority: i32) -> i32;
+            fn CloseHandle(handle: isize) -> i32;
+            fn GetCurrentProcessId() -> u32;
+            fn LocalFree(mem: isize) -> isize;
+        }
+        #[repr(C)]
+        struct ThreadEntry32 {
+            size: u32,
+            usage: u32,
+            thread_id: u32,
+            owner_pid: u32,
+            base_pri: i32,
+            delta_pri: i32,
+            flags: u32,
+        }
+        const TH32CS_SNAPTHREAD: u32 = 0x4;
+        const THREAD_SET_INFORMATION: u32 = 0x20;
+        const THREAD_QUERY_LIMITED_INFORMATION: u32 = 0x800;
+        const ABOVE_NORMAL: i32 = 1;
+
+        let pid = GetCurrentProcessId();
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if snap == -1 || snap == 0 {
+            return;
+        }
+        let mut entry = ThreadEntry32 {
+            size: size_of::<ThreadEntry32>() as u32,
+            usage: 0,
+            thread_id: 0,
+            owner_pid: 0,
+            base_pri: 0,
+            delta_pri: 0,
+            flags: 0,
+        };
+        let mut boosted = 0u32;
+        let mut ok = Thread32First(snap, &raw mut entry);
+        while ok != 0 {
+            if entry.owner_pid == pid {
+                let h = OpenThread(
+                    THREAD_SET_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION,
+                    0,
+                    entry.thread_id,
+                );
+                if h != 0 {
+                    let mut desc: *mut u16 = std::ptr::null_mut();
+                    if GetThreadDescription(h, &raw mut desc) >= 0 && !desc.is_null() {
+                        let mut len = 0usize;
+                        while *desc.add(len) != 0 {
+                            len += 1;
+                        }
+                        let name = String::from_utf16_lossy(std::slice::from_raw_parts(desc, len));
+                        if name.starts_with("DSD") {
+                            SetThreadPriority(h, ABOVE_NORMAL);
+                            boosted += 1;
+                        }
+                        LocalFree(desc as isize);
+                    }
+                    CloseHandle(h);
+                }
+            }
+            ok = Thread32Next(snap, &raw mut entry);
+        }
+        CloseHandle(snap);
+        if boosted > 0 {
+            eprintln!("[mummu] raised {boosted} device-server thread(s) above the compute pools");
+        }
+    }
+}
+
 pub fn gpu_device() -> burn::tensor::Device {
     burn::tensor::Device::wgpu(Default::default())
 }
