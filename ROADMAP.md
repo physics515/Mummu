@@ -593,8 +593,19 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       so microsecond-scale service threads always preempt spinners. Fence 26.5 -> 8.7 ms/group.
       Then the host slab flipped to Q4 (i8-resident, 3.6x less RAM than the F16-widened slab;
       `MUMMU_HOST_SLAB=f16` reverts) with the planner pricing flex residency at its true 9/5 of
-      packed bytes. Measured sum on the 27B: warm **3.19-3.25 s/token** (from 4.03), cold request
-      **139 s** wall (from ~450), host RAM **-14 GiB**, plan 552 host + 1496 wgpu clusters.
+      packed bytes. Measured sum on the 27B, same session, quiet box: warm **3.19-3.25 s/token**
+      from a 4.03 baseline, cold request **139 s** wall (from ~450), host RAM **-14 GiB**, plan 552
+      host + 1496 wgpu clusters.
+      **Read that pair as a within-session RATIO, not an absolute.** Re-measuring the identical
+      commit hours later on an idle box gave **3.46-3.57**, and merged main gave **3.65-3.77** —
+      the same binaries, drifting ~10% between sessions. Worse, the first run after a 20 GB cold
+      load measured **4.70-7.66** while the machine was still settling, a 2.4x spread that would
+      read as a catastrophic regression to anyone comparing it against a number from another day.
+      This box's decode gate is only meaningful as (quiet, warm, >=3 runs, same session), and a
+      cross-session absolute is worth about +/-10% at best. A bisect against the pre-merge commit
+      cleared the 2026-08-25 nightly of the apparent 13% loss: the residual ~5% does not separate
+      from noise at this sample size. Standing figure for main: **~3.5-3.8 s/token**, ~59x off
+      ollama's measured 16.0 tok/s on this box and checkpoint.
       Next, ranked: (1) the residual ~8.5 ms/group fence — suspected polling handoff, worth a
       timeline pass now that priorities are clean; (2) SIMD the flex i8 inner loop (mlp.* is
       ~3.3 ms/call, still ~4x off the traffic bound); (3) a real m<=64 packed GEMM for prefill;
