@@ -757,6 +757,38 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       be written down when that arrives. Implement `plan::pick_depth` (a pure function of the device
       inventory and these constants, with unit tests) before any expert-axis work, so the bound is
       enforced rather than rediscovered.
+- [ ] **Ship kernels against a token-share gate, not a microbenchmark ratio — the rule that would
+      have saved a whole session.** *(2026-08-26)* Peer review supplied the arithmetic and it is
+      damning: before writing the split-K kernel, the predicted end-to-end gain was
+      `dt_tok = n_device_layers * (t_S1 - t_S*) = (0.118 - 0.109) ms * ~20 layers ~= 0.18 ms`
+      against a 4579 ms token — **0.004%**. Every one of those numbers was already in hand. The
+      controlled A/B afterwards measured exactly that null (4.591 vs 4.579 s/tok at pinned
+      placement). **Gate: ship a kernel change only when `dt_tok / t_tok > ~0.5%`.** A
+      microbenchmark ratio is evidence about a term, never a target; the term's SHARE decides.
+      This is the same failure as trusting a 1.72 s/tok run that returned empty completions, one
+      level up — optimizing the measurement instead of the thing it predicts.
+      Also: record `backend_budget`'s live-VRAM read with every benchmark and REFUSE cross-session
+      comparisons when the baseline moved more than ~512 MiB. This box drifted 1.9 -> 8.9 GiB in one
+      session, which moved placement 42 -> 20 layers and decode 2.25 -> 6 s/tok with no code change.
+      The log line already exists (`VRAM: X free of Y ... budget A -> B`); the discipline is to
+      treat a drifted baseline as a rejected measurement rather than a result.
+- [ ] **Deferred neurons: overlap the host FFN with the NEXT layer's GPU attention.** *(2026-08-26,
+      peer review, novel synthesis)* The profile says the GPU FFN is ~14 ms of a 2250 ms token, so
+      kernel work is subordinate to the placement/overlap question — the 22-44 layers still on the
+      host are what binds. Generalize KTransformers' Expert Deferral (SOSP'25) from routed experts
+      to activation-partitioned DENSE FFN, using pieces mummu already has: `gate_energy` is the
+      hot/cold statistic PowerInfer needs, `ffn_skip_tau` is the threshold, and `partition.rs`'s
+      permutation split gives the exact dense<->partition mapping. Hot/shared clusters run on the
+      GPU immediately; cold clusters run on the host CONCURRENTLY with layer l+1's attention
+      instead of serialized before it:
+      `y_l = A_l(x_l) + sum_c CPU_c(x_l)` with `CPU_{C,l} || A_{l+1}`.
+      **Two honest caveats before anyone builds it.** (1) Deferral changes numerics — layer l's
+      residual completes after l+1's attention begins, so it needs its own parity story;
+      KTransformers reports <=0.5% accuracy drop, which is non-zero and this repo's gate is
+      byte-exact. (2) mummu's deferred-join machinery already exists and measured ZERO overlap
+      earlier today, because the flex thread pool saturates every core — deferral only pays if the
+      host has slack for the GPU work to hide behind, which is what the thread-priority fixes were
+      about. Measure the available slack BEFORE building the schedule.
 - [ ] **Do NOT make the clustered path universal until a fits-on-one-device fast path exists.**
       *(2026-08-24)* Partitioning earns its keep only when a model must span devices. Measured, the
       split costs **2.4x** in dispatch (32 cluster matmuls 4.13 ms against 1.68 ms fused), so imposing it
