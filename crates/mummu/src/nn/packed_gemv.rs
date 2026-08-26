@@ -129,11 +129,26 @@ mod cube_impl {
     };
     use cubecl::prelude::*;
 
-    /// One unit per u32 word of the packed weight: per k-step it loads the
-    /// word (8 nibbles), the one f32 scale those 8 columns share (8 ≤ 32
-    /// and words never straddle a block), and x[k], then does 8 fused
-    /// mul-adds into private accumulators. No cross-unit reduction; the
-    /// unit writes its 8 output columns at the end.
+    /// Split-K packed GEMV.
+    ///
+    /// A workgroup is 32 word-columns wide (UNIT_POS_X; coalesced — at any
+    /// k the 32 lanes read 32 consecutive u32 words) by `split` k-slices
+    /// deep (UNIT_POS_Y). Each thread accumulates its word's `per_word`
+    /// outputs over k_len/split steps in registers; partials meet in shared
+    /// memory (32 * split * per_word f32 — 16 KiB at split 16, Q4) and the
+    /// slice-0 threads reduce and store.
+    ///
+    /// Why: the split-1 shape gave gate/up 2176 threads on a card with 8448
+    /// cores, each walking 5120 dependent FMAs — measured 0.6-0.7x against
+    /// burn's dequantize path. `split` multiplies resident threads and
+    /// divides the dependent chain by the same factor; what it buys costs
+    /// one barrier plus a strided sum, orders of magnitude below the chain
+    /// it removes.
+    ///
+    /// The barrier sits OUTSIDE the validity guard: in a partial workgroup
+    /// (n_words not a multiple of 32 — test shapes, never the 27B's) every
+    /// thread must still reach sync_cube, so invalid lanes contribute zero
+    /// partials and skip only the final store.
     #[cube(launch)]
     fn packed_gemv_kernel(
         w_packed: &Tensor<u32>,
@@ -141,27 +156,36 @@ mod cube_impl {
         x: &Tensor<f32>,
         out: &mut Tensor<f32>,
         #[comptime] per_word: usize,
+        #[comptime] split: usize,
     ) {
-        let wc = ABSOLUTE_POS;
+        let lane = usize::cast_from(UNIT_POS_X);
+        let slice = usize::cast_from(UNIT_POS_Y);
+        let wc = usize::cast_from(CUBE_POS_X) * 32 + lane;
         let n_words = w_packed.shape(1);
-        if wc < n_words {
-            let k_len = x.shape(1);
+        let valid = wc < n_words;
+
+        let k_len = x.shape(1);
+        let bits = comptime!(32u32 / per_word as u32);
+        let mask = comptime!((1u32 << (32u32 / per_word as u32)) - 1);
+        let sign = comptime!(1u32 << (32u32 / per_word as u32 - 1));
+        let span = comptime!(1i32 << (32u32 / per_word as u32));
+
+        let mut acc = Array::<f32>::new(per_word);
+        #[unroll]
+        for j in 0..per_word {
+            acc[j] = 0.0f32;
+        }
+        if valid {
             let stride_w = w_packed.stride(0);
             let stride_s = scales.stride(0);
-            // 32 values per scale block, `per_word` of them per u32 word, and
-            // words never straddle a block — so every value this unit decodes
-            // shares one scale.
+            // 32 values per scale block, `per_word` per u32 word, and words
+            // never straddle a block — every value this thread decodes at a
+            // given k shares one scale.
             let sc_col = wc / comptime!(32 / per_word);
-            let bits = comptime!(32u32 / per_word as u32);
-            let mask = comptime!((1u32 << (32u32 / per_word as u32)) - 1);
-            let sign = comptime!(1u32 << (32u32 / per_word as u32 - 1));
-            let span = comptime!(1i32 << (32u32 / per_word as u32));
-            let mut acc = Array::<f32>::new(per_word);
-            #[unroll]
-            for j in 0..per_word {
-                acc[j] = 0.0f32;
-            }
-            for k in 0..k_len {
+            let k_per = k_len / split;
+            let k0 = slice * k_per;
+            for kk in 0..k_per {
+                let k = k0 + kk;
                 let word = w_packed[k * stride_w + wc];
                 let xs = x[k] * scales[k * stride_s + sc_col];
                 #[unroll]
@@ -174,12 +198,48 @@ mod cube_impl {
                     acc[j] += f32::cast_from(q) * xs;
                 }
             }
-            let base = wc * per_word;
+        }
+        if comptime!(split == 1) {
+            if valid {
+                let base = wc * per_word;
+                #[unroll]
+                for j in 0..per_word {
+                    out[base + j] = acc[j];
+                }
+            }
+        } else {
+            let mut partials = Shared::<[f32]>::new_slice(comptime!(32 * split * per_word));
+            let slot = (lane * split + slice) * per_word;
             #[unroll]
             for j in 0..per_word {
-                out[base + j] = acc[j];
+                partials[slot + j] = acc[j];
+            }
+            sync_cube();
+            if valid && slice == 0 {
+                let base = wc * per_word;
+                #[unroll]
+                for j in 0..per_word {
+                    let mut total = 0.0f32;
+                    for ss in 0..split {
+                        total += partials[(lane * split + ss) * per_word + j];
+                    }
+                    out[base + j] = total;
+                }
             }
         }
+    }
+
+    /// Split-K factor (`MUMMU_GEMV_SPLIT`, default 16, max 32: the shared
+    /// partial buffer is 32 * split * per_word f32 — 16 KiB at (16, Q4)).
+    fn gemv_split() -> usize {
+        static S: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *S.get_or_init(|| {
+            std::env::var("MUMMU_GEMV_SPLIT")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&v| (1..=32).contains(&v))
+                .unwrap_or(16)
+        })
     }
 
     pub(super) fn q4s_gemv_cube<R: CubeRuntime>(
@@ -202,8 +262,20 @@ mod cube_impl {
         let client = x.client.clone();
         let device = x.device.clone();
         let out = empty_device::<R, f32>(client.clone(), device, Shape::new([1, n]));
-        let cube_dim = CubeDim { x: 256, y: 1, z: 1 };
-        let cubes = (n_words as u32).div_ceil(256);
+        // Split-K factor: `MUMMU_GEMV_SPLIT`, default 16 — near the
+        // occupancy knee for both production shapes. Forced to 1 when it
+        // does not divide k, so odd shapes keep the exact split-1 path.
+        let k_len = x.meta.shape()[1];
+        let mut split = gemv_split();
+        if split == 0 || k_len % split != 0 {
+            split = 1;
+        }
+        let cube_dim = CubeDim {
+            x: 32,
+            y: split as u32,
+            z: 1,
+        };
+        let cubes = (n_words as u32).div_ceil(32);
         debug_assert_eq!(
             n_words * per_word,
             n,
@@ -218,6 +290,7 @@ mod cube_impl {
             x.into_tensor_arg(),
             out.clone().into_tensor_arg(),
             per_word,
+            split,
         );
         out
     }
