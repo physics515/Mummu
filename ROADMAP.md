@@ -789,6 +789,45 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       earlier today, because the flex thread pool saturates every core — deferral only pays if the
       host has slack for the GPU work to hide behind, which is what the thread-priority fixes were
       about. Measure the available slack BEFORE building the schedule.
+- [ ] **The suffix plan, gated: overlay floor first, deferral last, and every schedule priced
+      against measured hide windows.** *(2026-08-26, two peer reviews synthesized)* Standing facts
+      the plan is built on: the split-K join is DETERMINISTIC by construction (no atomics — partials
+      to shared memory, one barrier, one lane sums in declared index order; verified in
+      `packed_gemv.rs`, answering the atomicAdd/nondeterminism concern the Thinking Machines work
+      raises); KTransformers-style "defer cold FFN into next-layer attention" is DEAD on this box by
+      its own arithmetic (hide window ~1 ms of decode attention against a multi-ms host FFN —
+      min(t_D, W)/t_tok ~ 0.02%, the same class as the 0.004% split-K null); and the flex pool
+      saturates every core, so any plan that ADDS host work is illegal until the slack probe says
+      otherwise.
+      **Corrected arithmetic on the overlay floor.** The review's "0.92 s vs 5.9 s (~6x)" used the
+      DEGRADED box's 134 ms/FFN. Healthy-box numbers: host-Q4 full-width FFN ~36 ms/layer against a
+      PCIe-streamed Q4 overlay ~6 ms/layer (134 MB/layer over ~25 GB/s + sub-ms compute), x22
+      overflow layers ~ **0.66 s on a 2.25 s token, ~29%** — not 6x, but far past the 0.5% ship
+      gate. FlexGen-on-the-suffix, byte-exact, no host slack needed, double-buffered through the
+      existing `move_to` + executor. THIS is the next big item.
+      **Order, each step with a kill:** (1) clean-boot 42-layer baseline (the 42->20 regression was
+      environment; comparisons against a drifted baseline are rejected, not explained); (2) the
+      slack/contention probe — `probe_contention` now logs `C = t_paired/t_alone` per device pair at
+      load, and any pair with C >> 1 contributes ZERO to a hide window; (3) operator-granular
+      placement (attention/KV pinned to dGPU, FFN placed by measured cost) — but NOTE the in-profile
+      counterevidence: the DeltaNet trunk measured WORSE on the card (delta.proj 5.83 -> 10.41 ms),
+      so "pin all attention on dGPU" needs a whole-KIND probe before it is believed; (4) the overlay
+      floor; (5) exact same-layer hot/cold join (identical to today at tau=0; `PP^T = I` keeps it
+      byte-exact); (6) the auction + LOGIT-LENS CREDIT (novel): a tail cluster that cannot finish
+      before the lm-head contributes `alpha_l * W_U * LN_f(F_D)` at the LOGITS — one ridge-fitted
+      scalar per layer, residual rho_l certified in the header, opt-in, dropped-if-late bounded by
+      the existing energy inequality — instead of KTransformers' add-at-l+2 whose window this box
+      does not have; (7) certified deferral LAST, default |D|=0, legal only under the Lipschitz sum
+      `sum_l Lip(Psi_{l+1}) E||F_D||` inside the parity slack.
+      **Declared numerics, so schedule freedom never breaks the gate:** the manifest grows (a) a
+      reduction contract per join (accumulation precision, declared order, fma allowed/forbidden —
+      the CPU/GPU fma-contraction trap), (b) NAMED numeric variants per layer (`dense_exact`,
+      `hotcold_exact`, `hotcold_skip`) each carrying its own parity certificate and calibration
+      check, with the runtime COMMITTING to one variant set at load from the same snapshot that
+      reads live VRAM — so a degraded box becomes a declared mode switch in run metadata instead of
+      an unattributed 2x drift. Order-invariant joins, if ever needed, use f64 accumulation of f32
+      partials (products of f32 are exact in f64; final round-half-even cast) or ReproBLAS-style
+      binned accumulators — not atomics.
 - [ ] **Do NOT make the clustered path universal until a fits-on-one-device fast path exists.**
       *(2026-08-24)* Partitioning earns its keep only when a model must span devices. Measured, the
       split costs **2.4x** in dispatch (32 cluster matmuls 4.13 ms against 1.68 ms fused), so imposing it
