@@ -714,6 +714,49 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       computed reserve and therefore several layers of card space; (3) the packed GEMV is still
       0.6-0.7x on the gate/up shape (1496 units each walking 5120 k-steps serially) — a k-split
       with plane reduction is the obvious fix and would move the whole ranking.
+- [ ] **Dense -> MoE on import, a third (nested) axis, and the maximum useful nesting depth — answered
+      with this repo's own measurements.** *(2026-08-26 research)* Framing: layers are rows, each
+      depending on the last; MoE experts are columns, independent within a row, so striping columns
+      across devices avoids waiting on a slow peer. All three questions are well posed and mummu is
+      further along than it looks.
+      **(1) Dense -> MoE is already half-built, and the exact-identity version is the only one that
+      passes the parity gate.** `partition.rs` does balanced k-means over FFN columns into 32
+      clusters/layer with an exact permutation split — that IS MoEfication (Zhang et al. 2022): a
+      permutation `P` with `PP^T = I` makes the all-experts sum reproduce the dense FFN bit-exactly,
+      which is why the pack survives parity today. What is missing is only the ROUTER: every cluster
+      currently runs on every token (dense mode). The scaffolding for a lossy router already exists —
+      `ExpertExec::gate_energy` plus `ffn_skip_tau` in `nn/moe.rs` are precisely the activation-norm
+      score and threshold that MoEfication and D2DMoE (NeurIPS 2024) prescribe. Wiring it is the
+      cheap increment; it must stay opt-in and quality-gated, because it is the first lossy thing in
+      the pack.
+      **(2) The third axis is the shape mummu already has, minus one router.** Remote clusters are
+      fused per (layer, device) into ONE bank, so the outer axis (device group) and inner axis
+      (clusters within the bank) both exist; inner work never crosses a device. Adding
+      `p(e|x) = p(g|x) p(e|x,g)` (Hi-MoE style) means an outer router on the host and an inner
+      router per device, with cross-device traffic of K_out activations rather than K_out*K_in.
+      Worth recording as research: SVD-block conversion that is born device-striped (experts cut
+      from the singular basis, widths set by each device's residual capacity, so no second placement
+      pass), and Kronecker/CP factorization where the group factor is device-resident and the small
+      factor is the movable cell. Both are gated behind the kernel floor below.
+      **(3) Maximum nesting depth on THIS runtime: D* = 2, sometimes 3, never 4 — and we can prove
+      it from measured constants rather than theory.** The binding constraint is not memory or
+      communication volume, it is the dispatch and host-staging floor. Measured here: 32x544 narrow
+      matmuls cost **2.36x** one fused 17408-wide matmul; the cluster hybrid (3.35-3.77 s/tok) loses
+      to whole-layer placement (2.25); the merge fence was 26.5 ms/group before the thread-priority
+      fixes and 8.7 ms after, against a GPU FFN of ~0.1 ms; and cubecl has no peer-to-peer for wgpu,
+      so every cross-device hop stages through the host. A level is worth adding only if its units
+      are fat enough that one local matmul hides a staging hop — which caps the useful leaf at a few
+      hundred columns wide, i.e. depth 3 only when the inner unit is a single fat matmul, and never
+      depth 4. **The cluster path already ran the experiment this analogy proposes and lost**, not
+      because independence is worthless but because a cell below ~500 columns costs more in launches
+      and fences than it saves in parallelism.
+      **What this implies for now.** Today's profile puts the GPU FFN at ~14 ms of a 2250 ms token;
+      the gap lives in the layers still on the host and in the trunk. So NMoE striping optimizes a
+      term that is not currently binding. It becomes the right tool when a model cannot fit even at
+      Q4 across the available devices — the multi-box case — and the depth bound above will already
+      be written down when that arrives. Implement `plan::pick_depth` (a pure function of the device
+      inventory and these constants, with unit tests) before any expert-axis work, so the bound is
+      enforced rather than rediscovered.
 - [ ] **Do NOT make the clustered path universal until a fits-on-one-device fast path exists.**
       *(2026-08-24)* Partitioning earns its keep only when a model must span devices. Measured, the
       split costs **2.4x** in dispatch (32 cluster matmuls 4.13 ms against 1.68 ms fused), so imposing it
