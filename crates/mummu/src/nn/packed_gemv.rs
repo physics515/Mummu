@@ -231,15 +231,131 @@ mod cube_impl {
 
     /// Split-K factor (`MUMMU_GEMV_SPLIT`, default 16, max 32: the shared
     /// partial buffer is 32 * split * per_word f32 — 16 KiB at (16, Q4)).
-    fn gemv_split() -> usize {
-        static S: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    fn gemv_split_override() -> Option<usize> {
+        static S: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
         *S.get_or_init(|| {
             std::env::var("MUMMU_GEMV_SPLIT")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
                 .filter(|&v| (1..=32).contains(&v))
-                .unwrap_or(16)
         })
+    }
+
+    /// Candidate split factors, ordered by a CAPACITY prior.
+    ///
+    /// The prior is residency, not occupancy: a weight that fits the card's
+    /// L2 is not starved for memory parallelism, so splitting it only adds
+    /// partial-sum traffic and shared-memory pressure. A weight that misses
+    /// L2 streams from DRAM, where extra outstanding transactions do buy
+    /// bandwidth. `l2_bytes` is the usable fraction (~0.75) of the device's
+    /// L2; when it is unknown the prior degrades to "try everything", which
+    /// is exactly what the measurement then resolves.
+    ///
+    /// This ORDERS the search. It never decides. The previous revision
+    /// decided — it shipped `split = 16` derived from a Little's-law
+    /// occupancy argument, and the card answered that `gate/up` is flat
+    /// across every split while `down` gains 2.3x. Two independent peer
+    /// reviews made the same derivation. A rule three parties derive and
+    /// the hardware refuses is not a rule.
+    fn split_candidates(weight_bytes: u64, l2_bytes: Option<u64>) -> Vec<usize> {
+        let resident = l2_bytes.is_some_and(|l2| weight_bytes <= l2);
+        if resident {
+            // L2-resident: 1 first, and only modest splits are worth a try.
+            vec![1, 2, 4, 8]
+        } else {
+            vec![1, 4, 8, 16, 32]
+        }
+    }
+
+    /// The measured best split for one (device, shape, packing), cached for
+    /// the process.
+    ///
+    /// Autotune rather than arithmetic, because the arithmetic was wrong and
+    /// because the published numbers for these exact shapes disagree across
+    /// GPU generations. Each entry costs a handful of warm launches, once,
+    /// and is keyed so a different card or a different projection shape gets
+    /// its own answer.
+    fn gemv_split_for<R: CubeRuntime>(
+        client: &ComputeClient<R>,
+        device: &R::Device,
+        w_vals: &CubeTensor<R>,
+        w_scales: &CubeTensor<R>,
+        x: &CubeTensor<R>,
+        n: usize,
+        n_words: usize,
+        k_len: usize,
+        per_word: usize,
+    ) -> usize {
+        if let Some(forced) = gemv_split_override() {
+            return forced;
+        }
+        static CACHE: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<(String, usize, usize, usize), usize>>,
+        > = std::sync::OnceLock::new();
+        let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        let key = (format!("{device:?}"), n, k_len, per_word);
+        if let Some(&hit) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+            return hit;
+        }
+
+        let props = client.properties();
+        // Usable L2 for a streaming weight; 3/4 is the common working
+        // fraction once the activation and output tiles are accounted for.
+        let l2 = u64::from(props.hardware.max_shared_memory_size as u32)
+            .checked_mul(0)
+            .and(None::<u64>)
+            .or_else(|| std::env::var("MUMMU_L2_MIB").ok().and_then(|v| v.parse::<u64>().ok()).map(|m| m << 20))
+            .map(|b| b / 4 * 3);
+        let weight_bytes = (n_words as u64 * k_len as u64 * 4) + (w_scales.meta.num_elements() as u64 * 4);
+
+        let mut best = (1usize, f64::INFINITY);
+        for cand in split_candidates(weight_bytes, l2) {
+            if k_len % cand != 0 {
+                continue;
+            }
+            let run = || {
+                let out = empty_device::<R, f32>(
+                    client.clone(),
+                    x.device.clone(),
+                    Shape::new([1, n]),
+                );
+                packed_gemv_kernel::launch::<R>(
+                    client,
+                    CubeCount::Static((n_words as u32).div_ceil(32), 1, 1),
+                    CubeDim { x: 32, y: cand as u32, z: 1 },
+                    w_vals.clone().into_tensor_arg(),
+                    w_scales.clone().into_tensor_arg(),
+                    x.clone().into_tensor_arg(),
+                    out.clone().into_tensor_arg(),
+                    per_word,
+                    cand,
+                );
+                out
+            };
+            // Warm (kernel compile, autotune, pool), then time. `sync`
+            // blocks until the device drains, which is what makes these
+            // numbers comparable — a launch alone returns immediately.
+            run();
+            let _ = cubecl::future::block_on(client.sync());
+            let t0 = std::time::Instant::now();
+            for _ in 0..3 {
+                run();
+            }
+            let _ = cubecl::future::block_on(client.sync());
+            let ms = t0.elapsed().as_secs_f64() * 1e3 / 3.0;
+            if ms < best.1 {
+                best = (cand, ms);
+            }
+        }
+        eprintln!(
+            "[mummu] gemv split for [{k_len} x {n}] (per_word {per_word}): {} at {:.3} ms",
+            best.0, best.1
+        );
+        cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, best.0);
+        best.0
     }
 
     pub(super) fn q4s_gemv_cube<R: CubeRuntime>(
@@ -266,7 +382,17 @@ mod cube_impl {
         // occupancy knee for both production shapes. Forced to 1 when it
         // does not divide k, so odd shapes keep the exact split-1 path.
         let k_len = x.meta.shape()[1];
-        let mut split = gemv_split();
+        let mut split = gemv_split_for(
+            &client,
+            &x.device,
+            &w_vals,
+            &w_scales,
+            &x,
+            n,
+            n_words,
+            k_len,
+            per_word,
+        );
         if split == 0 || k_len % split != 0 {
             split = 1;
         }
