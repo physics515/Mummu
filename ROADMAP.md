@@ -805,6 +805,15 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       overflow layers ~ **0.66 s on a 2.25 s token, ~29%** — not 6x, but far past the 0.5% ship
       gate. FlexGen-on-the-suffix, byte-exact, no host slack needed, double-buffered through the
       existing `move_to` + executor. THIS is the next big item.
+      **MEASURED 2026-08-26, and it is the green light:** `probe_contention` on the real pack gives
+      **dGPU 0.71 -> 0.72 ms paired (C=1.01)** and **host 7.62 -> 8.21 ms paired (C=1.08)**. The
+      dGPU and the host barely contend — effectively private memory systems for this workload, which
+      is the assumption FlexGen/KTransformers make and this box now VERIFIES rather than inherits.
+      Hide windows that pair GPU work with host work are therefore real, and the overlay floor is
+      legal. (The iGPU/flex pair, which shares DDR5, is still unmeasured and must not be assumed
+      free.) Same load also vindicated the measured split: four production shapes chose THREE
+      different factors — [5120x17408] -> 16, [5120x10240] -> 8, [5120x6144] -> 16, [6144x5120] ->
+      32. One global constant would have been wrong for most of them.
       **Order, each step with a kill:** (1) clean-boot 42-layer baseline (the 42->20 regression was
       environment; comparisons against a drifted baseline are rejected, not explained); (2) the
       slack/contention probe — `probe_contention` now logs `C = t_paired/t_alone` per device pair at
