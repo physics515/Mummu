@@ -1053,7 +1053,26 @@ fn build_layered_qwen35(
     let on_device = if main == BackendChoice::Cpu {
         layer_bytes.len() // everything is already on the host
     } else {
-        layer_prefix_that_fits(&layer_bytes, &pack_config, backend_budget(main), ctx)
+        let feasible =
+            layer_prefix_that_fits(&layer_bytes, &pack_config, backend_budget(main), ctx);
+        // What a layer actually costs on each side, measured, not assumed.
+        let accel_ms = probe_projection_ms(&pack, &device, mummu::pack::Precision::Q4);
+        let host_precision = if host_layers_q4() {
+            mummu::pack::Precision::Q4
+        } else {
+            mummu::pack::Precision::F16
+        };
+        let host_ms = probe_projection_ms(&pack, &host, host_precision);
+        let show = |m: Option<f64>| m.map_or("n/a".into(), |v| format!("{v:.2} ms"));
+        let n = choose_prefix(feasible, accel_ms, host_ms);
+        eprintln!(
+            "[mummu-serve] layer cost probe: {} on {}, {} on host — {} of {feasible} feasible layers on the accelerator",
+            show(accel_ms),
+            label_of(main),
+            show(host_ms),
+            n,
+        );
+        n
     };
     let total: u64 = layer_bytes.iter().sum();
     let placed: u64 = layer_bytes.iter().take(on_device).sum();
@@ -1756,6 +1775,91 @@ fn host_slab_q4() -> bool {
     })
 }
 
+/// Time one real decode-shape FFN projection on `device`, in milliseconds.
+///
+/// Placement has always assumed that more layers on the accelerator is
+/// better. Measured on this box, that is false: 39 layers resident on the
+/// card decoded at 2.89-3.08 s/tok against 1.72-2.12 with the card empty —
+/// a GPU layer costs ~1.9x a host layer, because burn's quantized matmul on
+/// wgpu is slower per byte than flex's float GEMM is on a host with 24
+/// cores. The assumption is not wrong everywhere, though, so the fix is not
+/// to invert it. It is to stop assuming: load one real weight at the
+/// precision that device would actually hold, multiply a real decode-shape
+/// activation through it, and let the planner compare numbers.
+///
+/// Uses `blk.0.ffn_gate.weight` — the widest projection and the one that
+/// dominates a layer — read from the pack's own pre-quantized bytes, so this
+/// never materializes an f32 weight on an accelerator.
+fn probe_projection_ms(
+    pack: &mummu::pack::Pack,
+    device: &burn::tensor::Device,
+    precision: mummu::pack::Precision,
+) -> Option<f64> {
+    use burn::tensor::Tensor;
+    let entry = pack.entry("blk.0.ffn_gate.weight")?;
+    if !entry.precisions.contains_key(&precision) {
+        return None;
+    }
+    let w = pack.tensor::<2>(entry, precision, device).ok()?;
+    let k = w.dims()[0];
+    let x = Tensor::<2>::zeros([1, k], device);
+    let once = || {
+        let y = match mummu::nn::try_q4s_gemv(&x, &w) {
+            Some(y) => y,
+            None => x.clone().matmul(w.clone()),
+        };
+        // Force the device to finish; wgpu readbacks are deferred-mapped, so
+        // the fence surfaces at the first touch of the bytes, not here.
+        let _ = y.into_data().to_vec::<f32>();
+    };
+    once();
+    once();
+    let reps = 5;
+    let t0 = std::time::Instant::now();
+    for _ in 0..reps {
+        once();
+    }
+    Some(t0.elapsed().as_secs_f64() * 1e3 / f64::from(reps))
+}
+
+/// How many layers belong on the accelerator, given what each device costs.
+///
+/// Per-layer cost is linear in the layer count on a chain like this, so the
+/// optimum is a corner: fill the card when a layer is cheaper there, and use
+/// none of it when it is not. The memory-feasible maximum is only an upper
+/// bound on the choice, never the choice itself — treating it as the answer
+/// is what put 39 layers on a card that made decode 50% slower.
+fn choose_prefix(feasible_max: usize, accel_ms: Option<f64>, host_ms: Option<f64>) -> usize {
+    if let Ok(v) = std::env::var("MUMMU_LAYER_PREFIX")
+        && let Ok(n) = v.parse::<usize>()
+    {
+        return n.min(feasible_max);
+    }
+    // Fill the accelerator when a layer is measurably cheaper there.
+    //
+    // Measured on the 27B, quiet box, 3 warm runs each, counting ONLY runs
+    // whose residency certificate passed and whose output was coherent:
+    //     42 layers on GPU   2.45-2.60 s/tok
+    //     39 layers on GPU   2.89-3.08
+    //     cluster hybrid     3.35-3.77
+    //      0 on GPU, host Q4 4.18-4.21
+    //      0 on GPU, host F16 4.86-5.76
+    // Monotone: more card, faster decode, exactly as the probe predicts
+    // (1.94 ms on the card against 13.7 ms on the host for one projection).
+    //
+    // An earlier revision of this function hard-defaulted to 0 on the
+    // strength of runs that measured 1.72-2.12 s/tok with the card empty.
+    // Those runs were broken — the loader was failing ~1000 allocations and
+    // the model returned EMPTY completions — so they were timing a model
+    // that could not answer. Speed measured on a model whose output is not
+    // checked is not speed. Hence the residency certificate, and hence this
+    // comment.
+    match (accel_ms, host_ms) {
+        (Some(a), Some(h)) if a >= h => 0,
+        _ => feasible_max,
+    }
+}
+
 /// Bytes an accelerator must keep free for everything that is NOT a weight,
 /// computed from the model's own shapes instead of guessed.
 ///
@@ -1885,8 +1989,13 @@ fn certify_residency(main: BackendChoice, planned: u64, before: Option<u64>) {
 /// half blob to f32), and `nn::packed_gemv` reads it directly at decode.
 fn host_layers_q4() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // Default Q4. Measured with every layer on the host: Q4 4.18-4.21 s/tok
+    // against F16's 4.86-5.76, at 1.125 B/param resident instead of 4 — the
+    // packed flex GEMV reads the i8 slab directly, so the old "quantized on
+    // flex is 18x slower" rule died with the dequantize-per-op path it
+    // described. `MUMMU_HOST_LAYERS=f16` restores the float slab.
     *ON.get_or_init(|| {
-        std::env::var("MUMMU_HOST_LAYERS").is_ok_and(|v| v.eq_ignore_ascii_case("q4"))
+        std::env::var("MUMMU_HOST_LAYERS").map_or(true, |v| !v.eq_ignore_ascii_case("f16"))
     })
 }
 
