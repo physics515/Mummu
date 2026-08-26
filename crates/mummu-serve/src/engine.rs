@@ -995,6 +995,9 @@ fn build_layered_qwen35(
 ) -> Result<qwen35::LoadedQwen35, String> {
     use mummu::pack::Pack;
     let pack = Pack::open(pack_dir)?;
+    // The model's own shapes drive the activation reserve (see
+    // `computed_reserve_bytes`), so the config is needed before placement.
+    let pack_config = qwen35::Qwen35Config::from_gguf(&pack.header()?)?;
     let level = precision_for(policy);
     // Per-tensor precision, starting from the best a pack stores and demoting
     // only as far as this device's live budget forces — so the layers that do
@@ -1040,10 +1043,17 @@ fn build_layered_qwen35(
     let device = device_of(main);
     let host = mummu::backend::cpu_device();
 
+    // Context the reserve must survive. The KV term scales with it, so this
+    // is the one number that trades layers-on-card against how long a
+    // conversation may get before the card runs out of room mid-token.
+    let ctx = std::env::var("MUMMU_CTX")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(4096);
     let on_device = if main == BackendChoice::Cpu {
         layer_bytes.len() // everything is already on the host
     } else {
-        layers_that_fit(&layer_bytes, backend_budget(main))
+        layer_prefix_that_fits(&layer_bytes, &pack_config, backend_budget(main), ctx)
     };
     let total: u64 = layer_bytes.iter().sum();
     let placed: u64 = layer_bytes.iter().take(on_device).sum();
@@ -1107,12 +1117,14 @@ fn build_layered_qwen35(
             device_choose(e)
         }
     };
+    let vram_before = mummu::vram::memory().map(|m| m.used);
     let model = qwen35::load_from_pack_layered(pack_dir, &dev_for, &host, &head, &choose)
         .map_err(|e| e.to_string())?;
     eprintln!(
         "[mummu-serve] layered model resident in {:.0}s",
         started.elapsed().as_secs_f32()
     );
+    certify_residency(main, placed, vram_before);
     Ok(model)
 }
 
@@ -1744,6 +1756,130 @@ fn host_slab_q4() -> bool {
     })
 }
 
+/// Bytes an accelerator must keep free for everything that is NOT a weight,
+/// computed from the model's own shapes instead of guessed.
+///
+/// The old number was a flat 3 GiB, then a flat 1.5 GiB, both picked by hand
+/// against the f32 dequantize transients that `nn::packed_gemv` has since
+/// deleted. A reserve that is too large costs layers on the card (each is
+/// ~0.22 GiB at Q4, so a spare gigabyte is four or five layers); one that is
+/// too small kills a generation mid-token. Neither is a knob worth guessing,
+/// because every term is derivable:
+///
+/// * **KV cache** — full-attention layers only (`(i+1) % interval == 0`),
+///   `2 (k,v) x kv_heads x ctx x head_dim` f32 per layer.
+/// * **Recurrent state** — DeltaNet layers, context-INDEPENDENT:
+///   `conv [b, conv_dim, k-1]` plus `state [b, n_v_heads, d_state, d_state]`.
+/// * **Activation peak** — prefill dominates decode by the prompt length:
+///   mummu does not chunk prefill, so the widest live buffer is
+///   `[tokens, intermediate]` f32 and gate/up/product are live together.
+/// * **Pool slack** — cubecl reserves in ~1 GiB pages, so a partial page is
+///   unavailable to weights whatever the arithmetic says.
+///
+/// `MUMMU_ACTIVATION_RESERVE_GB` still overrides, for the case where a
+/// measurement disagrees with this model.
+fn computed_reserve_bytes(cfg: &qwen35::Qwen35Config, layers_on_device: usize, ctx: usize) -> u64 {
+    if let Some(gb) = std::env::var("MUMMU_ACTIVATION_RESERVE_GB")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|gb| *gb >= 0.0)
+    {
+        return (gb * f64::from(1u32 << 30)) as u64;
+    }
+    let f32b = 4u64;
+    let n = layers_on_device.min(cfg.num_layers);
+    // Layers are placed as a prefix, so count the kinds within that prefix.
+    let full_attn = (0..n).filter(|&l| cfg.is_attention(l)).count() as u64;
+    let delta = n as u64 - full_attn;
+
+    let kv = full_attn
+        * 2
+        * cfg.num_key_value_heads as u64
+        * ctx as u64
+        * cfg.head_dim as u64
+        * f32b;
+    let conv = delta
+        * cfg.conv_dim() as u64
+        * cfg.conv_kernel.saturating_sub(1) as u64
+        * f32b;
+    let state = delta * cfg.n_v_heads as u64 * (cfg.d_state as u64).pow(2) * f32b;
+    // Three [tokens, intermediate] buffers live at once through SwiGLU.
+    let act = 3 * ctx as u64 * cfg.intermediate_size as u64 * f32b;
+    const POOL_SLACK: u64 = 1 << 30;
+
+    kv + conv + state + act + POOL_SLACK
+}
+
+/// The largest layer prefix that fits, with the reserve recomputed at each
+/// candidate count.
+///
+/// The reserve GROWS with the number of layers placed (more KV, more
+/// recurrent state), so "budget minus a constant" is the wrong shape and
+/// overshoots exactly where it matters — at the top of the card. Walk the
+/// prefix and stop at the last `n` whose weights AND own reserve both fit.
+fn layer_prefix_that_fits(
+    layer_bytes: &[u64],
+    cfg: &qwen35::Qwen35Config,
+    budget: u64,
+    ctx: usize,
+) -> usize {
+    let mut used = 0u64;
+    let mut best = 0usize;
+    for (i, &b) in layer_bytes.iter().enumerate() {
+        used += b;
+        let n = i + 1;
+        if used + computed_reserve_bytes(cfg, n, ctx) <= budget {
+            best = n;
+        } else {
+            break;
+        }
+    }
+    best
+}
+
+/// Check that the accelerator actually holds what the plan placed there.
+///
+/// Five consecutive runs reported "44/64 layers on GPU (9.80 GiB)" while the
+/// card held nothing — the loader was asking one device for the whole model
+/// at f32 (100.20 GiB against ~13 usable) and nearly every allocation
+/// failed. The planner's arithmetic was correct; it was describing a world
+/// the loader never built, and every decode number taken from those runs
+/// measured the host. A placement claim is worth exactly the bytes that show
+/// up, so measure and say so.
+///
+/// Advisory, not fatal: the reading is process-wide and absent without NVML,
+/// so it must not take down a server that is generating correctly. It exists
+/// so this failure is legible the FIRST time rather than the fifth.
+fn certify_residency(main: BackendChoice, planned: u64, before: Option<u64>) {
+    if main == BackendChoice::Cpu || planned == 0 {
+        return;
+    }
+    let (Some(before), Some(after)) = (before, mummu::vram::memory().map(|m| m.used)) else {
+        eprintln!("[mummu-serve] residency: no VRAM reading — placement unverified");
+        return;
+    };
+    let observed = after.saturating_sub(before);
+    let gib = |b: u64| b as f64 / f64::from(1u32 << 30);
+    // Half the plan is a deliberately generous floor: pool chunking,
+    // alignment and other processes all move this number. The failure it
+    // must catch is total (nothing resident at all), not marginal.
+    if observed * 2 < planned {
+        eprintln!(
+            "[mummu-serve] RESIDENCY FAILED: planned {:.2} GiB on {}, card grew {:.2} GiB.              The plan was NOT realized — decode is running on the host and the placement              line above is fiction.",
+            gib(planned),
+            label_of(main),
+            gib(observed),
+        );
+    } else {
+        eprintln!(
+            "[mummu-serve] residency ok: {:.2} GiB planned, {:.2} GiB resident on {}",
+            gib(planned),
+            gib(observed),
+            label_of(main),
+        );
+    }
+}
+
 /// Load host-resident layers at Q4 instead of F16 (`MUMMU_HOST_LAYERS=q4`).
 /// Q4 is 1.125 B/param resident on flex against F16's 4 (flex widens the
 /// half blob to f32), and `nn::packed_gemv` reads it directly at decode.
@@ -2338,5 +2474,92 @@ pub fn is_installed(spec: &ModelSpec, models_root: &Path) -> bool {
         WeightFormat::Gguf { .. } => spec
             .gguf_path(models_root)
             .is_some_and(|p| p.is_file()),
+    }
+}
+
+#[cfg(test)]
+mod reserve_tests {
+    use super::*;
+
+    /// The 27B this project actually serves.
+    fn cfg_27b() -> qwen35::Qwen35Config {
+        qwen35::Qwen35Config {
+            vocab_size: 248_320,
+            hidden_size: 5120,
+            num_layers: 64,
+            num_attention_heads: 24,
+            num_key_value_heads: 4,
+            head_dim: 256,
+            intermediate_size: 17408,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+            rope_dim: 64,
+            full_attention_interval: 4,
+            conv_kernel: 4,
+            d_inner: 4096,
+            d_state: 128,
+            n_k_heads: 16,
+            n_v_heads: 32,
+            eos_token_id: mummu::models::qwen2::EosIds::One(0),
+        }
+    }
+
+    /// The reserve must GROW with the layer count — that is the whole reason
+    /// "budget minus a constant" was the wrong shape.
+    #[test]
+    fn reserve_is_monotone_in_layers() {
+        let cfg = cfg_27b();
+        let mut prev = 0u64;
+        for n in [0usize, 8, 16, 32, 44, 64] {
+            let r = computed_reserve_bytes(&cfg, n, 4096);
+            assert!(r >= prev, "reserve fell from {prev} to {r} at n={n}");
+            prev = r;
+        }
+    }
+
+    /// KV is the context-dependent term; recurrent state is not.
+    #[test]
+    fn reserve_scales_with_context_but_state_does_not() {
+        let cfg = cfg_27b();
+        let short = computed_reserve_bytes(&cfg, 64, 1024);
+        let long = computed_reserve_bytes(&cfg, 64, 8192);
+        assert!(long > short, "longer context must reserve more");
+        // Delta-only prefix (no full-attention layer among the first 3 when
+        // the interval is 4) still carries conv+state, which cannot be zero.
+        let delta_only = computed_reserve_bytes(&cfg, 3, 1024);
+        assert!(delta_only > (1u64 << 30), "pool slack plus state at minimum");
+    }
+
+    /// A prefix must never be admitted whose weights plus its OWN reserve
+    /// exceed the budget — the bug that let the planner claim 44 layers the
+    /// card could not hold.
+    #[test]
+    fn prefix_never_exceeds_budget() {
+        let cfg = cfg_27b();
+        let per_layer = 239_000_000u64; // ~0.223 GiB, the measured Q4 layer
+        let bytes = vec![per_layer; 64];
+        for budget_gib in [4u64, 8, 10, 13, 16, 64] {
+            let budget = budget_gib << 30;
+            let n = layer_prefix_that_fits(&bytes, &cfg, budget, 4096);
+            let used: u64 = bytes[..n].iter().sum();
+            assert!(
+                used + computed_reserve_bytes(&cfg, n, 4096) <= budget || n == 0,
+                "n={n} overshoots a {budget_gib} GiB budget"
+            );
+            assert!(n <= 64);
+        }
+    }
+
+    /// More budget can never place fewer layers.
+    #[test]
+    fn prefix_is_monotone_in_budget() {
+        let cfg = cfg_27b();
+        let bytes = vec![239_000_000u64; 64];
+        let mut prev = 0usize;
+        for gib in 4..=20u64 {
+            let n = layer_prefix_that_fits(&bytes, &cfg, gib << 30, 4096);
+            assert!(n >= prev, "budget {gib} GiB placed {n} < {prev}");
+            prev = n;
+        }
     }
 }

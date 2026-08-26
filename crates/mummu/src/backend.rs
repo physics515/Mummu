@@ -17,6 +17,10 @@ use once_cell::sync::OnceCell;
 /// backends at runtime through [`burn::tensor::Device`]; with the workspace
 /// `fusion` feature, fusion applies to supporting devices automatically.
 #[must_use]
+pub fn gpu_device() -> burn::tensor::Device {
+    burn::tensor::Device::wgpu(Default::default())
+}
+
 /// Raise every cubecl device-server thread ("DSD-*") above the compute
 /// pools. Those threads encode command buffers, submit to the driver, and
 /// signal readback-map completions — microseconds of CPU each — but at
@@ -102,10 +106,6 @@ pub fn boost_device_server_threads() {
             eprintln!("[mummu] raised {boosted} device-server thread(s) above the compute pools");
         }
     }
-}
-
-pub fn gpu_device() -> burn::tensor::Device {
-    burn::tensor::Device::wgpu(Default::default())
 }
 
 /// Move a tensor to `device`, staging through host memory when both ends are
