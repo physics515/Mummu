@@ -675,6 +675,45 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       121.5-128 ms/token. Layered placement is the same shape and is already 2x our best hybrid
       while using NO GPU at all. Getting its layers actually resident is the highest-value item on
       this list by a wide margin.
+- [x] **Layer-granular placement now works and is the fastest valid configuration: 2.25 s/tok
+      against the cluster path's 3.35.** *(2026-08-26)* The loader was asking ONE device for the
+      whole model at f32 before placing anything — 100.20 GiB by manifest arithmetic against ~13
+      GiB usable, a 7.7x overshoot, so ~1000 allocations failed and the card held nothing while the
+      planner reported 44/64 layers placed. Building the skeleton on the host and letting
+      `assign_param` place each tensor (they are dead allocations: every one is overwritten before
+      any reader sees it) fixes it. Card now holds 10.66 GiB against 9.36 planned, zero panics.
+      Measured, quiet box, 3 warm runs each, counting ONLY runs whose residency certificate passed
+      and whose decoded text was inspected:
+
+      | configuration | s/token |
+      |---|---|
+      | **42 layers on GPU, host Q4** | **2.25-2.40** |
+      | 42 layers on GPU, host F16 | 2.45-2.60 |
+      | 39 layers on GPU | 2.89-3.08 |
+      | cluster hybrid | 3.35-3.77 |
+      | 0 on GPU, host Q4 | 4.18-4.21 |
+      | 0 on GPU, host F16 | 4.86-5.76 |
+
+      Monotone in card occupancy. Host RAM 63.5 -> 48.4 GiB. Gap to ollama on this box
+      (121.5-128 ms/tok) is now **~18x**, from ~28x when this work started and 76x as first logged.
+      **Three corrections worth keeping.** (1) The "340 MB exceeds wgpu's 256 MiB max buffer size"
+      diagnosis was WRONG — cubecl's Vulkan path sets that limit to u64::MAX and the error is a
+      memory-pool OOM. Two peer reviews inherited that premise from this log and built tiling
+      machinery (`k*`, TILEGUARD) on it; none was needed and none was written. (2) Host layers
+      belong at Q4, not F16: 4.18 against 4.86-5.76 at 1.125 B/param instead of 4. The standing
+      "quantized on flex is 18x slower" rule described the dequantize-per-op path that
+      `nn::packed_gemv` replaced. (3) **A run measuring 1.72-2.12 s/tok with the card empty was
+      believed for three cycles and used to justify defaulting layers OFF the accelerator. It was
+      producing EMPTY completions.** Timing a model whose output nobody checks is not timing
+      anything. The residency certificate and the output check both exist because of that, and the
+      placement default now follows a probe that prices each device at the precision it will
+      actually hold.
+      Next, ranked: (1) the cost probe should price a whole LAYER rather than one projection — the
+      DeltaNet trunk profiles worse on the card (delta.proj 5.83 -> 10.41 ms) and the current probe
+      cannot see that; (2) chunk prefill, whose unchunked activation peak is ~855 MB of the
+      computed reserve and therefore several layers of card space; (3) the packed GEMV is still
+      0.6-0.7x on the gate/up shape (1496 units each walking 5120 k-steps serially) — a k-split
+      with plane reduction is the obvious fix and would move the whole ranking.
 - [ ] **Do NOT make the clustered path universal until a fits-on-one-device fast path exists.**
       *(2026-08-24)* Partitioning earns its keep only when a model must span devices. Measured, the
       split costs **2.4x** in dispatch (32 cluster matmuls 4.13 ms against 1.68 ms fused), so imposing it

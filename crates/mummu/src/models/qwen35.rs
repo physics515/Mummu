@@ -1136,17 +1136,23 @@ pub fn load_from_pack_layered(
     let untied = pack.entry("output.weight").is_some();
     let trunk = config.num_layers;
 
-    // Build each layer on its own device.
-    let mut model = build(&config, &layer_device(0), untied);
-    for (l, layer) in model.layers.iter_mut().enumerate() {
-        let d = layer_device(l);
-        *layer = layer.clone().to_device(&d);
-    }
-    model.embed_tokens = model.embed_tokens.clone().to_device(embed_device);
-    model.norm = model.norm.clone().to_device(head_device);
-    if let Some(h) = model.lm_head.take() {
-        model.lm_head = Some(h.to_device(head_device));
-    }
+    // Build the skeleton on the HOST, never on an accelerator.
+    //
+    // `build` materializes every parameter as f32. Building it on layer 0's
+    // device asked ONE device for the whole model at f32 — measured from the
+    // manifest, 100.20 GiB against a card with ~13 GiB usable, a 7.7x
+    // overshoot — so allocation failed roughly a thousand times and the card
+    // ended up holding nothing while the planner reported 44 of 64 layers
+    // placed. None of it was ever needed: the loop below replaces every
+    // parameter through `assign_param`, which takes the destination device
+    // per tensor, and the `assigned != expected` check proves none is
+    // missed. These are dead allocations — every one is overwritten before
+    // any reader sees it — so dropping them cannot change results.
+    //
+    // The per-layer `to_device` pre-move goes for the same reason: it moved
+    // f32 skeleton weights onto the card purely to overwrite them.
+    let build_host = crate::backend::cpu_device();
+    let mut model = build(&config, &build_host, untied);
 
     let mut assigned = 0usize;
     for entry in &pack.manifest.tensors {
@@ -1182,6 +1188,14 @@ pub fn load_from_pack_layered(
         };
         assign_param(&mut model, &path, src, QuantPolicy::Off, &device).map_err(parse)?;
         assigned += 1;
+    }
+    // Every parameter above was assigned onto its own device. Pin the three
+    // specials, which the pack may not cover on every path; `to_device` is a
+    // no-op for a tensor already home.
+    model.embed_tokens = model.embed_tokens.clone().to_device(embed_device);
+    model.norm = model.norm.clone().to_device(head_device);
+    if let Some(h) = model.lm_head.take() {
+        model.lm_head = Some(h.to_device(head_device));
     }
     let expected = expected_tensor_count(&config, untied);
     if assigned != expected {
