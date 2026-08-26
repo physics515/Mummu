@@ -1065,6 +1065,7 @@ fn build_layered_qwen35(
         let host_ms = probe_projection_ms(&pack, &host, host_precision);
         let show = |m: Option<f64>| m.map_or("n/a".into(), |v| format!("{v:.2} ms"));
         let n = choose_prefix(feasible, accel_ms, host_ms);
+        probe_contention(&pack);
         eprintln!(
             "[mummu-serve] layer cost probe: {} on {}, {} on host — {} of {feasible} feasible layers on the accelerator",
             show(accel_ms),
@@ -1857,6 +1858,61 @@ fn choose_prefix(feasible_max: usize, accel_ms: Option<f64>, host_ms: Option<f64
     match (accel_ms, host_ms) {
         (Some(a), Some(h)) if a >= h => 0,
         _ => feasible_max,
+    }
+}
+
+/// Pairwise contention: how much slower one device's projection gets while
+/// the other runs the same work. `C = t_paired / t_alone`; 1.0 is no
+/// contention. This is the term the offload literature omits — it assumes
+/// the CPU and GPU have private memory systems, which is false for an iGPU
+/// and unreliable under WDDM. A hide window built from solo numbers
+/// overstates itself by exactly this factor.
+///
+/// Logged, not yet consumed: it is the admission gate for any
+/// overlay/deferral schedule (peer review, 2026-08-26 — "contention-broken
+/// pairs contribute 0, not t_a, to the hide window").
+fn probe_contention(pack: &mummu::pack::Pack) {
+    let gpu = mummu::backend::gpu_device();
+    let host = mummu::backend::cpu_device();
+    let solo_gpu = probe_projection_ms(pack, &gpu, mummu::pack::Precision::Q4);
+    let solo_host = probe_projection_ms(pack, &host, mummu::pack::Precision::Q4);
+    let (Some(sg), Some(sh)) = (solo_gpu, solo_host) else {
+        return;
+    };
+    // Pair: time the dGPU projection while the host hammers its own, and
+    // vice versa. Scoped threads so the pack borrow stays simple.
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let paired_gpu = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = probe_projection_ms(pack, &host, mummu::pack::Precision::Q4);
+            }
+        });
+        let t = probe_projection_ms(pack, &gpu, mummu::pack::Precision::Q4);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        t
+    });
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let paired_host = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = probe_projection_ms(pack, &gpu, mummu::pack::Precision::Q4);
+            }
+        });
+        let t = probe_projection_ms(pack, &host, mummu::pack::Precision::Q4);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        t
+    });
+    if let (Some(pg), Some(ph)) = (paired_gpu, paired_host) {
+        eprintln!(
+            "[mummu-serve] contention: dGPU {:.2} -> {:.2} ms paired (C={:.2}); host {:.2} -> {:.2} ms paired (C={:.2})",
+            sg,
+            pg,
+            pg / sg,
+            sh,
+            ph,
+            ph / sh,
+        );
     }
 }
 
