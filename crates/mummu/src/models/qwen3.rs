@@ -21,6 +21,7 @@ use burn::nn::{Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNor
 use burn::store::{ModuleAdapter, PyTorchToBurnAdapter, SafetensorsStore};
 use burn::tensor::{Device, Int, Tensor, TensorData};
 
+use crate::attn_config::{RopeScaling, check_sliding_window, sliding_window_from_gguf};
 use crate::gguf::{GgufFile, GgufMap, GgufTensorInfo, GgufValue};
 use crate::import::{
     CastFloatAdapter, DequantSink, ImportError, gguf_store, load_checked, required_file,
@@ -46,6 +47,24 @@ pub struct Qwen3Config {
     pub head_dim: usize,
     pub rms_norm_eps: f64,
     pub rope_theta: f32,
+    /// Frequency scaling (YaRN / linear / …). `null` on the Qwen3 checkpoints
+    /// in the zoo; a scaled one is refused at load rather than answered wrong
+    /// ([`crate::attn_config`]).
+    /// `rope_parameters` is the same object under the name newer transformers
+    /// writes; reading only `rope_scaling` would let a freshly-serialized
+    /// scaled checkpoint through as unscaled.
+    #[serde(default, alias = "rope_parameters")]
+    pub rope_scaling: Option<RopeScaling>,
+    /// The trained context length (Qwen3-0.6B: 40 960), used to tell an inert
+    /// sliding window from a clipping one.
+    #[serde(default)]
+    pub max_position_embeddings: Option<usize>,
+    /// Declared window span — `null` on Qwen3-0.6B, and gated by
+    /// `use_sliding_window` regardless.
+    #[serde(default)]
+    pub sliding_window: Option<usize>,
+    #[serde(default)]
+    pub use_sliding_window: bool,
     #[serde(default)]
     pub tie_word_embeddings: bool,
     /// EOS token id(s) — `<|im_end|>` first for the instruct checkpoints.
@@ -60,7 +79,7 @@ impl Qwen3Config {
         if cfg.head_dim == 0 {
             cfg.head_dim = cfg.hidden_size / cfg.num_attention_heads;
         }
-        cfg.validate()?;
+        cfg.validate("qwen3 config.json")?;
         Ok(cfg)
     }
 
@@ -112,15 +131,33 @@ impl Qwen3Config {
             head_dim,
             rms_norm_eps: f64::from(gguf_f32(f, "qwen3.attention.layer_norm_rms_epsilon")?),
             rope_theta: gguf_f32(f, "qwen3.rope.freq_base")?,
+            rope_scaling: RopeScaling::from_gguf(f, "qwen3"),
+            max_position_embeddings: f
+                .get("qwen3.context_length")
+                .and_then(GgufValue::as_u64)
+                .and_then(|v| usize::try_from(v).ok()),
+            sliding_window: sliding_window_from_gguf(f, "qwen3"),
+            // A GGUF header has no `use_sliding_window` twin: llama.cpp writes
+            // the key only for architectures that window, so presence enables.
+            use_sliding_window: true,
             // No separate output.weight tensor means the lm-head is tied.
             tie_word_embeddings: f.tensor("output.weight").is_none(),
             eos_token_id,
         };
-        cfg.validate()?;
+        cfg.validate("qwen3 GGUF header")?;
         Ok(cfg)
     }
 
-    fn validate(&self) -> Result<(), String> {
+    fn validate(&self, whose: &str) -> Result<(), String> {
+        if let Some(scaling) = &self.rope_scaling {
+            scaling.check(whose)?;
+        }
+        check_sliding_window(
+            self.sliding_window,
+            self.use_sliding_window,
+            self.max_position_embeddings,
+            whose,
+        )?;
         if self.num_key_value_heads == 0
             || !self
                 .num_attention_heads
@@ -428,6 +465,10 @@ mod tests {
             head_dim: 6,
             rms_norm_eps: 1e-6,
             rope_theta: 1e6,
+            rope_scaling: None,
+            max_position_embeddings: Some(512),
+            sliding_window: None,
+            use_sliding_window: false,
             tie_word_embeddings: true,
             eos_token_id: EosIds::One(2),
         }
@@ -448,6 +489,62 @@ mod tests {
         assert_ne!(cfg.head_dim, cfg.hidden_size / cfg.num_attention_heads);
         assert!(cfg.eos_token_id.contains(151_645));
         assert!(cfg.tie_word_embeddings);
+    }
+
+    /// Qwen3-0.6B's own config: `rope_scaling: null`, `sliding_window: null`,
+    /// `use_sliding_window: false`. The load Mummu parity-verifies must keep
+    /// working with the new fields present.
+    #[test]
+    fn the_real_qwen3_06b_shape_with_null_scaling_still_loads() {
+        let json = br#"{
+            "vocab_size": 151936, "hidden_size": 1024, "intermediate_size": 3072,
+            "num_hidden_layers": 28, "num_attention_heads": 16, "num_key_value_heads": 8,
+            "head_dim": 128, "rms_norm_eps": 1e-6, "rope_theta": 1000000,
+            "rope_scaling": null, "sliding_window": null, "use_sliding_window": false,
+            "max_window_layers": 28, "max_position_embeddings": 40960,
+            "tie_word_embeddings": true, "eos_token_id": 151645
+        }"#;
+        let cfg = Qwen3Config::from_json_bytes(json).expect("the zoo's own shape must load");
+        assert!(cfg.rope_scaling.is_none() && cfg.sliding_window.is_none());
+        assert_eq!(cfg.max_position_embeddings, Some(40960));
+    }
+
+    /// The pre-4.38 spelling (`"type"` rather than `"rope_type"`) is read too,
+    /// so an older linear-scaled checkpoint cannot slip past.
+    #[test]
+    fn a_linear_scaled_checkpoint_is_refused_in_the_legacy_spelling() {
+        let json = br#"{
+            "vocab_size": 151936, "hidden_size": 1024, "intermediate_size": 3072,
+            "num_hidden_layers": 28, "num_attention_heads": 16, "num_key_value_heads": 8,
+            "head_dim": 128, "rms_norm_eps": 1e-6, "rope_theta": 1000000,
+            "rope_scaling": {"type": "linear", "factor": 2.0}
+        }"#;
+        let err = Qwen3Config::from_json_bytes(json).expect_err("linear must refuse");
+        assert!(err.contains("linear"), "{err}");
+        assert!(err.contains("qwen3 config.json"), "{err}");
+    }
+
+    /// Newer transformers serializes the same object as `rope_parameters`.
+    /// Reading only `rope_scaling` would let a scaled checkpoint through as
+    /// unscaled — the exact silent failure this whole gate exists to stop.
+    #[test]
+    fn the_newer_rope_parameters_spelling_is_read_as_well() {
+        let json = br#"{
+            "vocab_size": 151936, "hidden_size": 1024, "intermediate_size": 3072,
+            "num_hidden_layers": 28, "num_attention_heads": 16, "num_key_value_heads": 8,
+            "head_dim": 128, "rms_norm_eps": 1e-6, "rope_theta": 1000000,
+            "rope_parameters": {"rope_type": "yarn", "rope_theta": 1000000.0, "factor": 4.0}
+        }"#;
+        let err = Qwen3Config::from_json_bytes(json).expect_err("yarn must refuse");
+        assert!(err.contains("yarn"), "{err}");
+        // And the plain spelling of the same field still loads.
+        let plain = br#"{
+            "vocab_size": 151936, "hidden_size": 1024, "intermediate_size": 3072,
+            "num_hidden_layers": 28, "num_attention_heads": 16, "num_key_value_heads": 8,
+            "head_dim": 128, "rms_norm_eps": 1e-6, "rope_theta": 1000000,
+            "rope_parameters": {"rope_type": "default", "rope_theta": 1000000.0}
+        }"#;
+        assert!(Qwen3Config::from_json_bytes(plain).is_ok());
     }
 
     #[test]

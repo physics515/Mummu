@@ -1445,6 +1445,49 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       of the shared blocks, no new module shapes. Gate: a *long-context* parity leg vs llama.cpp on a
       rope-scaled checkpoint — the short-prompt gates cannot see this by construction. *(2026-08-21,
       mistral.rs scan.)*
+      *(2026-08-22)* **Half (1) shipped — `crates/mummu/src/attn_config.rs`.** Every loader
+      (qwen2 / qwen3 / olmoe / lfm2, both the `config.json` and the GGUF-header path) now parses the
+      fields and refuses the load naming the mode, so the silent-degradation case is gone; half (2)
+      is what remains open here. Three things the implementation had to get right, each of which
+      would have been a bug: (a) **presence is not enablement** — every Qwen2.5 checkpoint ships
+      `"sliding_window": 32768` next to `"use_sliding_window": false`, so refusing on the field would
+      have rejected two parity-verified models; each family therefore decides *enabled* by its own
+      convention (Qwen reads the flag, OLMoE/LFM2 have none so a declared window is live) and passes
+      the answer to `check_sliding_window`, which additionally treats a window ≥ the trained context
+      as inert because it can never clip. (b) **transformers renamed the object**: `rope_parameters`
+      is the current spelling and `rope_scaling` the old one, so reading only the old name would let
+      a freshly-serialized YaRN checkpoint through as unscaled — both are read (serde `alias`), plus
+      the pre-4.38 `"type"` key beside `"rope_type"`, and a config naming two *different* modes is
+      refused rather than arbitrated. (c) **a per-layer-type RoPE map reads as plain**: transformers
+      lets Gemma-3-style configs nest one object per `layer_types` entry
+      (`{"full_attention": {…}, "sliding_attention": {…}}`), which deserializes with every named
+      field absent — i.e. straight through a naive check. The unknown keys are kept (`serde(flatten)`)
+      precisely so the nesting can be seen and refused. 11 unit tests in `attn_config` + 6 across the
+      family loaders (the load that must keep working is pinned as its own test), and the negative
+      space is covered for each: yarn, legacy-spelling linear, an enabled window, a zero window, a
+      disagreeing pair, and the nested map. **Real-file proof, not just unit tests**: all four cached
+      checkpoints re-parse through the new validation — qwen3-0.6B `scaling=None window=None
+      maxpos=40960`, qwen2.5-1.5B `window=Some(32768) use=false`, LFM2.5-1.2B `maxpos=128000`,
+      OLMoE-1B-7B `maxpos=4096` — the Qwen2.5-0.5B CPU budget gate still loads and decodes real
+      weights at **13.45 tok/s** (budget ≥ 6; 12.41 on a first, busier pass), and a new header-only leg
+      (`real_gguf::real_qwen2_gguf_header_declares_no_rope_scaling_and_no_window`) confirms the
+      Q4_K_M GGUF declares no `qwen2.rope.scaling.*` and no `qwen2.attention.sliding_window`, with
+      `context_length` 32768 read through the new path.
+      *(2026-08-22 research)* Two findings that scope what is left. (1) The mode list is closed and
+      short — `['default', 'linear', 'dynamic', 'yarn', 'longrope', 'llama3']` — with per-mode fields
+      documented (`factor` for all; `original_max_position_embeddings` for yarn/longrope/llama3;
+      `beta_fast` 32 / `beta_slow` 1 / `attention_factor` for yarn; `short_factor`/`long_factor`
+      lists of `head_dim/2` for longrope; `low_freq_factor`/`high_freq_factor` for llama3), so half
+      (2) is a bounded amount of arithmetic over the same `rope_tables` inputs rather than an
+      open-ended surface. (2) **The windowed mask is the cheap half of SWA and the wrong half to stop
+      at**: llama.cpp's `llama_kv_cache_unified_iswa` allocates *window-sized* KV for SWA layers
+      because KV outside the window is provably unused, which is where the memory actually goes —
+      and the documented cost is that a slid-past window cannot be recovered, so prefix cache /
+      context shift / context reuse are all off for those layers. Read against P9's KV-cache
+      persistence and P5's prompt-prefix reuse items before implementing, because a window-sized
+      cache silently invalidates both for the same layers. —
+      https://huggingface.co/docs/transformers/main/en/internal/rope_utils ·
+      https://github.com/ggml-org/llama.cpp/pull/13194
 - [ ] **Llama-family decoder port (`llama`)** *(mistral.rs parity)* — the loader that multiplies
       checkpoint coverage most per unit of new surface: Llama 2/3.x and the wide Mistral/TinyLlama-style
       fine-tune space share one architecture shape, and it is strictly a subset of blocks Mummu already

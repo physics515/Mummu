@@ -77,6 +77,13 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
   under an f16 name** — the one failure mode that turns a benchmark into fiction. One process can
   hold an f16 accelerator beside an f32 host, which the old `Gpu`/`GpuF16` type aliases could not
   express at all.
+- **Unsupported attention shapes are refused, not approximated** — every loader parses the
+  `rope_scaling` / `rope_parameters` object (both spellings, plus the pre-4.38 `type` key) and the
+  `sliding_window` fields, from `config.json` *and* the GGUF header, and fails the load naming the
+  mode when it is not plain rotary + full causal attention. A YaRN-scaled or windowed checkpoint
+  would otherwise load clean and degrade only far out in the context, where short prompts never
+  look. Presence is not enablement: Qwen2.5 ships an inert `sliding_window: 32768` behind
+  `use_sliding_window: false` and keeps loading, as does a window spanning the whole trained context.
 - **Five architectures ported and running on real weights** — Qwen2/2.5, Qwen3 dense, the LFM2/2.5
   hybrid, **OLMoE** (sparse MoE), and the all-MiniLM sentence embedder; Qwen2.5-1.5B, Qwen3-0.6B, and
   LFM2.5-1.2B/230M load and greedy-decode correctly on the reference GPU (wgpu/Vulkan), and

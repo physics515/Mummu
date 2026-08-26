@@ -8,7 +8,12 @@
 
 use std::path::PathBuf;
 
+<<<<<<< HEAD
 use mummu::backend::use_gpu;
+=======
+use mummu::attn_config::{RopeScaling, sliding_window_from_gguf};
+use mummu::backend::{Gpu, use_gpu};
+>>>>>>> 939a3ee (attn: refuse rope scaling and live sliding windows instead of answering wrong)
 use mummu::gguf::{GgmlType, GgufFile, GgufValue};
 use mummu::models::CausalLm;
 use mummu::models::qwen2;
@@ -72,6 +77,41 @@ fn real_qwen2_gguf_header_parses_and_describes_the_model() {
         embd.dims,
         kquants,
         payload_bytes as f64 / f64::from(1u32 << 30)
+    );
+}
+
+/// The attention-shaping half of the same header: a llama.cpp GGUF declares
+/// `<arch>.rope.scaling.*` and `<arch>.attention.sliding_window` only for
+/// models that use them, so the zoo's own files must parse to "no scaling, no
+/// window" — and `Qwen2Config::from_gguf` must accept them. Header-only, so it
+/// needs no GPU and no dequantization.
+#[test]
+#[ignore = "needs a local GGUF model file (MUMMU_GGUF_PATH)"]
+fn real_qwen2_gguf_header_declares_no_rope_scaling_and_no_window() {
+    let Some(path) = gguf_path() else {
+        panic!("set MUMMU_GGUF_PATH to a local .gguf model file");
+    };
+    let f = GgufFile::open(&path).expect("header parses");
+
+    let scaling = RopeScaling::from_gguf(&f, "qwen2");
+    let window = sliding_window_from_gguf(&f, "qwen2");
+    eprintln!("[real_gguf] rope.scaling = {scaling:?} · attention.sliding_window = {window:?}");
+    assert!(
+        scaling.is_none(),
+        "an unscaled checkpoint must declare no rope.scaling.* keys, got {scaling:?}"
+    );
+    assert!(
+        window.is_none(),
+        "Qwen2.5 GGUFs declare no window, got {window:?}"
+    );
+
+    // And the whole config still parses through the new validation.
+    let cfg = qwen2::Qwen2Config::from_gguf(&f).expect("gguf config parses");
+    assert!(cfg.rope_scaling.is_none() && cfg.sliding_window.is_none());
+    assert_eq!(cfg.hidden_size, 1536, "Qwen2.5-1.5B hidden size");
+    eprintln!(
+        "[real_gguf] context_length = {:?} · theta {}",
+        cfg.max_position_embeddings, cfg.rope_theta
     );
 }
 
