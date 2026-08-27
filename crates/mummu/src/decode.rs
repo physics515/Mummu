@@ -198,9 +198,26 @@ pub fn sample_id(logits: &[f32], opts: &SamplerOptions, rng: &mut Pcg32) -> u32 
     chosen
 }
 
-/// The shared decode driver: prefill once via `step`, then one token per
-/// iteration. Emits each accepted token through `on_token`; a `Break` return
-/// cancels cooperatively *before* the next forward. EOS is never emitted.
+/// Prompt tokens fed per prefill call (`MUMMU_PREFILL_CHUNK`; `0`/`off`
+/// disables chunking). The default 1024 keeps the peak SwiGLU activation
+/// (`3 · chunk · intermediate · 4 B`) near 200 MiB on the 27B — the number
+/// the accelerator reserve in mummu-serve is derived from, so the two must
+/// move together. `mummu_schedule::prefill::best_chunk` solves for the
+/// optimum from measured constants; this is its memory-feasible default.
+#[must_use]
+pub fn prefill_chunk_len() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| match std::env::var("MUMMU_PREFILL_CHUNK") {
+        Ok(v) if v == "0" || v.eq_ignore_ascii_case("off") => usize::MAX,
+        Ok(v) => v.parse::<usize>().ok().filter(|&c| c >= 1).unwrap_or(1024),
+        Err(_) => 1024,
+    })
+}
+
+/// The shared decode driver: prefill via `step` (in chunks — see
+/// [`prefill_chunk_len`]), then one token per iteration. Emits each accepted
+/// token through `on_token`; a `Break` return cancels cooperatively *before*
+/// the next forward. EOS is never emitted.
 /// `step(new_ids, past)` returns `[1, vocab]` logits for the last position.
 pub async fn generate_loop(
     mut step: impl FnMut(&[u32], usize) -> Tensor<2>,
@@ -218,7 +235,24 @@ pub async fn generate_loop(
     let greedy = opts.temperature == 0.0;
     let mut logits = {
         let _s = crate::prof::scope("prefill");
-        step(prompt_ids, 0)
+        // Chunked prefill: feeding the prompt in slices bounds the widest
+        // live activation at [chunk, intermediate] instead of
+        // [prompt, intermediate] — on the 27B that turns an ~816 MiB
+        // accelerator reserve into ~214 MiB, which is two to three more
+        // resident layers, every token, forever. Exact by the same invariant
+        // the caches are tested on (prefill+decode ≡ full forward): the KV
+        // cat, the conv window and the DeltaNet state all carry across
+        // calls. Cost: each non-final chunk computes one throwaway lm_head
+        // projection (`CausalLm::forward` has no skip-head mode yet).
+        let chunk = prefill_chunk_len();
+        let mut done = 0usize;
+        let mut last = None;
+        while done < prompt_ids.len() {
+            let end = done.saturating_add(chunk).min(prompt_ids.len());
+            last = Some(step(&prompt_ids[done..end], done));
+            done = end;
+        }
+        last.expect("non-empty prompt")
     };
     let mut out: Vec<u32> = Vec::with_capacity(max_tokens);
     for past in (prompt_ids.len()..).take(max_tokens) {
