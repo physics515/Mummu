@@ -8,12 +8,8 @@
 
 use std::path::PathBuf;
 
-<<<<<<< HEAD
-use mummu::backend::use_gpu;
-=======
 use mummu::attn_config::{RopeScaling, sliding_window_from_gguf};
-use mummu::backend::{Gpu, use_gpu};
->>>>>>> 939a3ee (attn: refuse rope scaling and live sliding windows instead of answering wrong)
+use mummu::backend::use_gpu;
 use mummu::gguf::{GgmlType, GgufFile, GgufValue};
 use mummu::models::CausalLm;
 use mummu::models::qwen2;
