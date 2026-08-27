@@ -339,10 +339,33 @@ pub fn vnni_available() -> bool {
 }
 
 /// Activation distributions whose predicted mean relative quantization error
-/// exceeds this fall back to the exact f32 path. A healthy vector predicts
-/// ~0.004 (half a ulp of i8 per element); 0.02 is five times that — the
-/// signature of groups owned by a single outlier.
-pub const QUALITY_LIMIT: f32 = 0.02;
+/// exceeds this fall back to the exact f32 path.
+///
+/// Calibrated against measured reality, not synthetic waves: uniform-ish
+/// test vectors predict ~0.004, but REAL decode activations on the 27B
+/// (post-RMSNorm hidden states, SwiGLU products) measure 0.022–0.043 —
+/// heavy tails raise per-group `amax/mean` without hurting the dot, whose
+/// error concentrates over K terms (the same per-32 i8 activation
+/// quantization llama.cpp applies universally, with no dispatch at all).
+/// An early 0.02 limit routed every production host GEMV to the slow exact
+/// path and silently gave the speedup back. 0.12 keeps the gate where it
+/// catches the genuinely pathological shape — a lone outlier owning each
+/// group predicts ~0.126 — and nothing real. `MUMMU_VNNI_QUALITY` overrides
+/// for operators chasing a quality/speed boundary.
+pub const QUALITY_LIMIT: f32 = 0.12;
+
+/// The effective dispatch limit ([`QUALITY_LIMIT`] or `MUMMU_VNNI_QUALITY`).
+#[must_use]
+pub fn quality_limit() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MUMMU_VNNI_QUALITY")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(QUALITY_LIMIT)
+    })
+}
 
 /// `y = x · W` over the packed representation, integer fast path when legal,
 /// exact f32 path otherwise. `out.len() == w.n`, `x.len() == w.k`.
@@ -354,7 +377,7 @@ pub fn gemv_q4n_auto(w: &PackedQ4, x: &[f32], out: &mut [f32]) {
     assert_eq!(x.len(), w.k, "activation length");
     assert_eq!(out.len(), w.n, "output length");
     let acts = Q8Acts::quantize(x);
-    if acts.quality > QUALITY_LIMIT || !vnni_available() {
+    if acts.quality > quality_limit() || !vnni_available() {
         log_fallback(w.k, w.n, acts.quality);
         gemv_q4n_f32(w, x, out);
         return;
@@ -757,7 +780,7 @@ mod tests {
         }
         let acts = Q8Acts::quantize(&x);
         assert!(
-            acts.quality > QUALITY_LIMIT,
+            acts.quality > quality_limit(),
             "the adversarial vector must trip the quality gate ({})",
             acts.quality
         );
