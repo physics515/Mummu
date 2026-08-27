@@ -966,6 +966,27 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       512 MiB slack, so a quiet box gets ~1 GiB back ≈ 4 layers, and the session where ambient
       drifted 1.9→8.9 GiB is exactly what the quantile would have tracked). `MUMMU_VRAM_GUARD_GB`
       pins the old behavior.
+- [x] **First production measurement of the branch: 0.75 s/token warm — 3× on the old branch, and
+      the same-session gap to ollama is 3.4×, down from ~18×.** *(2026-08-27, evening run; artifact:
+      the "750-Millisecond Token" flamegraph page.)* Protocol: this branch's serve on port 8097,
+      deployed launcher's env (RAYON 8, GPU budget 15, warm cubecl cache), layered path, 64-token
+      greedy, warm, back-to-back with ollama 0.32.15 on the same GGUF — ambient 4.3–5.4 GiB held
+      elsewhere all session (recorded; the old branch's 2.25–2.40 was a QUIETER session, so the 3×
+      is conservative). Numbers: mummu decode **750 ms/token** (folded self-times sum to 749 —
+      accounting closes; NOTE `elapsed_ms` in the done event includes prefill), prefill 359 ms/tok
+      at 36 prompt tokens; ollama **223 ms/token** decode (its own quiet record is ~125 — same
+      ambient tax). Placement: 41/64 layers (watermark margin left 10.9 GiB of an 11.4 free), twins
+      144 packed in 6.7 s, residency certified 10.51 GiB. Token anatomy (decode, per token): host
+      SwiGLU FFN 359 ms (48%), host GDN mixers 229 (31%), lm_head-on-host 68 (9%), full attention
+      64 (9%), norms+boundary fence 25, argmax readback **0.18 ms** — orchestration is ~7% over the
+      cost floor; the token is cost-bound on the 23 host layers now. Found and fixed live: the
+      activation-quality dispatch limit (0.02, synthetic-calibrated) sent EVERY production host
+      GEMV down the exact-f32 path — real activations measure 0.022–0.043; limit now 0.12
+      (`MUMMU_VNNI_QUALITY`), same-session effect 1172 → 750 ms/token, host `mlp.down` 13.1 → 5.2
+      ms/call (2.5×). Open: in-situ host GEMV runs ~5.2 ms/call vs 1.1–1.6 quiet microbench (live
+      ~2–3× inflation, unexplained); 8-vs-16 rayon threads is now a NULL (60.75 vs 60.98 s — the
+      old 8-thread rule's penalty died with the old kernel); lm_head on host at 68 ms/tok is the
+      new #3 line item (pin-to-GPU A/B ≈ break-even at ~0.7 GiB, row-split is the better shape).
 - [ ] **The overlay floor is built, measured — and NOT wired into serve, by its own arithmetic.**
       *(2026-08-27)* `mummu::overlay` implements the three-state planner (resident/host/stream), the
       R-slot ring executor with a farthest-ahead prefetch thread, the row-block pipelining model,
