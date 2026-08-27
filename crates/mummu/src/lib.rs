@@ -18,6 +18,9 @@ pub mod backend;
 /// Host CPU kernels: the packed-nibble Q4 GEMV at the DRAM roofline
 /// (AVX-512 VNNI) and its calibration machinery (SPEC 1).
 pub mod flex;
+/// The overlay floor: ring-streamed layers with a three-state per-layer
+/// planner (resident / host / stream) and a capacity theorem (SPEC 5).
+pub mod overlay;
 /// Synchronous-dataflow model of the decode step: priced DAG, the maximum
 /// cycle ratio, and the T* period floor (SPEC 2).
 pub mod sdf;
