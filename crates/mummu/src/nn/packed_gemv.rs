@@ -437,6 +437,7 @@ mod flex_impl {
     use burn::backend::tensor::{FloatTensor, QuantizedTensor};
     use burn::backend::{Flex, TensorMetadata};
     use burn::tensor::TensorData;
+    use burn::tensor::quantization::QuantValue;
     use burn_flex::FlexTensor;
 
     impl Q4GemvOps for Flex {
@@ -456,6 +457,22 @@ mod flex_impl {
                 .as_slice::<i8>()
                 .expect("flex quantized weight is contiguous i8");
             let scales: &[f32] = w.scales();
+            // The packed-nibble VNNI path (SPEC 1): its own host
+            // quantization grid (groups along K), so it engages only for
+            // Q4S — repacking a Q8S slab through a 4-bit grid would throw
+            // away real precision — and only while K divides the group
+            // width. MUMMU_VNNI_GEMV=0 restores the i8 loop below.
+            if matches!(
+                w.dtype(),
+                burn::tensor::DType::QFloat(s) if matches!(s.value, QuantValue::Q4S)
+            ) && k_len.is_multiple_of(32)
+                && crate::flex::registry::enabled()
+                && let Some(packed) = crate::flex::registry::resolve(wq, scales, k_len, n)
+            {
+                let mut out = vec![0f32; n];
+                crate::flex::kernels::gemv_q4n_auto(&packed, xs, &mut out);
+                return FlexTensor::from_data(TensorData::new(out, [1, n]));
+            }
             let blocks = n / 32;
             let mut out = vec![0f32; n];
             // Rayon par-chunks: persistent pool threads (a scope-spawn per
@@ -545,11 +562,29 @@ mod tests {
     use super::*;
     use burn::tensor::{Distribution, Tensor};
 
-    /// The packed GEMV against the dequantize-then-matmul reference on the
-    /// host backend — same math, different summation order, so the bound
-    /// is tight.
+    /// Serializes the two flex-path tests: `force_disable` is process-global
+    /// and they set it in opposite directions.
+    static FLEX_PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Restores the packed host path on drop, so a failing assert cannot
+    /// leave the process with the fast path disabled for other tests.
+    struct RestoreFastPath;
+    impl Drop for RestoreFastPath {
+        fn drop(&mut self) {
+            crate::flex::registry::force_disable(false);
+        }
+    }
+
+    /// The baseline i8 GEMV against the dequantize-then-matmul reference on
+    /// the host backend — same math, different summation order, so the bound
+    /// is tight. The VNNI twin is forced off: it computes on its own host
+    /// quantization grid with quantized activations, which is gated by its
+    /// own error-bound tests in `flex::kernels`, not by this one.
     #[test]
     fn q4s_gemv_matches_dequant_matmul_on_flex() {
+        let _serial = FLEX_PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::flex::registry::force_disable(true);
+        let _restore = RestoreFastPath;
         let device = crate::backend::cpu_device();
         let (k, n) = (192, 160);
         let x = Tensor::<2>::random([1, k], Distribution::Uniform(-1.0, 1.0), &device);
@@ -571,6 +606,44 @@ mod tests {
         assert!(
             diff / scale < 1e-4,
             "packed vs reference rel err {} (abs {diff})",
+            diff / scale
+        );
+    }
+
+    /// The VNNI twin path end to end through `try_q4s_gemv`: deterministic,
+    /// and a faithful 4-bit evaluation (its result sits within the combined
+    /// requantization + activation budget of the device-grid reference —
+    /// a few percent — while the tight per-row bounds are asserted in
+    /// `flex::kernels`). K % 64 == 0 here, the production shape class.
+    #[test]
+    fn q4s_gemv_vnni_twin_is_deterministic_and_faithful() {
+        let _serial = FLEX_PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::flex::registry::force_disable(false);
+        let device = crate::backend::cpu_device();
+        let (k, n) = (256, 96);
+        let x = Tensor::<2>::random([1, k], Distribution::Uniform(-1.0, 1.0), &device);
+        let w = Tensor::<2>::random([k, n], Distribution::Uniform(-1.0, 1.0), &device);
+        let wq = crate::quant::quantize_weight(crate::quant::QuantPolicy::Q4, w);
+
+        let a = try_q4s_gemv(&x, &wq).expect("packed path must engage");
+        let b = try_q4s_gemv(&x, &wq).expect("second call");
+        let rep = a
+            .clone()
+            .sub(b)
+            .abs()
+            .max()
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap()[0];
+        assert_eq!(rep, 0.0, "twin path must be deterministic call to call");
+
+        let want = x.matmul(wq.dequantize());
+        let diff = a.sub(want.clone()).abs().max().into_data().to_vec::<f32>().unwrap()[0];
+        let scale = want.abs().max().into_data().to_vec::<f32>().unwrap()[0].max(1e-6);
+        assert!(
+            diff / scale < 0.05,
+            "twin vs device-grid reference rel err {} (abs {diff}) — outside the \
+             requant+activation budget",
             diff / scale
         );
     }

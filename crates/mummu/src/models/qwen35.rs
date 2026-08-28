@@ -34,7 +34,7 @@ use burn::nn::conv::{Conv1d, Conv1dConfig};
 use burn::nn::{
     Embedding, EmbeddingConfig, Linear, LinearConfig, PaddingConfig1d, RmsNorm, RmsNormConfig,
 };
-use burn::tensor::{DType, Device, Int, Tensor, TensorData, activation};
+use burn::tensor::{Bool, DType, Device, Int, Tensor, TensorData, activation};
 
 use crate::gguf::{GgufFile, GgufMap, GgufTensorInfo, GgufValue};
 use crate::import::ImportError;
@@ -443,33 +443,23 @@ impl GatedDeltaNet {
         drop(_s_split);
         let _s_recur = crate::prof::scope("delta.recur");
 
-        // The recurrence, one token at a time. State S[b, h, i, j]:
-        // i indexes the key dim, j the value dim.
         let scale = 1.0 / (ds as f32).sqrt();
-        let mut s = cache
+        let s0 = cache
             .state
             .take()
             .unwrap_or_else(|| Tensor::<4>::zeros([b, hv, ds, ds], &device));
-        let mut outs: Vec<Tensor<4>> = Vec::with_capacity(t);
-        for tau in 0..t {
-            let q_t = q.clone().narrow(2, tau, 1).mul_scalar(scale); // [b, hv, 1, ds]
-            let k_t = k.clone().narrow(2, tau, 1); // [b, hv, 1, ds]
-            let v_t = v.clone().narrow(2, tau, 1); // [b, hv, 1, ds]
-            let g_t = g.clone().narrow(1, tau, 1).reshape([b, hv, 1, 1]); // per-head decay logit
-            let b_t = beta.clone().narrow(1, tau, 1).reshape([b, hv, 1, 1]);
-
-            s = s.mul(g_t.exp());
-            // v̂[j] = Σ_i S[i, j]·k[i]  — k over the key axis.
-            let v_hat = s.clone().mul(k_t.clone().swap_dims(2, 3)).sum_dim(2); // [b, hv, 1, ds]
-            let d = v_t.sub(v_hat).mul(b_t); // [b, hv, 1, ds]
-            // S += k ⊗ d  (outer product over [key, value]).
-            s = s.add(k_t.swap_dims(2, 3).matmul(d.clone()));
-            // o[j] = Σ_i S[i, j]·q[i].
-            let o = s.clone().mul(q_t.swap_dims(2, 3)).sum_dim(2); // [b, hv, 1, ds]
-            outs.push(o);
-        }
-        cache.state = Some(s);
-        let o = Tensor::cat(outs, 2); // [b, hv, t, ds]
+        // Prefill spans longer than one chunk take the chunkwise-parallel
+        // form — algebraically exact, an evaluation-order change and not an
+        // approximation (the derivation lives on `gdn_recurrence_chunked`),
+        // at roughly C-fold fewer kernel launches. The threshold is the
+        // chunk length itself: at or below one chunk the triangular-solve
+        // setup costs more launches than the batching saves, and decode
+        // (`t == 1`) stays on the sequential path by construction.
+        let (o, s_new) = match gdn_chunk() {
+            Some(c) if t > c => gdn_recurrence_chunked(&q, &k, &v, &g, &beta, s0, scale, c),
+            _ => gdn_recurrence_sequential(&q, &k, &v, &g, &beta, s0, scale),
+        };
+        cache.state = Some(s_new); // [b, hv, ds, ds]; o is [b, hv, t, ds]
         drop(_s_recur);
         let _s = crate::prof::scope("delta.out");
 
@@ -479,6 +469,235 @@ impl GatedDeltaNet {
         let gated = o.mul(activation::silu(z)).reshape([b, t, cfg.d_inner]);
         qlinear(&self.out_proj, gated)
     }
+}
+
+/// Chunk length for the chunkwise-parallel DeltaNet prefill, `None` when
+/// that path is disabled. One env read per process (mirrors
+/// [`lookahead_verify`]): `MUMMU_GDN_CHUNK` unset → the default 64; an
+/// integer overrides it; `0` or `off` disables chunking entirely (every
+/// prefill then runs the sequential reference); anything unrecognized
+/// falls back to the default.
+fn gdn_chunk() -> Option<usize> {
+    static CHUNK: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *CHUNK.get_or_init(|| match std::env::var("MUMMU_GDN_CHUNK") {
+        Err(_) => Some(64),
+        Ok(v) => {
+            let v = v.trim();
+            if v.eq_ignore_ascii_case("off") {
+                None
+            } else {
+                match v.parse::<usize>() {
+                    Ok(0) => None,
+                    Ok(c) => Some(c),
+                    Err(_) => Some(64),
+                }
+            }
+        }
+    })
+}
+
+/// The DeltaNet recurrence, one token at a time — decode's path (`t == 1`)
+/// and the exactness reference the chunked form is tested against. State
+/// `S[b, h, i, j]`: `i` indexes the key dim, `j` the value dim.
+///
+/// `q`/`k`/`v` are `[b, hv, t, ds]` (already conv'd, SiLU'd, L2-normed and
+/// tiled), `g`/`beta` are `[b, t, hv]` (per-head decay logits and update
+/// gates), `s0` is the carried state `[b, hv, ds, ds]`. Returns the
+/// per-token outputs `[b, hv, t, ds]` and the final state.
+fn gdn_recurrence_sequential(
+    q: &Tensor<4>,
+    k: &Tensor<4>,
+    v: &Tensor<4>,
+    g: &Tensor<3>,
+    beta: &Tensor<3>,
+    s0: Tensor<4>,
+    scale: f32,
+) -> (Tensor<4>, Tensor<4>) {
+    let [b, hv, t, _ds] = q.dims();
+    let mut s = s0;
+    let mut outs: Vec<Tensor<4>> = Vec::with_capacity(t);
+    for tau in 0..t {
+        let q_t = q.clone().narrow(2, tau, 1).mul_scalar(scale); // [b, hv, 1, ds]
+        let k_t = k.clone().narrow(2, tau, 1); // [b, hv, 1, ds]
+        let v_t = v.clone().narrow(2, tau, 1); // [b, hv, 1, ds]
+        let g_t = g.clone().narrow(1, tau, 1).reshape([b, hv, 1, 1]); // per-head decay logit
+        let b_t = beta.clone().narrow(1, tau, 1).reshape([b, hv, 1, 1]);
+
+        s = s.mul(g_t.exp());
+        // v̂[j] = Σ_i S[i, j]·k[i]  — k over the key axis.
+        let v_hat = s.clone().mul(k_t.clone().swap_dims(2, 3)).sum_dim(2); // [b, hv, 1, ds]
+        let d = v_t.sub(v_hat).mul(b_t); // [b, hv, 1, ds]
+        // S += k ⊗ d  (outer product over [key, value]).
+        s = s.add(k_t.swap_dims(2, 3).matmul(d.clone()));
+        // o[j] = Σ_i S[i, j]·q[i].
+        let o = s.clone().mul(q_t.swap_dims(2, 3)).sum_dim(2); // [b, hv, 1, ds]
+        outs.push(o);
+    }
+    (Tensor::cat(outs, 2), s) // [b, hv, t, ds]
+}
+
+/// Chunkwise-parallel evaluation of the same recurrence — the Gated
+/// DeltaNet / DeltaNet WY form (Yang et al.), specialised to this
+/// parameterization's **scalar** per-head decay. Same signature as
+/// [`gdn_recurrence_sequential`] plus the chunk length.
+///
+/// Within a chunk of length `C` starting from state `S₀`, write
+/// `L_t = Σ_{j≤t} g_j` (cumulative log-decay) and `P_t = exp(L_t)`, so
+/// `P_t/P_j` is the decay applied between tokens `j` and `t`. Unrolling
+/// `S_t = γ_t·S_{t−1} + k_t d_tᵀ` with `d_t = β_t(v_t − γ_t·S_{t−1}ᵀk_t)`
+/// gives, by induction on `t`,
+///
+/// ```text
+/// S_t = P_t·S₀ + Σ_{τ≤t} (P_t/P_τ)·k_τ d_τᵀ
+/// ```
+///
+/// and substituting that back into `d_t` makes the `d`s the solution of a
+/// unit lower-triangular system:
+///
+/// ```text
+/// (I + A)·D = B,   A[t,τ] = β_t·(P_t/P_τ)·(k_t·k_τ)      (τ < t, else 0)
+///                  B[t]   = β_t·v_t − β_t·P_t·(S₀ᵀ k_t)
+/// ```
+///
+/// With `D` solved, the outputs and the chunk-final state are plain
+/// batched matmuls:
+///
+/// ```text
+/// o_t = scale·(P_t·S₀ᵀq_t + Σ_{j≤t} (P_t/P_j)·(q_t·k_j)·d_j)
+/// S_C = P_C·S₀ + Σ_τ (P_C/P_τ)·k_τ d_τᵀ
+/// ```
+///
+/// The output sum is INCLUSIVE (`j ≤ t`): the sequential order updates `S`
+/// with token `t` before reading `o_t`. Hand-checked against two unrolled
+/// steps of the sequential recurrence at `C = 2` (both `d₂ = b₂ − A[2,1]d₁`
+/// and the `o`/`S` reads land on the same expressions).
+///
+/// Exactness of the solve: `A` is strictly lower triangular, so `N = −A`
+/// is nilpotent (`N^C = 0`) and `(I + A)⁻¹ = Σ_{k<C} N^k` — a FINITE
+/// Neumann sum, evaluated in `⌈log₂C⌉` doubling stages
+/// (`R ← R + X·R`, `X ← X·X`, with `R = Σ_{k<span} N^k`, `X = N^span`).
+/// Nothing is truncated, so the chunked path is algebraically exact — an
+/// evaluation-order change, not an approximation.
+///
+/// Numerical safety: every decay ratio `P_t/P_j` is `exp(L_t − L_j)` — a
+/// difference of cumulative logs, never a ratio of products (γ^64 reaches
+/// ~1e-19 at half-life decay per step; the products underflow f32 where
+/// the log differences stay O(10)). Non-causal entries are masked to −∞
+/// BEFORE the exp — their raw exponents are positive and would overflow
+/// under strong decay. The whole chunk runs on an f32 island (the same
+/// guard `GatedAttention` uses for its scores) and casts back to the
+/// ambient dtype on the way out.
+///
+/// Launch economics: the sequential loop issues ~9 small ops per token;
+/// a chunk issues ~20 chunk-level ops plus 2–3 matmuls per doubling stage
+/// (6 stages at C = 64) — ~40 launches per 64 tokens, every one of them a
+/// batched matmul over all heads, against ~576 for the same span
+/// sequentially.
+#[allow(clippy::too_many_arguments)] // the recurrence's natural arity
+fn gdn_recurrence_chunked(
+    q: &Tensor<4>,
+    k: &Tensor<4>,
+    v: &Tensor<4>,
+    g: &Tensor<3>,
+    beta: &Tensor<3>,
+    s0: Tensor<4>,
+    scale: f32,
+    chunk: usize,
+) -> (Tensor<4>, Tensor<4>) {
+    let [b, hv, t, _ds] = q.dims();
+    let device = q.device();
+    let ambient = q.dtype();
+
+    // The f32 island. q is pre-scaled once — equivalent to the sequential
+    // per-token mul_scalar, which commutes through everything q touches.
+    let qf = q.clone().cast(DType::F32).mul_scalar(scale);
+    let kf = k.clone().cast(DType::F32);
+    let vf = v.clone().cast(DType::F32);
+    // [b, t, hv] → [b, hv, t, 1], ready to broadcast over ds and columns.
+    let gf = g
+        .clone()
+        .cast(DType::F32)
+        .swap_dims(1, 2)
+        .reshape([b, hv, t, 1]);
+    let bf = beta
+        .clone()
+        .cast(DType::F32)
+        .swap_dims(1, 2)
+        .reshape([b, hv, t, 1]);
+
+    let mut s = s0.cast(DType::F32); // [b, hv, ds(key), ds(value)]
+    let mut outs: Vec<Tensor<4>> = Vec::with_capacity(t.div_ceil(chunk));
+    let mut start = 0;
+    while start < t {
+        let c = chunk.min(t - start); // the final chunk may be partial
+        let qc = qf.clone().narrow(2, start, c); // [b, hv, c, ds]
+        let kc = kf.clone().narrow(2, start, c);
+        let vc = vf.clone().narrow(2, start, c);
+        let gc = gf.clone().narrow(2, start, c); // [b, hv, c, 1]
+        let bc = bf.clone().narrow(2, start, c);
+
+        // Cumulative log-decay L_t and its exponential P_t, both within
+        // the chunk (g ≤ 0, so L is non-increasing and P ∈ (0, 1]).
+        let l = gc.cumsum(2); // [b, hv, c, 1]
+        let p = l.clone().exp();
+        // decay[t, j] = P_t/P_j = exp(L_t − L_j) for j ≤ t, unit diagonal.
+        let noncausal = Tensor::<2, Bool>::tril_mask([c, c], 0, &device).unsqueeze::<4>();
+        let decay = l
+            .clone()
+            .sub(l.clone().swap_dims(2, 3))
+            .mask_fill(noncausal, f32::NEG_INFINITY)
+            .exp(); // [b, hv, c, c], causal-inclusive
+
+        // A[t, j] = β_t·(P_t/P_j)·(k_t·k_j), strictly lower. Every entry
+        // of `decay` is finite in [0, 1], so a plain tril is safe here.
+        let a = decay
+            .clone()
+            .mul(kc.clone().matmul(kc.clone().swap_dims(2, 3)))
+            .mul(bc.clone())
+            .tril(-1);
+
+        // RHS rows: B[t] = β_t·v_t − β_t·P_t·(S₀ᵀ k_t).
+        let u0 = bc
+            .clone()
+            .mul(vc)
+            .sub(bc.mul(p.clone()).mul(kc.clone()).matmul(s.clone()));
+
+        // D = (I + A)⁻¹·B through the finite Neumann sum of N = −A.
+        let n = a.neg();
+        let eye = Tensor::<2>::eye(c, &device)
+            .cast(DType::F32)
+            .unsqueeze::<4>();
+        let mut r = n.clone().add(eye); // Σ_{k<2} N^k
+        if c > 2 {
+            let mut x = n.clone().matmul(n); // N²
+            let mut span = 2usize; // r = Σ_{k<span} N^k, x = N^span
+            loop {
+                r = r.clone().add(x.clone().matmul(r));
+                span *= 2;
+                if span >= c {
+                    break; // N^span = 0 from here on
+                }
+                x = x.clone().matmul(x);
+            }
+        }
+        let u = r.matmul(u0); // the solved pseudo-values, [b, hv, c, ds]
+
+        // o_t = P_t·S₀ᵀq_t + Σ_{j≤t} (P_t/P_j)·(q_t·k_j)·u_j — inclusive
+        // j ≤ t is exactly the unit diagonal of `decay`.
+        let qk = qc.clone().matmul(kc.clone().swap_dims(2, 3)).mul(decay);
+        let o_c = p.clone().mul(qc).matmul(s.clone()).add(qk.matmul(u.clone()));
+        outs.push(o_c);
+
+        // S_C = P_C·S₀ + Σ_j (P_C/P_j)·k_j u_jᵀ, again via log differences.
+        let l_last = l.clone().narrow(2, c - 1, 1); // [b, hv, 1, 1] = L_C
+        let to_end = l_last.clone().sub(l).exp(); // (P_C/P_j) ∈ (0, 1]
+        s = s
+            .mul(l_last.exp())
+            .add(kc.mul(to_end).swap_dims(2, 3).matmul(u));
+
+        start += c;
+    }
+    (Tensor::cat(outs, 2).cast(ambient), s.cast(ambient))
 }
 
 /// One trunk layer: exactly one of `self_attn` / `linear_attn`.
@@ -1826,6 +2045,8 @@ impl CausalLm for LoadedQwen35 {
 
 #[cfg(test)]
 mod tests {
+    use burn::tensor::Distribution;
+
     use super::*;
 
     /// A toy config exercising both layer kinds: layer 1 is full attention
@@ -1924,6 +2145,136 @@ mod tests {
             .map(|(x, y)| (x - y).abs())
             .fold(0.0f32, f32::max);
         assert!(max_diff > 1e-6, "different prefixes must change the logits");
+    }
+
+    /// Max |a − b| across two same-shape tensors, read back on the host.
+    fn max_abs_diff<const D: usize>(a: Tensor<D>, b: Tensor<D>) -> f32 {
+        a.sub(b)
+            .abs()
+            .max()
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .unwrap()[0]
+    }
+
+    /// Random recurrence inputs shaped like the post-conv/norm/tile tensors:
+    /// q/k/v `[b, hv, t, ds]`, decay logits g ≤ 0 (softplus·a with a < 0
+    /// guarantees that in the real model), β ∈ (0, 1) (a sigmoid). q and k
+    /// are L2-normalized per position like the model's are — unit ‖k‖ is
+    /// what keeps the delta-rule map `γ(I − βkkᵀ)` contractive, so long
+    /// test sequences stay O(1) instead of drifting past an abs tolerance.
+    #[allow(clippy::type_complexity)]
+    fn random_recurrence_inputs(
+        t: usize,
+        g_range: (f64, f64),
+        device: &Device,
+    ) -> (Tensor<4>, Tensor<4>, Tensor<4>, Tensor<3>, Tensor<3>) {
+        let (b, hv, ds) = (1, 3, 4);
+        let dims = [b, hv, t, ds];
+        let uni = Distribution::Uniform(-1.0, 1.0);
+        let l2 = |x: Tensor<4>| {
+            let norm = x.clone().powi_scalar(2).sum_dim(3).sqrt().clamp_min(1e-6);
+            x.div(norm)
+        };
+        (
+            l2(Tensor::<4>::random(dims, uni, device)),
+            l2(Tensor::<4>::random(dims, uni, device)),
+            Tensor::<4>::random(dims, uni, device),
+            Tensor::<3>::random([b, t, hv], Distribution::Uniform(g_range.0, g_range.1), device),
+            Tensor::<3>::random([b, t, hv], Distribution::Uniform(0.05, 0.95), device),
+        )
+    }
+
+    /// The chunked evaluation is exact: identical inputs and initial state
+    /// must reproduce the sequential recurrence's outputs AND final state.
+    /// Lengths cross the chunk boundaries of C = 64 (5 < C; 64 = exactly
+    /// one chunk; 100 = one full + one partial; 129 = two full + a final
+    /// chunk of ONE token), each from both a zero and a random carried
+    /// state (`None` vs `Some(S)` in the cache).
+    #[test]
+    fn chunked_recurrence_matches_sequential() {
+        let device = crate::backend::cpu_device();
+        let (b, hv, ds) = (1, 3, 4);
+        let scale = 1.0 / (ds as f32).sqrt();
+        for &t in &[5usize, 64, 100, 129] {
+            for random_state in [false, true] {
+                let (q, k, v, g, beta) = random_recurrence_inputs(t, (-1.0, 0.0), &device);
+                let s0 = if random_state {
+                    Tensor::<4>::random([b, hv, ds, ds], Distribution::Uniform(-1.0, 1.0), &device)
+                } else {
+                    Tensor::<4>::zeros([b, hv, ds, ds], &device)
+                };
+                let (o_seq, s_seq) =
+                    gdn_recurrence_sequential(&q, &k, &v, &g, &beta, s0.clone(), scale);
+                let (o_chk, s_chk) = gdn_recurrence_chunked(&q, &k, &v, &g, &beta, s0, scale, 64);
+                let od = max_abs_diff(o_seq, o_chk);
+                let sd = max_abs_diff(s_seq, s_chk);
+                assert!(
+                    od < 1e-4,
+                    "outputs diverge at t={t} (random_state={random_state}): {od}"
+                );
+                assert!(
+                    sd < 1e-4,
+                    "final state diverges at t={t} (random_state={random_state}): {sd}"
+                );
+            }
+        }
+    }
+
+    /// γ-underflow stress: decay near 0.5/step over t = 128 puts the raw
+    /// cumulative product at ~0.5¹²⁸ ≈ 3e-39 — below f32's smallest
+    /// normal — so any P_t/P_j formed as a ratio of products dies. The
+    /// exp-of-cumsum-difference form must keep the chunked path on top of
+    /// the sequential reference anyway.
+    #[test]
+    fn chunked_recurrence_survives_gamma_underflow() {
+        let device = crate::backend::cpu_device();
+        let (b, hv, ds) = (1, 3, 4);
+        let scale = 1.0 / (ds as f32).sqrt();
+        let (q, k, v, g, beta) = random_recurrence_inputs(128, (-0.8, -0.6), &device);
+        let s0 = Tensor::<4>::random([b, hv, ds, ds], Distribution::Uniform(-1.0, 1.0), &device);
+        let (o_seq, s_seq) = gdn_recurrence_sequential(&q, &k, &v, &g, &beta, s0.clone(), scale);
+        let (o_chk, s_chk) = gdn_recurrence_chunked(&q, &k, &v, &g, &beta, s0, scale, 64);
+        let od = max_abs_diff(o_seq, o_chk);
+        let sd = max_abs_diff(s_seq, s_chk);
+        assert!(od < 1e-4, "outputs diverge under strong decay: {od}");
+        assert!(sd < 1e-4, "final state diverges under strong decay: {sd}");
+    }
+
+    /// The cache invariant again, with the prefill long enough (100 > the
+    /// default chunk of 64, and `MUMMU_GDN_CHUNK` is unset under test) that
+    /// it runs the CHUNKED path: stepped decode after it must still equal
+    /// one full forward. Together with
+    /// `chunked_recurrence_matches_sequential` this pins the chunked
+    /// prefill → sequential decode handoff (conv window + carried state).
+    #[test]
+    fn cached_decode_matches_chunked_prefill() {
+        let m = toy_model();
+        let device = crate::backend::cpu_device();
+        let ids: Vec<u32> = (0..104u32).map(|i| (i * 37 + 11) % 64).collect();
+
+        let mut full_cache = m.new_cache();
+        let full = m
+            .forward(&ids, 0, &mut full_cache, &device)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+
+        let mut cache = m.new_cache();
+        let _ = m.forward(&ids[..100], 0, &mut cache, &device);
+        let mut last = Vec::new();
+        for (i, &id) in ids.iter().enumerate().skip(100) {
+            last = m
+                .forward(&[id], i, &mut cache, &device)
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap();
+        }
+        assert_eq!(full.len(), last.len());
+        for (i, (f, s)) in full.iter().zip(&last).enumerate() {
+            assert!((f - s).abs() < 1e-4, "logit {i}: full {f} vs stepped {s}");
+        }
     }
 
     #[test]

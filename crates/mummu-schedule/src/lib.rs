@@ -20,6 +20,22 @@
 //! not take among those still open. That terminates in at most one pass per
 //! device and gives the makespan-optimal split whenever memory does not bind;
 //! where memory does bind, it gives the best split subject to those caps.
+//!
+//! The residency modules extend the same philosophy — measure, don't
+//! guess — to VRAM itself. [`p2`] keeps an online quantile of ambient VRAM
+//! consumption in five numbers; [`watermark`] turns it into a
+//! chance-constrained reserve `Pr[usage + ambient > VRAM] <= alpha` with
+//! hysteresis, replacing the one-NVML-sample-at-load guess that once
+//! drifted 1.9 -> 8.9 GiB mid-session; [`placement`] chooses which
+//! contiguous run of layers lives on the GPU under that budget (a knapsack
+//! on a chain, solved exactly); and [`prefill`] picks the prefill chunk
+//! size that removes the unchunked ~855 MB activation peak from the
+//! reserve entirely.
+
+pub mod p2;
+pub mod placement;
+pub mod prefill;
+pub mod watermark;
 
 /// One device the scheduler may assign work to.
 #[derive(Debug, Clone)]

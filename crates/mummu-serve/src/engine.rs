@@ -1055,14 +1055,18 @@ fn build_layered_qwen35(
     } else {
         let feasible =
             layer_prefix_that_fits(&layer_bytes, &pack_config, backend_budget(main), ctx);
-        // What a layer actually costs on each side, measured, not assumed.
+        // What a layer actually costs on each side, measured, not assumed —
+        // with the host reading clamped to its DRAM floor, because the probe
+        // tensor goes L3-warm on the host while production streams every
+        // host layer per token (see `host_probe_floor_ms`).
         let accel_ms = probe_projection_ms(&pack, &device, mummu::pack::Precision::Q4);
         let host_precision = if host_layers_q4() {
             mummu::pack::Precision::Q4
         } else {
             mummu::pack::Precision::F16
         };
-        let host_ms = probe_projection_ms(&pack, &host, host_precision);
+        let host_ms = probe_projection_ms(&pack, &host, host_precision)
+            .map(|m| m.max(host_probe_floor_ms(&pack, host_precision).unwrap_or(0.0)));
         let show = |m: Option<f64>| m.map_or("n/a".into(), |v| format!("{v:.2} ms"));
         let n = choose_prefix(feasible, accel_ms, host_ms);
         probe_contention(&pack);
@@ -1094,20 +1098,12 @@ fn build_layered_qwen35(
     // with the last layer so the final projection does not cross.
     let head = dev_for(layer_bytes.len().saturating_sub(1));
     let started = Instant::now();
-    // What precision a HOST layer carries.
-    //
-    // This used to be F16 unconditionally, because burn-flex's quantized
-    // matmul was pathologically slow — the same 89 M-param weight measured
-    // 268 ms at Q4 against 13.3 ms at F16 (`examples/device-throughput.rs`,
-    // 2026-08-23). That measured burn-flex's dequantize-PER-OP fallback at
-    // decode shape, and mummu no longer takes it: `nn::packed_gemv` reads
-    // flex's i8 storage directly at m=1 (measured 4.54 -> 3.34 ms/call on
-    // this model's mlp, at 3.6x less RAM). Large-m prefill still falls
-    // through to dequantize-then-gemm, which is the right shape there —
-    // one dequantize amortized over many rows rather than per token.
-    //
-    // Default stays F16 until that trade is measured on TTFT as well as
-    // decode; `MUMMU_HOST_LAYERS=q4` opts in.
+    // What precision a HOST layer carries. Default Q4 (see `host_layers_q4`
+    // for the measured history); at decode the packed VNNI twin
+    // (`flex::kernels`, built at load by `warm_host_twins`) reads
+    // 0.5625 B/param at DRAM speed — measured 46-48 GB/s effective on this
+    // box, 3.4-6.3x the i8 slab path per projection in the streaming
+    // regime. `MUMMU_HOST_LAYERS=f16` restores the float slab.
     //
     // Only Linear/Expert weights switch: the embedding is a gather and the
     // norm vectors anchor the numerics, so both stay as `mixed_precision`
@@ -1145,7 +1141,66 @@ fn build_layered_qwen35(
         started.elapsed().as_secs_f32()
     );
     certify_residency(main, placed, vram_before);
+    RESIDENT_VRAM.store(placed, std::sync::atomic::Ordering::Relaxed);
+    warm_host_twins(&model, on_device);
     Ok(model)
+}
+
+/// Build the packed VNNI twin of every host-resident Q4 projection at LOAD,
+/// so the first token never pays the repack (a few tens of ms per tensor,
+/// ~200 tensors on a 22-layer host half — seconds that belong in the load
+/// bar, not the first request). One zero GEMV per weight routes through
+/// `try_q4s_gemv`, whose flex path builds and registers the twin as a side
+/// effect; float-precision host layers and the accelerator's tensors
+/// decline and cost nothing. `MUMMU_VNNI_WARM=off` skips.
+fn warm_host_twins(model: &qwen35::LoadedQwen35, from_layer: usize) {
+    if !mummu::flex::registry::enabled()
+        || std::env::var("MUMMU_VNNI_WARM").is_ok_and(|v| v.eq_ignore_ascii_case("off"))
+        || from_layer >= model.model.layers.len()
+    {
+        return;
+    }
+    use burn::tensor::Tensor;
+    let started = Instant::now();
+    let mut built = 0usize;
+    let mut warm = |l: &burn::nn::Linear| {
+        let w = l.weight.val();
+        if !matches!(w.dtype(), burn::tensor::DType::QFloat(_)) {
+            return;
+        }
+        let k = w.dims()[0];
+        if !k.is_multiple_of(32) {
+            return;
+        }
+        let x = Tensor::<2>::zeros([1, k], &w.device());
+        if mummu::nn::try_q4s_gemv(&x, &w).is_some() {
+            built += 1;
+        }
+    };
+    for layer in model.model.layers.iter().skip(from_layer) {
+        if let Some(a) = &layer.self_attn {
+            warm(&a.q_proj);
+            warm(&a.k_proj);
+            warm(&a.v_proj);
+            warm(&a.o_proj);
+        }
+        if let Some(d) = &layer.linear_attn {
+            warm(&d.qkv_proj);
+            warm(&d.z_proj);
+            warm(&d.beta_proj);
+            warm(&d.alpha_proj);
+            warm(&d.out_proj);
+        }
+        warm(&layer.mlp.gate_proj);
+        warm(&layer.mlp.up_proj);
+        warm(&layer.mlp.down_proj);
+    }
+    if built > 0 {
+        eprintln!(
+            "[mummu-serve] vnni twins: {built} host projections packed in {:.1}s",
+            started.elapsed().as_secs_f32()
+        );
+    }
 }
 
 /// Plan and load a partitioned qwen35 pack: trunk + local FFN clusters on
@@ -1804,23 +1859,77 @@ fn probe_projection_ms(
     let w = pack.tensor::<2>(entry, precision, device).ok()?;
     let k = w.dims()[0];
     let x = Tensor::<2>::zeros([1, k], device);
-    let once = || {
-        let y = match mummu::nn::try_q4s_gemv(&x, &w) {
-            Some(y) => y,
-            None => x.clone().matmul(w.clone()),
-        };
+    let gemv = || match mummu::nn::try_q4s_gemv(&x, &w) {
+        Some(y) => y,
+        None => x.clone().matmul(w.clone()),
+    };
+    let touch = |y: burn::tensor::Tensor<2>| {
         // Force the device to finish; wgpu readbacks are deferred-mapped, so
         // the fence surfaces at the first touch of the bytes, not here.
         let _ = y.into_data().to_vec::<f32>();
     };
-    once();
-    once();
+    touch(gemv());
+    touch(gemv());
+    // AMORTIZED throughput, one sync for the whole batch — not per-call
+    // latency. Production pays one readback per TOKEN (the argmax index),
+    // not per projection, so a per-call fence would charge the accelerator
+    // ~1.5 ms of sync it never pays at the margin — enough to flip
+    // `choose_prefix` to an empty card now that the host's VNNI path runs a
+    // projection in ~1 ms. (The host side is synchronous either way; the
+    // amortization changes nothing there.)
     let reps = 5;
     let t0 = std::time::Instant::now();
+    let mut last = None;
     for _ in 0..reps {
-        once();
+        last = Some(gemv());
     }
+    touch(last.expect("reps >= 1"));
     Some(t0.elapsed().as_secs_f64() * 1e3 / f64::from(reps))
+}
+
+/// Sustained host DRAM read bandwidth, GB/s, measured once per process
+/// (threaded sum over a 512 MiB buffer — past every cache on this part).
+/// The denominator for [`host_probe_floor_ms`].
+fn host_dram_gbps() -> f64 {
+    static BW: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *BW.get_or_init(|| {
+        use rayon::prelude::*;
+        let words = (512usize << 20) / 8;
+        let buf: Vec<u64> = (0..words as u64).collect();
+        let mut best = f64::INFINITY;
+        for _ in 0..3 {
+            let t0 = std::time::Instant::now();
+            let s: u64 = buf
+                .par_chunks(1 << 16)
+                .map(|c| c.iter().fold(0u64, |a, &b| a.wrapping_add(b)))
+                .reduce(|| 0, u64::wrapping_add);
+            std::hint::black_box(s);
+            best = best.min(t0.elapsed().as_secs_f64());
+        }
+        (words * 8) as f64 / best / 1e9
+    })
+}
+
+/// The floor a host-side projection probe may not report under: the probe
+/// times ONE tensor warm, and a ~50 MB packed weight fits this part's
+/// 128 MB L3 — measured 0.5 ms warm against 1.1 ms streaming. Production
+/// cycles every host layer per token, so nothing stays cache-resident and
+/// the honest per-projection cost is the packed bytes over DRAM bandwidth.
+/// Without this clamp the L3-warm number beats the accelerator probe and
+/// `choose_prefix` empties the card — the probe-vs-production trap, again.
+fn host_probe_floor_ms(pack: &mummu::pack::Pack, precision: mummu::pack::Precision) -> Option<f64> {
+    let entry = pack.entry("blk.0.ffn_gate.weight")?;
+    let &[k, n] = entry.shape.as_slice() else {
+        return None;
+    };
+    let bytes = match precision {
+        // Packed nibbles + f16 scales per 32-group (the VNNI twin's stream).
+        mummu::pack::Precision::Q4 => (k * n) as f64 * (0.5 + 2.0 / 32.0),
+        mummu::pack::Precision::Q8 => (k * n) as f64 * (1.0 + 4.0 / 32.0),
+        // flex widens a half blob to f32 on load.
+        mummu::pack::Precision::F16 | mummu::pack::Precision::F32 => (k * n) as f64 * 4.0,
+    };
+    Some(bytes / (host_dram_gbps() * 1e6))
 }
 
 /// How many layers belong on the accelerator, given what each device costs.
@@ -1964,7 +2073,13 @@ fn computed_reserve_bytes(cfg: &qwen35::Qwen35Config, layers_on_device: usize, c
         * f32b;
     let state = delta * cfg.n_v_heads as u64 * (cfg.d_state as u64).pow(2) * f32b;
     // Three [tokens, intermediate] buffers live at once through SwiGLU.
-    let act = 3 * ctx as u64 * cfg.intermediate_size as u64 * f32b;
+    // Prefill is CHUNKED (`mummu::decode::prefill_chunk_len`, default 1024),
+    // so the widest live buffer is [chunk, intermediate], not
+    // [ctx, intermediate] — on the 27B that is ~214 MiB instead of ~816 MiB,
+    // which is two to three more layers on the card. The reserve and the
+    // decode driver read the same knob, so they cannot disagree.
+    let act_tokens = ctx.min(mummu::decode::prefill_chunk_len()) as u64;
+    let act = 3 * act_tokens * cfg.intermediate_size as u64 * f32b;
     const POOL_SLACK: u64 = 1 << 30;
 
     kv + conv + state + act + POOL_SLACK
@@ -2309,6 +2424,53 @@ fn ensure_host_room(need: u64, keep: BackendChoice) {
 /// else on the machine; `MUMMU_IGPU_BUDGET_GB` overrides.
 const INTEGRATED_GPU_BUDGET: u64 = 8 << 30;
 
+/// VRAM the model's own placement holds (set after a certified load) — the
+/// term that separates "what the card holds" into ours vs ambient for the
+/// watermark. Approximate on unload (it stays until the next load), which
+/// only UNDER-estimates ambient — the conservative direction.
+static RESIDENT_VRAM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How much free VRAM to leave for ambient growth: the chance-constrained
+/// watermark over ambient consumption (SPEC 3), fed a sample on every call.
+///
+/// `guard_bytes()` tracks the 1-alpha quantile of ambient (everything on the
+/// card that is not ours) with envelope semantics — it covers every spike it
+/// has seen immediately, shrinks only after a quiet window — so the margin
+/// returned here is the headroom between that envelope and ambient right
+/// now. Early in a process the estimator is cold and the margin is just the
+/// fragmentation slack; a session whose compositor/browser actually moves
+/// grows it. `MUMMU_VRAM_GUARD_GB` pins the old fixed-reserve behavior.
+fn vram_margin_bytes(m: &mummu::vram::Memory) -> u64 {
+    if let Some(gb) = std::env::var("MUMMU_VRAM_GUARD_GB")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|gb| *gb >= 0.0)
+    {
+        return (gb * f64::from(1u32 << 30)) as u64;
+    }
+    use mummu::schedule::watermark::{Watermark, WatermarkConfig};
+    static WM: std::sync::Mutex<Option<Watermark>> = std::sync::Mutex::new(None);
+    let ambient = m
+        .used
+        .saturating_sub(RESIDENT_VRAM.load(std::sync::atomic::Ordering::Relaxed));
+    let mut guard = WM.lock().unwrap_or_else(|e| e.into_inner());
+    let wm = guard.get_or_insert_with(|| {
+        Watermark::new(WatermarkConfig {
+            // 1 GiB idle floor + 512 MiB allocator slack: together ~1.5 GiB
+            // at a quiet desktop — a layer or two cheaper than the fixed
+            // 2 GiB, and it grows when ambient actually misbehaves.
+            floor_bytes: 1 << 30,
+            frag_slack_bytes: 512 << 20,
+            ..WatermarkConfig::default()
+        })
+    });
+    wm.observe_ambient(ambient);
+    if ALLOC_FAILED.load(std::sync::atomic::Ordering::SeqCst) {
+        wm.breach();
+    }
+    wm.guard_bytes().saturating_sub(ambient).max(512 << 20)
+}
+
 fn backend_budget(backend: BackendChoice) -> u64 {
     let inv = mummu::backend::inventory();
     match backend {
@@ -2364,11 +2526,16 @@ fn backend_budget(backend: BackendChoice) -> u64 {
                 })
                 .unwrap_or(15 << 30);
             match mummu::vram::memory() {
-                // Leave the desktop its working set. 2 GiB is what this box
-                // idles at with a browser and the usual tray software up;
-                // below that, compositing starts stuttering before we OOM.
+                // Leave the desktop room for what ambient consumption may
+                // GROW to, not a hand-picked constant: the margin comes from
+                // the chance-constrained watermark (`vram_margin_bytes` —
+                // a tracked quantile of ambient VRAM with hysteresis). The
+                // fixed 2 GiB it replaces was sized for this box's idle and
+                // then paid on every box in every session, quiet or not; a
+                // session where ambient actually drifted 1.9 -> 8.9 GiB is
+                // exactly what the quantile tracks and the constant missed.
                 Some(m) => {
-                    let live = m.headroom(2 << 30);
+                    let live = m.free.saturating_sub(vram_margin_bytes(&m));
                     if live < configured {
                         eprintln!(
                             "[mummu-serve] VRAM: {:.1} GiB free of {:.1} GiB                              ({:.1} GiB held elsewhere) — budget {:.1} -> {:.1} GiB",

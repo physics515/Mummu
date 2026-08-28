@@ -902,6 +902,102 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       not knowable from outside, so the cap now applies ONLY to groups that actually dequantize (the
       Q8 family), and native groups keep their proven organic widths. Upstream issue to file against
       burn: wgpu q_matmul, m=1, both `num_quants 4` and `num_quants 8` reproduced with exact shapes.
+- [x] **The host GEMV reaches the DRAM roofline: packed-nibble AVX-512 VNNI kernel, 3.4–6.3x per
+      projection in the streaming regime.** *(2026-08-27)* `mummu::flex::kernels` — the SIMD-of-the-
+      i8-inner-loop item above, done properly: host weights get their OWN packed representation
+      (`PackedQ4`: 4-bit offset-binary nibbles grouped along **K**, f16 scales — 0.5625 B/param
+      streamed vs the i8 slab's 1.125), activations quantize per-32-group to i8 (`Q8Acts`), and the
+      dot is two `vpdpbusd` integer dots subtracted **in i32** (the offset part is ~1000x the true
+      dot; subtracting it in f32 measurably cost 5e-4 of the answer — first cut of the kernel did).
+      Measured on the 7950X3D (quiet, `examples/vnni-gemv-probe.rs`): DRAM-regime (cache-defeating
+      round-robin) **46.4–48.2 GB/s effective** against a 42.2 GB/s measured threaded-read roofline —
+      the kernel out-streams a scalar reference read, so βeff ≈ βDRAM and the game is over on
+      bandwidth; L3-warm single-tensor calls hit 91–108 GB/s (the 27B's 50 MB gate/up fits the 128 MB
+      L3). Per projection vs the incumbent i8 path: gate/up 3.66→1.07 ms (3.4x), down 6.77→1.08
+      (6.3x), qkv 2.10→0.38 (5.5x), out 2.22→0.37 (6.0x). Integration: the flex `q4s_gemv` impl
+      consults a sidecar registry (`flex::registry`, ptr-keyed + content-tag-verified) and serve
+      builds every host layer's twin at load (`warm_host_twins`); `MUMMU_VNNI_GEMV=0` restores the
+      i8 slab path. **Numerics note:** the twin is its own quantization grid (groups along K, and a
+      second 4-bit rounding when repacked lazily from the i8 slab), so host-layer logits move within
+      quant noise — accepted deliberately this run (owner's call: speed over byte-parity), gated by
+      per-row activation-ε error bounds in `flex::kernels` tests and the real-weights coherence gate
+      `tests/real_vnni_q4.rs`. Follow-ups: source twins from the pack's F16 blob at load (one
+      rounding), drop the i8 slab once prefill also runs packed (the second 2x of host RAM), and a
+      real m>1 packed GEMM.
+- [x] **Two consequences wired into placement, or the kernel would have broken it.** *(2026-08-27)*
+      (1) `probe_projection_ms` now measures **amortized** throughput (one sync per batch, not per
+      call) — production pays one readback per token, and the per-call fence was ~1.5 ms of pure
+      probe artifact that the now-fast host would have beaten, flipping `choose_prefix` to an empty
+      card. (2) The host probe is clamped to a measured DRAM floor (`host_probe_floor_ms`): the probe
+      tensor goes L3-warm while production streams every host layer per token — the
+      probe-the-production-path lesson, again.
+- [x] **The decode step has a computed floor: T\* = 1391 ms/token at the 42/22 placement — the
+      2.25–2.40 s measured token is 62–73% orchestration.** *(2026-08-27)* `mummu::sdf` models the
+      step as a priced dataflow graph (nodes = layer work, edges = crossings/readback with
+      token-delays) and computes the max cycle ratio by parametric search;
+      `mummu::attrib` adds exact Shapley attribution over togglable components with per-replicate
+      CIs (`examples/orchestration-attribution.rs` prints the table). The floor is from recorded
+      per-piece numbers, so it moves when the VNNI kernel's numbers land in the cost table —
+      recompute per placement; `sdf::regression_gate(measured, t_star)` is the 1.05x check. Graph
+      capture stays the framework-side lever (burn 0.22 stable), but the bound now exists to say
+      whether capture alone closes the gap.
+- [x] **Chunked prefill: the ~816 MiB activation reserve term is now ~214 MiB.** *(2026-08-27)*
+      `generate_loop` feeds the prompt in `MUMMU_PREFILL_CHUNK`-sized slices (default 1024; `off`
+      restores one-shot) — exact by the same cached-decode ≡ full-forward invariant every cache
+      already passes, GDN state and conv window included. `computed_reserve_bytes` prices the
+      activation peak at the chunk, not the context, so the reserve frees two-to-three more GPU
+      layers at ctx 4096 (`mummu_schedule::prefill::best_chunk` solves the general trade; its 27B
+      case: peak 816→272 MiB for +6.5% prefill time). Cost: each non-final chunk computes one
+      throwaway lm_head projection — a skip-head forward flag is the follow-up.
+- [x] **The GDN prefill is chunkwise-parallel and exact: ~14x fewer launches per 64 tokens.**
+      *(2026-08-27)* `GatedDeltaNet` evaluates prefill in C=64 chunks (`MUMMU_GDN_CHUNK`) via the
+      delta-rule WY/UT form — strictly-lower-triangular system solved by a finite Neumann doubling
+      (exact, no truncation), decay ratios as `exp(cumsum-log differences)` (never ratios of
+      products; survives γ^128 ≈ 3e-39), f32 island like the attention scores. Sequential recurrence
+      kept verbatim for decode and as the test reference; equivalence pinned at t ∈ {5, 64, 100,
+      129} with random initial state, plus an underflow stress test and a chunked-prefill→decode
+      handoff gate. A 2048-token prefill drops from ~18k launches to ~1.3k per GDN layer.
+- [x] **VRAM guard is now a tracked quantile, not a constant: chance-constrained placement.**
+      *(2026-08-27)* `mummu-schedule` gains P² online quantile estimation (Jain–Chlamtac),
+      a `Watermark` guard (envelope semantics: rises immediately on any spike, shrinks only after a
+      quiet window; breach events force it up), the contiguous-run placement DP (`placement::place`,
+      brute-force-pinned) and the prefill chunk solver. serve's `backend_budget` replaces the fixed
+      2 GiB desktop reserve with `vram_margin_bytes` — quantile-of-ambient headroom (floor 1 GiB +
+      512 MiB slack, so a quiet box gets ~1 GiB back ≈ 4 layers, and the session where ambient
+      drifted 1.9→8.9 GiB is exactly what the quantile would have tracked). `MUMMU_VRAM_GUARD_GB`
+      pins the old behavior.
+- [x] **First production measurement of the branch: 0.75 s/token warm — 3× on the old branch, and
+      the same-session gap to ollama is 3.4×, down from ~18×.** *(2026-08-27, evening run; artifact:
+      the "750-Millisecond Token" flamegraph page.)* Protocol: this branch's serve on port 8097,
+      deployed launcher's env (RAYON 8, GPU budget 15, warm cubecl cache), layered path, 64-token
+      greedy, warm, back-to-back with ollama 0.32.15 on the same GGUF — ambient 4.3–5.4 GiB held
+      elsewhere all session (recorded; the old branch's 2.25–2.40 was a QUIETER session, so the 3×
+      is conservative). Numbers: mummu decode **750 ms/token** (folded self-times sum to 749 —
+      accounting closes; NOTE `elapsed_ms` in the done event includes prefill), prefill 359 ms/tok
+      at 36 prompt tokens; ollama **223 ms/token** decode (its own quiet record is ~125 — same
+      ambient tax). Placement: 41/64 layers (watermark margin left 10.9 GiB of an 11.4 free), twins
+      144 packed in 6.7 s, residency certified 10.51 GiB. Token anatomy (decode, per token): host
+      SwiGLU FFN 359 ms (48%), host GDN mixers 229 (31%), lm_head-on-host 68 (9%), full attention
+      64 (9%), norms+boundary fence 25, argmax readback **0.18 ms** — orchestration is ~7% over the
+      cost floor; the token is cost-bound on the 23 host layers now. Found and fixed live: the
+      activation-quality dispatch limit (0.02, synthetic-calibrated) sent EVERY production host
+      GEMV down the exact-f32 path — real activations measure 0.022–0.043; limit now 0.12
+      (`MUMMU_VNNI_QUALITY`), same-session effect 1172 → 750 ms/token, host `mlp.down` 13.1 → 5.2
+      ms/call (2.5×). Open: in-situ host GEMV runs ~5.2 ms/call vs 1.1–1.6 quiet microbench (live
+      ~2–3× inflation, unexplained); 8-vs-16 rayon threads is now a NULL (60.75 vs 60.98 s — the
+      old 8-thread rule's penalty died with the old kernel); lm_head on host at 68 ms/tok is the
+      new #3 line item (pin-to-GPU A/B ≈ break-even at ~0.7 GiB, row-split is the better shape).
+- [ ] **The overlay floor is built, measured — and NOT wired into serve, by its own arithmetic.**
+      *(2026-08-27)* `mummu::overlay` implements the three-state planner (resident/host/stream), the
+      R-slot ring executor with a farthest-ahead prefetch thread, the row-block pipelining model,
+      and the capacity theorem (min VRAM = ring + activations + KV, independent of depth — proven on
+      a 4x-oversubscribed synthetic model), 21 tests green. But the planner's own decision rule,
+      fed the measured numbers, now picks **Host** for every layer: staging measured 4.2 GB/s
+      (`examples/overlay-floor-probe.rs`, round-trip-conservative — re-measure with a cleaner
+      one-way probe before trusting) ⇒ ~32 ms/layer streamed, vs the VNNI host at ~6–10 ms/layer.
+      Streaming becomes live the day a model's host path is slower than its transfer again (bigger
+      layers, weaker host) — the planner flips on its inputs, which is the point. Wiring into the
+      qwen35 forward stays open behind that measurement.
 
 ## Phases
 
