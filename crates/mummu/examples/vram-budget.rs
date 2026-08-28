@@ -7,15 +7,23 @@
 fn main() {
     let inv = mummu::backend::inventory();
     for g in &inv.gpus {
-        println!("adapter: {} total={:?} MiB", g.name, g.vram_bytes.map(|b| b >> 20));
+        println!(
+            "adapter: {} total={:?} MiB",
+            g.name,
+            g.vram_bytes.map(|b| b >> 20)
+        );
     }
     match mummu::vram::memory() {
-        None => println!("
-NVML unavailable"),
+        None => println!(
+            "
+NVML unavailable"
+        ),
         Some(m) => println!(
             "
 NVML global: total {:>6} MiB  used {:>6} MiB  free {:>6} MiB",
-            m.total >> 20, m.used >> 20, m.free >> 20
+            m.total >> 20,
+            m.used >> 20,
+            m.free >> 20
         ),
     }
     match mummu::backend::video_memory() {

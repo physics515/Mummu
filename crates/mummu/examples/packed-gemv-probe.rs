@@ -26,22 +26,38 @@ fn bench(label: &str, iters: usize, f: &mut dyn FnMut() -> Tensor<2>) -> f64 {
 fn main() {
     let gpu = backend::gpu_device();
     let w_width = 22 * 544usize;
-    for (k, n, label) in [(5120usize, w_width, "gate/up"), (w_width, 5120usize, "down")] {
+    for (k, n, label) in [
+        (5120usize, w_width, "gate/up"),
+        (w_width, 5120usize, "down"),
+    ] {
         println!("[{label}] W [{k}, {n}] Q4S, x [1, {k}] f32");
         let w = Tensor::<2>::random([k, n], Distribution::Uniform(-0.5, 0.5), &gpu);
         let wq = quantize_weight(
-            if std::env::var("PROBE_Q8").is_ok() { QuantPolicy::Q8 } else { QuantPolicy::Q4 },
+            if std::env::var("PROBE_Q8").is_ok() {
+                QuantPolicy::Q8
+            } else {
+                QuantPolicy::Q4
+            },
             w,
         );
         let x = Tensor::<2>::random([1, k], Distribution::Uniform(-1.0, 1.0), &gpu);
 
         let got = try_q4s_gemv(&x, &wq).expect("packed path must engage");
         let want = x.clone().matmul(wq.clone().dequantize());
-        let diff = got.clone().sub(want.clone()).abs().max().into_data().try_to_vec::<f32>().unwrap()[0];
+        let diff = got
+            .clone()
+            .sub(want.clone())
+            .abs()
+            .max()
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap()[0];
         let scale = want.abs().max().into_data().try_to_vec::<f32>().unwrap()[0].max(1e-6);
         println!("  parity vs dequant reference: rel {:.2e}", diff / scale);
 
-        let packed = bench("packed q4s_gemv", 50, &mut || try_q4s_gemv(&x, &wq).unwrap());
+        let packed = bench("packed q4s_gemv", 50, &mut || {
+            try_q4s_gemv(&x, &wq).unwrap()
+        });
         let baseline = bench("today's q_matmul", 20, &mut || x.clone().matmul(wq.clone()));
         println!("  speedup: {:.1}x", baseline / packed);
     }

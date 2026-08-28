@@ -30,7 +30,9 @@ pub use crate::pack::Precision;
 
 /// What kind of device a tier lives on — the planner's speed ordering
 /// follows `speed`, not this tag; it exists for labels and defaults.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum DeviceClass {
     Cpu,
     IntegratedGpu,
@@ -150,8 +152,8 @@ pub fn plan_tiers(
     // not the budget, becomes the limit.
     let cost_of = |tier: Tier, e: usize| -> Option<u64> {
         let stored = costs[e].bytes.get(&tier.precision).copied()?;
-        let host_q4 = devices[tier.device].class == DeviceClass::Cpu
-            && tier.precision == Precision::Q4;
+        let host_q4 =
+            devices[tier.device].class == DeviceClass::Cpu && tier.precision == Precision::Q4;
         Some(if host_q4 { stored * 9 / 5 } else { stored })
     };
 
@@ -162,7 +164,9 @@ pub fn plan_tiers(
     for (e, cost) in costs.iter().enumerate() {
         let mut best: Option<(u64, Tier)> = None;
         for &slot in slots.iter().rev() {
-            let Some(bytes) = cost_of(slot, e) else { continue };
+            let Some(bytes) = cost_of(slot, e) else {
+                continue;
+            };
             if used[slot.device] + bytes <= devices[slot.device].budget_bytes
                 && best.is_none_or(|(b, _)| bytes < b)
             {
@@ -210,7 +214,10 @@ pub fn plan_tiers(
                 let cheapest = costs
                     .iter()
                     .filter_map(|c| {
-                        dev.ladder.iter().filter_map(|p| c.bytes.get(p).copied()).min()
+                        dev.ladder
+                            .iter()
+                            .filter_map(|p| c.bytes.get(p).copied())
+                            .min()
                     })
                     .max()
                     .unwrap_or(u64::MAX);
@@ -283,7 +290,8 @@ pub fn plan_tiers(
             // 71 against the host's 72 it received zero clusters in every
             // default plan (found by adversarial review, verified against
             // this function line by line).
-            if devices[d].speed <= devices[cur.device].speed && held[cur.device] <= quota[cur.device]
+            if devices[d].speed <= devices[cur.device].speed
+                && held[cur.device] <= quota[cur.device]
             {
                 continue; // no makespan gain from this move
             }
@@ -292,7 +300,10 @@ pub fn plan_tiers(
                 .ladder
                 .iter()
                 .filter_map(|&p| {
-                    let slot = Tier { device: d, precision: p };
+                    let slot = Tier {
+                        device: d,
+                        precision: p,
+                    };
                     cost_of(slot, e).map(|b| (b, slot))
                 })
                 .min_by_key(|&(b, _)| b)
@@ -315,11 +326,16 @@ pub fn plan_tiers(
         let cur = tiers[e];
         let cur_bytes = cost_of(cur, e).expect("admitted tier has a cost");
         for &p in &devices[cur.device].ladder {
-            let slot = Tier { device: cur.device, precision: p };
+            let slot = Tier {
+                device: cur.device,
+                precision: p,
+            };
             if slot == cur {
                 break; // the ladder is best-first: nothing finer remains
             }
-            let Some(bytes) = cost_of(slot, e) else { continue };
+            let Some(bytes) = cost_of(slot, e) else {
+                continue;
+            };
             if used[cur.device] - cur_bytes + bytes <= devices[cur.device].budget_bytes {
                 used[cur.device] = used[cur.device] - cur_bytes + bytes;
                 tiers[e] = slot;
@@ -357,9 +373,13 @@ mod tests {
 
     fn cost(q4: u64, q8: u64, f32: u64) -> ExpertCost {
         ExpertCost {
-            bytes: [(Precision::Q4, q4), (Precision::Q8, q8), (Precision::F32, f32)]
-                .into_iter()
-                .collect(),
+            bytes: [
+                (Precision::Q4, q4),
+                (Precision::Q8, q8),
+                (Precision::F32, f32),
+            ]
+            .into_iter()
+            .collect(),
         }
     }
 
@@ -453,7 +473,10 @@ mod tests {
             plan.tiers
         );
         assert!(
-            plan.tiers.iter().filter(|t| t.device == 1).all(|t| t.precision == Precision::F32),
+            plan.tiers
+                .iter()
+                .filter(|t| t.device == 1)
+                .all(|t| t.precision == Precision::F32),
             "only its own ladder's rung may be used: {:?}",
             plan.tiers
         );
@@ -466,9 +489,18 @@ mod tests {
         let costs = vec![cost(1, 2, 8); 4];
         // GPU budget 2 = exactly one expert at its cheapest rung (q8).
         let plan = plan_tiers(&devices(100, 2), &costs, &[0.1, 0.5, 0.3, 0.1]).unwrap();
-        assert_eq!(plan.tiers[1], Tier { device: 1, precision: Precision::Q8 });
+        assert_eq!(
+            plan.tiers[1],
+            Tier {
+                device: 1,
+                precision: Precision::Q8
+            }
+        );
         assert!(
-            plan.tiers.iter().enumerate().all(|(e, t)| e == 1 || t.device == 0),
+            plan.tiers
+                .iter()
+                .enumerate()
+                .all(|(e, t)| e == 1 || t.device == 0),
             "only the hottest gets the fast device: {:?}",
             plan.tiers
         );
@@ -479,7 +511,11 @@ mod tests {
         // CPU holds 4 bytes: four q4 experts exactly; GPU off (0 budget).
         let costs = vec![cost(1, 2, 8); 4];
         let plan = plan_tiers(&devices(4, 0), &costs, &[]).unwrap();
-        assert!(plan.tiers.iter().all(|t| *t == Tier { device: 0, precision: Precision::Q4 }));
+        assert!(plan.tiers.iter().all(|t| *t
+            == Tier {
+                device: 0,
+                precision: Precision::Q4
+            }));
         assert_eq!(plan.used_bytes, vec![4, 0]);
     }
 
@@ -490,7 +526,13 @@ mod tests {
         let costs = vec![cost(1, 2, 8); 4];
         let plan = plan_tiers(&devices(5, 0), &costs, &[0.0, 0.0, 1.0, 0.0]).unwrap();
         assert_eq!(plan.tiers[2].precision, Precision::Q8);
-        assert_eq!(plan.tiers.iter().filter(|t| t.precision == Precision::Q4).count(), 3);
+        assert_eq!(
+            plan.tiers
+                .iter()
+                .filter(|t| t.precision == Precision::Q4)
+                .count(),
+            3
+        );
         assert_eq!(plan.used_bytes[0], 5);
     }
 
@@ -511,8 +553,26 @@ mod tests {
         let b = plan_tiers(&devices(100, 2), &costs, &[0.0, 1.0, 0.0]).unwrap();
         let moves = a.diff(&b);
         assert_eq!(moves.len(), 2, "{moves:?}");
-        assert!(moves.contains(&(1, Tier { device: 1, precision: Precision::Q8 })), "{moves:?}");
-        assert!(moves.contains(&(0, Tier { device: 0, precision: Precision::Q8 })), "{moves:?}");
+        assert!(
+            moves.contains(&(
+                1,
+                Tier {
+                    device: 1,
+                    precision: Precision::Q8
+                }
+            )),
+            "{moves:?}"
+        );
+        assert!(
+            moves.contains(&(
+                0,
+                Tier {
+                    device: 0,
+                    precision: Precision::Q8
+                }
+            )),
+            "{moves:?}"
+        );
     }
 
     #[test]

@@ -1773,7 +1773,11 @@ mod tests {
             .unwrap();
         staged.evict();
         assert!(!staged.is_staged(), "eviction drops the device copy");
-        let after_evict = staged.run_tensor(x).into_data().try_to_vec::<f32>().unwrap();
+        let after_evict = staged
+            .run_tensor(x)
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap();
 
         for (i, w) in want.iter().enumerate() {
             for (label, got) in [
@@ -1981,9 +1985,21 @@ mod tests {
     /// softmax, top-k, sparse weighted sum of per-expert SwiGLUs).
     fn reference(m: &SparseMoe, x: &[f32], t: usize, norm: bool) -> Vec<f32> {
         let rw = m.gate.weight.val().into_data().try_to_vec::<f32>().unwrap(); // [h, e]
-        let gw = m.experts.gate.val().into_data().try_to_vec::<f32>().unwrap(); // [e, inter, h]
+        let gw = m
+            .experts
+            .gate
+            .val()
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap(); // [e, inter, h]
         let uw = m.experts.up.val().into_data().try_to_vec::<f32>().unwrap();
-        let dw = m.experts.down.val().into_data().try_to_vec::<f32>().unwrap(); // [e, h, inter]
+        let dw = m
+            .experts
+            .down
+            .val()
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap(); // [e, h, inter]
         let mut out = vec![0f32; t * HIDDEN];
         for tok in 0..t {
             let xrow = &x[tok * HIDDEN..][..HIDDEN];
@@ -2087,9 +2103,21 @@ mod tests {
     /// Full-mixture reference (every expert, softmax-weighted) for the k=E edge.
     fn reference_all_experts(m: &SparseMoe, x: &[f32], t: usize) -> Vec<f32> {
         let rw = m.gate.weight.val().into_data().try_to_vec::<f32>().unwrap();
-        let gw = m.experts.gate.val().into_data().try_to_vec::<f32>().unwrap();
+        let gw = m
+            .experts
+            .gate
+            .val()
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap();
         let uw = m.experts.up.val().into_data().try_to_vec::<f32>().unwrap();
-        let dw = m.experts.down.val().into_data().try_to_vec::<f32>().unwrap();
+        let dw = m
+            .experts
+            .down
+            .val()
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap();
         let mut out = vec![0f32; t * HIDDEN];
         for tok in 0..t {
             let xrow = &x[tok * HIDDEN..][..HIDDEN];

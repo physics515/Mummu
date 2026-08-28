@@ -145,9 +145,11 @@ struct Entry {
 /// costs. Two entries with equal bytes keep the cheaper.
 fn prune(mut v: Vec<Entry>) -> Vec<Entry> {
     v.sort_by(|a, b| {
-        a.bytes
-            .cmp(&b.bytes)
-            .then(a.cost.partial_cmp(&b.cost).unwrap_or(std::cmp::Ordering::Equal))
+        a.bytes.cmp(&b.bytes).then(
+            a.cost
+                .partial_cmp(&b.cost)
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
     });
     let mut out: Vec<Entry> = Vec::with_capacity(v.len());
     let mut best = f64::INFINITY;
@@ -182,7 +184,12 @@ pub fn place_free(w: &[u64], g: &[f64], h: &[f64], kappa: f64, budget: u64) -> P
     debug_assert!(!kappa.is_nan(), "place_free: kappa must not be NaN");
 
     if l == 0 {
-        return Placement { gpu: vec![], run: None, cost_ms: 0.0, gpu_bytes: 0 };
+        return Placement {
+            gpu: vec![],
+            run: None,
+            cost_ms: 0.0,
+            gpu_bytes: 0,
+        };
     }
 
     let budget = u128::from(budget);
@@ -190,9 +197,17 @@ pub fn place_free(w: &[u64], g: &[f64], h: &[f64], kappa: f64, budget: u64) -> P
     // Frontiers after placing layer 0. Starting on either device costs no
     // transition — consistent with `place`, which charges boundaries
     // between layers, not the chain's open ends.
-    let mut host = vec![Entry { bytes: 0, cost: h[0], mask: 0 }];
+    let mut host = vec![Entry {
+        bytes: 0,
+        cost: h[0],
+        mask: 0,
+    }];
     let mut gpu = if u128::from(w[0]) <= budget {
-        vec![Entry { bytes: u128::from(w[0]), cost: g[0], mask: 1 }]
+        vec![Entry {
+            bytes: u128::from(w[0]),
+            cost: g[0],
+            mask: 1,
+        }]
     } else {
         vec![]
     };
@@ -203,16 +218,28 @@ pub fn place_free(w: &[u64], g: &[f64], h: &[f64], kappa: f64, budget: u64) -> P
 
         let mut next_host = Vec::with_capacity(host.len() + gpu.len());
         for e in &host {
-            next_host.push(Entry { bytes: e.bytes, cost: e.cost + h[i], mask: e.mask });
+            next_host.push(Entry {
+                bytes: e.bytes,
+                cost: e.cost + h[i],
+                mask: e.mask,
+            });
         }
         for e in &gpu {
-            next_host.push(Entry { bytes: e.bytes, cost: e.cost + h[i] + kappa, mask: e.mask });
+            next_host.push(Entry {
+                bytes: e.bytes,
+                cost: e.cost + h[i] + kappa,
+                mask: e.mask,
+            });
         }
 
         let mut next_gpu = Vec::with_capacity(host.len() + gpu.len());
         for e in &gpu {
             if e.bytes + wl <= budget {
-                next_gpu.push(Entry { bytes: e.bytes + wl, cost: e.cost + g[i], mask: e.mask | bit });
+                next_gpu.push(Entry {
+                    bytes: e.bytes + wl,
+                    cost: e.cost + g[i],
+                    mask: e.mask | bit,
+                });
             }
         }
         for e in &host {
@@ -233,7 +260,11 @@ pub fn place_free(w: &[u64], g: &[f64], h: &[f64], kappa: f64, budget: u64) -> P
     let best = host
         .iter()
         .chain(gpu.iter())
-        .min_by(|a, b| a.cost.partial_cmp(&b.cost).unwrap_or(std::cmp::Ordering::Equal))
+        .min_by(|a, b| {
+            a.cost
+                .partial_cmp(&b.cost)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
         .expect("the all-host assignment is always feasible");
 
     let gpu_mask: Vec<bool> = (0..l).map(|i| best.mask >> i & 1 == 1).collect();
@@ -260,7 +291,9 @@ mod tests {
     struct Pcg(u64);
     impl Pcg {
         fn new(seed: u64) -> Self {
-            Pcg(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(0xDA3E_39CB_94B9_5BDB))
+            Pcg(seed
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .wrapping_add(0xDA3E_39CB_94B9_5BDB))
         }
         fn next_u32(&mut self) -> u32 {
             let old = self.0;
@@ -308,7 +341,11 @@ mod tests {
     }
 
     fn bytes_of(mask: &[bool], w: &[u64]) -> u64 {
-        mask.iter().zip(w).filter(|&(&on, _)| on).map(|(_, &b)| b).sum()
+        mask.iter()
+            .zip(w)
+            .filter(|&(&on, _)| on)
+            .map(|(_, &b)| b)
+            .sum()
     }
 
     /// place() against brute force over every contiguous run (plus the
@@ -409,7 +446,10 @@ mod tests {
     #[test]
     fn zero_budget_puts_everything_on_the_host() {
         let (w, g, h, kappa, _) = instance(42, 10);
-        for placement in [place(&w, &g, &h, kappa, 0), place_free(&w, &g, &h, kappa, 0)] {
+        for placement in [
+            place(&w, &g, &h, kappa, 0),
+            place_free(&w, &g, &h, kappa, 0),
+        ] {
             assert!(placement.gpu.iter().all(|&b| !b));
             assert_eq!(placement.run, None);
             assert_eq!(placement.gpu_bytes, 0);
@@ -436,7 +476,10 @@ mod tests {
     /// Zero layers is a legal (empty) model: nothing to place, zero cost.
     #[test]
     fn empty_chain_is_the_empty_placement() {
-        for placement in [place(&[], &[], &[], 1.0, 100), place_free(&[], &[], &[], 1.0, 100)] {
+        for placement in [
+            place(&[], &[], &[], 1.0, 100),
+            place_free(&[], &[], &[], 1.0, 100),
+        ] {
             assert_eq!(placement.gpu, Vec::<bool>::new());
             assert_eq!(placement.run, None);
             assert_eq!(placement.cost_ms, 0.0);

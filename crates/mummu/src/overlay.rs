@@ -336,7 +336,11 @@ pub fn plan(layers: &[LayerCost], vram_budget_bytes: u64, m: &OverlayModel) -> O
     for _sweep in 0..8 {
         let mut improved = false;
         for i in 0..layers.len() {
-            for cand in [LayerAction::Resident, LayerAction::Stream, LayerAction::Host] {
+            for cand in [
+                LayerAction::Resident,
+                LayerAction::Stream,
+                LayerAction::Host,
+            ] {
                 if cand == actions[i] {
                     continue;
                 }
@@ -1002,7 +1006,11 @@ mod tests {
         );
         assert_eq!(p.resident_bytes, 0);
         assert_eq!(p.ring_bytes, 0);
-        assert!(close(p.predicted_token_ms, 20.0), "{}", p.predicted_token_ms);
+        assert!(
+            close(p.predicted_token_ms, 20.0),
+            "{}",
+            p.predicted_token_ms
+        );
     }
 
     /// Crossings are counted cyclically: each contiguous host run pays two,
@@ -1170,7 +1178,10 @@ mod tests {
         }
         let wall = t.elapsed().as_secs_f64() * 1e3;
         let sum_compute = 9.0 * 80.0;
-        assert!(wall >= sum_compute - 20.0, "compute alone is {sum_compute} ms: {wall}");
+        assert!(
+            wall >= sum_compute - 20.0,
+            "compute alone is {sum_compute} ms: {wall}"
+        );
         assert!(
             wall < sum_compute + 2.0 * 40.0 + 120.0,
             "transfers must hide under compute (serial would be ~1080 ms): {wall}"
@@ -1198,7 +1209,10 @@ mod tests {
         }
         let wall = t.elapsed().as_secs_f64() * 1e3;
         let sum_tx = 6.0 * 60.0;
-        assert!(wall >= sum_tx - 20.0, "uploads are serial on one link: {wall}");
+        assert!(
+            wall >= sum_tx - 20.0,
+            "uploads are serial on one link: {wall}"
+        );
         assert!(
             wall < sum_tx + 100.0,
             "transfer-bound wall must track sum-of-tx (~{sum_tx} ms), \

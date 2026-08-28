@@ -66,12 +66,13 @@ async fn main() -> ExitCode {
             .start_handler(|_| demote_current_thread())
             .build_global()
         {
-            eprintln!("[mummu-serve] rayon pool was already initialized ({e}); gemm herd keeps default priority");
+            eprintln!(
+                "[mummu-serve] rayon pool was already initialized ({e}); gemm herd keeps default priority"
+            );
         }
     }
 
-    let addr = std::env::var("MUMMU_ADDR")
-        .unwrap_or_else(|_| mummu_serve::DEFAULT_ADDR.into());
+    let addr = std::env::var("MUMMU_ADDR").unwrap_or_else(|_| mummu_serve::DEFAULT_ADDR.into());
     let shim_addr = std::env::var("MUMMU_OLLAMA_ADDR")
         .unwrap_or_else(|_| mummu_serve::DEFAULT_OLLAMA_ADDR.into());
 

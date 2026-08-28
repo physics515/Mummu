@@ -287,7 +287,9 @@ pub fn decode_graph(costs: &LayerCosts, placement: &[Machine]) -> Result<Graph, 
     }
     let bad = |name: &str, v: f64| -> Result<(), String> {
         if !v.is_finite() || v < 0.0 {
-            Err(format!("decode_graph: {name} = {v} must be finite and >= 0"))
+            Err(format!(
+                "decode_graph: {name} = {v} must be finite and >= 0"
+            ))
         } else {
             Ok(())
         }

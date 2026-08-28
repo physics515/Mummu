@@ -438,7 +438,8 @@ mod tests {
             |id| id == 3, // treat the follow-up token as EOS
             |_| std::ops::ControlFlow::Continue(()),
         )
-        .await.unwrap();
+        .await
+        .unwrap();
         assert_eq!(out, vec![2], "one token, then EOS never emitted");
     }
 

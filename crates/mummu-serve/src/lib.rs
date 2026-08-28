@@ -128,9 +128,9 @@ pub fn shim_disabled(addr: &str) -> bool {
 /// # Errors
 /// If the address can't be resolved or bound.
 pub async fn bind(addr: &str) -> std::io::Result<TcpListener> {
-    TcpListener::bind(addr).await.map_err(|e| {
-        std::io::Error::new(e.kind(), format!("bind {addr}: {e}"))
-    })
+    TcpListener::bind(addr)
+        .await
+        .map_err(|e| std::io::Error::new(e.kind(), format!("bind {addr}: {e}")))
 }
 
 /// Bind both listeners and serve until ctrl-c. This is exactly what the
@@ -299,18 +299,28 @@ pub(crate) fn json_response(status: u16, body: serde_json::Value) -> Response {
 
 /// Parse a JSON body, or hand back the 400 response to return as-is. Keeps
 /// the sync server's error wire format (`{"error": "bad json: …"}`).
-pub(crate) fn parse_json<T: serde::de::DeserializeOwned>(
-    body: &Bytes,
-) -> Result<T, Box<Response>> {
+pub(crate) fn parse_json<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, Box<Response>> {
     let text = match std::str::from_utf8(body) {
         Ok(t) => t,
-        Err(e) => return Err(Box::new(json_response(400, json!({"error": format!("body read: {e}")})))),
+        Err(e) => {
+            return Err(Box::new(json_response(
+                400,
+                json!({"error": format!("body read: {e}")}),
+            )));
+        }
     };
     if text.len() > MAX_BODY_BYTES {
-        return Err(Box::new(json_response(400, json!({"error": "body too large"}))));
+        return Err(Box::new(json_response(
+            400,
+            json!({"error": "body too large"}),
+        )));
     }
-    serde_json::from_str::<T>(text)
-        .map_err(|e| Box::new(json_response(400, json!({"error": format!("bad json: {e}")}))))
+    serde_json::from_str::<T>(text).map_err(|e| {
+        Box::new(json_response(
+            400,
+            json!({"error": format!("bad json: {e}")}),
+        ))
+    })
 }
 
 async fn not_found() -> Response {
@@ -654,7 +664,9 @@ fn sampler_options(o: &ChatOptions) -> Result<SamplerOptions, String> {
     let top_p = o.top_p.unwrap_or(0.9);
     let top_k = o.top_k.unwrap_or(defaults.top_k);
     if !temperature.is_finite() || temperature < 0.0 {
-        return Err(format!("temperature must be finite and >= 0, got {temperature}"));
+        return Err(format!(
+            "temperature must be finite and >= 0, got {temperature}"
+        ));
     }
     if !(top_p > 0.0 && top_p <= 1.0) {
         return Err(format!("top_p must be in (0, 1], got {top_p}"));
@@ -712,7 +724,10 @@ fn publish_profile() {
 /// GET /api/profile — the last profiled generation's flame graph, as SVG a
 /// browser renders directly (frames are zoomable; widths are self time).
 async fn profile_svg() -> Response {
-    let last = LAST_PROFILE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let last = LAST_PROFILE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     match last {
         Some((svg, _)) => Response::builder()
             .header("content-type", "image/svg+xml")
@@ -728,7 +743,10 @@ async fn profile_svg() -> Response {
 /// GET /api/profile/folded — the same data as folded stacks (`path (Nx) µs`
 /// per line), for tooling or a quick sort in a terminal.
 async fn profile_folded() -> Response {
-    let last = LAST_PROFILE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let last = LAST_PROFILE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     match last {
         Some((_, folded)) => Response::builder()
             .header("content-type", "text/plain; charset=utf-8")
@@ -871,9 +889,8 @@ mod tests {
 
     #[test]
     fn options_max_tokens_still_works_and_wins() {
-        let parsed = chat_request(
-            r#"{"model": "m", "messages": [], "options": {"max_tokens": 7}}"#,
-        );
+        let parsed =
+            chat_request(r#"{"model": "m", "messages": [], "options": {"max_tokens": 7}}"#);
         assert_eq!(parsed.max_tokens(), 7);
 
         let parsed = chat_request(

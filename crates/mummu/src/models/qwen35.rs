@@ -685,7 +685,11 @@ fn gdn_recurrence_chunked(
         // o_t = P_t·S₀ᵀq_t + Σ_{j≤t} (P_t/P_j)·(q_t·k_j)·u_j — inclusive
         // j ≤ t is exactly the unit diagonal of `decay`.
         let qk = qc.clone().matmul(kc.clone().swap_dims(2, 3)).mul(decay);
-        let o_c = p.clone().mul(qc).matmul(s.clone()).add(qk.matmul(u.clone()));
+        let o_c = p
+            .clone()
+            .mul(qc)
+            .matmul(s.clone())
+            .add(qk.matmul(u.clone()));
         outs.push(o_c);
 
         // S_C = P_C·S₀ + Σ_j (P_C/P_j)·k_j u_jᵀ, again via log differences.
@@ -2181,7 +2185,11 @@ mod tests {
             l2(Tensor::<4>::random(dims, uni, device)),
             l2(Tensor::<4>::random(dims, uni, device)),
             Tensor::<4>::random(dims, uni, device),
-            Tensor::<3>::random([b, t, hv], Distribution::Uniform(g_range.0, g_range.1), device),
+            Tensor::<3>::random(
+                [b, t, hv],
+                Distribution::Uniform(g_range.0, g_range.1),
+                device,
+            ),
             Tensor::<3>::random([b, t, hv], Distribution::Uniform(0.05, 0.95), device),
         )
     }

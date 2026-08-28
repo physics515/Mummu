@@ -18,7 +18,7 @@ use burn::tensor::{Device, Int, Tensor, TensorData};
 use crate::attn_config::{RopeScaling, check_sliding_window, sliding_window_from_gguf};
 use crate::gguf::{GgufFile, GgufMap, GgufTensorInfo, GgufValue};
 use crate::import::{
-    FloatCastAdapter, DequantSink, ImportError, gguf_store, load_checked, required_file,
+    DequantSink, FloatCastAdapter, ImportError, gguf_store, load_checked, required_file,
 };
 use crate::models::CausalLm;
 use crate::models::qwen2::EosIds;

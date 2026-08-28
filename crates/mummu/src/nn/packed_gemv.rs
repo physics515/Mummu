@@ -28,15 +28,15 @@
 //! puts on a device (pack.rs `quantized_tensor_data`). Weights are
 //! `[K, N]` row-major with blocks along N; blocks never straddle rows.
 
-use burn::backend::backend_extension;
-use burn::backend::tensor::{FloatTensor, QuantizedTensor};
-use burn::backend::{Backend, Flex, Wgpu};
 #[cfg(feature = "cuda")]
 use burn::backend::Cuda;
 #[cfg(feature = "vulkan-spirv")]
 use burn::backend::Vulkan;
-use burn::tensor::{DType, Tensor};
+use burn::backend::backend_extension;
+use burn::backend::tensor::{FloatTensor, QuantizedTensor};
+use burn::backend::{Backend, Flex, Wgpu};
 use burn::tensor::quantization::{QuantScheme, QuantStore, QuantValue, ScaleDtype};
+use burn::tensor::{DType, Tensor};
 
 /// Is a weight tensor in the one packed format this module reads?
 fn scheme_supported(scheme: &QuantScheme) -> bool {
@@ -304,9 +304,15 @@ mod cube_impl {
         let l2 = u64::from(props.hardware.max_shared_memory_size as u32)
             .checked_mul(0)
             .and(None::<u64>)
-            .or_else(|| std::env::var("MUMMU_L2_MIB").ok().and_then(|v| v.parse::<u64>().ok()).map(|m| m << 20))
+            .or_else(|| {
+                std::env::var("MUMMU_L2_MIB")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .map(|m| m << 20)
+            })
             .map(|b| b / 4 * 3);
-        let weight_bytes = (n_words as u64 * k_len as u64 * 4) + (w_scales.meta.num_elements() as u64 * 4);
+        let weight_bytes =
+            (n_words as u64 * k_len as u64 * 4) + (w_scales.meta.num_elements() as u64 * 4);
 
         let mut best = (1usize, f64::INFINITY);
         for cand in split_candidates(weight_bytes, l2) {
@@ -314,11 +320,8 @@ mod cube_impl {
                 continue;
             }
             let run = || {
-                let out = empty_device::<R, f32>(
-                    client.clone(),
-                    x.device.clone(),
-                    Shape::new([1, n]),
-                );
+                let out =
+                    empty_device::<R, f32>(client.clone(), x.device.clone(), Shape::new([1, n]));
                 packed_gemv_kernel::launch::<R>(
                     client,
                     CubeCount::Static((n_words as u32).div_ceil(32), 1, 1),
@@ -383,15 +386,7 @@ mod cube_impl {
         // does not divide k, so odd shapes keep the exact split-1 path.
         let k_len = x.meta.shape()[1];
         let mut split = gemv_split_for(
-            &client,
-            &x.device,
-            &w_vals,
-            &w_scales,
-            &x,
-            n,
-            n_words,
-            k_len,
-            per_word,
+            &client, &x.device, &w_vals, &w_scales, &x, n, n_words, k_len, per_word,
         );
         if split == 0 || k_len % split != 0 {
             split = 1;
@@ -547,7 +542,11 @@ mod fusion_impl {
             let out = TensorIr::uninit(client.create_empty_handle(), shape_out, DType::F32);
             let desc = CustomOpIr::new("mummu_q4s_gemv", &[x.into_ir(), w.into_ir()], &[out]);
             client
-                .register(stream, OperationIr::Custom(desc.clone()), Gemv::<B>::new(desc))
+                .register(
+                    stream,
+                    OperationIr::Custom(desc.clone()),
+                    Gemv::<B>::new(desc),
+                )
                 .output()
         }
     }
@@ -634,7 +633,13 @@ mod tests {
         assert_eq!(rep, 0.0, "twin path must be deterministic call to call");
 
         let want = x.matmul(wq.dequantize());
-        let diff = a.sub(want.clone()).abs().max().into_data().try_to_vec::<f32>().unwrap()[0];
+        let diff = a
+            .sub(want.clone())
+            .abs()
+            .max()
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap()[0];
         let scale = want.abs().max().into_data().try_to_vec::<f32>().unwrap()[0].max(1e-6);
         assert!(
             diff / scale < 0.05,
@@ -652,6 +657,9 @@ mod tests {
         let wf = Tensor::<2>::random([64, 64], Distribution::Uniform(-1.0, 1.0), &device);
         assert!(try_q4s_gemv(&x2, &wf).is_none(), "m=2 must decline");
         let x1 = Tensor::<2>::random([1, 64], Distribution::Uniform(-1.0, 1.0), &device);
-        assert!(try_q4s_gemv(&x1, &wf).is_none(), "float weight must decline");
+        assert!(
+            try_q4s_gemv(&x1, &wf).is_none(),
+            "float weight must decline"
+        );
     }
 }

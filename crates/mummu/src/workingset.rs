@@ -183,7 +183,9 @@ pub fn schedule(demands: &[LayerDemand], budget: &Budget) -> Plan {
     // Reserve room for streaming: pinning the entire cache would leave the
     // prefetcher nowhere to land, turning every non-pinned unit into
     // overflow.
-    let pin_cap = capacity.saturating_sub(per_layer_stage.max(1)).min(capacity);
+    let pin_cap = capacity
+        .saturating_sub(per_layer_stage.max(1))
+        .min(capacity);
     let mut hot: Vec<(UnitId, usize)> = uses.iter().map(|(&u, &n)| (u, n)).collect();
     // Hottest first; ties by id so a plan is reproducible.
     hot.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));

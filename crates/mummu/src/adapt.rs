@@ -156,8 +156,8 @@ impl Controller {
                 Some(prev) => prev.min(ceiling),
                 None => ceiling,
             });
-            let next = ((ceiling as f64 * self.policy.shrink_factor) as u64)
-                .max(self.policy.floor_bytes);
+            let next =
+                ((ceiling as f64 * self.policy.shrink_factor) as u64).max(self.policy.floor_bytes);
             self.last_change = now;
             self.best = None; // the old best was measured under a limit that no longer holds
             if next < self.budget {
@@ -308,7 +308,10 @@ mod tests {
         let mut c = Controller::new(policy(), 5_000);
         let t = Instant::now();
         assert_eq!(c.observe(&sample(10.0), t), Adjust::Hold);
-        assert_eq!(c.observe(&sample(99.0), t + Duration::from_secs(5)), Adjust::Hold);
+        assert_eq!(
+            c.observe(&sample(99.0), t + Duration::from_secs(5)),
+            Adjust::Hold
+        );
         // Past the dwell, an improvement is actionable.
         assert_eq!(
             c.observe(&sample(99.0), t + Duration::from_secs(11)),
@@ -333,7 +336,10 @@ mod tests {
         let mut c = Controller::new(policy(), 5_000);
         let t = Instant::now();
         // Establish a good result at 5_000, then grow to 6_000.
-        assert_eq!(c.observe(&sample(20.0), t + Duration::from_secs(11)), Adjust::Grow(6_000));
+        assert_eq!(
+            c.observe(&sample(20.0), t + Duration::from_secs(11)),
+            Adjust::Grow(6_000)
+        );
         // 6_000 turns out much worse -> go back to what was measurably better.
         let got = c.observe(&sample(5.0), t + Duration::from_secs(30));
         assert!(
@@ -358,7 +364,10 @@ mod tests {
             },
             t + Duration::from_secs(40),
         );
-        assert!(matches!(got, Adjust::Grow(_)), "host pressure should pull work to the device: {got:?}");
+        assert!(
+            matches!(got, Adjust::Grow(_)),
+            "host pressure should pull work to the device: {got:?}"
+        );
         assert!(c.budget() > before);
     }
 

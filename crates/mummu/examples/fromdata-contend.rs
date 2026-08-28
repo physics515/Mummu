@@ -6,8 +6,8 @@
 //! the flex pool entirely.
 use burn::tensor::{Tensor, TensorData};
 use mummu::backend;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 fn main() {

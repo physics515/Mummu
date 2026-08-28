@@ -70,7 +70,12 @@ impl Server {
     /// short wait in practice; the timeout is there so a wedged task can
     /// never keep the process alive after the user asked it to close.
     fn stop(&self) {
-        if let Some(tx) = self.shutdown.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        if let Some(tx) = self
+            .shutdown
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
             let _ = tx.send(());
         }
         let task = self.task.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -136,7 +141,11 @@ fn start(app: &AppHandle, server: &Arc<Server>) -> Result<(), Box<dyn std::error
     let api = tauri::async_runtime::block_on(mummu_serve::bind(&addr))?;
     let url = local_url(&api)?;
 
-    let shim_addr = env_addr("MUMMU_APP_OLLAMA_ADDR", "MUMMU_OLLAMA_ADDR", DEFAULT_OLLAMA_ADDR);
+    let shim_addr = env_addr(
+        "MUMMU_APP_OLLAMA_ADDR",
+        "MUMMU_OLLAMA_ADDR",
+        DEFAULT_OLLAMA_ADDR,
+    );
     let shim = if mummu_serve::shim_disabled(&shim_addr) {
         None
     } else {

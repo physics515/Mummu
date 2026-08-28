@@ -265,10 +265,24 @@ impl GgmlType {
     pub fn block_size(self) -> u64 {
         match self {
             Self::F32 | Self::F16 | Self::BF16 => 1,
-            Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::Q8_1
+            Self::Q4_0
+            | Self::Q4_1
+            | Self::Q5_0
+            | Self::Q5_1
+            | Self::Q8_0
+            | Self::Q8_1
             | Self::IQ4_NL => 32,
-            Self::Q2_K | Self::Q3_K | Self::Q4_K | Self::Q5_K | Self::Q6_K | Self::Q8_K
-            | Self::IQ4_XS | Self::IQ2_XS | Self::IQ2_S | Self::IQ3_XXS | Self::IQ3_S => 256,
+            Self::Q2_K
+            | Self::Q3_K
+            | Self::Q4_K
+            | Self::Q5_K
+            | Self::Q6_K
+            | Self::Q8_K
+            | Self::IQ4_XS
+            | Self::IQ2_XS
+            | Self::IQ2_S
+            | Self::IQ3_XXS
+            | Self::IQ3_S => 256,
         }
     }
 
@@ -278,18 +292,18 @@ impl GgmlType {
         match self {
             Self::F32 => 4,
             Self::F16 | Self::BF16 => 2,
-            Self::Q4_0 => 18,  // f16 d + 16 B qs
-            Self::Q4_1 => 20,  // f16 d + f16 m + 16 B qs
-            Self::Q5_0 => 22,  // f16 d + 4 B qh + 16 B qs
-            Self::Q5_1 => 24,  // f16 d + f16 m + 4 B qh + 16 B qs
-            Self::Q8_0 => 34,  // f16 d + 32 i8
-            Self::Q8_1 => 36,  // f16 d + f16 s + 32 i8
-            Self::Q2_K => 84,  // 16 B scales + 64 B qs + f16 d + f16 dmin
-            Self::Q3_K => 110, // 32 B hmask + 64 B qs + 12 B scales + f16 d
-            Self::Q4_K => 144, // f16 d + f16 dmin + 12 B scales + 128 B qs
-            Self::Q5_K => 176, // Q4_K + 32 B qh
-            Self::Q6_K => 210, // 128 B ql + 64 B qh + 16 i8 scales + f16 d
-            Self::Q8_K => 292, // f32 d + 256 i8 + 16 i16 bsums
+            Self::Q4_0 => 18,    // f16 d + 16 B qs
+            Self::Q4_1 => 20,    // f16 d + f16 m + 16 B qs
+            Self::Q5_0 => 22,    // f16 d + 4 B qh + 16 B qs
+            Self::Q5_1 => 24,    // f16 d + f16 m + 4 B qh + 16 B qs
+            Self::Q8_0 => 34,    // f16 d + 32 i8
+            Self::Q8_1 => 36,    // f16 d + f16 s + 32 i8
+            Self::Q2_K => 84,    // 16 B scales + 64 B qs + f16 d + f16 dmin
+            Self::Q3_K => 110,   // 32 B hmask + 64 B qs + 12 B scales + f16 d
+            Self::Q4_K => 144,   // f16 d + f16 dmin + 12 B scales + 128 B qs
+            Self::Q5_K => 176,   // Q4_K + 32 B qh
+            Self::Q6_K => 210,   // 128 B ql + 64 B qh + 16 i8 scales + f16 d
+            Self::Q8_K => 292,   // f32 d + 256 i8 + 16 i16 bsums
             Self::IQ4_XS => 136, // f16 d + u16 scales_h + 4 B scales_l + 128 B qs
             Self::IQ4_NL => 18,  // f16 d + 16 B qs
             Self::IQ2_XS => 74,  // f16 d + 32 u16 (grid|signs) + 8 B scales
@@ -1322,7 +1336,11 @@ fn dequant_iq2_s(block: &[u8], out: &mut Vec<f32>) {
 fn push_signed_row4(out: &mut Vec<f32>, dl: f32, grid: u32, signs: u8, bit0: u8) {
     for j in 0..4u8 {
         let mag = f32::from((grid >> (8 * j)) as u8);
-        let sign = if signs & (1 << (bit0 + j)) != 0 { -1.0 } else { 1.0 };
+        let sign = if signs & (1 << (bit0 + j)) != 0 {
+            -1.0
+        } else {
+            1.0
+        };
         out.push(dl * mag * sign);
     }
 }
@@ -1359,9 +1377,7 @@ fn dequant_iq3_s(block: &[u8], out: &mut Vec<f32>) {
     let signs = &block[74..106];
     let scales = &block[106..110];
     for ib32 in 0..8usize {
-        let db = d
-            * (1.0
-                + 2.0 * f32::from((scales[ib32 / 2] >> (4 * (ib32 % 2))) & 0x0F));
+        let db = d * (1.0 + 2.0 * f32::from((scales[ib32 / 2] >> (4 * (ib32 % 2))) & 0x0F));
         for l in 0..4usize {
             let h = u16::from(qh[ib32]);
             let i1 = usize::from(u16::from(qs[8 * ib32 + 2 * l]) | ((h << (8 - 2 * l)) & 256));

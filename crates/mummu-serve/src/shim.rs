@@ -74,7 +74,10 @@ async fn no_embeddings() -> Response {
 }
 
 async fn unsupported() -> Response {
-    json_response(501, json!({"error": "not supported by the mummu-serve shim"}))
+    json_response(
+        501,
+        json!({"error": "not supported by the mummu-serve shim"}),
+    )
 }
 
 async fn not_found_path() -> Response {
@@ -317,7 +320,9 @@ impl OllamaOptions {
         let top_p = self.top_p.unwrap_or(0.9);
         let top_k = self.top_k.unwrap_or(defaults.top_k);
         if !temperature.is_finite() || temperature < 0.0 {
-            return Err(format!("temperature must be finite and >= 0, got {temperature}"));
+            return Err(format!(
+                "temperature must be finite and >= 0, got {temperature}"
+            ));
         }
         if !(top_p > 0.0 && top_p <= 1.0) {
             return Err(format!("top_p must be in (0, 1], got {top_p}"));
@@ -438,20 +443,14 @@ async fn run(
     if stream {
         let (tx, rx) = mpsc::unbounded_channel::<serde_json::Value>();
         tokio::spawn(async move {
-            let result = engine::run_chat(
-                &p.spec,
-                &p.root,
-                &p.turns,
-                &p.opts,
-                p.max_tokens,
-                |delta| {
+            let result =
+                engine::run_chat(&p.spec, &p.root, &p.turns, &p.opts, p.max_tokens, |delta| {
                     if tx.send(wrap(&p.spec.name, delta)).is_err() {
                         return ControlFlow::Break(());
                     }
                     ControlFlow::Continue(())
-                },
-            )
-            .await;
+                })
+                .await;
             let last = match result {
                 Ok(r) => finish(&p.spec.name, "", &r, started),
                 Err(e) => {

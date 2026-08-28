@@ -23,10 +23,18 @@ fn probe(label: &str, device: &burn::tensor::Device) {
     // `per_tensor` / `per_block` setters, so a rung is now the setter to apply.
     type Rung = fn(QuantScheme) -> QuantScheme;
     let schemes: Vec<(&str, QuantValue, Rung)> = vec![
-        ("Q8S/tensor", QuantValue::Q8S, |s| s.per_tensor(ScaleDtype::F32)),
-        ("Q8S/block32", QuantValue::Q8S, |s| s.per_block([32], ScaleDtype::F32)),
-        ("Q4S/tensor", QuantValue::Q4S, |s| s.per_tensor(ScaleDtype::F32)),
-        ("Q4S/block32", QuantValue::Q4S, |s| s.per_block([32], ScaleDtype::F32)),
+        ("Q8S/tensor", QuantValue::Q8S, |s| {
+            s.per_tensor(ScaleDtype::F32)
+        }),
+        ("Q8S/block32", QuantValue::Q8S, |s| {
+            s.per_block([32], ScaleDtype::F32)
+        }),
+        ("Q4S/tensor", QuantValue::Q4S, |s| {
+            s.per_tensor(ScaleDtype::F32)
+        }),
+        ("Q4S/block32", QuantValue::Q4S, |s| {
+            s.per_block([32], ScaleDtype::F32)
+        }),
     ];
     for (name, value, level) in schemes {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -36,7 +44,10 @@ fn probe(label: &str, device: &burn::tensor::Device) {
             let qparams = compute_q_params(&scheme, range);
             let wq = w.clone().quantize(&scheme, qparams);
             let out = x.clone().matmul(wq);
-            out.into_data().convert::<f32>().try_to_vec::<f32>().unwrap()
+            out.into_data()
+                .convert::<f32>()
+                .try_to_vec::<f32>()
+                .unwrap()
         }));
         match outcome {
             Ok(got) => {

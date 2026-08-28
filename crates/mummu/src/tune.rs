@@ -21,7 +21,6 @@
 
 use std::path::{Path, PathBuf};
 
-
 /// File-name stem of the environment database cubecl 0.11 persists autotune
 /// picks into, under the configured cache root. Load-bearing for safety:
 /// [`clear_autotune_cache`] removes only files starting with this stem, never

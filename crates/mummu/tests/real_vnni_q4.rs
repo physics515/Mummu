@@ -89,9 +89,12 @@ fn real_weight_tensor_through_the_twin_stays_inside_its_bound_and_is_faster() {
     //  (1) requantization along K: per output n, Σ_k |W_dev − W_twin|·|x_k|
     //      with both grids rebuilt from the same bytes the paths read;
     //  (2) activation quantization: the per-row ε bound from the kernel.
-    let dev_grid = wq.dequantize().into_data().try_to_vec::<f32>().expect("device grid");
-    let (qi8, qscales) =
-        mummu::pack::quantize_blocks(&dev_grid, out_w, mummu::pack::Precision::Q4);
+    let dev_grid = wq
+        .dequantize()
+        .into_data()
+        .try_to_vec::<f32>()
+        .expect("device grid");
+    let (qi8, qscales) = mummu::pack::quantize_blocks(&dev_grid, out_w, mummu::pack::Precision::Q4);
     let twin_pack = mummu::flex::kernels::PackedQ4::from_q4s_slab(&qi8, &qscales, in_w, out_w);
     let twin_grid = twin_pack.dequantize();
     let acts = mummu::flex::kernels::Q8Acts::quantize(&x_host);
@@ -102,8 +105,7 @@ fn real_weight_tensor_through_the_twin_stays_inside_its_bound_and_is_faster() {
     for n in 0..out_w {
         let mut req = 0.0f32;
         for k in 0..in_w {
-            req += (dev_grid[k * out_w + n] - twin_grid[k * out_w + n]).abs()
-                * x_host[k].abs();
+            req += (dev_grid[k * out_w + n] - twin_grid[k * out_w + n]).abs() * x_host[k].abs();
         }
         let budget = req + act_bound[n] + 1e-5 * scale;
         let err = (base[n] - twin[n]).abs();

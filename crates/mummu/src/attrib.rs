@@ -215,9 +215,9 @@ pub fn attribute(n: usize, replicates: usize, measure: &mut dyn FnMut(u32) -> f6
 /// 12.7, not 1.96); beyond 30 the normal approximation is within 2%.
 fn t_975(df: usize) -> f64 {
     const TABLE: [f64; 30] = [
-        12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228, 2.201, 2.179,
-        2.160, 2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086, 2.080, 2.074, 2.069, 2.064,
-        2.060, 2.056, 2.052, 2.048, 2.045, 2.042,
+        12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228, 2.201, 2.179, 2.160,
+        2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086, 2.080, 2.074, 2.069, 2.064, 2.060, 2.056,
+        2.052, 2.048, 2.045, 2.042,
     ];
     if df == 0 {
         f64::INFINITY
@@ -362,7 +362,11 @@ mod tests {
         let full = (1u32 << n) - 1;
         let total = v(full) - v(0);
         let phi = shapley(n, &mut v);
-        assert_close(phi.iter().sum::<f64>(), total, "sum(phi) vs v(full)-v(empty)");
+        assert_close(
+            phi.iter().sum::<f64>(),
+            total,
+            "sum(phi) vs v(full)-v(empty)",
+        );
     }
 
     /// A dummy component (never changes the measurement) must get 0 — the

@@ -29,10 +29,10 @@
 //! The long-standing "wgpu's Q4 kernel returns garbage" note is **withdrawn**
 //! — 2026-08-23, `examples/pack-precision-probe.rs`.
 
+use burn::tensor::Tensor;
 use burn::tensor::quantization::{
     Calibration, QuantScheme, QuantValue, ScaleDtype, compute_q_params, compute_range,
 };
-use burn::tensor::Tensor;
 
 pub use mummu_mix::QuantPolicy;
 
@@ -68,10 +68,7 @@ impl SchemeExt for QuantPolicy {
 /// Quantize one weight tensor per `policy` (min-max calibration — weights
 /// are static, so calibration is exact). The caller has already decided
 /// eligibility; `Off` is a caller bug.
-pub fn quantize_weight<const D: usize>(
-    policy: QuantPolicy,
-    tensor: Tensor<D>,
-) -> Tensor<D> {
+pub fn quantize_weight<const D: usize>(policy: QuantPolicy, tensor: Tensor<D>) -> Tensor<D> {
     let scheme = policy
         .scheme()
         .expect("quantize_weight called with QuantPolicy::Off");

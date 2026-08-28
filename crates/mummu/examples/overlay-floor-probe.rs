@@ -10,7 +10,7 @@
 use std::time::Instant;
 
 use burn::tensor::{Distribution, Tensor};
-use mummu::overlay::{min_vram_bytes, plan, LayerAction, LayerCost, OverlayModel};
+use mummu::overlay::{LayerAction, LayerCost, OverlayModel, min_vram_bytes, plan};
 
 fn main() {
     // ---- staging bandwidth, measured (or skipped gracefully) -------------

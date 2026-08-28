@@ -54,12 +54,7 @@ impl ShortConvConfig {
 impl ShortConv {
     /// Cache-aware forward. `x` is `[b, t, d]`: the whole prompt at prefill,
     /// one token per decode step after. Rolls `state` forward either way.
-    pub fn forward(
-        &self,
-        x: Tensor<3>,
-        kernel_len: usize,
-        state: &mut ConvState,
-    ) -> Tensor<3> {
+    pub fn forward(&self, x: Tensor<3>, kernel_len: usize, state: &mut ConvState) -> Tensor<3> {
         let [b, t, d] = x.dims();
         let kk = kernel_len;
         assert!(kk >= 2, "ShortConv forward: kernel_len must be >= 2");

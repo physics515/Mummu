@@ -2594,12 +2594,19 @@ that fits the model AND uses every device to the fullest.
       the f16 arm FIRST because whichever arm runs first locks the process.
       Default behaviour is unchanged by construction (a wgpu device defaults to F32), which is what
       the re-run f32 parity numbers are evidence for.
-- [ ] **`cargo fmt --check` is red across the tree — ~330 hunks in ~50 files**, concentrated in the
+- [x] **`cargo fmt --check` is red across the tree — ~330 hunks in ~50 files**, concentrated in the
       newest modules (`nn/moe.rs` 41, `pack.rs` 39, `mummu-serve/src/engine.rs` 45, `models/qwen35.rs`
       24). There is no `rustfmt.toml`, so this is default-rustfmt drift accumulated over many runs,
       not a house style. Deliberately NOT bundled into the 2026-08-25 migration commit — a 6 800-line
       reformat would have buried a 57-file semantic change. Land it as its OWN commit, touching
       nothing else, and then the guardrail is checkable again on every later run. *(2026-08-25.)*
+      *(2026-08-28) **Done — `cargo fmt --all` on its own commit: 208 rustfmt hunks across 51 files,
+      nothing else touched.** The guardrail is green again, so from this run on a red
+      `cargo fmt --check` means the current change, not accumulated drift. It really was pure default
+      rustfmt: `cargo check --all-targets --keep-going` and all 366 lib tests pass unchanged either
+      side of it, which is the only claim a reformat is entitled to make. Still no `rustfmt.toml` and
+      deliberately so — adding one would turn future drift into a house-style argument instead of a
+      one-command fix.*
 - [ ] **The parity and budget gates need a compile-only CI leg.** The 35-target breakage above
       survived several runs precisely because `cargo test` (which compiles only what it runs) and
       `cargo build` (default targets) both stayed green while `--all-targets` was red. A cheap
