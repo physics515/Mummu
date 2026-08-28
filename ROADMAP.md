@@ -325,6 +325,25 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       (read from source this run), which is exactly why `[cubecl.compilation] cache` is inert on our
       path. — https://github.com/gfx-rs/wgpu/issues/5293 ·
       https://docs.rs/wgpu/latest/wgpu/struct.PipelineCache.html
+      *(2026-08-28) **Route (1) landed upstream — read from cubecl-wgpu 0.11.0-pre.3's source, now
+      in the tree.** The 2026-08-09 finding that `CompilationCache` is "constructed in the cuda and
+      hip runtimes only" is no longer true: `cubecl-wgpu/src/compute/server.rs` builds a **persistent
+      SPIR-V compilation store** — `compilation_store("vulkan", format!("spirv_{vendor}_{device}"))`,
+      keyed per adapter — with an in-process pipeline cache mirroring it
+      (`CompilationCache::mirroring(&spirv_cache)`), and the source says why the other arm is
+      different: "WGSL is compiled by the driver on every run, so without the SPIR-V store there is
+      nothing persisted for a switch to invalidate" (`CompilationCache::unbound()`). Two consequences
+      worth acting on. **(a) It is gated on cubecl's `spirv` feature, which is exactly what Mummu's
+      `vulkan-spirv` turns on** — so the default build is on the arm that now persists, and the
+      non-Vulkan fallback is not. **(b) It caches the SPIR-V module, NOT the wgpu pipeline**: the
+      `ComputePipeline` is still created per process, so this should shave the compile-to-SPIR-V half
+      of the cold tax and leave pipeline creation. That is a measurable prediction, and the harness to
+      test it already exists — `mummu-bench/tests/warmup_f16.rs` measured the whole curve (first burst
+      12.5-16.3 tok/s, flat 37-41 from burst 2). Re-run it on pre.3 across TWO processes: if the
+      SECOND process's first burst is faster than the first process's was, the store is carrying, and
+      `CausalLm::warm_up`'s cost should drop rather than its need disappearing. Do this before
+      touching route (2) (shipping a warm cache with the binary) — it changes what there is left to
+      ship.*
 - [ ] **A stale autotune cache is permanent, silent, and cost 21–27 % of f16 decode** — found while
       closing the item above, and it is the reason "just persist the autotune cache" is not a free win
       for consumers. This run's FIRST budget run happened on a contended machine (9.1 tok/s f32, failing
