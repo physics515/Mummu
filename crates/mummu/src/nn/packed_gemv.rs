@@ -631,7 +631,7 @@ mod flex_impl {
             // A process-global hot set purely improves the visiting order;
             // interleaved requests only degrade the seeds, never the answer.
             static HOT: Mutex<Option<crate::flex::head::HotSet>> = Mutex::new(None);
-            let k = crate::flex::head::head_k();
+            let k = crate::flex::head::effective_k();
             let seeds = {
                 let mut hot = HOT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 hot.get_or_insert_with(crate::flex::head::HotSet::new)

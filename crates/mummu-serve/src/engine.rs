@@ -2806,6 +2806,17 @@ async fn drive(
             let start = Instant::now();
             let mut ids: Vec<u32> = Vec::new();
             let mut emitted = String::new();
+            // Tell the bounded head how many candidates THIS request's
+            // sampler will consult: greedy reads only the argmax (k = 1,
+            // where the norm bound prunes hardest — the first live run
+            // measured k = 1024 evaluating ~91% of the vocab), sampling
+            // reads its top_k. Overlapping requests combine via fetch_max
+            // and the drop falls back to the safe env default.
+            let _head_k = mummu::flex::head::RequestTopK::set(if opts.temperature == 0.0 {
+                1
+            } else {
+                opts.top_k
+            });
             let out = m.lm.generate(&prompt_ids, max_tokens, opts, &device, |id| {
                 ids.push(id);
                 // Incremental decode: re-decode the whole tail and emit the
