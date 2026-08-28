@@ -106,6 +106,47 @@ pub fn head_k() -> usize {
     })
 }
 
+/// The per-request k override, 0 = none. Why it exists: the first live run
+/// measured the bounded head EVALUATING ~91% of the vocab at the default
+/// k = 1024 — the 1024th logit sits deep in the bulk, so the threshold
+/// prunes almost nothing, and the walk cost 469 ms where the dense head
+/// cost 68. The caller that knows the sampler (serve's engine) also knows
+/// greedy needs k = 1 — where the threshold is the running MAX and the
+/// bound prunes hard. `RequestTopK` raises this for the request's scope.
+static REQUEST_TOPK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// RAII scope for a per-request head k (serve sets 1 for greedy requests,
+/// the request's own `top_k` for sampled ones). Concurrency contract:
+/// overlapping requests combine via `fetch_max`, and the drop resets to
+/// "no override", which falls back to [`head_k`]'s SAFE default — a
+/// concurrent request can therefore only ever see a k at least as large
+/// as its own need, never smaller.
+pub struct RequestTopK;
+
+impl RequestTopK {
+    #[must_use]
+    pub fn set(k: usize) -> Self {
+        REQUEST_TOPK.fetch_max(k.max(1), std::sync::atomic::Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for RequestTopK {
+    fn drop(&mut self) {
+        REQUEST_TOPK.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The k the next head evaluation uses: the request override when one is
+/// active, else the env default.
+#[must_use]
+pub fn effective_k() -> usize {
+    match REQUEST_TOPK.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => head_k(),
+        k => k,
+    }
+}
+
 /// Per-row and per-tile bound metadata for one packed head, built in one
 /// pass over the packed bytes.
 pub struct HeadMeta {
@@ -281,66 +322,111 @@ pub fn head_topk(
     let mut evaluated = vec![false; tiles];
     let mut evaluated_tiles = 0usize;
     let mut evaluated_rows = 0usize;
-    let mut scratch = vec![0.0f32; TILE];
-    let eval_tile = |t: usize,
-                         top: &mut TopK,
-                         evaluated: &mut Vec<bool>,
-                         evaluated_tiles: &mut usize,
-                         evaluated_rows: &mut usize,
-                         scratch: &mut Vec<f32>| {
-        if evaluated[t] {
-            return;
-        }
-        evaluated[t] = true;
-        *evaluated_tiles += 1;
-        let n0 = t * TILE;
-        let n1 = ((t + 1) * TILE).min(w.n);
-        *evaluated_rows += n1 - n0;
-        w.dot_rows(n0, n1, &acts, x, integer_ok, &mut scratch[..n1 - n0]);
-        for (i, &y) in scratch[..n1 - n0].iter().enumerate() {
-            top.push(y, u32::try_from(n0 + i).expect("vocab fits u32"));
+
+    // Tiles evaluate in PARALLEL batches: the first live run measured the
+    // serial walk at 469 ms against the dense head's rayon-wide 68 — a
+    // bound that isn't pruning must never cost more than the evaluation it
+    // failed to skip. A batch runs across the pool, its results merge into
+    // the heap serially, and the threshold advances between batches. The
+    // stop rule is unchanged (a tile is skipped only when its bound is
+    // below the threshold AT CHECK TIME, and the threshold only rises), so
+    // exactness is preserved; a batch may evaluate up to its own size past
+    // the serial stopping point — bounded extra work, never a wrong
+    // answer. Batch size RAMPS: the first batch is exactly big enough to
+    // fill the heap (so a real threshold exists before anything wider
+    // launches — a flat 64-tile first batch was measured evaluating an
+    // entire small vocab before pruning could begin), then doubles to the
+    // cap for parallel width.
+    const BATCH: usize = 64;
+    use rayon::prelude::*;
+    let eval_batch = |batch: &[u32],
+                      top: &mut TopK,
+                      evaluated: &mut [bool],
+                      evaluated_tiles: &mut usize,
+                      evaluated_rows: &mut usize| {
+        let results: Vec<(usize, usize, Vec<f32>)> = batch
+            .par_iter()
+            .map(|&t| {
+                let t = t as usize;
+                let n0 = t * TILE;
+                let n1 = ((t + 1) * TILE).min(w.n);
+                let mut vals = vec![0.0f32; n1 - n0];
+                w.dot_rows(n0, n1, &acts, x, integer_ok, &mut vals);
+                (t, n0, vals)
+            })
+            .collect();
+        for (t, n0, vals) in results {
+            evaluated[t] = true;
+            *evaluated_tiles += 1;
+            *evaluated_rows += vals.len();
+            for (i, &y) in vals.iter().enumerate() {
+                top.push(y, u32::try_from(n0 + i).expect("vocab fits u32"));
+            }
         }
     };
 
-    // Seeds first: the hot set's previous winners.
-    for &t in seed_tiles {
-        let t = t as usize;
-        if t < tiles {
-            eval_tile(
-                t,
-                &mut top,
-                &mut evaluated,
-                &mut evaluated_tiles,
-                &mut evaluated_rows,
-                &mut scratch,
-            );
-        }
+    // Seeds first: the hot set's previous winners establish a high
+    // threshold before the ordered walk begins.
+    let seed_batch: Vec<u32> = {
+        let mut s: Vec<u32> = seed_tiles
+            .iter()
+            .copied()
+            .filter(|&t| (t as usize) < tiles)
+            .collect();
+        s.sort_unstable();
+        s.dedup();
+        s
+    };
+    if !seed_batch.is_empty() {
+        eval_batch(
+            &seed_batch,
+            &mut top,
+            &mut evaluated,
+            &mut evaluated_tiles,
+            &mut evaluated_rows,
+        );
     }
 
-    // Bound walk: tiles by bound descending; stop at the first that
-    // cannot beat the current k-th value.
+    // Bound walk: tiles by bound descending, in batches; stop at the first
+    // tile that cannot beat the current k-th value.
     let mut order: Vec<u32> = (0..tiles as u32).collect();
-    let mut bounds: Vec<f32> = (0..tiles).map(bound_of).collect();
+    let bounds: Vec<f32> = (0..tiles).map(bound_of).collect();
     order.sort_unstable_by(|&a, &b| {
         bounds[b as usize]
             .partial_cmp(&bounds[a as usize])
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    for &t in &order {
-        let t = t as usize;
-        if bounds[t] < top.threshold() {
-            break; // every later tile's bound is smaller still
+    let mut cursor = 0usize;
+    let mut batch_target = k.div_ceil(TILE).max(1).min(BATCH);
+    while cursor < order.len() {
+        let mut batch: Vec<u32> = Vec::with_capacity(batch_target);
+        let mut stop = false;
+        while cursor < order.len() && batch.len() < batch_target {
+            let t = order[cursor] as usize;
+            cursor += 1;
+            if evaluated[t] {
+                continue;
+            }
+            if bounds[t] < top.threshold() {
+                stop = true; // every later tile's bound is smaller still
+                break;
+            }
+            batch.push(t as u32);
         }
-        eval_tile(
-            t,
-            &mut top,
-            &mut evaluated,
-            &mut evaluated_tiles,
-            &mut evaluated_rows,
-            &mut scratch,
-        );
+        if !batch.is_empty() {
+            eval_batch(
+                &batch,
+                &mut top,
+                &mut evaluated,
+                &mut evaluated_tiles,
+                &mut evaluated_rows,
+            );
+        }
+        if stop {
+            break;
+        }
+        batch_target = (batch_target * 2).min(BATCH);
     }
-    bounds.clear();
 
     let (ids, vals) = top.into_sorted();
     HeadTopK {
@@ -582,6 +668,26 @@ mod tests {
         let s1 = hot.seeds(64, 1);
         let s2 = hot.seeds(64, 1);
         assert_ne!(s1.last(), s2.last());
+    }
+
+    /// The per-request k override: fetch_max semantics while scopes
+    /// overlap, safe-default fallback on drop. Large values on purpose —
+    /// the override is process-global and a small k during a parallel
+    /// head test's window would weaken ITS coverage, so this test proves
+    /// the arithmetic without ever lowering the effective k below any
+    /// other test's need.
+    #[test]
+    fn request_topk_overrides_and_resets() {
+        assert_eq!(effective_k(), head_k());
+        {
+            let _a = RequestTopK::set(2000);
+            assert_eq!(effective_k(), 2000);
+            let _b = RequestTopK::set(3000); // the larger concurrent need wins
+            assert_eq!(effective_k(), 3000);
+            let _c = RequestTopK::set(2500); // a smaller one cannot shrink it
+            assert_eq!(effective_k(), 3000);
+        }
+        assert_eq!(effective_k(), head_k(), "drop must restore the default");
     }
 
     /// meta_for memoizes per twin allocation and rebuilds for a new one.
