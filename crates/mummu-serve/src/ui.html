@@ -293,18 +293,28 @@ async function send() {
 // timeout this is here to avoid.
 function chatOverSocket(request, onEvent) {
   return new Promise((resolve, reject) => {
+    // Only a failure BEFORE the stream opens is worth falling back on; once
+    // frames are flowing, a drop is a real error and retrying would replay
+    // the whole generation.
+    let opened = false;
+    // ONE fallback, ever: a socket the proxy refuses fires BOTH error and
+    // close with `opened` still false, and two `chatOverSse` calls run the
+    // whole generation twice — the duplicate parks on the model slot and
+    // burns a full decode after the visible one finishes.
+    let fellBack = false;
+    const fallBack = () => {
+      if (opened || fellBack) return;
+      fellBack = true;
+      chatOverSse(request, onEvent).then(resolve, reject);
+    };
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
     let socket;
     try {
       socket = new WebSocket(`${proto}//${location.host}/api/chat/ws`);
     } catch (e) {
-      chatOverSse(request, onEvent).then(resolve, reject);
+      fallBack();
       return;
     }
-    // Only a failure BEFORE the stream opens is worth falling back on; once
-    // frames are flowing, a drop is a real error and retrying would replay
-    // the whole generation.
-    let opened = false;
     socket.addEventListener("open", () => {
       opened = true;
       socket.send(JSON.stringify(request));
@@ -317,12 +327,10 @@ function chatOverSocket(request, onEvent) {
         reject(e);
       }
     });
-    socket.addEventListener("error", () => {
-      if (!opened) chatOverSse(request, onEvent).then(resolve, reject);
-    });
+    socket.addEventListener("error", fallBack);
     socket.addEventListener("close", () => {
       if (opened) resolve();
-      else chatOverSse(request, onEvent).then(resolve, reject);
+      else fallBack();
     });
   });
 }

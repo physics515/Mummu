@@ -180,6 +180,76 @@ pub fn best_chunk(
     })
 }
 
+/// The chunkwise GDN prefill's cost model and argmin (SPEC P5.5's
+/// adaptive-chunk half): evaluating a `t_tokens` prefill in chunks of `c`
+/// costs
+///
+/// ```text
+/// T(c) = ceil(t/c) * (a0 + a1*c + a2*c^2 + a3*c^3*log2(c))
+/// ```
+///
+/// per layer, where `a0` is per-chunk launch/sync overhead (the term that
+/// murders small chunks — the sequential loop is the degenerate c = 1 of
+/// this model, ~9 launches per token), `a1*c` the per-token projections,
+/// `a2*c^2` the C-by-C interaction matrices (decay, `K K^T`, `Q K^T`), and
+/// `a3*c^3*log2(c)` the finite Neumann doubling (log2(c) stages of C-by-C
+/// matmul). All coefficients are measured, not derived — fit them from
+/// three timed chunk sizes and re-fit when the kernel changes.
+///
+/// Distinct from [`best_chunk`] deliberately: the memory-vs-time trade
+/// there is about activation peaks; this one is pure time — the GDN chunk
+/// never materializes anything bigger than `c x c` per head.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GdnChunkChoice {
+    pub chunk: usize,
+    pub chunks: usize,
+    /// `T(chunk)` in the coefficients' time unit.
+    pub time: f64,
+    /// The sequential loop's cost under the same model (`c = 1`), so the
+    /// caller can log the ratio this choice buys.
+    pub sequential_time: f64,
+}
+
+/// Minimize the GDN chunk model over `c in 1..=min(c_max, t_tokens)`.
+/// Returns `None` for an empty prefill. Ties break toward the smaller `c`
+/// (smaller transient state, same time).
+#[must_use]
+pub fn best_gdn_chunk(
+    t_tokens: usize,
+    a0: f64,
+    a1: f64,
+    a2: f64,
+    a3: f64,
+    c_max: usize,
+) -> Option<GdnChunkChoice> {
+    debug_assert!(
+        a0 >= 0.0 && a1 >= 0.0 && a2 >= 0.0 && a3 >= 0.0,
+        "cost coefficients must be nonnegative"
+    );
+    if t_tokens == 0 || c_max == 0 {
+        return None;
+    }
+    let per_chunk = |c: usize| -> f64 {
+        let cf = c as f64;
+        a0 + a1 * cf + a2 * cf * cf + a3 * cf * cf * cf * (cf.log2().max(0.0))
+    };
+    let time_at = |c: usize| -> f64 { t_tokens.div_ceil(c) as f64 * per_chunk(c) };
+    let upper = c_max.min(t_tokens);
+    let mut best: Option<(usize, f64)> = None;
+    for c in 1..=upper {
+        let t = time_at(c);
+        if best.is_none_or(|(_, bt)| t < bt) {
+            best = Some((c, t));
+        }
+    }
+    best.map(|(chunk, time)| GdnChunkChoice {
+        chunk,
+        chunks: t_tokens.div_ceil(chunk),
+        time,
+        sequential_time: time_at(1),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,5 +422,50 @@ mod tests {
     fn activation_peak_is_three_f32_buffers() {
         assert_eq!(activation_peak_per_token_bytes(17408), 3 * 17408 * 4);
         assert_eq!(activation_peak_per_token_bytes(0), 0);
+    }
+
+    /// GDN chunk model: launch-dominated costs pick a big chunk, cubic
+    /// (solve)-dominated costs pick a small one, and the reported times are
+    /// the model at the reported points — checked against a brute scan.
+    #[test]
+    fn gdn_chunk_tracks_the_dominant_term() {
+        // Launch-heavy (a0 huge): the sequential loop pays a0 per token, so
+        // the argmin runs to the cap.
+        let launchy = best_gdn_chunk(2048, 5.0, 0.01, 0.0, 0.0, 64).unwrap();
+        assert_eq!(launchy.chunk, 64);
+        assert!(launchy.sequential_time > launchy.time * 10.0);
+
+        // Solve-heavy (a3 huge): big chunks pay c^3 log c, so small wins.
+        let solvey = best_gdn_chunk(2048, 0.01, 0.0, 0.0, 1.0, 64).unwrap();
+        assert!(
+            solvey.chunk <= 2,
+            "cubic-dominated argmin at {}",
+            solvey.chunk
+        );
+
+        // A balanced instance has an interior minimum; verify vs brute force.
+        let (a0, a1, a2, a3) = (2.0, 0.05, 0.001, 1e-6);
+        let got = best_gdn_chunk(4096, a0, a1, a2, a3, 256).unwrap();
+        let model = |c: usize| {
+            let cf = c as f64;
+            4096f64.div_euclid(cf).max(0.0); // silence: use div_ceil below
+            (4096usize.div_ceil(c)) as f64
+                * (a0 + a1 * cf + a2 * cf * cf + a3 * cf * cf * cf * cf.log2().max(0.0))
+        };
+        let brute = (1..=256).map(model).fold(f64::INFINITY, f64::min);
+        assert!((got.time - brute).abs() < 1e-9);
+        assert!(
+            got.chunk > 1 && got.chunk < 256,
+            "interior argmin, got {}",
+            got.chunk
+        );
+        assert!((got.sequential_time - model(1)).abs() < 1e-9);
+    }
+
+    /// Degenerate GDN inputs return None.
+    #[test]
+    fn gdn_chunk_degenerate_inputs() {
+        assert_eq!(best_gdn_chunk(0, 1.0, 1.0, 0.0, 0.0, 64), None);
+        assert_eq!(best_gdn_chunk(64, 1.0, 1.0, 0.0, 0.0, 0), None);
     }
 }

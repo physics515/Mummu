@@ -287,23 +287,19 @@ impl GatedAttention {
         drop(_s_rope);
         let _s_kv = crate::prof::scope("fa.kv");
 
-        let (k_all, v_all) = match kv.take() {
-            Some((pk, pv)) => (
-                Tensor::cat(vec![pk, k_new], 2),
-                Tensor::cat(vec![pv, v_new], 2),
-            ),
-            None => (k_new, v_new),
-        };
-        *kv = Some((k_all.clone(), v_all.clone()));
+        // Storage dtype (f16 KV when enabled) is the cache helper's call;
+        // scores upcast to the f32 island below and the value matmul
+        // upcasts to ambient, so precision here is storage-only.
+        let ambient = q.dtype();
+        let (k_all, v_all) = crate::nn::kv_append(kv, k_new, v_new);
 
         let group = nh / nkv;
         let k = repeat_kv(k_all, group);
-        let v = repeat_kv(v_all, group);
+        let v = repeat_kv(v_all, group).cast(ambient);
         drop(_s_kv);
         let _s_scores = crate::prof::scope("fa.scores");
 
         // f32 island for the scores — the same overflow guard as GqaAttention.
-        let ambient = q.dtype();
         let scale = 1.0 / (hd as f32).sqrt();
         let mut scores = q
             .cast(DType::F32)
@@ -349,11 +345,39 @@ pub struct GatedDeltaNet {
 }
 
 /// DeltaNet decode state: the rolling conv window and the recurrent memory.
+///
+/// The state lives in exactly one of two worlds at a time: the tensor
+/// fields (prefill and the tensor decode path) or the host fields (the
+/// fused decode path, SPEC P3) — each path converts the other's fields on
+/// entry and leaves its own. `middle` caches the layer's extracted small
+/// weights for the fused kernel; per-request rebuild costs microseconds
+/// and avoids any global keyed on tensor storage.
 pub struct DeltaState {
     /// Last `conv_kernel - 1` mix columns, `[b, conv_dim, k-1]`.
     pub conv: Option<Tensor<3>>,
     /// Per-head associative memory `[b, n_v_heads, d_state, d_state]`.
     pub state: Option<Tensor<4>>,
+    /// Host twin of `conv` for the fused decode step (batch 1),
+    /// `[conv_dim * (k-1)]` channel-major, oldest first.
+    pub host_conv: Option<Vec<f32>>,
+    /// Host twin of `state`, `[n_v_heads * d_state * d_state]` head-major.
+    pub host_state: Option<Vec<f32>>,
+    /// The fused kernel's per-layer constants, extracted at first use.
+    pub middle: Option<std::sync::Arc<crate::flex::gdn::GdnMiddle>>,
+}
+
+impl DeltaState {
+    /// An empty state (fresh generation).
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            conv: None,
+            state: None,
+            host_conv: None,
+            host_state: None,
+            middle: None,
+        }
+    }
 }
 
 impl GatedDeltaNet {
@@ -364,6 +388,31 @@ impl GatedDeltaNet {
         let conv_dim = cfg.conv_dim();
         let kk = cfg.conv_kernel;
         let device = x.device();
+
+        // The fused host decode step (SPEC P3): one function replaces the
+        // ~9 small-tensor ops between the projections, with the state kept
+        // as plain host memory across tokens. Flex only, batch 1, t == 1;
+        // MUMMU_FUSED_GDN=0 (or the force switch) restores the path below.
+        if t == 1 && b == 1 && crate::flex::gdn::enabled() && crate::backend::is_flex(&device) {
+            return self.forward_fused_decode(x, cfg, cache, &device);
+        }
+        // Entering the tensor path with host-resident state (a prefill
+        // after fused decode steps — the multi-turn shape): materialize
+        // the tensors the code below reads, and drop the host twins.
+        if let Some(hc) = cache.host_conv.take() {
+            debug_assert_eq!(hc.len(), conv_dim * (kk - 1));
+            cache.conv = Some(
+                Tensor::<1>::from_data(TensorData::new(hc, [conv_dim * (kk - 1)]), &device)
+                    .reshape([1, conv_dim, kk - 1]),
+            );
+        }
+        if let Some(hs) = cache.host_state.take() {
+            debug_assert_eq!(hs.len(), hv * ds * ds);
+            cache.state = Some(
+                Tensor::<1>::from_data(TensorData::new(hs, [hv * ds * ds]), &device)
+                    .reshape([1, hv, ds, ds]),
+            );
+        }
 
         let _s_proj = crate::prof::scope("delta.proj");
         let mixed = qlinear(&self.qkv_proj, x.clone()); // [b, t, conv_dim]
@@ -379,7 +428,24 @@ impl GatedDeltaNet {
         let _s_conv = crate::prof::scope("delta.conv");
         let mix_cm = mixed.swap_dims(1, 2); // channel-major [b, conv_dim, t]
         let conv_out = if t > 1 {
-            self.conv1d.forward(mix_cm.clone()).narrow(2, 0, t)
+            match &cache.conv {
+                // Continuation (a later prefill chunk, or a prompt after
+                // decode steps): the first kk-1 positions' windows reach
+                // into the PREVIOUS span, which the rolling cache holds.
+                // Running the conv over [cached | new] and taking the
+                // outputs aligned to the new span reproduces the
+                // uninterrupted conv exactly. The old code fell into the
+                // fresh-start branch here and convolved those positions
+                // against zero history — wrong at every chunk boundary
+                // (found by the forward_advance equivalence test; the
+                // chunked-prefill exactness claim held only for prompts
+                // within one chunk).
+                Some(prev) => {
+                    let ext = Tensor::cat(vec![prev.clone(), mix_cm.clone()], 2);
+                    self.conv1d.forward(ext).narrow(2, kk - 1, t)
+                }
+                None => self.conv1d.forward(mix_cm.clone()).narrow(2, 0, t),
+            }
         } else {
             let window = match &cache.conv {
                 Some(prev) => Tensor::cat(vec![prev.clone(), mix_cm.clone()], 2),
@@ -448,15 +514,22 @@ impl GatedDeltaNet {
             .state
             .take()
             .unwrap_or_else(|| Tensor::<4>::zeros([b, hv, ds, ds], &device));
-        // Prefill spans longer than one chunk take the chunkwise-parallel
+        // Prefill spans beyond a few tokens take the chunkwise-parallel
         // form — algebraically exact, an evaluation-order change and not an
         // approximation (the derivation lives on `gdn_recurrence_chunked`),
-        // at roughly C-fold fewer kernel launches. The threshold is the
-        // chunk length itself: at or below one chunk the triangular-solve
-        // setup costs more launches than the batching saves, and decode
-        // (`t == 1`) stays on the sequential path by construction.
+        // at roughly C-fold fewer kernel launches. The old threshold was
+        // one full chunk (t > 64), which left every 2..=64-token prompt on
+        // the sequential loop at ~9 launches per token — the exact cliff
+        // SPEC P5.2 names. A partial chunk is handled exactly (`chunk.min`
+        // below), so the crossover is only launch arithmetic: one chunk
+        // costs ~20 chunk-level ops + 2-3 matmuls per doubling stage
+        // against 9·t sequential — even at t = 8 the chunk wins. The
+        // sequential ceiling is measured-tunable (`MUMMU_GDN_SEQ_MAX`,
+        // default 4); decode (t == 1) stays sequential by construction.
         let (o, s_new) = match gdn_chunk() {
-            Some(c) if t > c => gdn_recurrence_chunked(&q, &k, &v, &g, &beta, s0, scale, c),
+            Some(c) if t > gdn_seq_max() => {
+                gdn_recurrence_chunked(&q, &k, &v, &g, &beta, s0, scale, c)
+            }
             _ => gdn_recurrence_sequential(&q, &k, &v, &g, &beta, s0, scale),
         };
         cache.state = Some(s_new); // [b, hv, ds, ds]; o is [b, hv, t, ds]
@@ -468,6 +541,108 @@ impl GatedDeltaNet {
         let z = z.reshape([b, t, hv, ds]);
         let gated = o.mul(activation::silu(z)).reshape([b, t, cfg.d_inner]);
         qlinear(&self.out_proj, gated)
+    }
+
+    /// The fused decode step (SPEC P3): projections stay tensor ops (they
+    /// are single packed-GEMV dispatches on the twin path), everything
+    /// between them runs as one host function over the state kept in plain
+    /// memory. See `flex::gdn` for the pass structure and the algebra.
+    fn forward_fused_decode(
+        &self,
+        x: Tensor<3>,
+        cfg: &Qwen35Config,
+        cache: &mut DeltaState,
+        device: &Device,
+    ) -> Tensor<3> {
+        let _s_proj = crate::prof::scope("delta.proj");
+        let mixed_t = qlinear(&self.qkv_proj, x.clone()); // [1, 1, conv_dim]
+        let z_t = qlinear(&self.z_proj, x.clone()); // [1, 1, d_inner]
+        let beta_t = qlinear(&self.beta_proj, x.clone()); // [1, 1, hv]
+        let alpha_t = qlinear(&self.alpha_proj, x); // [1, 1, hv]
+        drop(_s_proj);
+
+        let _s = crate::prof::scope("delta.fused");
+        let middle = match &cache.middle {
+            Some(m) => std::sync::Arc::clone(m),
+            None => {
+                let m = std::sync::Arc::new(self.fused_middle(cfg));
+                cache.middle = Some(std::sync::Arc::clone(&m));
+                m
+            }
+        };
+        let host = |t: Tensor<3>| -> Vec<f32> {
+            t.into_data()
+                .try_to_vec::<f32>()
+                .expect("flex activations are f32")
+        };
+        let (mixed, z, beta, alpha) = (host(mixed_t), host(z_t), host(beta_t), host(alpha_t));
+
+        // The state's host twins, converted from tensors on first use
+        // (prefill ran the tensor path) or zero-initialized (no prefix).
+        if cache.host_conv.is_none() {
+            cache.host_conv = Some(match cache.conv.take() {
+                Some(tc) => tc
+                    .into_data()
+                    .try_to_vec::<f32>()
+                    .expect("conv window is f32"),
+                None => vec![0f32; middle.ring_len()],
+            });
+        }
+        if cache.host_state.is_none() {
+            cache.host_state = Some(match cache.state.take() {
+                Some(ts) => ts.into_data().try_to_vec::<f32>().expect("state is f32"),
+                None => vec![0f32; middle.state_len()],
+            });
+        }
+
+        let mut gated = vec![0f32; cfg.d_inner];
+        crate::flex::gdn::gdn_step(
+            &middle,
+            &mixed,
+            &z,
+            &beta,
+            &alpha,
+            cache.host_conv.as_mut().expect("just filled"),
+            cache.host_state.as_mut().expect("just filled"),
+            &mut gated,
+        );
+        drop(_s);
+
+        let _s_out = crate::prof::scope("delta.out");
+        let gated_t = Tensor::<3>::from_data(TensorData::new(gated, [1, 1, cfg.d_inner]), device);
+        qlinear(&self.out_proj, gated_t)
+    }
+
+    /// Extract the fused kernel's per-layer constants (conv taps, gates'
+    /// bias/decay, the norm gain). A few hundred KB, once per request per
+    /// layer — cached on the [`DeltaState`].
+    fn fused_middle(&self, cfg: &Qwen35Config) -> crate::flex::gdn::GdnMiddle {
+        let host = |t: Tensor<1>| -> Vec<f32> {
+            t.into_data().try_to_vec::<f32>().expect("params are f32")
+        };
+        // Conv1d weight is [conv_dim, 1, kk] row-major: channel-major with
+        // the taps fastest — exactly the [c][tap] layout the FIR reads.
+        let conv_w = self
+            .conv1d
+            .weight
+            .val()
+            .reshape([cfg.conv_dim() * cfg.conv_kernel]);
+        crate::flex::gdn::GdnMiddle {
+            hk: cfg.n_k_heads,
+            hv: cfg.n_v_heads,
+            ds: cfg.d_state,
+            kk: cfg.conv_kernel,
+            conv_dim: cfg.conv_dim(),
+            key_dim: cfg.key_dim(),
+            d_inner: cfg.d_inner,
+            l2_eps: cfg.rms_norm_eps as f32,
+            norm_eps: cfg.rms_norm_eps as f32,
+            scale: 1.0 / (cfg.d_state as f32).sqrt(),
+            conv_w: host(conv_w),
+            dt_bias: host(self.dt_bias.val()),
+            a: host(self.a.val()),
+            gamma: host(self.norm.gamma.val()),
+        }
     }
 }
 
@@ -493,6 +668,21 @@ fn gdn_chunk() -> Option<usize> {
                 }
             }
         }
+    })
+}
+
+/// Longest span the sequential recurrence still evaluates when chunking is
+/// on (`MUMMU_GDN_SEQ_MAX`, default 4): above it, even a single partial
+/// chunk launches fewer kernels than `~9 · t` sequential steps. `0` keeps
+/// only decode (`t == 1`) sequential.
+fn gdn_seq_max() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("MUMMU_GDN_SEQ_MAX")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(4)
+            .max(1)
     })
 }
 
@@ -1261,6 +1451,9 @@ fn snapshot_kv(kv: &Qwen35Kv) -> Qwen35Kv {
         Qwen35Kv::Delta(d) => Qwen35Kv::Delta(DeltaState {
             conv: d.conv.clone(),
             state: d.state.clone(),
+            host_conv: d.host_conv.clone(),
+            host_state: d.host_state.clone(),
+            middle: d.middle.clone(),
         }),
     }
 }
@@ -1377,6 +1570,19 @@ pub fn load_from_pack_layered(
     let build_host = crate::backend::cpu_device();
     let mut model = build(&config, &build_host, untied);
 
+    // A cold load is a multi-minute disk read (~17 GB for the 27B off an
+    // HDD), and nothing else prints between the fit plan and "resident" —
+    // without these lines a slow load is indistinguishable from a hang.
+    // Bytes come from the pack's own read counter, so the line reports what
+    // actually came off the disk.
+    let expected = expected_tensor_count(&config, untied);
+    let load_started = std::time::Instant::now();
+    let mut last_progress = std::time::Instant::now();
+    // Announce before the first read: the embedding is a single multi-GiB
+    // range near the front of the manifest, so the first between-tensor
+    // progress check can be tens of seconds out.
+    eprintln!("[mummu] load: assigning {expected} tensors from the pack");
+
     let mut assigned = 0usize;
     for entry in &pack.manifest.tensors {
         let Some(path) = pack_param_path(&entry.name, trunk) else {
@@ -1411,6 +1617,15 @@ pub fn load_from_pack_layered(
         };
         assign_param(&mut model, &path, src, QuantPolicy::Off, &device).map_err(parse)?;
         assigned += 1;
+        if last_progress.elapsed().as_secs() >= 15 {
+            let gib = pack.bytes_read() as f64 / f64::from(1u32 << 30);
+            let secs = load_started.elapsed().as_secs_f64();
+            eprintln!(
+                "[mummu] load: {assigned}/{expected} tensors — {gib:.2} GiB off the pack in {secs:.0}s ({:.0} MB/s)",
+                pack.bytes_read() as f64 / f64::from(1u32 << 20) / secs,
+            );
+            last_progress = std::time::Instant::now();
+        }
     }
     // Every parameter above was assigned onto its own device. Pin the three
     // specials, which the pack may not cover on every path; `to_device` is a
@@ -1420,7 +1635,6 @@ pub fn load_from_pack_layered(
     if let Some(h) = model.lm_head.take() {
         model.lm_head = Some(h.to_device(head_device));
     }
-    let expected = expected_tensor_count(&config, untied);
     if assigned != expected {
         return Err(parse(format!(
             "pack supplied {assigned} trunk tensors, the architecture needs {expected}"
@@ -1673,10 +1887,7 @@ impl CausalLm for LoadedQwen35 {
                 if self.config.is_attention(i) {
                     Qwen35Kv::Attn(None)
                 } else {
-                    Qwen35Kv::Delta(DeltaState {
-                        conv: None,
-                        state: None,
-                    })
+                    Qwen35Kv::Delta(DeltaState::empty())
                 }
             })
             .collect()
@@ -1689,6 +1900,34 @@ impl CausalLm for LoadedQwen35 {
         cache: &mut Self::Cache,
         device: &Device,
     ) -> Tensor<2> {
+        self.forward_impl(new_ids, past, cache, device, true)
+            .expect("forward_impl returns logits when need_logits is true")
+    }
+
+    fn forward_advance(
+        &self,
+        new_ids: &[u32],
+        past: usize,
+        cache: &mut Self::Cache,
+        device: &Device,
+    ) {
+        let _ = self.forward_impl(new_ids, past, cache, device, false);
+    }
+}
+
+impl LoadedQwen35 {
+    /// The shared body of `forward` / `forward_advance`: runs the trunk,
+    /// and computes the final norm + lm_head only when `need_logits` —
+    /// a non-final prefill chunk advances every cache without paying the
+    /// head projection (~68 ms/call on the 27B's host head).
+    fn forward_impl(
+        &self,
+        new_ids: &[u32],
+        past: usize,
+        cache: &mut Vec<Qwen35Kv>,
+        device: &Device,
+        need_logits: bool,
+    ) -> Option<Tensor<2>> {
         let t = new_ids.len();
         assert!(t >= 1, "qwen35 forward: need at least one token");
         assert!(
@@ -2010,6 +2249,12 @@ impl CausalLm for LoadedQwen35 {
                 pct(la_a3),
             );
         }
+        // Advance-only calls stop here: every cache (KV, conv window,
+        // recurrent state) is updated; the final norm and head are the
+        // only work skipped, and nothing downstream reads them.
+        if !need_logits {
+            return None;
+        }
         // The final norm and head may live elsewhere than the last layer.
         let head_device = self.model.norm.gamma.val().device();
         let x = if x.device() == head_device {
@@ -2028,8 +2273,15 @@ impl CausalLm for LoadedQwen35 {
         // [1, 5120] x [5120, 248320] f32 matmul, and it runs on whichever
         // device holds the embedding table — the HOST, for a split model.
         let _s = crate::prof::scope("lm_head");
-        match &self.model.lm_head {
-            Some(head) => qlinear2(head, last),
+        Some(match &self.model.lm_head {
+            // The bounded-exact host head (SPEC P4.3/P4.4) engages when
+            // serve opted in and the weight is packed on flex; every
+            // consulted coordinate equals the dense head's value (see
+            // `flex::head`), and the skipped rows never stream.
+            Some(head) => match crate::nn::try_q4s_head(&last, &head.weight.val()) {
+                Some(logits) => logits,
+                None => qlinear2(head, last),
+            },
             None => {
                 // Tied head: logits = h · Eᵀ. The embedding may be on another
                 // device (host-resident gather table), and unlike the gather
@@ -2043,7 +2295,7 @@ impl CausalLm for LoadedQwen35 {
                     .matmul(e.swap_dims(0, 1))
                     .to_device(&out_device)
             }
-        }
+        })
     }
 }
 
@@ -2296,5 +2548,118 @@ mod tests {
         real.full_attention_interval = 4;
         let attn: Vec<usize> = (0..8).filter(|&i| real.is_attention(i)).collect();
         assert_eq!(attn, vec![3, 7]);
+    }
+
+    /// The skip-head advance (non-final prefill chunks) updates every
+    /// cache exactly like a full forward: advancing over a prefix and then
+    /// stepping must equal the one-shot forward.
+    #[test]
+    fn forward_advance_then_forward_matches_full() {
+        let m = toy_model();
+        let device = crate::backend::cpu_device();
+        let ids: Vec<u32> = vec![3, 17, 42, 9, 60, 11];
+
+        let mut c1 = m.new_cache();
+        let full = m
+            .forward(&ids, 0, &mut c1, &device)
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap();
+
+        let mut c2 = m.new_cache();
+        m.forward_advance(&ids[..4], 0, &mut c2, &device);
+        let stepped = m
+            .forward(&ids[4..], 4, &mut c2, &device)
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap();
+        for (i, (f, s)) in full.iter().zip(&stepped).enumerate() {
+            assert!((f - s).abs() < 1e-4, "logit {i}: full {f} vs advanced {s}");
+        }
+    }
+
+    /// Serializes the tests that toggle the fused-GDN force switch — it is
+    /// process-global, and the tolerant equality tests above must not have
+    /// the path flipped underneath a single run.
+    static FUSED_TOGGLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Re-enables the fused path on drop so a failing assert cannot leave
+    /// the process degraded for other tests.
+    struct RestoreFused;
+    impl Drop for RestoreFused {
+        fn drop(&mut self) {
+            crate::flex::gdn::force_disable(false);
+        }
+    }
+
+    /// The fused host decode step (SPEC P3) against the tensor path it
+    /// replaces: same prefix, same decode tokens, logits equal to fold
+    /// order. This is the oracle for the whole fused middle — conv ring,
+    /// L2 norms, gates, two-pass recurrence, gated RMSNorm.
+    #[test]
+    fn fused_gdn_decode_matches_tensor_decode() {
+        let _serial = FUSED_TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let m = toy_model();
+        let device = crate::backend::cpu_device();
+        let prefix: Vec<u32> = vec![3, 17, 42];
+        let decode: Vec<u32> = vec![9, 60, 11, 5];
+
+        let run = |fused: bool| -> Vec<Vec<f32>> {
+            crate::flex::gdn::force_disable(!fused);
+            let _restore = RestoreFused;
+            let mut cache = m.new_cache();
+            let _ = m.forward(&prefix, 0, &mut cache, &device);
+            decode
+                .iter()
+                .enumerate()
+                .map(|(i, &id)| {
+                    m.forward(&[id], prefix.len() + i, &mut cache, &device)
+                        .into_data()
+                        .try_to_vec::<f32>()
+                        .unwrap()
+                })
+                .collect()
+        };
+        let tensor = run(false);
+        let fused = run(true);
+        for (step, (a, b)) in tensor.iter().zip(&fused).enumerate() {
+            for (i, (x, y)) in a.iter().zip(b).enumerate() {
+                assert!(
+                    (x - y).abs() < 1e-4,
+                    "decode step {step} logit {i}: tensor {x} vs fused {y}"
+                );
+            }
+        }
+    }
+
+    /// The host state converts back for a tensor-path prefill (the
+    /// multi-turn shape: prefill, fused decode, prefill again) without
+    /// losing the carried recurrence.
+    #[test]
+    fn fused_decode_then_prefill_round_trips_state() {
+        let _serial = FUSED_TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let m = toy_model();
+        let device = crate::backend::cpu_device();
+
+        let run = |fused: bool| -> Vec<f32> {
+            crate::flex::gdn::force_disable(!fused);
+            let _restore = RestoreFused;
+            let mut cache = m.new_cache();
+            let _ = m.forward(&[1, 2, 3], 0, &mut cache, &device);
+            let _ = m.forward(&[7], 3, &mut cache, &device); // decode (fused when on)
+            let _ = m.forward(&[4, 9], 4, &mut cache, &device); // t = 2: tensor path
+            m.forward(&[8], 6, &mut cache, &device)
+                .into_data()
+                .try_to_vec::<f32>()
+                .unwrap()
+        };
+        let tensor = run(false);
+        let fused = run(true);
+        for (i, (x, y)) in tensor.iter().zip(&fused).enumerate() {
+            assert!(
+                (x - y).abs() < 1e-4,
+                "logit {i}: tensor {x} vs fused-then-tensor {y}"
+            );
+        }
     }
 }

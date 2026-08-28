@@ -169,6 +169,14 @@ pub fn cpu_device() -> burn::tensor::Device {
     burn::tensor::Device::flex()
 }
 
+/// Is `device` the burn-flex host? The host-only fast paths (fused GDN
+/// step, packed GEMM) gate on this so accelerator tensors never take a
+/// route whose extension impl exists only for `Flex`.
+#[must_use]
+pub fn is_flex(device: &burn::tensor::Device) -> bool {
+    *device == cpu_device()
+}
+
 /// The CUDA device (feature `cuda`). NVRTC compiles kernels at runtime — the
 /// WSL2-container GPU path where no correct Vulkan reaches the process.
 #[cfg(feature = "cuda")]

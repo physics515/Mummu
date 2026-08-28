@@ -153,7 +153,14 @@ fn details(spec: &ModelSpec) -> serde_json::Value {
 
 fn model_entry(spec: &ModelSpec, root: &std::path::Path) -> serde_json::Value {
     let dir = spec.dir(root);
-    let size = mummu::manage::dir_size(&dir);
+    // Size = the weight artifact, not the directory. A GGUF model's dir also
+    // holds its `.mummu` pack — 221 GB on the 27B — which every ollama
+    // client would display as the "model size", and which is pure extra
+    // disk traffic to walk while a load is saturating the same disk.
+    let size = spec
+        .gguf_path(root)
+        .and_then(|p| std::fs::metadata(&p).ok().map(|m| m.len()))
+        .unwrap_or_else(|| mummu::manage::dir_size(&dir));
     let modified = std::fs::metadata(&dir)
         .and_then(|m| m.modified())
         .map_or_else(|_| now_rfc3339(), rfc3339);
@@ -171,21 +178,59 @@ fn model_entry(spec: &ModelSpec, root: &std::path::Path) -> serde_json::Value {
 // Catalog endpoints
 // ---------------------------------------------------------------------------
 
+/// The last `/api/tags` answer and when it was built. Ollama clients poll
+/// tags every few seconds, and while a model load saturates the disk even
+/// the handful of metadata reads behind it can queue for minutes (observed
+/// live 2026-08-28: tags timed out during the 27B cold load). Fresh entries
+/// are served as-is; a stale one is served immediately while a single
+/// background rebuild refreshes it.
+static TAGS_CACHE: std::sync::Mutex<Option<(Instant, serde_json::Value)>> =
+    std::sync::Mutex::new(None);
+static TAGS_REFRESHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+const TAGS_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The `/api/tags` body, read from disk (catalog stats + weight sizes).
+fn build_tags() -> serde_json::Value {
+    let root = models_root();
+    let manager = ModelManager::new(root.clone());
+    let models: Vec<_> = manager
+        .catalog()
+        .iter()
+        .filter(|s| !matches!(s.architecture, mummu::registry::Architecture::MiniLm))
+        .filter(|s| engine::is_installed(s, &root))
+        .map(|s| model_entry(s, &root))
+        .collect();
+    json!({"models": models})
+}
+
+fn store_tags(body: serde_json::Value) {
+    *TAGS_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), body));
+}
+
 async fn tags() -> Response {
-    // `dir_size` walks every installed model's directory — disk work.
-    blocking(|| {
-        let root = models_root();
-        let manager = ModelManager::new(root.clone());
-        let models: Vec<_> = manager
-            .catalog()
-            .iter()
-            .filter(|s| !matches!(s.architecture, mummu::registry::Architecture::MiniLm))
-            .filter(|s| engine::is_installed(s, &root))
-            .map(|s| model_entry(s, &root))
-            .collect();
-        json_response(200, json!({"models": models}))
-    })
-    .await
+    let cached = TAGS_CACHE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    match cached {
+        Some((at, body)) if at.elapsed() < TAGS_TTL => json_response(200, body),
+        Some((_, body)) => {
+            // Stale: answer with it now and rebuild behind the response —
+            // one rebuilder at a time, so a slow disk queues one walk, not
+            // one per poll.
+            if !TAGS_REFRESHING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::spawn_blocking(|| {
+                    if let Ok(fresh) = std::panic::catch_unwind(build_tags) {
+                        store_tags(fresh);
+                    }
+                    TAGS_REFRESHING.store(false, std::sync::atomic::Ordering::SeqCst);
+                });
+            }
+            json_response(200, body)
+        }
+        None => {
+            let body = blocking(build_tags).await;
+            store_tags(body.clone());
+            json_response(200, body)
+        }
+    }
 }
 
 async fn ps() -> Response {
@@ -439,6 +484,34 @@ async fn run(
     wrap: fn(&str, &str) -> serde_json::Value,
     finish: fn(&str, &str, &engine::ChatResult, Instant) -> serde_json::Value,
 ) -> Response {
+    // One line per accepted request, before any engine work: a request that
+    // queues behind a cold model load produces nothing for its whole wait,
+    // and a surface that logs nothing while that happens reads as wedged
+    // (it did, live, 2026-08-28).
+    eprintln!(
+        "[mummu-serve] shim chat {}: request accepted (stream = {stream})",
+        p.spec.name
+    );
+    if !stream && let Some(dir) = engine::load_in_flight() {
+        // A non-stream response sends no bytes until the whole generation is
+        // done. Parked behind a model load — an hour on this disk — that is
+        // indistinguishable from a dead server, so refuse it honestly now.
+        let loading = dir.file_name().map_or_else(
+            || dir.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        eprintln!(
+            "[mummu-serve] shim chat {}: 503 — the {loading} load is in flight",
+            p.spec.name
+        );
+        return json_response(
+            503,
+            json!({"error": format!(
+                "a model is loading ({loading}); a non-streaming request would wait \
+                 silently for the whole load — retry once it completes, or set \"stream\": true"
+            )}),
+        );
+    }
     let started = Instant::now();
     if stream {
         let (tx, rx) = mpsc::unbounded_channel::<serde_json::Value>();

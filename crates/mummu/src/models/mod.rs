@@ -45,6 +45,22 @@ pub trait CausalLm {
     /// Is `id` an end-of-sequence token for this model?
     fn is_eos(&self, id: u32) -> bool;
 
+    /// Advance the cache over `new_ids` WITHOUT producing logits — the
+    /// non-final chunks of a chunked prefill, where a computed head
+    /// projection is pure waste (the 27B's host head costs ~68 ms per
+    /// chunk). The default runs the full forward and discards it, so a
+    /// model earns the saving by overriding (qwen35 skips the final norm
+    /// and head); semantics are otherwise identical to [`Self::forward`].
+    fn forward_advance(
+        &self,
+        new_ids: &[u32],
+        past: usize,
+        cache: &mut Self::Cache,
+        device: &Device,
+    ) {
+        let _ = self.forward(new_ids, past, cache, device);
+    }
+
     /// Full decode: prefill once, then one token per step, stopping at EOS,
     /// `max_tokens`, or a `Break` from `on_token` (streaming + cooperative
     /// cancellation). Greedy (`temperature == 0`) keeps the argmax on-device.
@@ -59,7 +75,14 @@ pub trait CausalLm {
         async move {
             let mut cache = self.new_cache();
             generate_loop(
-                |ids, past| self.forward(ids, past, &mut cache, device),
+                |ids, past, need_logits| {
+                    if need_logits {
+                        Some(self.forward(ids, past, &mut cache, device))
+                    } else {
+                        self.forward_advance(ids, past, &mut cache, device);
+                        None
+                    }
+                },
                 prompt_ids,
                 max_tokens,
                 opts,

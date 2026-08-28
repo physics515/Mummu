@@ -989,6 +989,17 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       layers at ctx 4096 (`mummu_schedule::prefill::best_chunk` solves the general trade; its 27B
       case: peak 816→272 MiB for +6.5% prefill time). Cost: each non-final chunk computes one
       throwaway lm_head projection — a skip-head forward flag is the follow-up.
+      *(2026-08-28) **CORRECTION: the "conv window included" claim was wrong.** Both causal-conv
+      decode paths (qwen35's DeltaNet mix conv and `nn::ShortConv`) computed every `t > 1` span
+      from ZERO history even when the rolling cache held the real previous columns — the `t > 1`
+      branch never read the cache. So every chunk boundary (prompts past `MUMMU_PREFILL_CHUNK` =
+      1024) and every prompt-after-decode continuation convolved its first K−1 positions against
+      zeros. The invariant tests all passed because none of them crossed a boundary with `t > 1`
+      on BOTH sides (single-call prefills and t = 1 decodes were always correct). Found by a new
+      multi-call equivalence test (`forward_advance_then_forward_matches_full`, toy logits off by
+      0.2 — not noise); fixed by convolving `[cached | new]` and taking the outputs aligned to the
+      new span; `chunked_prefill_matches_one_shot` (ShortConv) and the model-level test now pin
+      it. The skip-head follow-up itself also closed this run — see the entries below.*
 - [x] **The GDN prefill is chunkwise-parallel and exact: ~14x fewer launches per 64 tokens.**
       *(2026-08-27)* `GatedDeltaNet` evaluates prefill in C=64 chunks (`MUMMU_GDN_CHUNK`) via the
       delta-rule WY/UT form — strictly-lower-triangular system solved by a finite Neumann doubling
@@ -1038,6 +1049,152 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       Streaming becomes live the day a model's host path is slower than its transfer again (bigger
       layers, weaker host) — the planner flips on its inputs, which is the point. Wiring into the
       qwen35 forward stays open behind that measurement.
+- [x] **The host GDN middle is one fused function: the ~9 small-tensor ops between the projections
+      are gone from the decode step.** *(2026-08-28, the P3 slice of the optimization specs.)*
+      `mummu::flex::gdn::gdn_step` evaluates everything between a host GDN layer's projections —
+      FIR conv + ring roll + SiLU + split in one sweep, gates in scalar registers, the recurrence
+      as TWO passes over the per-head state via the output-correction identity
+      `S_t^T q = γ·(S_{t−1}^T q) + (q·k)·Δv` (one read pass yields both `S^T q` and `S^T k`; the
+      naive order takes three passes), gated RMSNorm fused into the head epilogue, heads across
+      the rayon pool. Wired into `GatedDeltaNet` at `t == 1`/batch 1 on flex (`MUMMU_FUSED_GDN=0`
+      reverts); the recurrent state lives as plain host memory between tokens (`DeltaState` host
+      twins, converted at the tensor/fused boundary in both directions — a later prefill
+      re-materializes tensors exactly). The projections stay tensor ops on purpose: they are
+      single packed-GEMV dispatches already, and the fused middle composes with any weight format.
+      Oracle: fused ≡ tensor decode to 1e-4 across carried-state steps; the multi-turn
+      prefill→fused→prefill round trip is pinned; the pre-existing cache-equivalence gates now run
+      THROUGH the fused path by default. Measured at 27B-shaped dims (hk 16, hv 48, ds 128,
+      conv_dim 10240; `examples/fused-middle-probe.rs`, this box, release): **0.24 ms/layer/token
+      against the ~10 ms/layer the tensor middle costs in the production flamegraph — ~42× on the
+      middle**, which prices the 229 ms/token of host GDN mixers at ~6 ms + projections once the
+      serve A/B confirms in-situ.
+- [x] **Prefill runs a real packed GEMM on the host: the weight streams once per batch, not once
+      per row.** *(2026-08-28, the P5 slice.)* `flex::kernels::gemm_q4n_{auto,vnni,scalar,f32}`:
+      64-column weight panels stay L2-resident across 8-row register blocks (17 zmm live), so
+      DRAM sees the packed bytes once for the whole chunk while activations stream once —
+      the row-looped `m <= 64` path re-streamed the WEIGHT per row, which was the entire host
+      prefill gap (359 ms/prompt-token vs ollama's 5.3 at m=36: 36 re-streams). Activation rows
+      quantize on the same per-row grids as m = 1, so the GEMM is the GEMV stacked
+      (bit-identical at the scalar level, 1e-5 fold-order at VNNI); a batch with one adversarial
+      row dispatches wholesale to the exact-f32 path, which is ALSO weight-stream-once now.
+      Routed via a Flex-only `Q4GemmOps` extension for m ∈ 2..=1024 (`backend::is_flex` gates;
+      accelerators keep their exact row loop and split-K GEMV). Also: the GDN chunkwise prefill
+      now engages from `t > 4` instead of `t > 64` (`MUMMU_GDN_SEQ_MAX`) — a partial chunk was
+      already exact, and the old gate left every 2..=64-token prompt on the ~9-launches-per-token
+      sequential loop. Measured (`examples/fused-middle-probe.rs`, gate/up shape, this box):
+      m=36 **8.9 ms vs the row loop's 23.2 = 2.6×**, rising to 2.8× at m=256 — and that baseline
+      flatters the row loop, whose "re-streams" came from a 128 MB L3 holding the ONE probe
+      tensor; a production prefill chunk walks 23 host layers, so the row loop pays DRAM per
+      re-stream while the GEMM's single pass amortizes. First cut measured only 1.5×: the
+      per-(row-block × column) f16→f32 scale conversion (scalar, no f16c) dominated — hoisted to
+      once per panel, which is the kind of thing only a measurement finds.
+- [x] **The host lm_head stopped streaming rows it can prove irrelevant: norm-bounded exact
+      top-k.** *(2026-08-28, the P4 slice.)* `mummu::flex::head`: greedy reads the argmax and
+      `sample_id` consults only its top-k candidates (renormalizing inside them), so the head
+      evaluates by tile-bounded branch and bound — per row,
+      `y ≤ ‖w′‖₂·‖x‖₂ + (max_g sx)/2 · Σ_g sw·L1_g` (Cauchy–Schwarz on the packed dot plus the
+      activation-quantization aggregate, one f32 per row built in one offline pass); 32-row tiles
+      sort by bound per token and the walk stops at the first tile that cannot beat the running
+      k-th logit. Every consulted coordinate equals the dense head's value under the same
+      dispatch; skipped rows never stream; worst case degrades to the full GEMV, never to
+      wrongness (tie order among exactly-equal logits is the one documented difference — the
+      sentinel-dense output carries every tied candidate). A temporal hot set (previous winners
+      first, rotating remainder) seeds the threshold — ordering only, exactness never depends on
+      it. OFF in the library (the parity legs read full-vocab logprobs, which the −1e30 sentinels
+      would perturb); serve opts in at load (`MUMMU_HEAD_BOUND` overrides both ways,
+      `MUMMU_HEAD_TOPK` default 1024 = the sampler's own candidate cap — the exactness boundary
+      for sampling). serve also finally WARMS the head twin (it was the one host projection
+      `warm_host_twins` skipped: ~700 MiB packed lazily on the first token, with a second
+      rounding) and gained `MUMMU_HEAD_DEVICE=gpu|host` for the pin A/B, with
+      `mummu_schedule::choices::admit_head` as the density calculus for that decision.
+- [x] **Non-final prefill chunks skip the head: `CausalLm::forward_advance`.** *(2026-08-28)* The
+      chunked-prefill follow-up, closed: `generate_loop`'s step closure carries `need_logits`, the
+      qwen35 forward body is shared through `forward_impl`, and non-final chunks advance every
+      cache without the final norm + lm_head (~68 ms of host head per chunk on the 27B; a
+      4096-token prompt has three such chunks). Other models keep the default (full forward,
+      discarded), so nothing changes until an architecture overrides it.
+- [x] **f16 KV cache, storage-only, env-gated.** *(2026-08-28, the P2.1 slice.)* `nn::kv_append`
+      stores k/v in f16 under `MUMMU_KV_F16` while the scores keep their f32 island and the value
+      matmul upcasts — persistent KV at ctx 4096 on the 27B goes 2.1 → 1.05 GiB (~4 more resident
+      layers) for one rounding on stored entries (SPEC P2.1's bound:
+      `|Δlogit| ≤ ‖q‖·‖δk‖/√d_h`). Both attention paths (GqaAttention and qwen35's gated
+      attention) ride the shared helper; a cache never mixes dtypes (the seeded dtype rules
+      appends); `computed_reserve_bytes` prices KV at the storage dtype so the halving actually
+      buys layers. Default OFF — flipping it is a parity-gated A/B on the real checkpoint
+      (llama.cpp leg), not a unit-test call; the mechanism and the pricing are in.
+- [x] **The in-situ bandwidth instrument exists: β̂ = bytes/dt on the production path, plus the
+      ANOVA that decomposes the live 2–3× inflation.** *(2026-08-28, the P1.1 slice.)*
+      `mummu::flex::insitu` records every packed host GEMV/GEMM call's actually-streamed bytes
+      and wall time (per-shape mean/p50/best-call GB/s — the best call is the in-process ceiling
+      proxy); serve prints and resets the table per request under `MUMMU_INSITU_REPORT=1`.
+      `examples/insitu-anova.rs` runs the SAME kernel under (threads 4/8/16 × priority
+      below/normal × memory-contender off/on), 30 reps per cell, medians with 5–95 bands, the
+      three main-effect contrasts, and SPEC P1.1's decision rule (kernel innocent iff quiet ≥ 85%
+      of the measured roofline; the largest |contrast| is the first code change). The gemm herd's
+      BELOW_NORMAL demotion — one of the sweep's suspects — became runtime-selectable
+      (`MUMMU_GEMM_PRIORITY=normal`) so the A/B needs no rebuild.
+      **First sweep, run this session (ambient not controlled — read within-session):** roofline
+      38.9 GB/s, quiet 16-thread cell **37.4 GB/s = 96% of roofline → kernel INNOCENT**; priority
+      contrast +0.10 ms and memory-contender contrast +0.13 ms both WITHIN NOISE — neither the
+      demotion nor raw DRAM contention explains a 2–3× live inflation. The one CLEAR effect is
+      **threads: +0.71 ms from 4→16** (4 th 26.3 GB/s, 8 th ~30, 16 th 37.4) — and the deployed
+      launcher pins `RAYON 8`, a ~20% bandwidth tax at these kernel speeds. The old "8-vs-16 is a
+      null" verdict was measured through the pre-VNNI path (60.75 vs 60.98 s end-to-end); at
+      roofline speeds the width matters again. Next: lift the launcher's pin (or hand it to
+      `governor::ThreadTuner`), then re-run `MUMMU_INSITU_REPORT=1` under real serve — with
+      priority, contention and width ruled out or fixed, the remaining suspects for live 5.2 ms
+      vs quiet 1.4-1.6 are wgpu-interleave effects the contender thread does not model.
+- [ ] **The scheduling/allocation library grew five planned-but-unwired solvers; wiring is
+      measurement-gated.** *(2026-08-28, the planning half of the specs — every solver is
+      brute-force- or KKT-pinned, dependency-free, and waiting on serve numbers, not on code.)*
+      (1) `mummu-schedule::governor` (P1.5): proportionally-fair waterfilling
+      (`x_j = B·√W_j/Σ√W_k`, the KKT optimum), the online shadow-price dual, least-squares
+      dynamics fit + DARE/LQR gain for between-token control, the per-step byte `Ledger`
+      (admission over priority — the TDMA-lite answer to staging-vs-stream contention), and a
+      `ThreadTuner` that walks a measured unimodal T(n) with hysteresis and re-opens its search on
+      regime change (the retired 8-thread rule, as a mechanism instead of a constant). Wire after
+      the ANOVA names the dominant effect. (2) `mummu-schedule::choices` (P2.4/P2.5/P4.1): the
+      exact multiple-choice residency knapsack over MiB granules — per item (layer, head, KV
+      pool) one option per (device × precision) — with `admit_head` as the named special case.
+      Subsumes `choose_prefix` the day serve feeds it real per-option costs. (3)
+      `mummu-mix::bits` (P2.4): reverse water-filling with the closed form
+      `b_l* = b̄ + ½log₂(c_l/gm)` and clamp-and-rewater, greedy integer allocation (optimal at
+      uniform counts, gap-bounded otherwise), and the AM/GM predictor with the skip-below-1.2
+      checklist. (4) `mummu-mix::scales` (P2.3, novel): low-rank factorization of the block-scale
+      matrix itself — truncated SVD of the log-scales (ALS was tried and REJECTED: its error was
+      not monotone in rank), positive reconstructions by construction, ~97% scale-metadata
+      reduction at r=4 on a 4096²/g=32 tensor, `calibrate_rank` sweeping on worst multiplicative
+      error. Composable with narrower scale dtypes; the device-side consumer needs a custom
+      dequant epilogue, which is the wiring gate. (5) `mummu-schedule::prefill::best_gdn_chunk`
+      (P5.5): the chunk cost model (launch + linear + quadratic + Neumann-cubic·log terms) and
+      its argmin — feed it three timed chunk sizes and let it replace the fixed C=64 when the
+      measurement disagrees.
+- [ ] **What the specs asked for and this box refuses, with reasons.** *(2026-08-28)* NUMA
+      first-touch/interleave and transparent huge pages (P1.4): the reference machine is a
+      single-socket 7950X3D on Windows — no second NUMA domain to interleave across, no THP (and
+      Windows large pages need `SeLockMemoryPrivilege` plus a locked-memory design the 96 GiB
+      host half should not adopt for an unmeasured win). Software prefetch: the packed layout was
+      built so the HARDWARE prefetcher sees pure sequential streams, and the kernel already
+      out-streams a threaded read — a `_mm_prefetch` sweep is only worth revisiting if the ANOVA
+      clears the environment and the kernel still misses the roofline. Device-side 4.5 bpw
+      (P2.2): burn's stored quant format is `QuantParam::F32` per 32-block; f16/e8m0 scales on
+      the DEVICE need either upstream burn support or a second custom storage beside
+      `packed_gemv`'s — deferred to the burn 0.22-stable bump, where the quant API is already
+      moving. The host side already ships 4.5 bpw (the twins' f16 scales). Deferred-correction
+      factored GDN state (P3.2's rank-r window): it amortizes state passes for a DRAM-bound
+      state, and this model's per-head state is 64 KB — L2-resident, already at two passes; the
+      window would add non-commutative bookkeeping to relieve pressure the memory system never
+      exposes (the LUT-plane lesson). RMSNorm/permutation weight folds (P3.3): folding
+      `diag(gamma)` into a QUANTIZED weight means requantizing on a different grid and desyncs
+      the twin from the tensor path the downgrade contract reverts to; the fused kernel computes
+      the norm scalar inline for less than the fold would save. Minimax gate polynomials (P3.5):
+      the fused kernel's exact transcendentals are arithmetic under the state passes' memory
+      time — the spec's own conclusion once a bound exists. CPU↔GPU vocab row-split (P4.2 of the
+      second set): the shape to reach for when VRAM opens PARTIALLY; the bounded head made the
+      host head cheap enough that `admit_head` should price the split against whole layers
+      first. KIVI-class 2-bit KV and per-head KV bit allocation: approximate levers, held per
+      the specs' own gate ("no approximate spec on the default serve path until the exact ones
+      hold the budget gates") — `mummu-mix::bits` is the allocator ready for that day.
 
 ## Phases
 

@@ -1,8 +1,8 @@
 # mummu-serve
 
-A minimal HTTP server + single-page chat UI over [mummu](../mummu). Sync all
-the way down (tiny_http worker threads, no async runtime), one resident model
-per backend, streamed completions over SSE.
+A minimal HTTP server + single-page chat UI over [mummu](../mummu). axum on
+a multi-threaded tokio runtime, one resident model per backend, streamed
+completions over SSE (or a WebSocket, for proxies that cut long responses).
 
 ## Endpoints
 
@@ -30,6 +30,15 @@ Implemented: `GET /` ("Ollama is running"), `/api/version`, `/api/tags`
 `num_predict`), `/api/pull` (catalog names only), `DELETE /api/delete`.
 Embeddings / create / copy / push answer with an explicit error. Model names
 are mummu catalog names; a trailing `:latest` is accepted and stripped.
+
+While a model load is in flight, a **non-streaming** chat/generate request
+answers `503` immediately instead of waiting silently for the whole load
+(an hour of zero bytes on a cold 27B looks exactly like a dead server);
+streaming requests hold open and deliver frames once the model is up. The
+`/api/tags` answer is cached for a few seconds and served stale while a
+single background walk refreshes it, so tags stays fast even while a load
+saturates the disk; a model's `size` is its weight file (the GGUF), not the
+model directory (which also holds the multi-precision `.mummu` pack).
 
 `POST /api/chat` body:
 

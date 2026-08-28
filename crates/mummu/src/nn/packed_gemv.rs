@@ -81,9 +81,21 @@ pub fn try_q4s_gemv(x: &Tensor<2>, w: &Tensor<2>) -> Option<Tensor<2>> {
         );
         return Some(Tensor::from_dispatch(y));
     }
-    // Prefill: row-by-row through the same exact op. Slower per element
-    // than a real GEMM, but it never materializes the f32 weight — the
-    // dequantize-first fallback's ~260 MB transient per matmul was the
+    // Prefill on the HOST: a real packed GEMM (SPEC P5.1) — the weight
+    // bytes stream once for the whole batch instead of once per row. The
+    // extension impl exists only for Flex, hence the device gate; the cap
+    // matches the prefill chunk so a pathological batch shape still finds
+    // the generic matmul.
+    if (2..=FLEX_GEMM_MAX).contains(&m) && crate::backend::is_flex(&x.device()) {
+        let y = <burn::backend::Dispatch as Q4GemmOps>::q4s_gemm(
+            x.clone().into_dispatch(),
+            w.clone().into_dispatch(),
+        );
+        return Some(Tensor::from_dispatch(y));
+    }
+    // Prefill elsewhere: row-by-row through the same exact op. Slower per
+    // element than a real GEMM, but it never materializes the f32 weight —
+    // the dequantize-first fallback's ~260 MB transient per matmul was the
     // VRAM-pool churn during prefill. Capped so pathological batch shapes
     // keep the old path.
     if m <= 64 {
@@ -102,6 +114,11 @@ pub fn try_q4s_gemv(x: &Tensor<2>, w: &Tensor<2>) -> Option<Tensor<2>> {
     None
 }
 
+/// The widest host batch the packed GEMM accepts — the prefill chunk's
+/// default. Wider means the caller is doing something the cost model has
+/// not seen; the generic matmul takes it.
+pub const FLEX_GEMM_MAX: usize = 1024;
+
 #[backend_extension(
     Flex,
     Wgpu,
@@ -113,6 +130,56 @@ pub fn try_q4s_gemv(x: &Tensor<2>, w: &Tensor<2>) -> Option<Tensor<2>> {
 pub trait Q4GemvOps: Backend {
     /// y = x · w, reading w's packed values and scales directly.
     fn q4s_gemv(x: FloatTensor<Self>, w: QuantizedTensor<Self>) -> FloatTensor<Self>;
+}
+
+#[backend_extension(Flex)]
+/// The packed-GEMM extension op (SPEC P5.1), host only: `x` is `[m, K]`
+/// f32, `w` as in [`Q4GemvOps`]; returns `[m, N]` f32 with the weight
+/// bytes streamed once for the whole batch. Only the Flex impl exists —
+/// callers gate on `backend::is_flex` (accelerators keep their own
+/// dispatch economics and the split-K GEMV).
+pub trait Q4GemmOps: Backend {
+    /// Y = X · w over the packed representation.
+    fn q4s_gemm(x: FloatTensor<Self>, w: QuantizedTensor<Self>) -> FloatTensor<Self>;
+}
+
+#[backend_extension(Flex)]
+/// The bounded-exact host lm_head (SPEC P4.3/P4.4): `[1, vocab]` logits
+/// whose top-`flex::head::head_k()` coordinates are the exact dense values
+/// and every other coordinate is `flex::head::SENTINEL`. Tile bounds
+/// (Cauchy–Schwarz + the activation-error aggregate) prove the skipped
+/// rows out of the top-k, so argmax and top-k sampling see exactly what
+/// the dense head would give them, at a fraction of the streamed bytes.
+pub trait Q4HeadOps: Backend {
+    /// Sentinel-dense bounded head evaluation.
+    fn q4s_head_topk(x: FloatTensor<Self>, w: QuantizedTensor<Self>) -> FloatTensor<Self>;
+}
+
+/// Route the lm_head through the bounded-exact top-k path when everything
+/// lines up: the path is enabled (serve opts in; the parity harness's
+/// full-softmax logprob legs must keep the dense head), the tensor lives
+/// on flex, it is a decode-shape call, and the weight is packed Q4.
+/// `None` means: use the dense head.
+pub fn try_q4s_head(x: &Tensor<2>, w: &Tensor<2>) -> Option<Tensor<2>> {
+    if !crate::flex::head::enabled() || !packed_gemv_enabled() {
+        return None;
+    }
+    if x.dims()[0] != 1 || !crate::backend::is_flex(&x.device()) {
+        return None;
+    }
+    let DType::QFloat(scheme) = w.dtype() else {
+        return None;
+    };
+    if !scheme_supported(&scheme)
+        || !matches!(scheme.value, burn::tensor::quantization::QuantValue::Q4S)
+    {
+        return None;
+    }
+    let y = <burn::backend::Dispatch as Q4HeadOps>::q4s_head_topk(
+        x.clone().into_dispatch(),
+        w.clone().into_dispatch(),
+    );
+    Some(Tensor::from_dispatch(y))
 }
 
 // ---------------------------------------------------------------------------
@@ -424,17 +491,70 @@ mod cube_impl {
 // ---------------------------------------------------------------------------
 
 mod flex_impl {
-    use super::Q4GemvOps;
+    use super::{Q4GemmOps, Q4GemvOps};
     use burn::backend::tensor::{FloatTensor, QuantizedTensor};
     use burn::backend::{Flex, TensorMetadata};
     use burn::tensor::TensorData;
     use burn::tensor::quantization::QuantValue;
     use burn_flex::FlexTensor;
 
+    /// The i8-slab GEMV over one activation row — the pre-VNNI baseline,
+    /// kept as the fallback for non-Q4S weights and as the GEMM's per-row
+    /// fallback. Rayon par-chunks: persistent pool threads (a scope-spawn
+    /// per call measured its cost — mlp stayed at f32-slab speed), each
+    /// owning a disjoint 32-aligned output range and walking every k. The
+    /// k-inner loop is written so LLVM vectorizes the i8-widen + FMA.
+    fn i8_gemv(xs: &[f32], wq: &[i8], scales: &[f32], k_len: usize, n: usize, out: &mut [f32]) {
+        use rayon::prelude::*;
+        let blocks = n / 32;
+        let chunk_blocks = blocks.div_ceil(rayon::current_num_threads().max(1)).max(4);
+        out.par_chunks_mut(chunk_blocks * 32)
+            .enumerate()
+            .for_each(|(t, chunk)| {
+                let b0 = t * chunk_blocks;
+                let nb = chunk.len() / 32;
+                for k in 0..k_len {
+                    let xk = xs[k];
+                    let row = &wq[k * n + b0 * 32..k * n + b0 * 32 + nb * 32];
+                    let srow = &scales[k * blocks + b0..k * blocks + b0 + nb];
+                    for b in 0..nb {
+                        let xs_s = xk * srow[b];
+                        let src = &row[b * 32..b * 32 + 32];
+                        let dst = &mut chunk[b * 32..b * 32 + 32];
+                        for j in 0..32 {
+                            dst[j] += xs_s * f32::from(src[j]);
+                        }
+                    }
+                }
+            });
+    }
+
+    /// The activation row(s) as a host slice, borrowing when contiguous.
+    fn host_rows(x: &FloatTensor<Flex>) -> Vec<f32> {
+        match x.as_slice::<f32>() {
+            Some(s) => s.to_vec(),
+            None => x
+                .clone()
+                .into_data()
+                .try_to_vec::<f32>()
+                .expect("f32 activations"),
+        }
+    }
+
+    /// Does this weight qualify for the packed twin (SPEC 1's grid)?
+    fn twin_eligible(w: &QuantizedTensor<Flex>, k_len: usize) -> bool {
+        matches!(
+            w.dtype(),
+            burn::tensor::DType::QFloat(s) if matches!(s.value, QuantValue::Q4S)
+        ) && k_len.is_multiple_of(32)
+            && crate::flex::registry::enabled()
+    }
+
     impl Q4GemvOps for Flex {
         fn q4s_gemv(x: FloatTensor<Self>, w: QuantizedTensor<Self>) -> FloatTensor<Self> {
             let shape = w.shape();
             let [k_len, n] = shape.dims::<2>();
+            let started = std::time::Instant::now();
             let xs_owned;
             let xs: &[f32] = match x.as_slice::<f32>() {
                 Some(s) => s,
@@ -453,46 +573,142 @@ mod flex_impl {
             // Q4S — repacking a Q8S slab through a 4-bit grid would throw
             // away real precision — and only while K divides the group
             // width. MUMMU_VNNI_GEMV=0 restores the i8 loop below.
-            if matches!(
-                w.dtype(),
-                burn::tensor::DType::QFloat(s) if matches!(s.value, QuantValue::Q4S)
-            ) && k_len.is_multiple_of(32)
-                && crate::flex::registry::enabled()
+            if twin_eligible(&w, k_len)
                 && let Some(packed) = crate::flex::registry::resolve(wq, scales, k_len, n)
             {
                 let mut out = vec![0f32; n];
                 crate::flex::kernels::gemv_q4n_auto(&packed, xs, &mut out);
+                crate::flex::insitu::record(
+                    k_len,
+                    n,
+                    1,
+                    packed.streamed_bytes(),
+                    started.elapsed(),
+                );
                 return FlexTensor::from_data(TensorData::new(out, [1, n]));
             }
-            let blocks = n / 32;
             let mut out = vec![0f32; n];
-            // Rayon par-chunks: persistent pool threads (a scope-spawn per
-            // call measured its cost — mlp stayed at f32-slab speed), each
-            // owning a disjoint 32-aligned output range and walking every
-            // k. The k-inner loop is written so LLVM vectorizes the
-            // i8-widen + FMA.
-            use rayon::prelude::*;
-            let chunk_blocks = blocks.div_ceil(rayon::current_num_threads().max(1)).max(4);
-            out.par_chunks_mut(chunk_blocks * 32)
-                .enumerate()
-                .for_each(|(t, chunk)| {
-                    let b0 = t * chunk_blocks;
-                    let nb = chunk.len() / 32;
-                    for k in 0..k_len {
-                        let xk = xs[k];
-                        let row = &wq[k * n + b0 * 32..k * n + b0 * 32 + nb * 32];
-                        let srow = &scales[k * blocks + b0..k * blocks + b0 + nb];
-                        for b in 0..nb {
-                            let xs_s = xk * srow[b];
-                            let src = &row[b * 32..b * 32 + 32];
-                            let dst = &mut chunk[b * 32..b * 32 + 32];
-                            for j in 0..32 {
-                                dst[j] += xs_s * f32::from(src[j]);
-                            }
-                        }
-                    }
-                });
+            i8_gemv(xs, wq, scales, k_len, n, &mut out);
+            crate::flex::insitu::record(
+                k_len,
+                n,
+                1,
+                k_len * n + scales.len() * 4,
+                started.elapsed(),
+            );
             FlexTensor::from_data(TensorData::new(out, [1, n]))
+        }
+    }
+
+    impl super::Q4HeadOps for Flex {
+        fn q4s_head_topk(x: FloatTensor<Self>, w: QuantizedTensor<Self>) -> FloatTensor<Self> {
+            use std::sync::Mutex;
+            let shape = w.shape();
+            let [k_len, n] = shape.dims::<2>();
+            let started = std::time::Instant::now();
+            let xs_owned;
+            let xs: &[f32] = match x.as_slice::<f32>() {
+                Some(s) => s,
+                None => {
+                    xs_owned = x.into_data().try_to_vec::<f32>().expect("f32 activations");
+                    &xs_owned
+                }
+            };
+            let wq: &[i8] = w
+                .tensor()
+                .as_slice::<i8>()
+                .expect("flex quantized weight is contiguous i8");
+            let scales: &[f32] = w.scales();
+            let Some(packed) = (twin_eligible(&w, k_len))
+                .then(|| crate::flex::registry::resolve(wq, scales, k_len, n))
+                .flatten()
+            else {
+                // No twin: the dense path answers.
+                let mut out = vec![0f32; n];
+                i8_gemv(xs, wq, scales, k_len, n, &mut out);
+                return FlexTensor::from_data(TensorData::new(out, [1, n]));
+            };
+            let meta = crate::flex::head::meta_for(&packed);
+            // A process-global hot set purely improves the visiting order;
+            // interleaved requests only degrade the seeds, never the answer.
+            static HOT: Mutex<Option<crate::flex::head::HotSet>> = Mutex::new(None);
+            let k = crate::flex::head::effective_k();
+            let seeds = {
+                let mut hot = HOT
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                hot.get_or_insert_with(crate::flex::head::HotSet::new)
+                    .seeds(n.div_ceil(crate::flex::head::TILE), 4)
+            };
+            let top = crate::flex::head::head_topk(&packed, &meta, xs, k, &seeds);
+            {
+                let mut hot = HOT
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(h) = hot.as_mut() {
+                    h.observe(xs, &top);
+                }
+            }
+            // The pruning ratio is the whole point — the ledger records the
+            // bytes actually streamed, which is what the report divides by.
+            let evaluated_bytes = (packed.streamed_bytes() as u128 * top.evaluated_rows as u128
+                / n.max(1) as u128) as usize;
+            crate::flex::insitu::record(k_len, n, 1, evaluated_bytes, started.elapsed());
+            let mut out = vec![crate::flex::head::SENTINEL; n];
+            for (&id, &v) in top.ids.iter().zip(&top.vals) {
+                out[id as usize] = v;
+            }
+            FlexTensor::from_data(TensorData::new(out, [1, n]))
+        }
+    }
+
+    impl Q4GemmOps for Flex {
+        fn q4s_gemm(x: FloatTensor<Self>, w: QuantizedTensor<Self>) -> FloatTensor<Self> {
+            let shape = w.shape();
+            let [k_len, n] = shape.dims::<2>();
+            let m = x.shape().dims::<2>()[0];
+            let started = std::time::Instant::now();
+            let xs = host_rows(&x);
+            assert_eq!(xs.len(), m * k_len, "activation batch shape");
+            let wq: &[i8] = w
+                .tensor()
+                .as_slice::<i8>()
+                .expect("flex quantized weight is contiguous i8");
+            let scales: &[f32] = w.scales();
+            if twin_eligible(&w, k_len)
+                && let Some(packed) = crate::flex::registry::resolve(wq, scales, k_len, n)
+            {
+                let mut out = vec![0f32; m * n];
+                crate::flex::kernels::gemm_q4n_auto(&packed, &xs, m, &mut out);
+                // The whole point of the GEMM: the weight streams ONCE for
+                // the batch — record it that way.
+                crate::flex::insitu::record(
+                    k_len,
+                    n,
+                    m,
+                    packed.streamed_bytes(),
+                    started.elapsed(),
+                );
+                return FlexTensor::from_data(TensorData::new(out, [m, n]));
+            }
+            // Non-Q4S (or twin disabled): the i8 loop per row. Correct, and
+            // still one op instead of m dispatches.
+            let mut out = vec![0f32; m * n];
+            for r in 0..m {
+                let (xr, orow) = (
+                    &xs[r * k_len..(r + 1) * k_len],
+                    &mut out[r * n..(r + 1) * n],
+                );
+                i8_gemv(xr, wq, scales, k_len, n, orow);
+            }
+            crate::flex::insitu::record(
+                k_len,
+                n,
+                m,
+                (k_len * n + scales.len() * 4) * m,
+                started.elapsed(),
+            );
+            FlexTensor::from_data(TensorData::new(out, [m, n]))
         }
     }
 }
@@ -655,11 +871,115 @@ mod tests {
         let device = crate::backend::cpu_device();
         let x2 = Tensor::<2>::random([2, 64], Distribution::Uniform(-1.0, 1.0), &device);
         let wf = Tensor::<2>::random([64, 64], Distribution::Uniform(-1.0, 1.0), &device);
-        assert!(try_q4s_gemv(&x2, &wf).is_none(), "m=2 must decline");
+        assert!(try_q4s_gemv(&x2, &wf).is_none(), "m=2 float must decline");
         let x1 = Tensor::<2>::random([1, 64], Distribution::Uniform(-1.0, 1.0), &device);
         assert!(
             try_q4s_gemv(&x1, &wf).is_none(),
             "float weight must decline"
         );
+    }
+
+    /// The host GEMM path (m > 1 on flex) equals m stacked single-row calls
+    /// through the same routing — the weight-stream-once evaluation must be
+    /// an execution change, not a numerics change.
+    #[test]
+    fn q4s_gemm_matches_stacked_gemvs_on_flex() {
+        let _serial = FLEX_PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::flex::registry::force_disable(false);
+        let device = crate::backend::cpu_device();
+        let (k, n, m) = (192, 96, 5);
+        let x = Tensor::<2>::random([m, k], Distribution::Uniform(-1.0, 1.0), &device);
+        let w = Tensor::<2>::random([k, n], Distribution::Uniform(-1.0, 1.0), &device);
+        let wq = crate::quant::quantize_weight(crate::quant::QuantPolicy::Q4, w);
+
+        let gemm = try_q4s_gemv(&x, &wq).expect("gemm path must engage");
+        assert_eq!(gemm.dims(), [m, n]);
+        let rows: Vec<Tensor<2>> = (0..m)
+            .map(|r| {
+                let xr = x.clone().slice([r..r + 1, 0..k]);
+                try_q4s_gemv(&xr, &wq).expect("row path must engage")
+            })
+            .collect();
+        let stacked = Tensor::cat(rows, 0);
+        let diff = gemm
+            .sub(stacked.clone())
+            .abs()
+            .max()
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap()[0];
+        let scale = stacked.abs().max().into_data().try_to_vec::<f32>().unwrap()[0].max(1e-6);
+        assert!(
+            diff / scale < 1e-5,
+            "gemm vs stacked gemvs rel err {} (abs {diff})",
+            diff / scale
+        );
+    }
+
+    /// The bounded head end to end through `try_q4s_head`: with k covering
+    /// the whole vocab every row is evaluated, so the sentinel-dense output
+    /// must equal the dense GEMV bitwise — the plumbing proof (pruning
+    /// exactness is pinned at the kernel level in `flex::head`). Disabled
+    /// by default: the gate must decline until serve opts in.
+    #[test]
+    fn bounded_head_scatter_matches_dense() {
+        let _serial = FLEX_PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::flex::registry::force_disable(false);
+        let device = crate::backend::cpu_device();
+        let (k, vocab) = (128, 512);
+        let x = Tensor::<2>::random([1, k], Distribution::Uniform(-1.0, 1.0), &device);
+        let w = Tensor::<2>::random([k, vocab], Distribution::Uniform(-1.0, 1.0), &device);
+        let wq = crate::quant::quantize_weight(crate::quant::QuantPolicy::Q4, w);
+
+        assert!(
+            try_q4s_head(&x, &wq).is_none(),
+            "the bounded head must be opt-in"
+        );
+        crate::flex::head::set_enabled(true);
+        let got = try_q4s_head(&x, &wq).expect("enabled head must engage");
+        crate::flex::head::set_enabled(false);
+
+        let dense = try_q4s_gemv(&x, &wq).expect("dense twin path");
+        // head_k (default 1024) >= vocab: everything is evaluated, so the
+        // scatter must reproduce the dense vector exactly.
+        let diff = got
+            .sub(dense)
+            .abs()
+            .max()
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap()[0];
+        assert_eq!(diff, 0.0, "full-coverage bounded head must equal dense");
+    }
+
+    /// The GEMM also serves the i8 fallback (twin off): same equality, so
+    /// disabling the VNNI path never disables prefill batching.
+    #[test]
+    fn q4s_gemm_i8_fallback_matches_stacked_gemvs() {
+        let _serial = FLEX_PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::flex::registry::force_disable(true);
+        let _restore = RestoreFastPath;
+        let device = crate::backend::cpu_device();
+        let (k, n, m) = (128, 64, 3);
+        let x = Tensor::<2>::random([m, k], Distribution::Uniform(-1.0, 1.0), &device);
+        let w = Tensor::<2>::random([k, n], Distribution::Uniform(-1.0, 1.0), &device);
+        let wq = crate::quant::quantize_weight(crate::quant::QuantPolicy::Q4, w);
+
+        let gemm = try_q4s_gemv(&x, &wq).expect("gemm path must engage");
+        let rows: Vec<Tensor<2>> = (0..m)
+            .map(|r| {
+                let xr = x.clone().slice([r..r + 1, 0..k]);
+                try_q4s_gemv(&xr, &wq).expect("row path must engage")
+            })
+            .collect();
+        let stacked = Tensor::cat(rows, 0);
+        let diff = gemm
+            .sub(stacked)
+            .abs()
+            .max()
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap()[0];
+        assert!(diff < 1e-5, "i8 gemm vs stacked gemvs abs err {diff}");
     }
 }

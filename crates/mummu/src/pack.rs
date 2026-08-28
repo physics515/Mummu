@@ -26,6 +26,8 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use burn::tensor::quantization::QuantScheme;
 use burn::tensor::{Device, Tensor, TensorData};
@@ -588,9 +590,49 @@ pub fn quantized_tensor_data(
     )
 }
 
+/// `read_exact` at an absolute offset through a shared handle. Positional
+/// only — no seek state on the handle — so probe threads and the loader can
+/// read through the same file object concurrently. (Windows `seek_read`
+/// does move the OS cursor, but nothing here ever reads through it.)
+fn read_exact_at(file: &std::fs::File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        #[cfg(windows)]
+        return std::os::windows::fs::FileExt::seek_read(file, buf, offset);
+        #[cfg(unix)]
+        return std::os::unix::fs::FileExt::read_at(file, buf, offset);
+    }
+    while !buf.is_empty() {
+        match read_at(file, buf, offset) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "blob ended before the requested range",
+                ));
+            }
+            Ok(n) => {
+                buf = &mut buf[n..];
+                offset += n as u64;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 pub struct Pack {
     pub dir: PathBuf,
     pub manifest: Manifest,
+    /// One long-lived read handle per blob, opened on first touch. The
+    /// Windows cache manager tracks read-ahead history per file object, so
+    /// a fresh handle per range (the old shape of `read_range`) restarted
+    /// the ramp on every tensor and a cold 20 GB load off an HDD ran
+    /// seek-bound at ~16 MB/s. The loaders walk tensors in manifest order —
+    /// append order — so on a kept handle the reads are forward-sequential
+    /// and the sequential-scan hint lets read-ahead go wide.
+    blobs: Mutex<BTreeMap<Precision, Arc<std::fs::File>>>,
+    /// Blob bytes read through this pack, for load-progress reporting.
+    bytes_read: AtomicU64,
 }
 
 impl Pack {
@@ -598,6 +640,18 @@ impl Pack {
     #[must_use]
     pub fn is_pack(dir: &Path) -> bool {
         dir.join("manifest.json").is_file() && dir.join("header.gguf").is_file()
+    }
+
+    /// Wrap an already-parsed manifest (tests assemble packs by hand;
+    /// `open` is the production path).
+    #[must_use]
+    pub fn new(dir: PathBuf, manifest: Manifest) -> Self {
+        Self {
+            dir,
+            manifest,
+            blobs: Mutex::new(BTreeMap::new()),
+            bytes_read: AtomicU64::new(0),
+        }
     }
 
     pub fn open(dir: &Path) -> Result<Self, String> {
@@ -611,10 +665,15 @@ impl Pack {
                 manifest.version
             ));
         }
-        Ok(Self {
-            dir: dir.to_path_buf(),
-            manifest,
-        })
+        Ok(Self::new(dir.to_path_buf(), manifest))
+    }
+
+    /// Total blob bytes read through this pack so far. Counted at
+    /// `read_range`, so a progress line built on it cannot drift from what
+    /// was actually pulled off the disk.
+    #[must_use]
+    pub fn bytes_read(&self) -> u64 {
+        self.bytes_read.load(Ordering::Relaxed)
     }
 
     /// Write the manifest back (after partitioning / calibration).
@@ -802,14 +861,38 @@ impl Pack {
         self.manifest.tensors.iter().find(|t| t.name == name)
     }
 
+    /// The long-lived read handle for a blob (see the `blobs` field for why
+    /// handles are kept rather than reopened per range).
+    fn blob(&self, precision: Precision) -> Result<Arc<std::fs::File>, String> {
+        let mut blobs = self.blobs.lock().expect("blob handle cache lock");
+        if let Some(f) = blobs.get(&precision) {
+            return Ok(Arc::clone(f));
+        }
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // `FILE_FLAG_SEQUENTIAL_SCAN`: the cache manager doubles its
+            // read-ahead and evicts behind the cursor — the access pattern
+            // a manifest-order load actually has.
+            const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
+            opts.custom_flags(FILE_FLAG_SEQUENTIAL_SCAN);
+        }
+        let f = Arc::new(
+            opts.open(self.dir.join(precision.blob_name()))
+                .map_err(|e| format!("open {}: {e}", precision.blob_name()))?,
+        );
+        blobs.insert(precision, Arc::clone(&f));
+        Ok(f)
+    }
+
     fn read_range(&self, precision: Precision, offset: u64, len: u64) -> Result<Vec<u8>, String> {
-        let mut file = std::fs::File::open(self.dir.join(precision.blob_name()))
-            .map_err(|e| format!("open {}: {e}", precision.blob_name()))?;
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|e| e.to_string())?;
+        let file = self.blob(precision)?;
         let mut buf = vec![0u8; usize::try_from(len).expect("blob fits")];
-        file.read_exact(&mut buf)
+        read_exact_at(&file, &mut buf, offset)
             .map_err(|e| format!("read {}: {e}", precision.blob_name()))?;
+        self.bytes_read.fetch_add(len, Ordering::Relaxed);
         Ok(buf)
     }
 
@@ -884,13 +967,26 @@ impl Pack {
             .get(&precision)
             .ok_or_else(|| format!("'{}' has no {precision:?} level", entry.name))?;
         let n: usize = entry.shape.iter().product();
-        let vbytes = self.read_range(precision, b.values_offset, b.values_len)?;
+        // The importer appends a tensor's values and scales back-to-back
+        // (`import_gguf`), so one read covers both and the second disk
+        // round-trip per tensor goes away. The layout check keeps any
+        // pack that disagrees on the two-read path rather than corrupt.
+        let (vbytes, sbytes) = if b.scales_offset == b.values_offset + b.values_len {
+            let mut joined =
+                self.read_range(precision, b.values_offset, b.values_len + b.scales_len)?;
+            let sbytes = joined.split_off(usize::try_from(b.values_len).expect("blob fits"));
+            (joined, sbytes)
+        } else {
+            (
+                self.read_range(precision, b.values_offset, b.values_len)?,
+                self.read_range(precision, b.scales_offset, b.scales_len)?,
+            )
+        };
         let values: Vec<i8> = match precision {
             Precision::Q4 => unpack_nibbles(&vbytes, n),
             Precision::Q8 => vbytes.iter().map(|&b| b as i8).collect(),
             _ => return Err(format!("{precision:?} is not a quantized level")),
         };
-        let sbytes = self.read_range(precision, b.scales_offset, b.scales_len)?;
         let scales: Vec<f32> = sbytes
             .as_chunks::<4>()
             .0
@@ -1088,10 +1184,7 @@ mod tests {
         )
         .unwrap();
         // No header.gguf here — construct Pack directly.
-        let pack = Pack {
-            dir: dir.clone(),
-            manifest,
-        };
+        let pack = Pack::new(dir.clone(), manifest);
         let device = crate::backend::cpu_device();
         // Columns [32,32) and [96,32) of gate → [rows, 64].
         let ranges = [(32usize, 32usize), (96, 32)];

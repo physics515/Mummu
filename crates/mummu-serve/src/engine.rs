@@ -174,6 +174,46 @@ fn resident_in(backend: BackendChoice) -> Option<(std::path::PathBuf, u64)> {
         .map(|(_, d, n)| (d.clone(), *n))
 }
 
+/// The load currently bringing a model up, if any: (model dir, its plan).
+/// Set by the slot's load closure for exactly as long as the load runs.
+/// Two consumers: `plan_fit` answers a same-model request from this instead
+/// of re-reading GGUF/pack metadata off the disk the loader is saturating,
+/// and the shim refuses non-stream requests up front instead of parking
+/// them silently behind a load that takes an hour on this disk.
+static LOADING: std::sync::Mutex<
+    Option<(std::path::PathBuf, BackendChoice, mummu::quant::QuantPolicy)>,
+> = std::sync::Mutex::new(None);
+
+/// Clears [`LOADING`] on drop, so a load that panics can't leave the flag
+/// stuck and every later non-stream shim request refused.
+struct LoadInFlight;
+
+impl LoadInFlight {
+    fn set(
+        dir: std::path::PathBuf,
+        backend: BackendChoice,
+        policy: mummu::quant::QuantPolicy,
+    ) -> Self {
+        *LOADING.lock().unwrap_or_else(|e| e.into_inner()) = Some((dir, backend, policy));
+        Self
+    }
+}
+
+impl Drop for LoadInFlight {
+    fn drop(&mut self) {
+        *LOADING.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+/// The model dir a load is currently bringing up, if any.
+pub fn load_in_flight() -> Option<std::path::PathBuf> {
+    LOADING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|(d, _, _)| d.clone())
+}
+
 /// Drop any resident model (frees VRAM/RAM).
 pub fn unload_all() -> bool {
     clear_tiers();
@@ -197,6 +237,12 @@ fn load_any(
     policy: mummu::quant::QuantPolicy,
     backend: BackendChoice,
 ) -> Result<Loaded, String> {
+    // Serve opts into the bounded-exact host lm_head (SPEC P4.3/P4.4):
+    // greedy reads the argmax and the sampler consults only its top-k
+    // candidates, both of which the bounded head reproduces exactly — the
+    // full-softmax consumers that need the dense head are the parity
+    // harness's, and it never sets this. `MUMMU_HEAD_BOUND=0` vetoes.
+    mummu::flex::head::set_enabled(true);
     let dir = spec.dir(models_root);
     match &spec.format {
         WeightFormat::Safetensors => {
@@ -395,7 +441,21 @@ pub async fn run_chat(
     on_delta: impl FnMut(&str) -> ControlFlow<()>,
 ) -> Result<ChatResult, String> {
     let prompt = render_prompt(spec.architecture, turns)?;
-    let plan = plan_fit(spec, models_root)?;
+    // Land a line in the log the moment a request enters the engine: the fit
+    // planning below can legitimately take minutes on a busy disk, and a
+    // request that logs nothing until it finishes reads as a hang (it did,
+    // live, 2026-08-28 — 10+ minutes of silence behind a cold 27B load).
+    eprintln!("[mummu-serve] chat request for {}", spec.name);
+    // `plan_fit` reads GGUF/pack metadata off disk; on an async worker that
+    // read pins the worker for its duration, so it declares itself blocking
+    // the same way the model load in `mummu::cache` does (and with the same
+    // current-thread-runtime escape hatch, where `block_in_place` panics).
+    let plan = match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => {
+            tokio::task::block_in_place(|| plan_fit(spec, models_root))?
+        }
+        _ => plan_fit(spec, models_root)?,
+    };
     eprintln!(
         "[mummu-serve] fit plan for {}: {:?} @ {:?}",
         spec.name, plan.backend, plan.policy
@@ -1152,8 +1212,16 @@ fn build_layered_qwen35(
         }
     };
     // Embedding on the host (a gather; see `pack_trunk_bytes`), and the head
-    // with the last layer so the final projection does not cross.
-    let head = dev_for(layer_bytes.len().saturating_sub(1));
+    // with the last layer so the final projection does not cross — unless
+    // `MUMMU_HEAD_DEVICE` pins it. The admission calculus for that pin is
+    // `mummu_schedule::choices::admit_head` (the head's ms-per-byte
+    // density vs the marginal layers the same bytes would hold); with the
+    // bounded head cutting the host head's cost, measure before pinning.
+    let head = match std::env::var("MUMMU_HEAD_DEVICE").as_deref() {
+        Ok(v) if v.eq_ignore_ascii_case("gpu") => device.clone(),
+        Ok(v) if v.eq_ignore_ascii_case("host") => host.clone(),
+        _ => dev_for(layer_bytes.len().saturating_sub(1)),
+    };
     let started = Instant::now();
     // What precision a HOST layer carries. Default Q4 (see `host_layers_q4`
     // for the measured history); at decode the packed VNNI twin
@@ -1251,6 +1319,21 @@ fn warm_host_twins(model: &qwen35::LoadedQwen35, from_layer: usize) {
         warm(&layer.mlp.gate_proj);
         warm(&layer.mlp.up_proj);
         warm(&layer.mlp.down_proj);
+    }
+    // The lm_head was the one host projection the old warm skipped — its
+    // ~700 MiB twin then packed lazily ON THE FIRST TOKEN (with a second
+    // 4-bit rounding logged) and stalled it by seconds. Warm it like the
+    // rest; the extra zero-GEMV also builds the bounded head's row-norm
+    // metadata while the load bar is already up.
+    if let Some(head) = &model.model.lm_head {
+        warm(head);
+        if mummu::flex::head::enabled() {
+            let w = head.weight.val();
+            if matches!(w.dtype(), burn::tensor::DType::QFloat(_)) {
+                let x = Tensor::<2>::zeros([1, w.dims()[0]], &w.device());
+                let _ = mummu::nn::try_q4s_head(&x, &w);
+            }
+        }
     }
     if built > 0 {
         eprintln!(
@@ -1810,10 +1893,26 @@ fn mixed_precision(
     // resource: give it the ceiling rather than a pressure-driven rung.
     for t in &pack.manifest.tensors {
         chosen.entry(t.name.clone()).or_insert_with(|| {
-            if matches!(t.role, Role::Embedding | Role::Vector | Role::Conv) {
-                mummu::pack::Precision::F32
-            } else {
-                precision_for(ceiling)
+            match t.role {
+                // The embedding lands in host RAM at the backend's float
+                // dtype either way — the stored level only sets the bytes
+                // off the disk that a cold load is bound by, and f16 holds
+                // a quantization-born source's values to well under its own
+                // quant error (measured 0.0000 relative on the 4-bit-born
+                // 27B; ~2^-12 worst case for an 8-bit-born one, an order
+                // below the Q8 rung — see `precision_for`): 2.55 GiB read
+                // instead of 5.09. A float-born source (f16/bf16/f32
+                // checkpoint) keeps f32 — f16's narrower exponent could
+                // clip a bf16 outlier — and so does a pack whose
+                // `source_bytes` is 0 (unknown source, below 1 bit/param).
+                Role::Embedding
+                    if (1.0..16.0).contains(&source_bits)
+                        && t.precisions.contains_key(&mummu::pack::Precision::F16) =>
+                {
+                    mummu::pack::Precision::F16
+                }
+                Role::Embedding | Role::Vector | Role::Conv => mummu::pack::Precision::F32,
+                Role::Linear | Role::Expert { .. } => precision_for(ceiling),
             }
         });
     }
@@ -2155,7 +2254,8 @@ fn probe_contention(pack: &mummu::pack::Pack) {
 /// because every term is derivable:
 ///
 /// * **KV cache** — full-attention layers only (`(i+1) % interval == 0`),
-///   `2 (k,v) x kv_heads x ctx x head_dim` f32 per layer.
+///   `2 (k,v) x kv_heads x ctx x head_dim` per layer at the cache's
+///   STORAGE dtype (f32, or f16 under `MUMMU_KV_F16`).
 /// * **Recurrent state** — DeltaNet layers, context-INDEPENDENT:
 ///   `conv [b, conv_dim, k-1]` plus `state [b, n_v_heads, d_state, d_state]`.
 /// * **Activation peak** — prefill dominates decode by the prompt length:
@@ -2180,8 +2280,16 @@ fn computed_reserve_bytes(cfg: &qwen35::Qwen35Config, layers_on_device: usize, c
     let full_attn = (0..n).filter(|&l| cfg.is_attention(l)).count() as u64;
     let delta = n as u64 - full_attn;
 
-    let kv =
-        full_attn * 2 * cfg.num_key_value_heads as u64 * ctx as u64 * cfg.head_dim as u64 * f32b;
+    // KV is priced at its STORAGE dtype: the f16 cache (`MUMMU_KV_F16`,
+    // SPEC P2.1) halves the persistent bytes, and pricing it at f32 would
+    // silently waste the layers the halving bought.
+    let kv_bytes = if mummu::nn::kv_f16_enabled() { 2 } else { f32b };
+    let kv = full_attn
+        * 2
+        * cfg.num_key_value_heads as u64
+        * ctx as u64
+        * cfg.head_dim as u64
+        * kv_bytes;
     let conv = delta * cfg.conv_dim() as u64 * cfg.conv_kernel.saturating_sub(1) as u64 * f32b;
     let state = delta * cfg.n_v_heads as u64 * (cfg.d_state as u64).pow(2) * f32b;
     // Three [tokens, intermediate] buffers live at once through SwiGLU.
@@ -2705,9 +2813,28 @@ fn plan_fit(spec: &ModelSpec, models_root: &Path) -> Result<FitPlan, String> {
         });
     }
 
+    // A load for this same checkpoint is already in flight: its plan is the
+    // answer, and the request will queue on the slot mutex either way.
+    // Answering from the flag instead of the disk matters — the loader is
+    // saturating the very disk the GGUF-header/manifest reads below would
+    // hit, and a request paying them mid-load sat 10+ minutes before its
+    // first log line (11 MB of GGUF metadata against a 1-4 MB/s seek storm,
+    // observed live 2026-08-28).
+    let dir = spec.dir(models_root);
+    {
+        let g = LOADING.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((d, backend, policy)) = g.as_ref()
+            && *d == dir
+        {
+            return Ok(FitPlan {
+                backend: *backend,
+                policy: *policy,
+            });
+        }
+    }
+
     // Already resident somewhere? Serve it from there — no fit check, and
     // no reload (the slot is keyed by the model dir).
-    let dir = spec.dir(models_root);
     let all_backends: &[BackendChoice] = &[
         #[cfg(feature = "cuda")]
         BackendChoice::Cuda,
@@ -2726,7 +2853,11 @@ fn plan_fit(spec: &ModelSpec, models_root: &Path) -> Result<FitPlan, String> {
     }
 
     let path = dir.join(file);
-    let f = GgufFile::open(&path).map_err(|e| e.to_string())?;
+    // The GGUF header is opened only where it is consumed (the non-pack
+    // size estimate below): it is 11 MB of metadata on the 27B, and the
+    // layered/tiered path never reads it — a per-request read of it during
+    // a load's disk storm is minutes of dead time for nothing.
+    let mut gguf: Option<GgufFile> = None;
     // Units that tier out across devices (MoE experts, partitioned FFN
     // clusters) leave only the trunk to fit the preferred backend.
     let tiered_pack = if tiers_mode().is_some() {
@@ -2801,7 +2932,12 @@ fn plan_fit(spec: &ModelSpec, models_root: &Path) -> Result<FitPlan, String> {
         // model's dimensions. See `examples/pack-precision-probe.rs`.)
         let need = match &tiered_pack {
             Some(pack) => pack_trunk_bytes(pack, precision_for(policy)),
-            None => estimate_resident_bytes(&f, policy),
+            None => {
+                if gguf.is_none() {
+                    gguf = Some(GgufFile::open(&path).map_err(|e| e.to_string())?);
+                }
+                estimate_resident_bytes(gguf.as_ref().expect("just opened"), policy)
+            }
         };
         // Loading evicts the slot's current occupant first — its bytes come
         // back to the budget.
@@ -2819,11 +2955,16 @@ fn plan_fit(spec: &ModelSpec, models_root: &Path) -> Result<FitPlan, String> {
             return Ok(FitPlan { backend, policy });
         }
     }
-    Err(format!(
-        "{} does not fit any backend even at Q4 (needs ~{} GiB quantized)",
-        spec.name,
-        estimate_resident_bytes(&f, QuantPolicy::Q4) >> 30
-    ))
+    let est = gguf
+        .or_else(|| GgufFile::open(&path).ok())
+        .map(|f| estimate_resident_bytes(&f, QuantPolicy::Q4) >> 30);
+    Err(match est {
+        Some(gib) => format!(
+            "{} does not fit any backend even at Q4 (needs ~{gib} GiB quantized)",
+            spec.name
+        ),
+        None => format!("{} does not fit any backend even at Q4", spec.name),
+    })
 }
 
 #[allow(clippy::too_many_arguments)] // one call site, mirrors the plan
@@ -2854,11 +2995,13 @@ async fn drive(
     // The load closure and the async body both want `device`; give the loader
     // its own handle so the future can capture the original by reference.
     let load_device = device.clone();
+    let flag_key = key.clone();
     let m = slot
         .acquire(&key, move |_| {
             // One bar for the whole load: a profiled COLD request would
             // otherwise smear minutes of import across the decode graph.
             let _s = mummu::prof::scope("model_load");
+            let _loading = LoadInFlight::set(flag_key, backend, policy);
             load_any(spec, models_root, &load_device, policy, backend)
         })
         .await?;
@@ -2879,6 +3022,17 @@ async fn drive(
         let start = Instant::now();
         let mut ids: Vec<u32> = Vec::new();
         let mut emitted = String::new();
+        // Tell the bounded head how many candidates THIS request's
+        // sampler will consult: greedy reads only the argmax (k = 1,
+        // where the norm bound prunes hardest — the first live run
+        // measured k = 1024 evaluating ~91% of the vocab), sampling
+        // reads its top_k. Overlapping requests combine via fetch_max
+        // and the drop falls back to the safe env default.
+        let _head_k = mummu::flex::head::RequestTopK::set(if opts.temperature == 0.0 {
+            1
+        } else {
+            opts.top_k
+        });
         let out =
             m.lm.generate(&prompt_ids, max_tokens, opts, &device, |id| {
                 ids.push(id);
@@ -2905,6 +3059,15 @@ async fn drive(
         let elapsed_ms = start.elapsed().as_millis();
         // Every completed generation is one placement's worth of evidence.
         observe_placement(out.len(), elapsed_ms);
+        // The in-situ bandwidth ledger (SPEC P1.1): per-shape
+        // beta_hat = bytes/dt on the production GEMV/GEMM path — the
+        // instrument for the live ~2-3x inflation over the quiet
+        // microbench. Per-request so the numbers attribute to a
+        // workload, reset so requests do not smear together.
+        if std::env::var("MUMMU_INSITU_REPORT").is_ok_and(|v| v != "0") {
+            eprint!("{}", mummu::flex::insitu::report());
+            mummu::flex::insitu::reset();
+        }
         if matches!(&m.lm, AnyLm::OlmoeQ(q) if q.pool.is_some()) {
             rebalance_tiers();
         }
@@ -2928,6 +3091,47 @@ pub fn is_installed(spec: &ModelSpec, models_root: &Path) -> bool {
             weights && dir.join("config.json").is_file() && dir.join("tokenizer.json").is_file()
         }
         WeightFormat::Gguf { .. } => spec.gguf_path(models_root).is_some_and(|p| p.is_file()),
+    }
+}
+
+#[cfg(test)]
+mod plan_fit_tests {
+    use super::*;
+
+    /// A request that arrives while a load for the same checkpoint is in
+    /// flight must get the loader's own plan straight from the flag.
+    /// `plan_fit` reading GGUF/pack metadata here is what parked requests
+    /// 10+ minutes behind the load's own disk storm before their first log
+    /// line (observed live, 2026-08-28). The spec's files deliberately do
+    /// not exist: touching the disk at all would fail this fit.
+    #[test]
+    fn a_load_in_flight_answers_plan_fit_without_disk() {
+        let spec = ModelSpec {
+            name: "qwen35-test-loading".into(),
+            repo: "test/loading".into(),
+            revision: "main".into(),
+            architecture: Architecture::Qwen35,
+            format: WeightFormat::Gguf {
+                file: "missing.gguf".into(),
+            },
+            disk_bytes_estimate: 0,
+        };
+        let root = Path::new("plan-fit-test-root-does-not-exist");
+        let _flag = LoadInFlight::set(
+            spec.dir(root),
+            BackendChoice::Cpu,
+            mummu::quant::QuantPolicy::Q4,
+        );
+        let plan = plan_fit(&spec, root).expect("the in-flight load's plan is the answer");
+        assert_eq!(plan.backend, BackendChoice::Cpu);
+        assert!(matches!(plan.policy, mummu::quant::QuantPolicy::Q4));
+        // A different checkpoint must not match the flag (and then fails on
+        // the missing file, proving the flag was the only thing answering).
+        let other = ModelSpec {
+            name: "qwen35-test-other".into(),
+            ..spec
+        };
+        assert!(plan_fit(&other, root).is_err());
     }
 }
 
