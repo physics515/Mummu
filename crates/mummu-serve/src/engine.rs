@@ -156,6 +156,41 @@ fn resident_in(backend: BackendChoice) -> Option<(std::path::PathBuf, u64)> {
         .map(|(_, d, n)| (d.clone(), *n))
 }
 
+/// The load currently bringing a model up, if any: (model dir, its plan).
+/// Set by the slot's load closure for exactly as long as the load runs.
+/// Two consumers: `plan_fit` answers a same-model request from this instead
+/// of re-reading GGUF/pack metadata off the disk the loader is saturating,
+/// and the shim refuses non-stream requests up front instead of parking
+/// them silently behind a load that takes an hour on this disk.
+static LOADING: std::sync::Mutex<Option<(std::path::PathBuf, BackendChoice, mummu::quant::QuantPolicy)>> =
+    std::sync::Mutex::new(None);
+
+/// Clears [`LOADING`] on drop, so a load that panics can't leave the flag
+/// stuck and every later non-stream shim request refused.
+struct LoadInFlight;
+
+impl LoadInFlight {
+    fn set(dir: std::path::PathBuf, backend: BackendChoice, policy: mummu::quant::QuantPolicy) -> Self {
+        *LOADING.lock().unwrap_or_else(|e| e.into_inner()) = Some((dir, backend, policy));
+        Self
+    }
+}
+
+impl Drop for LoadInFlight {
+    fn drop(&mut self) {
+        *LOADING.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+/// The model dir a load is currently bringing up, if any.
+pub fn load_in_flight() -> Option<std::path::PathBuf> {
+    LOADING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|(d, _, _)| d.clone())
+}
+
 /// Drop any resident model (frees VRAM/RAM).
 pub fn unload_all() -> bool {
     clear_tiers();
@@ -388,7 +423,21 @@ pub async fn run_chat(
     on_delta: impl FnMut(&str) -> ControlFlow<()>,
 ) -> Result<ChatResult, String> {
     let prompt = render_prompt(spec.architecture, turns)?;
-    let plan = plan_fit(spec, models_root)?;
+    // Land a line in the log the moment a request enters the engine: the fit
+    // planning below can legitimately take minutes on a busy disk, and a
+    // request that logs nothing until it finishes reads as a hang (it did,
+    // live, 2026-08-28 — 10+ minutes of silence behind a cold 27B load).
+    eprintln!("[mummu-serve] chat request for {}", spec.name);
+    // `plan_fit` reads GGUF/pack metadata off disk; on an async worker that
+    // read pins the worker for its duration, so it declares itself blocking
+    // the same way the model load in `mummu::cache` does (and with the same
+    // current-thread-runtime escape hatch, where `block_in_place` panics).
+    let plan = match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => {
+            tokio::task::block_in_place(|| plan_fit(spec, models_root))?
+        }
+        _ => plan_fit(spec, models_root)?,
+    };
     eprintln!(
         "[mummu-serve] fit plan for {}: {:?} @ {:?}",
         spec.name, plan.backend, plan.policy
@@ -2635,9 +2684,28 @@ fn plan_fit(spec: &ModelSpec, models_root: &Path) -> Result<FitPlan, String> {
         });
     }
 
+    // A load for this same checkpoint is already in flight: its plan is the
+    // answer, and the request will queue on the slot mutex either way.
+    // Answering from the flag instead of the disk matters — the loader is
+    // saturating the very disk the GGUF-header/manifest reads below would
+    // hit, and a request paying them mid-load sat 10+ minutes before its
+    // first log line (11 MB of GGUF metadata against a 1-4 MB/s seek storm,
+    // observed live 2026-08-28).
+    let dir = spec.dir(models_root);
+    {
+        let g = LOADING.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((d, backend, policy)) = g.as_ref()
+            && *d == dir
+        {
+            return Ok(FitPlan {
+                backend: *backend,
+                policy: *policy,
+            });
+        }
+    }
+
     // Already resident somewhere? Serve it from there — no fit check, and
     // no reload (the slot is keyed by the model dir).
-    let dir = spec.dir(models_root);
     let all_backends: &[BackendChoice] = &[
         #[cfg(feature = "cuda")]
         BackendChoice::Cuda,
@@ -2656,7 +2724,11 @@ fn plan_fit(spec: &ModelSpec, models_root: &Path) -> Result<FitPlan, String> {
     }
 
     let path = dir.join(file);
-    let f = GgufFile::open(&path).map_err(|e| e.to_string())?;
+    // The GGUF header is opened only where it is consumed (the non-pack
+    // size estimate below): it is 11 MB of metadata on the 27B, and the
+    // layered/tiered path never reads it — a per-request read of it during
+    // a load's disk storm is minutes of dead time for nothing.
+    let mut gguf: Option<GgufFile> = None;
     // Units that tier out across devices (MoE experts, partitioned FFN
     // clusters) leave only the trunk to fit the preferred backend.
     let tiered_pack = if tiers_mode().is_some() {
@@ -2728,7 +2800,12 @@ fn plan_fit(spec: &ModelSpec, models_root: &Path) -> Result<FitPlan, String> {
         // model's dimensions. See `examples/pack-precision-probe.rs`.)
         let need = match &tiered_pack {
             Some(pack) => pack_trunk_bytes(pack, precision_for(policy)),
-            None => estimate_resident_bytes(&f, policy),
+            None => {
+                if gguf.is_none() {
+                    gguf = Some(GgufFile::open(&path).map_err(|e| e.to_string())?);
+                }
+                estimate_resident_bytes(gguf.as_ref().expect("just opened"), policy)
+            }
         };
         // Loading evicts the slot's current occupant first — its bytes come
         // back to the budget.
@@ -2746,11 +2823,16 @@ fn plan_fit(spec: &ModelSpec, models_root: &Path) -> Result<FitPlan, String> {
             return Ok(FitPlan { backend, policy });
         }
     }
-    Err(format!(
-        "{} does not fit any backend even at Q4 (needs ~{} GiB quantized)",
-        spec.name,
-        estimate_resident_bytes(&f, QuantPolicy::Q4) >> 30
-    ))
+    let est = gguf
+        .or_else(|| GgufFile::open(&path).ok())
+        .map(|f| estimate_resident_bytes(&f, QuantPolicy::Q4) >> 30);
+    Err(match est {
+        Some(gib) => format!(
+            "{} does not fit any backend even at Q4 (needs ~{gib} GiB quantized)",
+            spec.name
+        ),
+        None => format!("{} does not fit any backend even at Q4", spec.name),
+    })
 }
 
 #[allow(clippy::too_many_arguments)] // one call site, mirrors the plan
@@ -2781,11 +2863,13 @@ async fn drive(
     // The load closure and the async body both want `device`; give the loader
     // its own handle so the future can capture the original by reference.
     let load_device = device.clone();
+    let flag_key = key.clone();
     let m = slot
         .acquire(&key, move |_| {
             // One bar for the whole load: a profiled COLD request would
             // otherwise smear minutes of import across the decode graph.
             let _s = mummu::prof::scope("model_load");
+            let _loading = LoadInFlight::set(flag_key, backend, policy);
             load_any(spec, models_root, &load_device, policy, backend)
         })
         .await?;
@@ -2876,6 +2960,47 @@ pub fn is_installed(spec: &ModelSpec, models_root: &Path) -> bool {
         WeightFormat::Gguf { .. } => spec
             .gguf_path(models_root)
             .is_some_and(|p| p.is_file()),
+    }
+}
+
+#[cfg(test)]
+mod plan_fit_tests {
+    use super::*;
+
+    /// A request that arrives while a load for the same checkpoint is in
+    /// flight must get the loader's own plan straight from the flag.
+    /// `plan_fit` reading GGUF/pack metadata here is what parked requests
+    /// 10+ minutes behind the load's own disk storm before their first log
+    /// line (observed live, 2026-08-28). The spec's files deliberately do
+    /// not exist: touching the disk at all would fail this fit.
+    #[test]
+    fn a_load_in_flight_answers_plan_fit_without_disk() {
+        let spec = ModelSpec {
+            name: "qwen35-test-loading".into(),
+            repo: "test/loading".into(),
+            revision: "main".into(),
+            architecture: Architecture::Qwen35,
+            format: WeightFormat::Gguf {
+                file: "missing.gguf".into(),
+            },
+            disk_bytes_estimate: 0,
+        };
+        let root = Path::new("plan-fit-test-root-does-not-exist");
+        let _flag = LoadInFlight::set(
+            spec.dir(root),
+            BackendChoice::Cpu,
+            mummu::quant::QuantPolicy::Q4,
+        );
+        let plan = plan_fit(&spec, root).expect("the in-flight load's plan is the answer");
+        assert_eq!(plan.backend, BackendChoice::Cpu);
+        assert!(matches!(plan.policy, mummu::quant::QuantPolicy::Q4));
+        // A different checkpoint must not match the flag (and then fails on
+        // the missing file, proving the flag was the only thing answering).
+        let other = ModelSpec {
+            name: "qwen35-test-other".into(),
+            ..spec
+        };
+        assert!(plan_fit(&other, root).is_err());
     }
 }
 
