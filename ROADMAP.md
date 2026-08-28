@@ -1140,7 +1140,21 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       (P2.2): burn's stored quant format is `QuantParam::F32` per 32-block; f16/e8m0 scales on
       the DEVICE need either upstream burn support or a second custom storage beside
       `packed_gemv`'s — deferred to the burn 0.22-stable bump, where the quant API is already
-      moving. The host side already ships 4.5 bpw (the twins' f16 scales).
+      moving. The host side already ships 4.5 bpw (the twins' f16 scales). Deferred-correction
+      factored GDN state (P3.2's rank-r window): it amortizes state passes for a DRAM-bound
+      state, and this model's per-head state is 64 KB — L2-resident, already at two passes; the
+      window would add non-commutative bookkeeping to relieve pressure the memory system never
+      exposes (the LUT-plane lesson). RMSNorm/permutation weight folds (P3.3): folding
+      `diag(gamma)` into a QUANTIZED weight means requantizing on a different grid and desyncs
+      the twin from the tensor path the downgrade contract reverts to; the fused kernel computes
+      the norm scalar inline for less than the fold would save. Minimax gate polynomials (P3.5):
+      the fused kernel's exact transcendentals are arithmetic under the state passes' memory
+      time — the spec's own conclusion once a bound exists. CPU↔GPU vocab row-split (P4.2 of the
+      second set): the shape to reach for when VRAM opens PARTIALLY; the bounded head made the
+      host head cheap enough that `admit_head` should price the split against whole layers
+      first. KIVI-class 2-bit KV and per-head KV bit allocation: approximate levers, held per
+      the specs' own gate ("no approximate spec on the default serve path until the exact ones
+      hold the budget gates") — `mummu-mix::bits` is the allocator ready for that day.
 
 ## Phases
 
