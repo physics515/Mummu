@@ -62,10 +62,19 @@ async fn main() -> ExitCode {
         }
         #[cfg(not(windows))]
         fn demote_current_thread() {}
-        if let Err(e) = rayon::ThreadPoolBuilder::new()
-            .start_handler(|_| demote_current_thread())
-            .build_global()
-        {
+        // BELOW_NORMAL is the measured default (fence 26.5 -> 8.7 ms), but
+        // it is also one axis of the in-situ ANOVA (SPEC P1.1): the live
+        // host GEMV runs 2-3x slower than quiet, and thread priority under
+        // desktop load is a suspect the sweep must be able to vary.
+        // `MUMMU_GEMM_PRIORITY=normal` runs the herd un-demoted for that
+        // A/B; anything else (or unset) keeps the proven demotion.
+        let demote = !std::env::var("MUMMU_GEMM_PRIORITY")
+            .is_ok_and(|v| v.eq_ignore_ascii_case("normal"));
+        let mut builder = rayon::ThreadPoolBuilder::new();
+        if demote {
+            builder = builder.start_handler(|_| demote_current_thread());
+        }
+        if let Err(e) = builder.build_global() {
             eprintln!("[mummu-serve] rayon pool was already initialized ({e}); gemm herd keeps default priority");
         }
     }

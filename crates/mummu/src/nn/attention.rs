@@ -215,18 +215,14 @@ impl GqaAttention {
         let k_new = apply_rope(k_new, cos, sin);
 
         // Append to (or seed) the cache, then attend over everything so far.
-        let (k_all, v_all) = match kv.take() {
-            Some((pk, pv)) => (
-                Tensor::cat(vec![pk, k_new], 2),
-                Tensor::cat(vec![pv, v_new], 2),
-            ),
-            None => (k_new, v_new),
-        };
-        *kv = Some((k_all.clone(), v_all.clone()));
+        let ambient = q.dtype();
+        let (k_all, v_all) = kv_append(kv, k_new, v_new);
 
         let group = nh / nkv;
         let k = repeat_kv(k_all, group);
-        let v = repeat_kv(v_all, group);
+        // The value path computes in the ambient dtype — a no-op cast
+        // unless the cache stores f16 (see [`kv_append`]).
+        let v = repeat_kv(v_all, group).cast(ambient);
 
         // f32 island: Qwen-class attention logits overflow f16 (max 65504)
         // in the q·kᵀ scores, collapsing softmax to NaN — llama.cpp pins this
@@ -234,7 +230,6 @@ impl GqaAttention {
         // softmax run in f32, the probabilities (all in [0, 1]) return to the
         // ambient dtype for the value matmul. Every cast is a no-op on f32
         // backends.
-        let ambient = q.dtype();
         let scale = 1.0 / (hd as f32).sqrt();
         let mut scores = q
             .cast(DType::F32)
@@ -247,6 +242,69 @@ impl GqaAttention {
         let ctx = probs.matmul(v).swap_dims(1, 2).reshape([b, t, nh * hd]);
         self.o_proj.forward(ctx)
     }
+}
+
+/// Is the half-precision KV cache on? Storage-only: scores keep their f32
+/// island and the value matmul upcasts, so the change is the cache's
+/// persistent bytes (half) and one rounding on stored k/v. `MUMMU_KV_F16`,
+/// default OFF — it moves logits within f16 quantization noise, and this
+/// repo's parity legs pin the f32 cache. Env-only and read once, on
+/// purpose: a process-global runtime toggle raced other threads' cache
+/// seeding (measured as flaky exact-equality tests); tests exercise the
+/// f16 path through [`kv_append_as`] instead.
+#[must_use]
+pub fn kv_f16_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("MUMMU_KV_F16").is_ok_and(|v| {
+            !(v == "0" || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("false"))
+        })
+    })
+}
+
+/// Append this step's k/v to a [`LayerKv`] in the configured storage dtype
+/// and return the full cached range (in storage dtype — callers cast for
+/// compute; both attention paths already run scores through the f32
+/// island). With [`kv_f16_enabled`] and f32 inputs, new entries are stored
+/// as f16: at ctx 4096 on the 27B that is 2.1 → 1.05 GiB of persistent KV
+/// (~4 more resident layers), for one f16 rounding on stored keys/values
+/// whose logit effect sits inside the reference's own quantization noise
+/// (SPEC P2.1's error budget: `|delta logit| <= ||q||·||dk|| / sqrt(hd)`).
+/// A cache that started in one dtype stays in it — a mid-generation env
+/// difference cannot mix dtypes inside one cache.
+pub fn kv_append(kv: &mut LayerKv, k_new: Tensor<4>, v_new: Tensor<4>) -> (Tensor<4>, Tensor<4>) {
+    kv_append_as(kv, k_new, v_new, kv_f16_enabled())
+}
+
+/// [`kv_append`] with the storage choice explicit — the seam tests use to
+/// exercise the f16 cache without a process-global toggle. `f16` applies
+/// only when seeding a fresh cache from f32 inputs; an existing cache
+/// dictates its own dtype.
+pub fn kv_append_as(
+    kv: &mut LayerKv,
+    k_new: Tensor<4>,
+    v_new: Tensor<4>,
+    f16: bool,
+) -> (Tensor<4>, Tensor<4>) {
+    let store_f16 = k_new.dtype() == DType::F32
+        && match kv {
+            Some((pk, _)) => pk.dtype() == DType::F16,
+            None => f16,
+        };
+    let (k_new, v_new) = if store_f16 {
+        (k_new.cast(DType::F16), v_new.cast(DType::F16))
+    } else {
+        (k_new, v_new)
+    };
+    let (k_all, v_all) = match kv.take() {
+        Some((pk, pv)) => (
+            Tensor::cat(vec![pk, k_new], 2),
+            Tensor::cat(vec![pv, v_new], 2),
+        ),
+        None => (k_new, v_new),
+    };
+    *kv = Some((k_all.clone(), v_all.clone()));
+    (k_all, v_all)
 }
 
 #[cfg(test)]
@@ -383,6 +441,88 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The f16 KV cache: seeding stores half-width tensors, an existing
+    /// f16 cache keeps its dtype for later appends (through the model's
+    /// own forward), and the attended output tracks the f32 cache within
+    /// f16 rounding. Exercised through `kv_append_as` — no process-global
+    /// toggle, so no race against the exact-equality tests.
+    #[test]
+    fn f16_kv_stores_half_and_tracks_f32() {
+        let device = crate::backend::cpu_device();
+        let a = attn(false, false, &device);
+        let x = input(6, 3.0, &device);
+
+        // f32 reference: full forward's last row.
+        let full = full_forward(&a, x.clone(), &device);
+        let last_full = &full[5 * HIDDEN..];
+
+        // Prefill 5 with the ordinary f32 path, then convert the cache to
+        // f16 — the state a `MUMMU_KV_F16=1` process would have built.
+        let mut kv: LayerKv = None;
+        let (cos, sin) = rope_tables(5, 0, HEAD_DIM, THETA, &device);
+        let mask = causal_mask(5, 0, &device);
+        let _ = a.forward(
+            x.clone().narrow(1, 0, 5),
+            HEADS,
+            KV_HEADS,
+            HEAD_DIM,
+            &cos,
+            &sin,
+            Some(&mask),
+            &mut kv,
+        );
+        let (pk, pv) = kv.take().expect("cache seeded");
+        kv = Some((pk.cast(DType::F16), pv.cast(DType::F16)));
+
+        // Decode through the model: the existing f16 cache dictates the
+        // append dtype (kv_append's continuation rule).
+        let step = x.narrow(1, 5, 1);
+        let (cos1, sin1) = rope_tables(1, 5, HEAD_DIM, THETA, &device);
+        let out = a
+            .forward(step, HEADS, KV_HEADS, HEAD_DIM, &cos1, &sin1, None, &mut kv)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        let (k, v) = kv.as_ref().expect("cache");
+        assert_eq!(k.dtype(), DType::F16, "an f16 cache stays f16");
+        assert_eq!(v.dtype(), DType::F16);
+        assert_eq!(k.dims()[2], 6, "the step appended");
+
+        // f16 has ~11 bits of mantissa; these unit-scale activations keep
+        // the attended output within ~1e-2 of the f32 cache.
+        for (i, (c, f)) in out.iter().zip(last_full).enumerate() {
+            assert!((c - f).abs() < 1e-2, "elem {i}: f16-kv {c} vs f32 {f}");
+        }
+    }
+
+    /// `kv_append_as` seeding semantics: f16 requested -> stored f16; an
+    /// f16-ambient input is never touched; and the seeded dtype rules
+    /// later appends regardless of the flag.
+    #[test]
+    fn kv_append_as_seeds_and_locks_the_dtype() {
+        let device = crate::backend::cpu_device();
+        let kvt = |seed: f32| {
+            Tensor::<1>::from_floats(
+                (0..8).map(|i| (i as f32) * 0.1 + seed).collect::<Vec<_>>().as_slice(),
+                &device,
+            )
+            .reshape([1, 2, 1, 4])
+        };
+        let mut kv: LayerKv = None;
+        let (k, v) = kv_append_as(&mut kv, kvt(0.0), kvt(1.0), true);
+        assert_eq!(k.dtype(), DType::F16);
+        assert_eq!(v.dtype(), DType::F16);
+        // Appending with the flag OFF keeps the cache's f16.
+        let (k, _) = kv_append_as(&mut kv, kvt(2.0), kvt(3.0), false);
+        assert_eq!(k.dtype(), DType::F16);
+        assert_eq!(k.dims()[2], 2);
+        // And an f32 cache stays f32 even when the flag turns on later.
+        let mut kv32: LayerKv = None;
+        let _ = kv_append_as(&mut kv32, kvt(0.0), kvt(1.0), false);
+        let (k, _) = kv_append_as(&mut kv32, kvt(2.0), kvt(3.0), true);
+        assert_eq!(k.dtype(), DType::F32);
     }
 
     /// Causality: changing a future token must not change an earlier output row.
