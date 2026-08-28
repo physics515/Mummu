@@ -1023,9 +1023,11 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       single packed-GEMV dispatches already, and the fused middle composes with any weight format.
       Oracle: fused ≡ tensor decode to 1e-4 across carried-state steps; the multi-turn
       prefill→fused→prefill round trip is pinned; the pre-existing cache-equivalence gates now run
-      THROUGH the fused path by default. Traffic per layer per token is the theory floor —
-      `2·hv·ds²` f32 over L2-resident state (~50 µs of memory at the 27B's shape) — against the
-      ~10 ms/layer the dispatch tax measured; A/B on the box is the standing next measurement.
+      THROUGH the fused path by default. Measured at 27B-shaped dims (hk 16, hv 48, ds 128,
+      conv_dim 10240; `examples/fused-middle-probe.rs`, this box, release): **0.24 ms/layer/token
+      against the ~10 ms/layer the tensor middle costs in the production flamegraph — ~42× on the
+      middle**, which prices the 229 ms/token of host GDN mixers at ~6 ms + projections once the
+      serve A/B confirms in-situ.
 - [x] **Prefill runs a real packed GEMM on the host: the weight streams once per batch, not once
       per row.** *(2026-08-28, the P5 slice.)* `flex::kernels::gemm_q4n_{auto,vnni,scalar,f32}`:
       64-column weight panels stay L2-resident across 8-row register blocks (17 zmm live), so
@@ -1039,7 +1041,13 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       accelerators keep their exact row loop and split-K GEMV). Also: the GDN chunkwise prefill
       now engages from `t > 4` instead of `t > 64` (`MUMMU_GDN_SEQ_MAX`) — a partial chunk was
       already exact, and the old gate left every 2..=64-token prompt on the ~9-launches-per-token
-      sequential loop.
+      sequential loop. Measured (`examples/fused-middle-probe.rs`, gate/up shape, this box):
+      m=36 **8.9 ms vs the row loop's 23.2 = 2.6×**, rising to 2.8× at m=256 — and that baseline
+      flatters the row loop, whose "re-streams" came from a 128 MB L3 holding the ONE probe
+      tensor; a production prefill chunk walks 23 host layers, so the row loop pays DRAM per
+      re-stream while the GEMM's single pass amortizes. First cut measured only 1.5×: the
+      per-(row-block × column) f16→f32 scale conversion (scalar, no f16c) dominated — hoisted to
+      once per panel, which is the kind of thing only a measurement finds.
 - [x] **The host lm_head stopped streaming rows it can prove irrelevant: norm-bounded exact
       top-k.** *(2026-08-28, the P4 slice.)* `mummu::flex::head`: greedy reads the argmax and
       `sample_id` consults only its top-k candidates (renormalizing inside them), so the head

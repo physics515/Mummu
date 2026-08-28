@@ -767,19 +767,32 @@ pub fn gemm_q4n_vnni(w: &PackedQ4, acts: &Q8ActsBatch, out: &mut [f32]) {
         let _ = &out_ptr; // capture the wrapper, not the raw pointer
         let col0 = p * GEMM_PANEL;
         let cols = GEMM_PANEL.min(n - col0);
+        // The panel's weight scales, converted to f32 ONCE (~40 KB). The
+        // first cut converted f16 inside the (column, row-block) loop —
+        // m/8 redundant software conversions per scale, which measured as
+        // the GEMM's dominant cost at prompt shapes (the half crate
+        // converts in scalar code; there is no hardware f16c on this
+        // path).
+        let mut rs_f32 = vec![0.0f32; cols * groups];
+        for c in 0..cols {
+            let rs = w.row_scales(col0 + c);
+            for g in 0..groups {
+                rs_f32[c * groups + g] = rs[g].to_f32();
+            }
+        }
         let mut combined = vec![0.0f32; GEMM_MR * groups];
         let mut mb = 0usize;
         while mb < m {
             let mrl = GEMM_MR.min(m - mb);
             for c in 0..cols {
                 let col = col0 + c;
-                let rs = w.row_scales(col);
+                let rsf = &rs_f32[c * groups..(c + 1) * groups];
                 // combined[r][g] = sw(col, g) · sx(mb + r, g).
                 for r in 0..mrl {
                     let sx = &acts.rows[mb + r].scales;
                     let dst = &mut combined[r * groups..(r + 1) * groups];
                     for g in 0..groups {
-                        dst[g] = rs[g].to_f32() * sx[g];
+                        dst[g] = rsf[g] * sx[g];
                     }
                 }
                 // SAFETY: vnni_available() checked; slices sized by the
