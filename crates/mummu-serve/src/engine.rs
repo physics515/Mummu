@@ -182,12 +182,16 @@ fn load_any(
     policy: mummu::quant::QuantPolicy,
     backend: BackendChoice,
 ) -> Result<Loaded, String> {
-    // Serve opts into the bounded-exact host lm_head (SPEC P4.3/P4.4):
-    // greedy reads the argmax and the sampler consults only its top-k
-    // candidates, both of which the bounded head reproduces exactly — the
-    // full-softmax consumers that need the dense head are the parity
-    // harness's, and it never sets this. `MUMMU_HEAD_BOUND=0` vetoes.
-    mummu::flex::head::set_enabled(true);
+    // The bounded-exact host lm_head stays OFF in serve, by measurement:
+    // on the 27B's real head geometry the Cauchy–Schwarz tile bounds
+    // prune almost nothing at ANY k — the live insitu ledger showed ~92%
+    // of rows evaluated per call even with the per-request k=1 greedy
+    // override and the parallel batched walk (0.67 GiB and ~98 ms per
+    // call against the dense head's 68 ms). Near-uniform row norms swamp
+    // the logit margins, so the bound pays its walk and skips nothing.
+    // The machinery stays for experiments (`MUMMU_HEAD_BOUND=1`) and for
+    // heads whose geometry cooperates; the measured head win on this
+    // model remains pinning it to the GPU when VRAM opens (admit_head).
     let dir = spec.dir(models_root);
     match &spec.format {
         WeightFormat::Safetensors => {
