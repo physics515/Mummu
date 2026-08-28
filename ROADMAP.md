@@ -2634,6 +2634,52 @@ that fits the model AND uses every device to the fullest.
       numbers recorded in `bench/BASELINE.md`, which is still not done. Worth noting for whoever does:
       the fusion arm took 167 s against the SPIR-V arm's 43 s on a warm build — fusion's first-forward
       cost is real and belongs in the recorded numbers, not hidden in a timeout.*
+      *(2026-08-28, later the same run) **Half of it is now mechanized; the other half is blocked on
+      the card, not on the work.** `mummu-bench` forwards `fusion` / `vulkan-spirv` as its own
+      features (default = mummu's own default, so every existing invocation builds unchanged), which
+      is what makes `--no-default-features --features vulkan-spirv` reach the gates at all — before
+      this they inherited mummu's defaults and the flag flip was unexpressible from that crate. And
+      every GPU gate now prints the set it was COMPILED under beside its numbers
+      (`[budget/fusion+vulkan-spirv] ...`, `[budget/f16/vulkan-spirv] ...`), from `cfg!` so the label
+      cannot drift from the build — the same guard-class as `budget_f16.rs`'s dtype assert, and for
+      the same reason: this repo has recorded a mislabeled measurement before. Both feature sets
+      compile clean and the label's unit test passes under each. What is still `[ ]`: the budget rows
+      themselves on the second set, which could not be measured because a warm-resident production
+      model held 15296 of 16376 MiB for the rest of the run — recorded as explicitly **not measured**
+      in the new `bench/BASELINE.md` feature-set table rather than left blank, since an empty cell
+      reads as "unchanged".*
+- [x] **The GPU perf gates need a VRAM precondition that reports a SKIP, not a block or a flake.**
+      *(2026-08-28)* This run could not measure the GPU budget rows on the second feature set: the
+      production `mummu-serve` on this box now keeps a 27B **warm-resident by design**, so the card
+      sits at 10-15 GiB used between requests (measured mid-run: 15014/16376 MiB used, 1048 free,
+      72 % util) and the f32 Qwen2.5-1.5B arm wants ~8 GiB runner / 11.5 GiB peak whole-card. That
+      turns the routine's existing operational rule — "run the budget gates on a quiet machine" — from
+      advice into an unsatisfiable precondition, and the failure mode is the bad one: a gate that
+      waits silently is indistinguishable from a gate that passed. Every gate already knows its own
+      need (`bench/BASELINE.md` records the runner and peak figures per row), and `mummu::vram`
+      already reads live free VRAM through NVML, so the pieces exist: read free VRAM at gate entry,
+      run when it clears the row's need, and otherwise print a summarized skip **carrying the
+      reading** and return without asserting. Same class as the missing-fixture item above and the
+      Ollama-tag one below — a precondition that is absent must say so in a way that cannot be read
+      as either a pass or a regression. Do NOT make it wait: a blocking gate inside a 4-hour routine
+      spends the run's budget on someone else's model.
+      *(2026-08-28, same run) **Shipped, and proven on the busy card that motivated it.**
+      `mummu_bench::gpu_has_room_for(need_mib, label)` reads live free VRAM through `mummu::vram`
+      (NVML — the card's *global* free, not the per-process DXGI budget that reports plenty while
+      someone else holds the card) and either returns `true` or prints one line and returns `false`,
+      which the gate treats as "return without asserting". Needs are per row, taken from
+      `bench/BASELINE.md` rather than guessed: **8192 MiB** for `budget.rs` (~8.0 GiB runner inside an
+      11.5 GiB whole-card peak) and **3686 MiB** for `budget_f16.rs` (~3.6 inside 6.75). Fail-open by
+      construction: a machine that cannot report VRAM at all gets `true`, so a box without an NVIDIA
+      driver behaves exactly as it did before the check existed. The decision itself is a pure leaf
+      (`fits(free, need)`) with a boundary test — inclusive at the need, exclusive one MiB below — so
+      it is testable without a particular card on a particular afternoon. REAL proof, unplanned: with
+      production holding the card, both gates printed
+      `SKIPPED, not a regression: needs 8192 MiB of VRAM, card has 1079 MiB free (15296 of 16376 MiB
+      held by every process on this machine)` and returned in **0.05 s** instead of pushing 6 GB of
+      weights at a card with 1 GiB free. What is deliberately NOT done: it does not wait, and it does
+      not lower the budget to fit — a gate that measures a contended card is worse than one that
+      says it did not run.*
 - [ ] **The Ollama greedy leg has no fixture on this machine** — `parity_qwen2`'s second leg fails
       with `model 'qwen2.5:1.5b-instruct-fp16' not found` while its logits leg passes. That is the
       missing-fixture-vs-wrong-answer confusion the P3 item above is about, hit in the field: the run

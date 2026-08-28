@@ -31,6 +31,13 @@ const DECODE_STEPS: usize = 32;
 const LONG_PREFILL_TOKENS: usize = 2048;
 const LONG_PREFILL_BUDGET_MS: f64 = 900.0;
 
+/// What this gate's own allocations need, from the f32 row of
+/// `bench/BASELINE.md`: ~8.0 GiB of runner inside an 11.5 GiB whole-card peak
+/// (weights, KV state, and the 201 MiB scores tensor the 2048-token prefill
+/// materializes). Below this the gate reports a skip instead of measuring a
+/// card it is sharing.
+const VRAM_NEED_MIB: u64 = 8 * 1024;
+
 fn qwen2_dir() -> Option<PathBuf> {
     let dir = PathBuf::from(std::env::var_os("MUMMU_QWEN2_DIR")?);
     dir.is_dir().then_some(dir)
@@ -42,6 +49,13 @@ async fn qwen2_stays_inside_its_perf_budgets() {
     let Some(dir) = qwen2_dir() else {
         panic!("set MUMMU_QWEN2_DIR to a dir with config.json/tokenizer.json/model.safetensors");
     };
+
+    // A shared card is the normal case on this box (a warm-resident
+    // production model can hold 10-15 GiB of it), and a gate that cannot get
+    // the VRAM it needs has not regressed — it has not run. Say which.
+    if !mummu_bench::gpu_has_room_for(VRAM_NEED_MIB, "budget") {
+        return;
+    }
     let text = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nExplain, in three sentences, why the sky is blue.<|im_end|>\n<|im_start|>assistant\n";
     let tok = Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer.json loads");
     let ids = tok.encode(text, false).expect("encodes").get_ids().to_vec();
@@ -88,8 +102,9 @@ async fn qwen2_stays_inside_its_perf_budgets() {
     let _ = argmax_id(logits).await.expect("argmax");
     let long_prefill_ms = start.elapsed().as_secs_f64() * 1e3;
 
+    let features = mummu_bench::gpu_feature_set();
     eprintln!(
-        "[budget] TTFT {ttft_ms:.1} ms (budget {TTFT_BUDGET_MS} ms), \
+        "[budget/{features}] TTFT {ttft_ms:.1} ms (budget {TTFT_BUDGET_MS} ms), \
          decode {tok_per_s:.1} tok/s (budget {DECODE_BUDGET_TOKENS_PER_S} tok/s), \
          prefill@{LONG_PREFILL_TOKENS} {long_prefill_ms:.0} ms \
          (budget {LONG_PREFILL_BUDGET_MS} ms)"

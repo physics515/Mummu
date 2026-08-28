@@ -7,8 +7,17 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+# The GPU feature set is forwarded rather than inherited so the budget gates
+# can be run BOTH ways from one tree (`--no-default-features --features
+# vulkan-spirv` against the default). The default set below is exactly
+# mummu's own default, so every existing invocation builds unchanged.
+[features]
+default = ["fusion", "vulkan-spirv"]
+fusion = ["mummu/fusion"]
+vulkan-spirv = ["mummu/vulkan-spirv"]
+
 [dependencies]
-mummu = { path = "../mummu" }
+mummu = { path = "../mummu", default-features = false }
 burn = { workspace = true }
 
 [dev-dependencies]
