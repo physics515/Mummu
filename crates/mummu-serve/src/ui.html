@@ -303,8 +303,15 @@ function chatOverSocket(request, onEvent) {
     }
     // Only a failure BEFORE the stream opens is worth falling back on; once
     // frames are flowing, a drop is a real error and retrying would replay
-    // the whole generation.
+    // the whole generation. A connection that never opens fires BOTH "error"
+    // and "close", so the fallback is guarded to post the request once.
     let opened = false;
+    let fellBack = false;
+    const fallBack = () => {
+      if (fellBack) return;
+      fellBack = true;
+      chatOverSse(request, onEvent).then(resolve, reject);
+    };
     socket.addEventListener("open", () => {
       opened = true;
       socket.send(JSON.stringify(request));
@@ -318,11 +325,11 @@ function chatOverSocket(request, onEvent) {
       }
     });
     socket.addEventListener("error", () => {
-      if (!opened) chatOverSse(request, onEvent).then(resolve, reject);
+      if (!opened) fallBack();
     });
     socket.addEventListener("close", () => {
       if (opened) resolve();
-      else chatOverSse(request, onEvent).then(resolve, reject);
+      else fallBack();
     });
   });
 }
