@@ -13,6 +13,7 @@
 //! rung into a `QuantScheme` — stays in `mummu::quant`.
 
 pub mod bits;
+pub mod hadamard;
 pub mod scales;
 
 /// Which quantization the keep-quantized path applies on import.

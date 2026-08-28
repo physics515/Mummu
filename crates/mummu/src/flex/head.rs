@@ -282,7 +282,7 @@ pub fn head_topk(
     let mut evaluated_tiles = 0usize;
     let mut evaluated_rows = 0usize;
     let mut scratch = vec![0.0f32; TILE];
-    let mut eval_tile = |t: usize,
+    let eval_tile = |t: usize,
                          top: &mut TopK,
                          evaluated: &mut Vec<bool>,
                          evaluated_tiles: &mut usize,

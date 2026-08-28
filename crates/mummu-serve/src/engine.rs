@@ -182,6 +182,12 @@ fn load_any(
     policy: mummu::quant::QuantPolicy,
     backend: BackendChoice,
 ) -> Result<Loaded, String> {
+    // Serve opts into the bounded-exact host lm_head (SPEC P4.3/P4.4):
+    // greedy reads the argmax and the sampler consults only its top-k
+    // candidates, both of which the bounded head reproduces exactly — the
+    // full-softmax consumers that need the dense head are the parity
+    // harness's, and it never sets this. `MUMMU_HEAD_BOUND=0` vetoes.
+    mummu::flex::head::set_enabled(true);
     let dir = spec.dir(models_root);
     match &spec.format {
         WeightFormat::Safetensors => {
@@ -1095,8 +1101,16 @@ fn build_layered_qwen35(
 
     let dev_for = |l: usize| if l < on_device { device.clone() } else { host.clone() };
     // Embedding on the host (a gather; see `pack_trunk_bytes`), and the head
-    // with the last layer so the final projection does not cross.
-    let head = dev_for(layer_bytes.len().saturating_sub(1));
+    // with the last layer so the final projection does not cross — unless
+    // `MUMMU_HEAD_DEVICE` pins it. The admission calculus for that pin is
+    // `mummu_schedule::choices::admit_head` (the head's ms-per-byte
+    // density vs the marginal layers the same bytes would hold); with the
+    // bounded head cutting the host head's cost, measure before pinning.
+    let head = match std::env::var("MUMMU_HEAD_DEVICE").as_deref() {
+        Ok(v) if v.eq_ignore_ascii_case("gpu") => device.clone(),
+        Ok(v) if v.eq_ignore_ascii_case("host") => host.clone(),
+        _ => dev_for(layer_bytes.len().saturating_sub(1)),
+    };
     let started = Instant::now();
     // What precision a HOST layer carries. Default Q4 (see `host_layers_q4`
     // for the measured history); at decode the packed VNNI twin
@@ -1194,6 +1208,21 @@ fn warm_host_twins(model: &qwen35::LoadedQwen35, from_layer: usize) {
         warm(&layer.mlp.gate_proj);
         warm(&layer.mlp.up_proj);
         warm(&layer.mlp.down_proj);
+    }
+    // The lm_head was the one host projection the old warm skipped — its
+    // ~700 MiB twin then packed lazily ON THE FIRST TOKEN (with a second
+    // 4-bit rounding logged) and stalled it by seconds. Warm it like the
+    // rest; the extra zero-GEMV also builds the bounded head's row-norm
+    // metadata while the load bar is already up.
+    if let Some(head) = &model.model.lm_head {
+        warm(head);
+        if mummu::flex::head::enabled() {
+            let w = head.weight.val();
+            if matches!(w.dtype(), burn::tensor::DType::QFloat(_)) {
+                let x = Tensor::<2>::zeros([1, w.dims()[0]], &w.device());
+                let _ = mummu::nn::try_q4s_head(&x, &w);
+            }
+        }
     }
     if built > 0 {
         eprintln!(
@@ -2036,7 +2065,8 @@ fn probe_contention(pack: &mummu::pack::Pack) {
 /// because every term is derivable:
 ///
 /// * **KV cache** — full-attention layers only (`(i+1) % interval == 0`),
-///   `2 (k,v) x kv_heads x ctx x head_dim` f32 per layer.
+///   `2 (k,v) x kv_heads x ctx x head_dim` per layer at the cache's
+///   STORAGE dtype (f32, or f16 under `MUMMU_KV_F16`).
 /// * **Recurrent state** — DeltaNet layers, context-INDEPENDENT:
 ///   `conv [b, conv_dim, k-1]` plus `state [b, n_v_heads, d_state, d_state]`.
 /// * **Activation peak** — prefill dominates decode by the prompt length:
@@ -2061,12 +2091,16 @@ fn computed_reserve_bytes(cfg: &qwen35::Qwen35Config, layers_on_device: usize, c
     let full_attn = (0..n).filter(|&l| cfg.is_attention(l)).count() as u64;
     let delta = n as u64 - full_attn;
 
+    // KV is priced at its STORAGE dtype: the f16 cache (`MUMMU_KV_F16`,
+    // SPEC P2.1) halves the persistent bytes, and pricing it at f32 would
+    // silently waste the layers the halving bought.
+    let kv_bytes = if mummu::nn::kv_f16_enabled() { 2 } else { f32b };
     let kv = full_attn
         * 2
         * cfg.num_key_value_heads as u64
         * ctx as u64
         * cfg.head_dim as u64
-        * f32b;
+        * kv_bytes;
     let conv = delta
         * cfg.conv_dim() as u64
         * cfg.conv_kernel.saturating_sub(1) as u64
@@ -2781,6 +2815,15 @@ async fn drive(
             let elapsed_ms = start.elapsed().as_millis();
             // Every completed generation is one placement's worth of evidence.
             observe_placement(out.len(), elapsed_ms);
+            // The in-situ bandwidth ledger (SPEC P1.1): per-shape
+            // beta_hat = bytes/dt on the production GEMV/GEMM path — the
+            // instrument for the live ~2-3x inflation over the quiet
+            // microbench. Per-request so the numbers attribute to a
+            // workload, reset so requests do not smear together.
+            if std::env::var("MUMMU_INSITU_REPORT").is_ok_and(|v| v != "0") {
+                eprint!("{}", mummu::flex::insitu::report());
+                mummu::flex::insitu::reset();
+            }
             if matches!(&m.lm, AnyLm::OlmoeQ(q) if q.pool.is_some()) {
                 rebalance_tiers();
             }
