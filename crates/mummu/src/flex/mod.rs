@@ -6,6 +6,7 @@
 //! everywhere else). See the module docs in [`kernels`].
 
 pub mod gdn;
+pub mod head;
 pub mod insitu;
 pub mod kernels;
 pub mod registry;

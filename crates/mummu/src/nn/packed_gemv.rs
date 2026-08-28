@@ -143,6 +143,45 @@ pub trait Q4GemmOps: Backend {
     fn q4s_gemm(x: FloatTensor<Self>, w: QuantizedTensor<Self>) -> FloatTensor<Self>;
 }
 
+#[backend_extension(Flex)]
+/// The bounded-exact host lm_head (SPEC P4.3/P4.4): `[1, vocab]` logits
+/// whose top-`flex::head::head_k()` coordinates are the exact dense values
+/// and every other coordinate is `flex::head::SENTINEL`. Tile bounds
+/// (Cauchy–Schwarz + the activation-error aggregate) prove the skipped
+/// rows out of the top-k, so argmax and top-k sampling see exactly what
+/// the dense head would give them, at a fraction of the streamed bytes.
+pub trait Q4HeadOps: Backend {
+    /// Sentinel-dense bounded head evaluation.
+    fn q4s_head_topk(x: FloatTensor<Self>, w: QuantizedTensor<Self>) -> FloatTensor<Self>;
+}
+
+/// Route the lm_head through the bounded-exact top-k path when everything
+/// lines up: the path is enabled (serve opts in; the parity harness's
+/// full-softmax logprob legs must keep the dense head), the tensor lives
+/// on flex, it is a decode-shape call, and the weight is packed Q4.
+/// `None` means: use the dense head.
+pub fn try_q4s_head(x: &Tensor<2>, w: &Tensor<2>) -> Option<Tensor<2>> {
+    if !crate::flex::head::enabled() || !packed_gemv_enabled() {
+        return None;
+    }
+    if x.dims()[0] != 1 || !crate::backend::is_flex(&x.device()) {
+        return None;
+    }
+    let DType::QFloat(scheme) = w.dtype() else {
+        return None;
+    };
+    if !scheme_supported(&scheme)
+        || !matches!(scheme.value, burn::tensor::quantization::QuantValue::Q4S)
+    {
+        return None;
+    }
+    let y = <burn::backend::Dispatch as Q4HeadOps>::q4s_head_topk(
+        x.clone().into_dispatch(),
+        w.clone().into_dispatch(),
+    );
+    Some(Tensor::from_dispatch(y))
+}
+
 // ---------------------------------------------------------------------------
 // CubeCL backends (wgpu / vulkan / cuda), non-fusion primitive level.
 // ---------------------------------------------------------------------------
@@ -560,6 +599,65 @@ mod flex_impl {
         }
     }
 
+    impl super::Q4HeadOps for Flex {
+        fn q4s_head_topk(x: FloatTensor<Self>, w: QuantizedTensor<Self>) -> FloatTensor<Self> {
+            use std::sync::Mutex;
+            let shape = w.shape();
+            let [k_len, n] = shape.dims::<2>();
+            let started = std::time::Instant::now();
+            let xs_owned;
+            let xs: &[f32] = match x.as_slice::<f32>() {
+                Some(s) => s,
+                None => {
+                    xs_owned = x.into_data().to_vec::<f32>().expect("f32 activations");
+                    &xs_owned
+                }
+            };
+            let wq: &[i8] = w
+                .tensor()
+                .as_slice::<i8>()
+                .expect("flex quantized weight is contiguous i8");
+            let scales: &[f32] = w.scales();
+            let Some(packed) = (twin_eligible(&w, k_len))
+                .then(|| crate::flex::registry::resolve(wq, scales, k_len, n))
+                .flatten()
+            else {
+                // No twin: the dense path answers.
+                let mut out = vec![0f32; n];
+                i8_gemv(xs, wq, scales, k_len, n, &mut out);
+                return FlexTensor::from_data(TensorData::new(out, [1, n]));
+            };
+            let meta = crate::flex::head::meta_for(&packed);
+            // A process-global hot set purely improves the visiting order;
+            // interleaved requests only degrade the seeds, never the answer.
+            static HOT: Mutex<Option<crate::flex::head::HotSet>> = Mutex::new(None);
+            let k = crate::flex::head::head_k();
+            let seeds = {
+                let mut hot = HOT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                hot.get_or_insert_with(crate::flex::head::HotSet::new)
+                    .seeds(n.div_ceil(crate::flex::head::TILE), 4)
+            };
+            let top = crate::flex::head::head_topk(&packed, &meta, xs, k, &seeds);
+            {
+                let mut hot = HOT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(h) = hot.as_mut() {
+                    h.observe(xs, &top);
+                }
+            }
+            // The pruning ratio is the whole point — the ledger records the
+            // bytes actually streamed, which is what the report divides by.
+            let evaluated_bytes = (packed.streamed_bytes() as u128
+                * top.evaluated_rows as u128
+                / n.max(1) as u128) as usize;
+            crate::flex::insitu::record(k_len, n, 1, evaluated_bytes, started.elapsed());
+            let mut out = vec![crate::flex::head::SENTINEL; n];
+            for (&id, &v) in top.ids.iter().zip(&top.vals) {
+                out[id as usize] = v;
+            }
+            FlexTensor::from_data(TensorData::new(out, [1, n]))
+        }
+    }
+
     impl Q4GemmOps for Flex {
         fn q4s_gemm(x: FloatTensor<Self>, w: QuantizedTensor<Self>) -> FloatTensor<Self> {
             let shape = w.shape();
@@ -793,6 +891,42 @@ mod tests {
             "gemm vs stacked gemvs rel err {} (abs {diff})",
             diff / scale
         );
+    }
+
+    /// The bounded head end to end through `try_q4s_head`: with k covering
+    /// the whole vocab every row is evaluated, so the sentinel-dense output
+    /// must equal the dense GEMV bitwise — the plumbing proof (pruning
+    /// exactness is pinned at the kernel level in `flex::head`). Disabled
+    /// by default: the gate must decline until serve opts in.
+    #[test]
+    fn bounded_head_scatter_matches_dense() {
+        let _serial = FLEX_PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::flex::registry::force_disable(false);
+        let device = crate::backend::cpu_device();
+        let (k, vocab) = (128, 512);
+        let x = Tensor::<2>::random([1, k], Distribution::Uniform(-1.0, 1.0), &device);
+        let w = Tensor::<2>::random([k, vocab], Distribution::Uniform(-1.0, 1.0), &device);
+        let wq = crate::quant::quantize_weight(crate::quant::QuantPolicy::Q4, w);
+
+        assert!(
+            try_q4s_head(&x, &wq).is_none(),
+            "the bounded head must be opt-in"
+        );
+        crate::flex::head::set_enabled(true);
+        let got = try_q4s_head(&x, &wq).expect("enabled head must engage");
+        crate::flex::head::set_enabled(false);
+
+        let dense = try_q4s_gemv(&x, &wq).expect("dense twin path");
+        // head_k (default 1024) >= vocab: everything is evaluated, so the
+        // scatter must reproduce the dense vector exactly.
+        let diff = got
+            .sub(dense)
+            .abs()
+            .max()
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap()[0];
+        assert_eq!(diff, 0.0, "full-coverage bounded head must equal dense");
     }
 
     /// The GEMM also serves the i8 fallback (twin off): same equality, so

@@ -217,6 +217,95 @@ impl PackedQ4 {
         let g = self.groups();
         &self.scales[n * g..(n + 1) * g]
     }
+
+    /// Visit one output row's groups as `(group, scale, signed quants)` —
+    /// the offline-analysis walk (row norms, error aggregates) without
+    /// exposing the packed layout.
+    pub fn for_each_group(&self, n: usize, mut f: impl FnMut(usize, f32, &[i8])) {
+        let groups = self.groups();
+        let mut row = vec![0u8; self.k];
+        unpack_row(self.row_qs(n), &mut row);
+        let rs = self.row_scales(n);
+        let mut signed = [0i8; GROUP];
+        for g in 0..groups {
+            for j in 0..GROUP {
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    signed[j] = (i32::from(row[g * GROUP + j]) - 8) as i8;
+                }
+            }
+            f(g, rs[g].to_f32(), &signed);
+        }
+    }
+
+    /// Evaluate output rows `n0..n1` against one activation vector,
+    /// writing into `out` — the tile evaluator for the bounded head.
+    /// `integer` selects the VNNI/scalar quantized path (the caller has
+    /// already applied the quality dispatch); otherwise the exact-f32
+    /// path over the same packed bytes. Row results are IDENTICAL to what
+    /// [`gemv_q4n_auto`] computes for those rows under the same dispatch.
+    pub fn dot_rows(
+        &self,
+        n0: usize,
+        n1: usize,
+        acts: &Q8Acts,
+        x: &[f32],
+        integer: bool,
+        out: &mut [f32],
+    ) {
+        assert!(n0 <= n1 && n1 <= self.n, "row range");
+        assert_eq!(out.len(), n1 - n0, "output length");
+        assert_eq!(acts.qs.len(), self.k, "activation length");
+        let groups = self.groups();
+        if integer {
+            let use_vnni = vnni_available();
+            let mut combined = vec![0.0f32; groups];
+            let mut row = vec![0u8; self.k];
+            for (i, n) in (n0..n1).enumerate() {
+                let rs = self.row_scales(n);
+                for g in 0..groups {
+                    combined[g] = rs[g].to_f32() * acts.scales[g];
+                }
+                if use_vnni {
+                    #[cfg(target_arch = "x86_64")]
+                    // SAFETY: vnni_available() checked; slice lengths
+                    // asserted above.
+                    unsafe {
+                        out[i] = row_dot_vnni(self.row_qs(n), &acts.qs, &combined);
+                    }
+                } else {
+                    unpack_row(self.row_qs(n), &mut row);
+                    let mut y = 0.0f32;
+                    for g in 0..groups {
+                        let mut dot = 0i32;
+                        for j in 0..GROUP {
+                            let kk = g * GROUP + j;
+                            dot += (i32::from(row[kk]) - 8) * i32::from(acts.qs[kk]);
+                        }
+                        y += combined[g] * dot as f32;
+                    }
+                    out[i] = y;
+                }
+            }
+        } else {
+            let mut row = vec![0u8; self.k];
+            for (i, n) in (n0..n1).enumerate() {
+                unpack_row(self.row_qs(n), &mut row);
+                let rs = self.row_scales(n);
+                let mut y = 0.0f32;
+                for g in 0..groups {
+                    let s = rs[g].to_f32();
+                    let mut acc = 0.0f32;
+                    for j in 0..GROUP {
+                        let kk = g * GROUP + j;
+                        acc += (i32::from(row[kk]) - 8) as f32 * x[kk];
+                    }
+                    y += s * acc;
+                }
+                out[i] = y;
+            }
+        }
+    }
 }
 
 /// Pack one row (offset nibbles, natural k order) into the chunk layout.
@@ -315,6 +404,13 @@ impl Q8Acts {
             scales,
             quality,
         }
+    }
+
+    /// Largest per-group activation scale — the coefficient of the
+    /// activation-quantization error bound (`eps <= max_scale/2 · A_row`).
+    #[must_use]
+    pub fn max_scale(&self) -> f32 {
+        self.scales.iter().fold(0.0f32, |m, &s| m.max(s))
     }
 }
 

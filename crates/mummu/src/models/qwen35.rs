@@ -2198,7 +2198,14 @@ impl CausalLm for LoadedQwen35 {
         // device holds the embedding table — the HOST, for a split model.
         let _s = crate::prof::scope("lm_head");
         match &self.model.lm_head {
-            Some(head) => qlinear2(head, last),
+            // The bounded-exact host head (SPEC P4.3/P4.4) engages when
+            // serve opted in and the weight is packed on flex; every
+            // consulted coordinate equals the dense head's value (see
+            // `flex::head`), and the skipped rows never stream.
+            Some(head) => match crate::nn::try_q4s_head(&last, &head.weight.val()) {
+                Some(logits) => logits,
+                None => qlinear2(head, last),
+            },
             None => {
                 // Tied head: logits = h · Eᵀ. The embedding may be on another
                 // device (host-resident gather table), and unlike the gather
