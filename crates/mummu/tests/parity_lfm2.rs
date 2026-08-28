@@ -143,7 +143,7 @@ fn first_forward_leg(tier: &Tier) {
         .forward(&ids, 0, &mut cache, &device)
         .into_data()
         .convert::<f32>()
-        .to_vec::<f32>()
+        .try_to_vec::<f32>()
         .expect("logits readback");
 
     let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();

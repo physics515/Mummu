@@ -43,7 +43,7 @@ fn main() {
     let up = timed(50, || {
         let d = host.clone().to_device(&dgpu);
         // Touch it so the move cannot be elided or left queued.
-        let _ = d.into_data().convert::<f32>().to_vec::<f32>().ok();
+        let _ = d.into_data().convert::<f32>().try_to_vec::<f32>().ok();
     });
     println!("  host -> dGPU -> host          {up:6.2} ms");
 
@@ -56,7 +56,7 @@ fn main() {
             let y = on_gpu.clone().add(on_gpu);
             x = y.to_device(&cpu);
         }
-        let _ = x.into_data().convert::<f32>().to_vec::<f32>().ok();
+        let _ = x.into_data().convert::<f32>().try_to_vec::<f32>().ok();
     });
     println!("  {LAYERS} layers, trunk on host   {round:6.2} ms/token   <- paid every token");
 
@@ -71,7 +71,7 @@ fn main() {
             let y = on.clone().add(on);
             x = backend::move_to(y, &cpu);
         }
-        let _ = x.into_data().convert::<f32>().to_vec::<f32>().ok();
+        let _ = x.into_data().convert::<f32>().try_to_vec::<f32>().ok();
     });
     println!("  same, 1 layer in 8 on the iGPU {three:6.2} ms/token");
 
@@ -90,7 +90,7 @@ fn main() {
             for _ in 0..ops {
                 x = x.clone().mul_scalar(1.0001).add_scalar(0.0);
             }
-            let _ = x.into_data().convert::<f32>().to_vec::<f32>().ok();
+            let _ = x.into_data().convert::<f32>().try_to_vec::<f32>().ok();
         });
         println!(
             "
@@ -105,7 +105,7 @@ fn main() {
             for _ in 0..ops {
                 x = x.clone().mul_scalar(1.0001).add_scalar(0.0);
             }
-            let _ = x.into_data().convert::<f32>().to_vec::<f32>().ok();
+            let _ = x.into_data().convert::<f32>().try_to_vec::<f32>().ok();
         });
         println!("  same on the dGPU                {gms:7.2} ms/token");
     }
@@ -120,7 +120,7 @@ fn main() {
         for _ in 0..LAYERS {
             x = x.clone().add(x);
         }
-        let _ = x.into_data().convert::<f32>().to_vec::<f32>().ok();
+        let _ = x.into_data().convert::<f32>().try_to_vec::<f32>().ok();
     });
     println!("  {LAYERS} layers, all on the dGPU {none:6.2} ms/token   <- what fitting buys");
 }

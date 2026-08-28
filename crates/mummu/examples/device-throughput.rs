@@ -34,7 +34,7 @@ fn time_matmul(device: &Device, w: &Tensor<2>, k: usize, m: usize, rounds: usize
             .matmul(w.clone())
             .into_data()
             .convert::<f32>()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .ok()?;
         let started = Instant::now();
         for _ in 0..rounds {
@@ -45,7 +45,7 @@ fn time_matmul(device: &Device, w: &Tensor<2>, k: usize, m: usize, rounds: usize
                 .matmul(w.clone())
                 .into_data()
                 .convert::<f32>()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .ok()?;
         }
         Some(started.elapsed().as_secs_f64() * 1000.0 / rounds as f64)

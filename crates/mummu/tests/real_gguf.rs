@@ -420,7 +420,7 @@ async fn real_lfm2_gguf_loads_and_decodes_on_gpu() {
         let mut cache = m.new_cache();
         m.forward(&prompt, 0, &mut cache, &device)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .expect("logits read back")
     };
     let gguf_logits = logits_of(&gguf_model);
@@ -500,7 +500,7 @@ async fn real_qwen2_gguf_loads_and_decodes_on_gpu() {
         let mut cache = m.new_cache();
         m.forward(&prompt, 0, &mut cache, &device)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .expect("logits read back")
     };
     let argmax = |v: &[f32]| -> usize {

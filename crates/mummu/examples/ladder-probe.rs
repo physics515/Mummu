@@ -49,7 +49,7 @@ fn main() {
         x.matmul(w)
             .into_data()
             .convert::<f32>()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap()
     };
     let scale = want.iter().map(|v| v.abs()).fold(1e-6, f32::max);
@@ -71,7 +71,7 @@ fn main() {
                     x.matmul(w)
                         .into_data()
                         .convert::<f32>()
-                        .to_vec::<f32>()
+                        .try_to_vec::<f32>()
                         .ok()
                 }))
                 .ok()

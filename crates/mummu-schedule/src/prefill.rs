@@ -118,9 +118,18 @@ pub fn best_chunk(
     mem_budget: u64,
     c_max: usize,
 ) -> Option<ChunkChoice> {
-    debug_assert!(t_sync.is_finite() && t_sync >= 0.0, "t_sync must be finite, nonnegative");
-    debug_assert!(k0.is_finite() && k0 >= 0.0, "k0 must be finite, nonnegative");
-    debug_assert!(k1.is_finite() && k1 >= 0.0, "k1 must be finite, nonnegative");
+    debug_assert!(
+        t_sync.is_finite() && t_sync >= 0.0,
+        "t_sync must be finite, nonnegative"
+    );
+    debug_assert!(
+        k0.is_finite() && k0 >= 0.0,
+        "k0 must be finite, nonnegative"
+    );
+    debug_assert!(
+        k1.is_finite() && k1 >= 0.0,
+        "k1 must be finite, nonnegative"
+    );
     debug_assert!(
         mem.a0 >= 0.0 && mem.a1 >= 0.0 && mem.a2 >= 0.0,
         "memory coefficients must be nonnegative"
@@ -293,7 +302,10 @@ mod tests {
 
         let budget = (300.0 * MIB) as u64;
         let tight = best_chunk(s, t_sync, k0, k1, mem, budget, s).unwrap();
-        assert!(mem.peak_bytes(s) > budget as f64, "the test only means something if c = S is infeasible");
+        assert!(
+            mem.peak_bytes(s) > budget as f64,
+            "the test only means something if c = S is infeasible"
+        );
         assert!(tight.chunk < s);
         assert!(tight.peak_bytes <= budget as f64);
 
@@ -306,7 +318,11 @@ mod tests {
     /// smaller-c tie-break must return it.
     #[test]
     fn zero_overhead_makes_the_smallest_chunk_optimal() {
-        let mem = MemModel { a0: 0.0, a1: 1.0, a2: 0.0 };
+        let mem = MemModel {
+            a0: 0.0,
+            a1: 1.0,
+            a2: 0.0,
+        };
         let got = best_chunk(1000, 0.0, 0.0, 0.01, mem, u64::MAX, 1000).unwrap();
         assert_eq!(got.chunk, 1);
         assert!((got.time - 1000.0 * 0.01).abs() < 1e-9);
@@ -336,14 +352,23 @@ mod tests {
         // Sanity on the constants: unchunked peak ~855 MB (3*4096*17408*4),
         // feasible c cap a bit over 1500 tokens.
         let unchunked_mb = mem.peak_bytes(s) / 1e6;
-        assert!((850.0..860.0).contains(&unchunked_mb), "unchunked peak {unchunked_mb} MB");
+        assert!(
+            (850.0..860.0).contains(&unchunked_mb),
+            "unchunked peak {unchunked_mb} MB"
+        );
         let c_cap = (budget as f64 / mem.a1) as usize;
-        assert!((1400..1600).contains(&c_cap), "feasible cap ~1505, got {c_cap}");
+        assert!(
+            (1400..1600).contains(&c_cap),
+            "feasible cap ~1505, got {c_cap}"
+        );
 
         let got = best_chunk(s, t_sync, k0, k1, mem, budget, s).unwrap();
         assert!(got.peak_bytes <= budget as f64);
         assert!(got.chunk <= c_cap);
-        assert!(got.chunks >= 3, "4096 tokens under a ~1505 cap is at least 3 chunks");
+        assert!(
+            got.chunks >= 3,
+            "4096 tokens under a ~1505 cap is at least 3 chunks"
+        );
 
         let t_one_chunk = t_sync + k0 + k1 * s as f64;
         eprintln!(
@@ -362,7 +387,11 @@ mod tests {
     /// Nothing to prefill or no chunk allowed: no answer, by contract.
     #[test]
     fn degenerate_inputs_return_none() {
-        let mem = MemModel { a0: 0.0, a1: 1.0, a2: 0.0 };
+        let mem = MemModel {
+            a0: 0.0,
+            a1: 1.0,
+            a2: 0.0,
+        };
         assert_eq!(best_chunk(0, 1.0, 1.0, 1.0, mem, 1000, 64), None);
         assert_eq!(best_chunk(64, 1.0, 1.0, 1.0, mem, 1000, 0), None);
     }
@@ -371,8 +400,16 @@ mod tests {
     /// affine part alone would.
     #[test]
     fn quadratic_memory_term_caps_the_chunk() {
-        let affine = MemModel { a0: 0.0, a1: 100.0, a2: 0.0 };
-        let quad = MemModel { a0: 0.0, a1: 100.0, a2: 10.0 };
+        let affine = MemModel {
+            a0: 0.0,
+            a1: 100.0,
+            a2: 0.0,
+        };
+        let quad = MemModel {
+            a0: 0.0,
+            a1: 100.0,
+            a2: 10.0,
+        };
         let budget = 1_000_000u64; // affine cap: 10_000; quad cap: ~311
         let a = best_chunk(4096, 0.5, 0.1, 0.001, affine, budget, 4096).unwrap();
         let q = best_chunk(4096, 0.5, 0.1, 0.001, quad, budget, 4096).unwrap();
@@ -400,7 +437,11 @@ mod tests {
 
         // Solve-heavy (a3 huge): big chunks pay c^3 log c, so small wins.
         let solvey = best_gdn_chunk(2048, 0.01, 0.0, 0.0, 1.0, 64).unwrap();
-        assert!(solvey.chunk <= 2, "cubic-dominated argmin at {}", solvey.chunk);
+        assert!(
+            solvey.chunk <= 2,
+            "cubic-dominated argmin at {}",
+            solvey.chunk
+        );
 
         // A balanced instance has an interior minimum; verify vs brute force.
         let (a0, a1, a2, a3) = (2.0, 0.05, 0.001, 1e-6);
@@ -413,7 +454,11 @@ mod tests {
         };
         let brute = (1..=256).map(model).fold(f64::INFINITY, f64::min);
         assert!((got.time - brute).abs() < 1e-9);
-        assert!(got.chunk > 1 && got.chunk < 256, "interior argmin, got {}", got.chunk);
+        assert!(
+            got.chunk > 1 && got.chunk < 256,
+            "interior argmin, got {}",
+            got.chunk
+        );
         assert!((got.sequential_time - model(1)).abs() < 1e-9);
     }
 

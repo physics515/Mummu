@@ -18,12 +18,12 @@ pub use attention::{
 pub use conv::{ConvState, ShortConv, ShortConvConfig};
 pub use mlp::{SwiGluMlp, SwiGluMlpConfig};
 pub mod packed_gemv;
+pub use moe::{
+    DeviceExpert, ExpertExec, ExpertPool, ExpertWeights, MoeExperts, Routing, SparseMoe,
+    SparseMoeConfig, SparseMoePerExpert, StagedExpert, trace_layer, trace_us,
+};
 pub use packed_gemv::{
     Q4GemmOps, Q4GemvOps, Q4HeadOps, packed_gemv_enabled, try_q4s_gemv, try_q4s_head,
-};
-pub use moe::{
-    DeviceExpert, ExpertExec, ExpertPool, ExpertWeights, MoeExperts, Routing, SparseMoe, SparseMoeConfig,
-    SparseMoePerExpert, StagedExpert, trace_layer, trace_us,
 };
 pub use rope::{apply_rope, rope_tables, rotate_half};
 

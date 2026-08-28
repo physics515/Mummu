@@ -61,7 +61,11 @@ fn main() {
         costs.extend(mummu::partition::cluster_costs(&pack, l).expect("cluster costs"));
     }
     let per_layer = costs.len() / layers;
-    println!("{} layers x {per_layer} clusters = {} total\n", layers, costs.len());
+    println!(
+        "{} layers x {per_layer} clusters = {} total\n",
+        layers,
+        costs.len()
+    );
 
     let plan = plan_tiers(&devices, &costs, &[]).expect("plan");
 
@@ -86,7 +90,10 @@ fn main() {
     println!("matmuls per token, one FFN projection:");
     println!("  today (one per cluster)      {before}");
     println!("  coalesced (one per run)      {after}");
-    println!("  reduction                    {:.1}x\n", before as f64 / after as f64);
+    println!(
+        "  reduction                    {:.1}x\n",
+        before as f64 / after as f64
+    );
 
     println!("runs per layer (how fragmented each layer's assignment is):");
     for (runs, layers_with) in &hist {

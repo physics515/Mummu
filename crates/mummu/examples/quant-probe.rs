@@ -4,7 +4,7 @@
 //!
 //! `cargo run --release -p mummu --example quant-probe`
 
-use burn::tensor::quantization::{Calibration, QuantLevel, QuantParam, QuantValue};
+use burn::tensor::quantization::{Calibration, QuantScheme, QuantValue, ScaleDtype};
 use burn::tensor::{Distribution, Tensor};
 
 fn probe(label: &str, device: &burn::tensor::Device) {
@@ -15,28 +15,39 @@ fn probe(label: &str, device: &burn::tensor::Device) {
     let ref_host = reference
         .into_data()
         .convert::<f32>()
-        .to_vec::<f32>()
+        .try_to_vec::<f32>()
         .unwrap();
     let ref_scale = ref_host.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
 
-    let schemes: Vec<(&str, QuantValue, QuantLevel)> = vec![
-        ("Q8S/tensor", QuantValue::Q8S, QuantLevel::Tensor),
-        ("Q8S/block32", QuantValue::Q8S, QuantLevel::block([32])),
-        ("Q4S/tensor", QuantValue::Q4S, QuantLevel::Tensor),
-        ("Q4S/block32", QuantValue::Q4S, QuantLevel::block([32])),
+    // burn 0.22.0-pre.3 replaced `QuantLevel` with the scheme's own
+    // `per_tensor` / `per_block` setters, so a rung is now the setter to apply.
+    type Rung = fn(QuantScheme) -> QuantScheme;
+    let schemes: Vec<(&str, QuantValue, Rung)> = vec![
+        ("Q8S/tensor", QuantValue::Q8S, |s| {
+            s.per_tensor(ScaleDtype::F32)
+        }),
+        ("Q8S/block32", QuantValue::Q8S, |s| {
+            s.per_block([32], ScaleDtype::F32)
+        }),
+        ("Q4S/tensor", QuantValue::Q4S, |s| {
+            s.per_tensor(ScaleDtype::F32)
+        }),
+        ("Q4S/block32", QuantValue::Q4S, |s| {
+            s.per_block([32], ScaleDtype::F32)
+        }),
     ];
     for (name, value, level) in schemes {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             use burn::tensor::quantization::{compute_q_params, compute_range};
-            let scheme = burn::tensor::quantization::QuantScheme::default()
-                .with_value(value)
-                .with_level(level)
-                .with_param(QuantParam::F32);
+            let scheme = level(QuantScheme::default().with_value(value));
             let range = compute_range(&scheme, &w, &Calibration::MinMax);
             let qparams = compute_q_params(&scheme, range);
             let wq = w.clone().quantize(&scheme, qparams);
             let out = x.clone().matmul(wq);
-            out.into_data().convert::<f32>().to_vec::<f32>().unwrap()
+            out.into_data()
+                .convert::<f32>()
+                .try_to_vec::<f32>()
+                .unwrap()
         }));
         match outcome {
             Ok(got) => {

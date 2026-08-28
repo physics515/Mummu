@@ -68,19 +68,20 @@ async fn main() -> ExitCode {
         // desktop load is a suspect the sweep must be able to vary.
         // `MUMMU_GEMM_PRIORITY=normal` runs the herd un-demoted for that
         // A/B; anything else (or unset) keeps the proven demotion.
-        let demote = !std::env::var("MUMMU_GEMM_PRIORITY")
-            .is_ok_and(|v| v.eq_ignore_ascii_case("normal"));
+        let demote =
+            !std::env::var("MUMMU_GEMM_PRIORITY").is_ok_and(|v| v.eq_ignore_ascii_case("normal"));
         let mut builder = rayon::ThreadPoolBuilder::new();
         if demote {
             builder = builder.start_handler(|_| demote_current_thread());
         }
         if let Err(e) = builder.build_global() {
-            eprintln!("[mummu-serve] rayon pool was already initialized ({e}); gemm herd keeps default priority");
+            eprintln!(
+                "[mummu-serve] rayon pool was already initialized ({e}); gemm herd keeps default priority"
+            );
         }
     }
 
-    let addr = std::env::var("MUMMU_ADDR")
-        .unwrap_or_else(|_| mummu_serve::DEFAULT_ADDR.into());
+    let addr = std::env::var("MUMMU_ADDR").unwrap_or_else(|_| mummu_serve::DEFAULT_ADDR.into());
     let shim_addr = std::env::var("MUMMU_OLLAMA_ADDR")
         .unwrap_or_else(|_| mummu_serve::DEFAULT_OLLAMA_ADDR.into());
 

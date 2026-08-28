@@ -8,9 +8,15 @@ use std::collections::BTreeMap;
 use mummu::gguf::GgufFile;
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: gguf-verify <path.gguf>");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: gguf-verify <path.gguf>");
     let f = GgufFile::open(std::path::Path::new(&path)).expect("gguf opens");
-    println!("architecture: {:?} | tensors: {}", f.architecture(), f.tensors.len());
+    println!(
+        "architecture: {:?} | tensors: {}",
+        f.architecture(),
+        f.tensors.len()
+    );
 
     let mut per_dtype: BTreeMap<String, (usize, f32)> = BTreeMap::new();
     let mut bad = 0usize;
@@ -37,7 +43,9 @@ fn main() {
             bad += 1;
             continue;
         }
-        let e = per_dtype.entry(format!("{:?}", t.dtype)).or_insert((0, 0.0));
+        let e = per_dtype
+            .entry(format!("{:?}", t.dtype))
+            .or_insert((0, 0.0));
         e.0 += 1;
         e.1 = e.1.max(max_abs);
         if i % 100 == 0 {

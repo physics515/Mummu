@@ -235,7 +235,9 @@ mod tests {
     struct Pcg(u64);
     impl Pcg {
         fn new(seed: u64) -> Self {
-            Pcg(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(0xDA3E_39CB_94B9_5BDB))
+            Pcg(seed
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .wrapping_add(0xDA3E_39CB_94B9_5BDB))
         }
         fn next_u32(&mut self) -> u32 {
             let old = self.0;

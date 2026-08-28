@@ -123,6 +123,45 @@ was an f32 run. f16 decodes at 20.5 ms/token against f32's 60.0, so f16 is the f
 the small one. What survives is the *f32* reading: 60 ms/token streams ~6.2 GB of f32 weights at
 ~103 GB/s against the card's ~672 GB/s, so that path is dispatch-bound, not bandwidth-bound.
 
+## Feature sets: every recorded number now names the one it came from
+
+`fusion` and `vulkan-spirv` change which kernels run and which compiler emits them, so numbers from
+the two sets are **not** interchangeable. Since 2026-08-28 `mummu-bench` forwards both as its own
+features (`--no-default-features --features vulkan-spirv` against the default `fusion+vulkan-spirv`),
+and every GPU gate prints the set it was compiled under beside its numbers —
+`[budget/fusion+vulkan-spirv] TTFT ...`, `[budget/f16/vulkan-spirv] ...`. The label comes from
+`cfg!`, so it cannot drift from the build. This exists because this file has already recorded a
+mislabeled measurement once: the 2026-07-11 and 07-12 "f16" rows were f32 runs wearing an f16 label,
+and nothing in the transcript said so.
+
+| Measured 2026-08-28, burn 0.22.0-pre.3 | fusion+vulkan-spirv | vulkan-spirv |
+| --- | --- | --- |
+| GGUF parity, qwen2 Q4_K_M, max abs delta logprob vs llama.cpp | 2.6619045283301324e-1 | 2.66160628951464e-1 |
+| GGUF parity, qwen3 Q4_K_M, same | 4.015074138812089e-1 | 4.015169464318422e-1 |
+| GGUF parity, top-5 ids + 24-token greedy | exact / byte-identical | exact / byte-identical |
+| `parity_gguf` wall clock, warm build, both qwen legs | 167 s | 43 s |
+| f32 budget row (TTFT / decode / prefill@2048) | 86.8 ms / 12.8 tok/s / 605 ms | **not measured** |
+| f16 budget row | **not measured** | **not measured** |
+
+The f32 budget row above was taken earlier in the same run, before the label landed, so it is
+labelled by invocation (`cargo test -p mummu-bench` with default features) rather than by its own
+transcript line — the last row in this file that will be.
+
+
+The unmeasured cells are unmeasured, not unchanged: the card on this box is shared with a
+warm-resident production `mummu-serve` and sat at 15296 of 16376 MiB held (1079 free) for the rest of
+the run. That is now a reported skip rather than a silent wait or a flake — the gates read live free
+VRAM through `mummu::vram` (NVML) at entry and print e.g. `[budget] SKIPPED, not a regression: needs
+8192 MiB of VRAM, card has 1079 MiB free (15296 of 16376 MiB held by every process on this machine)`,
+then return without loading weights. A box that cannot report VRAM at all is unaffected: no reading
+means run, exactly as before. Needs are per row, from this file: 8192 MiB for the f32 gate (~8.0 GiB
+runner inside an 11.5 GiB whole-card peak) and 3686 MiB for the f16 one (~3.6 GiB inside 6.75).
+
+Also settled on 0.22.0-pre.3: the default (`fusion`) set can run a parity gate again. On 0.22.0-pre.2
+it could not complete a single forward (`burn-fusion stream/execution/ordering.rs:49`, "Ordering is
+bigger than operations"), which is why every number recorded here before this date came from a stack
+that would not run the shipping default.
+
 ## Qwen2.5-0.5B-Instruct · CPU (burn-flex) · f32
 
 | Metric | Recorded (2026-07-10) | Budget |

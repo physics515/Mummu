@@ -242,10 +242,7 @@ mod tests {
             record("token;readback", Duration::from_micros(500));
             record("token;readback", Duration::from_micros(500));
             let folded = folded();
-            assert!(
-                folded.contains("token;readback (2x) 1000"),
-                "{folded:?}"
-            );
+            assert!(folded.contains("token;readback (2x) 1000"), "{folded:?}");
         });
     }
 

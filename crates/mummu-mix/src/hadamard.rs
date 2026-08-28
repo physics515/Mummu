@@ -31,7 +31,10 @@
 /// If `x.len()` is not a positive power of two.
 pub fn fwht(x: &mut [f32]) {
     let n = x.len();
-    assert!(n.is_power_of_two(), "fwht: length {n} is not a power of two");
+    assert!(
+        n.is_power_of_two(),
+        "fwht: length {n} is not a power of two"
+    );
     let mut h = 1;
     while h < n {
         for block in x.chunks_mut(2 * h) {
@@ -121,7 +124,11 @@ pub fn incoherence(w: &[f32]) -> f32 {
     let n = w.len();
     assert!(n > 0);
     let max = w.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
-    let norm = w.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>().sqrt();
+    let norm = w
+        .iter()
+        .map(|&v| f64::from(v) * f64::from(v))
+        .sum::<f64>()
+        .sqrt();
     if norm == 0.0 {
         return 0.0;
     }
@@ -138,7 +145,9 @@ mod tests {
     #[test]
     fn rotation_round_trips() {
         let (rows, cols) = (8, 64);
-        let w: Vec<f32> = (0..rows * cols).map(|i| ((i as f32) * 0.37).sin()).collect();
+        let w: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i as f32) * 0.37).sin())
+            .collect();
         let mut r = w.clone();
         rotate_rows(&mut r, rows, cols, 42);
         rotate_rows_inverse(&mut r, rows, cols, 42);
@@ -151,7 +160,9 @@ mod tests {
     #[test]
     fn rotation_preserves_norms() {
         let (rows, cols) = (4, 128);
-        let w: Vec<f32> = (0..rows * cols).map(|i| ((i as f32) * 0.11).cos()).collect();
+        let w: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i as f32) * 0.11).cos())
+            .collect();
         let before: f64 = w.iter().map(|&v| f64::from(v) * f64::from(v)).sum();
         let mut r = w;
         rotate_rows(&mut r, rows, cols, 7);
@@ -188,7 +199,9 @@ mod tests {
     #[test]
     fn group_range_improves() {
         let cols = 512usize;
-        let mut w: Vec<f32> = (0..cols).map(|i| ((i as f32) * 0.05).sin() * 0.02).collect();
+        let mut w: Vec<f32> = (0..cols)
+            .map(|i| ((i as f32) * 0.05).sin() * 0.02)
+            .collect();
         for spike in [3usize, 100, 301] {
             w[spike] = 5.0;
         }
@@ -222,10 +235,12 @@ mod tests {
         for (a, b) in x.iter().zip(&orig) {
             assert!((a - b * 4.0).abs() < 1e-6);
         }
-        assert!(std::panic::catch_unwind(|| {
-            let mut y = vec![0.0f32; 3];
-            fwht(&mut y);
-        })
-        .is_err());
+        assert!(
+            std::panic::catch_unwind(|| {
+                let mut y = vec![0.0f32; 3];
+                fwht(&mut y);
+            })
+            .is_err()
+        );
     }
 }

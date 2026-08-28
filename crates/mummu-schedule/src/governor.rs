@@ -242,10 +242,7 @@ pub fn fit_dynamics(
         .collect();
     let zt = transpose(&z);
     let mut ztz = matmul(&zt, &z);
-    let ridge = 1e-8
-        * (0..d)
-            .map(|i| ztz[i][i])
-            .fold(1.0f64, f64::max);
+    let ridge = 1e-8 * (0..d).map(|i| ztz[i][i]).fold(1.0f64, f64::max);
     for (i, row) in ztz.iter_mut().enumerate() {
         row[i] += ridge;
     }
@@ -470,7 +467,11 @@ impl ThreadTuner {
             "ThreadTuner::observe: bad measurement {median_ms}"
         );
         let prev = self.observed[self.cur];
-        self.observed[self.cur] = if prev.is_nan() { median_ms } else { prev.min(median_ms) };
+        self.observed[self.cur] = if prev.is_nan() {
+            median_ms
+        } else {
+            prev.min(median_ms)
+        };
         if !prev.is_nan() && median_ms > prev * 2.0 {
             // The world changed under the tuned pick; forget the neighbors
             // so the walk re-verifies them.
@@ -582,7 +583,11 @@ mod tests {
         // At the fixed point the split is the waterfill split.
         let x = waterfill(&[w1, w2], target);
         let x1 = price.demand(w1, 100.0);
-        assert!((x1 - x[0]).abs() < 0.05, "price split {x1} vs waterfill {}", x[0]);
+        assert!(
+            (x1 - x[0]).abs() < 0.05,
+            "price split {x1} vs waterfill {}",
+            x[0]
+        );
     }
 
     // -- LQR ---------------------------------------------------------------

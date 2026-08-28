@@ -288,7 +288,10 @@ impl TopK {
     fn into_sorted(self) -> (Vec<u32>, Vec<f32>) {
         let mut v = self.heap;
         v.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        (v.iter().map(|e| e.1).collect(), v.iter().map(|e| e.0).collect())
+        (
+            v.iter().map(|e| e.1).collect(),
+            v.iter().map(|e| e.0).collect(),
+        )
     }
 }
 
@@ -488,11 +491,7 @@ impl HotSet {
             self.drift_max = self.drift_max.max(d);
         }
         self.prev_x = x.to_vec();
-        let mut tiles: Vec<u32> = result
-            .ids
-            .iter()
-            .map(|&id| id / TILE as u32)
-            .collect();
+        let mut tiles: Vec<u32> = result.ids.iter().map(|&id| id / TILE as u32).collect();
         tiles.sort_unstable();
         tiles.dedup();
         self.tiles = tiles;

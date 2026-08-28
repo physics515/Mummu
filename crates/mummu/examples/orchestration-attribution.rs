@@ -196,10 +196,10 @@ fn run() -> Result<(), String> {
         attrib::Component::new("launches"),
     ];
     let cost_of = [
-        0.02 * placement.len() as f64,          // dispatch: nominal encode/layer
-        costs.readback_ms,                      // fences: the end-of-token sync
-        boundaries as f64 * costs.crossing_ms,  // crossings: paid per boundary
-        gpu_layers as f64 * costs.launch_ms,    // launches: paid per GPU dispatch
+        0.02 * placement.len() as f64,         // dispatch: nominal encode/layer
+        costs.readback_ms,                     // fences: the end-of-token sync
+        boundaries as f64 * costs.crossing_ms, // crossings: paid per boundary
+        gpu_layers as f64 * costs.launch_ms,   // launches: paid per GPU dispatch
     ];
     const FENCES: u32 = 1 << 1;
     const LAUNCHES: u32 = 1 << 3;

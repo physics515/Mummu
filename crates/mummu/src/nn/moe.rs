@@ -237,12 +237,12 @@ impl SparseMoePerExpert {
         let idx_host: Vec<i64> = idx
             .into_data()
             .convert::<i64>()
-            .to_vec::<i64>()
+            .try_to_vec::<i64>()
             .expect("routing indices read back");
         let vals_host: Vec<f32> = vals
             .into_data()
             .convert::<f32>()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .expect("routing weights read back");
         let mut routed: Vec<(Vec<i32>, Vec<f32>)> = vec![(Vec::new(), Vec::new()); e];
         for token in 0..bt {
@@ -371,7 +371,7 @@ pub trait ExpertExec: Send + Sync {
         let host = x
             .into_data()
             .convert::<f32>()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .expect("expert input read back");
         let out = self.run(&host, rows, hidden);
         Tensor::<2>::from_data(
@@ -426,7 +426,7 @@ where
         acts.matmul(compute_weight(&w.down))
             .into_data()
             .convert::<f32>()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .expect("expert output read back")
     }
 
@@ -484,7 +484,7 @@ where
             .sum_dim(1)
             .into_data()
             .convert::<f32>()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .expect("gate energy read back")
     }
 }
@@ -592,12 +592,12 @@ fn native_qmatmul_ok(device: &Device, dtype: DType) -> bool {
             .matmul(qw.clone())
             .into_data()
             .convert::<f32>()
-            .to_vec::<f32>();
+            .try_to_vec::<f32>();
         let deq = x
             .matmul(qw.dequantize())
             .into_data()
             .convert::<f32>()
-            .to_vec::<f32>();
+            .try_to_vec::<f32>();
         match (native, deq) {
             (Ok(a), Ok(b)) => {
                 // Agreement, not just absence of a panic: a native path that
@@ -733,7 +733,7 @@ impl ExpertExec for StagedExpert {
         self.run_tensor(xt)
             .into_data()
             .convert::<f32>()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .expect("expert output read back")
     }
 
@@ -1195,7 +1195,7 @@ impl ExpertPool {
                         let shape = data.shape.clone();
                         let vals = data
                             .convert::<f32>()
-                            .to_vec::<f32>()
+                            .try_to_vec::<f32>()
                             .expect("remote FFN partial reads back as f32");
                         match &mut acc {
                             Some((a, s)) => {
@@ -1347,7 +1347,7 @@ impl ExpertPool {
         let host: Vec<f32> = xt
             .into_data()
             .convert::<f32>()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .expect("FFN input read back");
         // Which rows each executor runs: all, or the rows where it matters.
         let rows_per_exec: Vec<Vec<i32>> = match skip {
@@ -1444,7 +1444,7 @@ impl ExpertPool {
         let host: Vec<f32> = xt
             .into_data()
             .convert::<f32>()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .expect("MoE input read back");
         type Routed<'a> = (usize, &'a (Vec<i32>, Vec<f32>));
         let active: Vec<Routed<'_>> = routing
@@ -1572,12 +1572,12 @@ mod tests {
             let a = dense
                 .forward(x.clone(), TOP_K, norm)
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap();
             let b = per_expert
                 .forward(x, TOP_K, norm)
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap();
             for (i, (da, db)) in a.iter().zip(&b).enumerate() {
                 assert!(
@@ -1675,12 +1675,12 @@ mod tests {
         let want = local
             .forward(x.clone(), TOP_K, true)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         let got = local
             .forward_pooled(x, TOP_K, true, &pool, 0)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         for (i, (a, b)) in want.iter().zip(&got).enumerate() {
             assert!(
@@ -1738,7 +1738,7 @@ mod tests {
         let want = pinned
             .run_tensor(x.clone())
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
 
         // Unstaged (the overflow path: computes on the host).
@@ -1754,7 +1754,7 @@ mod tests {
         let overflow = staged
             .run_tensor(x.clone())
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
 
         // Staged, then evicted, then staged again.
@@ -1763,17 +1763,21 @@ mod tests {
         let hot = staged
             .run_tensor(x.clone())
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         staged.stage(&device); // idempotent: no second transfer, same answer
         let again = staged
             .run_tensor(x.clone())
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         staged.evict();
         assert!(!staged.is_staged(), "eviction drops the device copy");
-        let after_evict = staged.run_tensor(x).into_data().to_vec::<f32>().unwrap();
+        let after_evict = staged
+            .run_tensor(x)
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap();
 
         for (i, w) in want.iter().enumerate() {
             for (label, got) in [
@@ -1844,12 +1848,12 @@ mod tests {
             let a = local
                 .forward(x.clone(), TOP_K, norm)
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap();
             let b = local
                 .forward_pooled(x, TOP_K, norm, &pool, 0)
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap();
             for (i, (da, db)) in a.iter().zip(&b).enumerate() {
                 assert!(
@@ -1876,12 +1880,12 @@ mod tests {
         let a = local
             .forward(x.clone(), TOP_K, true)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         let b = local
             .forward_pooled(x, TOP_K, true, &pool, 0)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         for (i, (da, db)) in a.iter().zip(&b).enumerate() {
             assert!((da - db).abs() < 1e-5, "after swap elem {i}: {da} vs {db}");
@@ -1924,8 +1928,8 @@ mod tests {
             TensorData::new(vec![0.25f32; 32], [1, 32]),
             (&device, crate::backend::float_dtype(&device)),
         );
-        let want = x.clone().matmul(t).into_data().to_vec::<f32>().unwrap();
-        let got = x.matmul(ready).into_data().to_vec::<f32>().unwrap();
+        let want = x.clone().matmul(t).into_data().try_to_vec::<f32>().unwrap();
+        let got = x.matmul(ready).into_data().try_to_vec::<f32>().unwrap();
         let scale = want.iter().map(|v| v.abs()).fold(1e-3, f32::max);
         for (i, (a, b)) in want.iter().zip(&got).enumerate() {
             assert!(
@@ -1980,10 +1984,22 @@ mod tests {
     /// Hand-rolled f32 reference of the whole block (per token: router
     /// softmax, top-k, sparse weighted sum of per-expert SwiGLUs).
     fn reference(m: &SparseMoe, x: &[f32], t: usize, norm: bool) -> Vec<f32> {
-        let rw = m.gate.weight.val().into_data().to_vec::<f32>().unwrap(); // [h, e]
-        let gw = m.experts.gate.val().into_data().to_vec::<f32>().unwrap(); // [e, inter, h]
-        let uw = m.experts.up.val().into_data().to_vec::<f32>().unwrap();
-        let dw = m.experts.down.val().into_data().to_vec::<f32>().unwrap(); // [e, h, inter]
+        let rw = m.gate.weight.val().into_data().try_to_vec::<f32>().unwrap(); // [h, e]
+        let gw = m
+            .experts
+            .gate
+            .val()
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap(); // [e, inter, h]
+        let uw = m.experts.up.val().into_data().try_to_vec::<f32>().unwrap();
+        let dw = m
+            .experts
+            .down
+            .val()
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap(); // [e, h, inter]
         let mut out = vec![0f32; t * HIDDEN];
         for tok in 0..t {
             let xrow = &x[tok * HIDDEN..][..HIDDEN];
@@ -2038,11 +2054,11 @@ mod tests {
         for t in [5, 1] {
             for norm in [false, true] {
                 let x = input(t, 2.0, &device);
-                let xv = x.clone().into_data().to_vec::<f32>().unwrap();
+                let xv = x.clone().into_data().try_to_vec::<f32>().unwrap();
                 let got = m
                     .forward(x, TOP_K, norm)
                     .into_data()
-                    .to_vec::<f32>()
+                    .try_to_vec::<f32>()
                     .unwrap();
                 let want = reference(&m, &xv, t, norm);
                 assert_eq!(got.len(), want.len());
@@ -2063,11 +2079,11 @@ mod tests {
         let device = crate::backend::cpu_device();
         let m = moe(&device);
         let x = input(3, 0.5, &device);
-        let xv = x.clone().into_data().to_vec::<f32>().unwrap();
+        let xv = x.clone().into_data().try_to_vec::<f32>().unwrap();
         let got = m
             .forward(x, EXPERTS, false)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         // Reference with TOP_K replaced by all experts: weights are the full
         // softmax row, every expert contributes.
@@ -2086,10 +2102,22 @@ mod tests {
 
     /// Full-mixture reference (every expert, softmax-weighted) for the k=E edge.
     fn reference_all_experts(m: &SparseMoe, x: &[f32], t: usize) -> Vec<f32> {
-        let rw = m.gate.weight.val().into_data().to_vec::<f32>().unwrap();
-        let gw = m.experts.gate.val().into_data().to_vec::<f32>().unwrap();
-        let uw = m.experts.up.val().into_data().to_vec::<f32>().unwrap();
-        let dw = m.experts.down.val().into_data().to_vec::<f32>().unwrap();
+        let rw = m.gate.weight.val().into_data().try_to_vec::<f32>().unwrap();
+        let gw = m
+            .experts
+            .gate
+            .val()
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap();
+        let uw = m.experts.up.val().into_data().try_to_vec::<f32>().unwrap();
+        let dw = m
+            .experts
+            .down
+            .val()
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap();
         let mut out = vec![0f32; t * HIDDEN];
         for tok in 0..t {
             let xrow = &x[tok * HIDDEN..][..HIDDEN];
@@ -2133,12 +2161,12 @@ mod tests {
         let a = m
             .forward(x.clone(), TOP_K, false)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         let b = m
             .forward(x, TOP_K, true)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         let differs = a.iter().zip(&b).any(|(x, y)| (x - y).abs() > 1e-7);
         assert!(differs, "renormalized weights should scale the output");
@@ -2155,12 +2183,12 @@ mod tests {
         let s = m
             .forward(row, TOP_K, false)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         let d = m
             .forward(double, TOP_K, false)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         assert_eq!(s.as_slice(), &d[..HIDDEN]);
         assert_eq!(s.as_slice(), &d[HIDDEN..]);
@@ -2175,7 +2203,7 @@ mod tests {
         let out = m
             .forward(x, TOP_K, false)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         assert!(out.iter().all(|&v| v == 0.0));
     }

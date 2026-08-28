@@ -127,9 +127,18 @@ impl ScaleFactor {
 /// If any scale is not strictly positive and finite, or `rank == 0`, or
 /// `rank > min(rows, cols)`.
 #[must_use]
-pub fn factorize_scales(s: &[f32], rows: usize, cols: usize, rank: usize, iters: usize) -> ScaleFactor {
+pub fn factorize_scales(
+    s: &[f32],
+    rows: usize,
+    cols: usize,
+    rank: usize,
+    iters: usize,
+) -> ScaleFactor {
     assert_eq!(s.len(), rows * cols, "scale matrix shape");
-    assert!(rank > 0 && rank <= rows.min(cols), "rank {rank} out of range");
+    assert!(
+        rank > 0 && rank <= rows.min(cols),
+        "rank {rank} out of range"
+    );
     for &v in s {
         assert!(v > 0.0 && v.is_finite(), "scales must be positive, got {v}");
     }
@@ -232,7 +241,10 @@ fn orthonormalize(x: &mut [f64], n: usize, rank: usize) {
                     x[j * rank + t] -= dot * x[j * rank + p];
                 }
             }
-            norm = (0..n).map(|j| x[j * rank + t] * x[j * rank + t]).sum::<f64>().sqrt();
+            norm = (0..n)
+                .map(|j| x[j * rank + t] * x[j * rank + t])
+                .sum::<f64>()
+                .sqrt();
             assert!(norm > 1e-12, "orthonormalize: degenerate re-seed");
         }
         for j in 0..n {
@@ -319,7 +331,10 @@ mod tests {
             );
         }
         let worst: Vec<f32> = facs.iter().map(|f| f.max_ratio_err(&s)).collect();
-        assert!(worst[4] < 1.001, "full-ish rank must be near exact: {worst:?}");
+        assert!(
+            worst[4] < 1.001,
+            "full-ish rank must be near exact: {worst:?}"
+        );
     }
 
     /// The storage arithmetic from the spec: r = 4 on a 4096x4096/g=32
@@ -363,7 +378,10 @@ mod tests {
         let (rows, cols) = (24, 12);
         let s = synthetic(rows, cols, 2);
         let (r, f) = calibrate_rank(&s, rows, cols, 8, 60, 1.001).expect("reachable");
-        assert!(r <= 3, "a rank-2(+offset) matrix must clear by rank 3, got {r}");
+        assert!(
+            r <= 3,
+            "a rank-2(+offset) matrix must clear by rank 3, got {r}"
+        );
         assert!(f.max_ratio_err(&s) <= 1.001);
         // An impossible bound: nothing clears ratio 1.0 minus epsilon.
         assert!(calibrate_rank(&s, rows, cols, 1, 4, 0.5).is_none());

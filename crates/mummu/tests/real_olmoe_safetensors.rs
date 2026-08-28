@@ -157,7 +157,7 @@ fn fused_expert_slot_is_bit_exact_against_the_raw_shard_bytes() {
     let slot: Vec<f32> = bank
         .slice(EXPERT..EXPERT + 1)
         .into_data()
-        .into_vec()
+        .try_into_vec()
         .expect("readback");
     // The checkpoint is bf16; the loader cast it to the backend float (f32).
     // Compare against the same cast applied to the truth bytes: bf16 -> f32

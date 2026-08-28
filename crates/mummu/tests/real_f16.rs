@@ -56,7 +56,7 @@ async fn qwen2_decodes_coherently_in_f16_on_gpu() {
         .to_vec();
 
     // Claim 1 (no crash): building the backend + loading casts bf16 -> f16 via
-    // CastFloatAdapter (load_from_dir targets the backend float dtype).
+    // FloatCastAdapter (load_from_dir targets the backend float dtype).
     let device =
         mummu::backend::gpu_device_f16().expect("f16 device settings lock once per process");
     let loaded = qwen2::load_from_dir(&dir, &device).expect("f16 weights load checked");
@@ -84,7 +84,7 @@ async fn qwen2_decodes_coherently_in_f16_on_gpu() {
 }
 
 /// f16 leg for the Qwen3 dense arch — bf16 weights cast to f16 on load
-/// (`CastFloatAdapter`), and its per-head q/k RMSNorm + decoupled head_dim
+/// (`FloatCastAdapter`), and its per-head q/k RMSNorm + decoupled head_dim
 /// ride the SAME f32-softmax attention island Qwen2/LFM2 use, so the q·kᵀ
 /// scores never overflow f16. Proves the dtype path (P3) and the f16
 /// precision milestone (P6) cover the new architecture, not just Qwen2.

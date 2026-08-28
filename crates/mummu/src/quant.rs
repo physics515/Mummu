@@ -29,10 +29,10 @@
 //! The long-standing "wgpu's Q4 kernel returns garbage" note is **withdrawn**
 //! — 2026-08-23, `examples/pack-precision-probe.rs`.
 
-use burn::tensor::quantization::{
-    Calibration, QuantLevel, QuantParam, QuantScheme, QuantValue, compute_q_params, compute_range,
-};
 use burn::tensor::Tensor;
+use burn::tensor::quantization::{
+    Calibration, QuantScheme, QuantValue, ScaleDtype, compute_q_params, compute_range,
+};
 
 pub use mummu_mix::QuantPolicy;
 
@@ -60,8 +60,7 @@ impl SchemeExt for QuantPolicy {
         Some(
             QuantScheme::default()
                 .with_value(value)
-                .with_level(QuantLevel::block([32]))
-                .with_param(QuantParam::F32),
+                .per_block([32], ScaleDtype::F32),
         )
     }
 }
@@ -69,10 +68,7 @@ impl SchemeExt for QuantPolicy {
 /// Quantize one weight tensor per `policy` (min-max calibration — weights
 /// are static, so calibration is exact). The caller has already decided
 /// eligibility; `Off` is a caller bug.
-pub fn quantize_weight<const D: usize>(
-    policy: QuantPolicy,
-    tensor: Tensor<D>,
-) -> Tensor<D> {
+pub fn quantize_weight<const D: usize>(policy: QuantPolicy, tensor: Tensor<D>) -> Tensor<D> {
     let scheme = policy
         .scheme()
         .expect("quantize_weight called with QuantPolicy::Off");
@@ -140,10 +136,10 @@ mod tests {
     fn q8_roundtrip_error_is_small() {
         let device = crate::backend::cpu_device();
         let w = Tensor::<2>::random([64, 64], Distribution::Default, &device);
-        let host = w.clone().into_data().to_vec::<f32>().unwrap();
+        let host = w.clone().into_data().try_to_vec::<f32>().unwrap();
         let max_abs = host.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
         let q = quantize_weight(QuantPolicy::Q8, w);
-        let back = q.dequantize().into_data().to_vec::<f32>().unwrap();
+        let back = q.dequantize().into_data().try_to_vec::<f32>().unwrap();
         let max_err = host
             .iter()
             .zip(&back)

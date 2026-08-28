@@ -87,7 +87,7 @@ mod tests {
     use super::*;
 
     fn to_vec(t: Tensor<4>) -> Vec<f32> {
-        t.into_data().to_vec::<f32>().unwrap()
+        t.into_data().try_to_vec::<f32>().unwrap()
     }
 
     #[test]

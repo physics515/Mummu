@@ -594,11 +594,7 @@ pub fn quantized_tensor_data(
 /// only — no seek state on the handle — so probe threads and the loader can
 /// read through the same file object concurrently. (Windows `seek_read`
 /// does move the OS cursor, but nothing here ever reads through it.)
-fn read_exact_at(
-    file: &std::fs::File,
-    mut buf: &mut [u8],
-    mut offset: u64,
-) -> std::io::Result<()> {
+fn read_exact_at(file: &std::fs::File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
     fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
         #[cfg(windows)]
         return std::os::windows::fs::FileExt::seek_read(file, buf, offset);
@@ -1098,7 +1094,7 @@ mod tests {
             let scheme = p.policy().scheme().unwrap();
             let data = quantized_tensor_data(&q, &scales, [rows, cols], scheme);
             let t = Tensor::<2>::from_data(data, &device);
-            let back = t.dequantize().into_data().to_vec::<f32>().unwrap();
+            let back = t.dequantize().into_data().try_to_vec::<f32>().unwrap();
             assert_eq!(back.len(), n, "{p:?} [{rows}, {cols}]");
             for (i, (&qq, &b)) in q.iter().zip(&back).enumerate().step_by(97) {
                 let ours = f32::from(qq) * scales[i / BLOCK];
@@ -1196,7 +1192,7 @@ mod tests {
             .tensor_cols(&ge, Precision::F32, &ranges, &device)
             .unwrap();
         assert_eq!(cslab.dims(), [rows, 64]);
-        let got = cslab.into_data().to_vec::<f32>().unwrap();
+        let got = cslab.into_data().try_to_vec::<f32>().unwrap();
         for r in 0..rows {
             for (k, &(start, len)) in ranges.iter().enumerate() {
                 let base: usize = ranges[..k].iter().map(|x| x.1).sum();
@@ -1214,7 +1210,7 @@ mod tests {
             .tensor_rows(&de, Precision::F32, &ranges, &device)
             .unwrap();
         assert_eq!(rslab.dims(), [64, rows]);
-        let gotr = rslab.into_data().to_vec::<f32>().unwrap();
+        let gotr = rslab.into_data().try_to_vec::<f32>().unwrap();
         for (k, &(start, len)) in ranges.iter().enumerate() {
             let base: usize = ranges[..k].iter().map(|x| x.1).sum();
             for i in 0..len {
@@ -1231,7 +1227,7 @@ mod tests {
         let cq = pack
             .tensor_cols(&ge, Precision::Q8, &ranges, &device)
             .unwrap();
-        let dq = cq.dequantize().into_data().to_vec::<f32>().unwrap();
+        let dq = cq.dequantize().into_data().try_to_vec::<f32>().unwrap();
         for r in 0..rows {
             for (k, &(start, len)) in ranges.iter().enumerate() {
                 let base: usize = ranges[..k].iter().map(|x| x.1).sum();

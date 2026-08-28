@@ -69,7 +69,10 @@ fn main() {
         let pct = i * 100 / n.max(1);
         if pct != last_pct && pct % 5 == 0 {
             last_pct = pct;
-            eprintln!("  {pct:>3}%  {name}  ({:.0}s)", started.elapsed().as_secs_f32());
+            eprintln!(
+                "  {pct:>3}%  {name}  ({:.0}s)",
+                started.elapsed().as_secs_f32()
+            );
         }
     })
     .unwrap_or_else(|e| {
@@ -77,7 +80,11 @@ fn main() {
         std::process::exit(1);
     });
     if out.exists() {
-        eprintln!("{} already exists — leaving the new pack at {}", out.display(), tmp.display());
+        eprintln!(
+            "{} already exists — leaving the new pack at {}",
+            out.display(),
+            tmp.display()
+        );
     } else {
         std::fs::rename(&tmp, &out).unwrap_or_else(|e| {
             eprintln!("finalize: {e}");
@@ -91,14 +98,24 @@ fn main() {
             std::process::exit(1);
         });
         let header = pack.header().expect("pack header");
-        let trunk = qwen35::Qwen35Config::from_gguf(&header).expect("config").num_layers;
+        let trunk = qwen35::Qwen35Config::from_gguf(&header)
+            .expect("config")
+            .num_layers;
         drop(header);
         let t = Instant::now();
-        mummu::partition::partition_pack(&mut pack, &qwen35::ffn_names(trunk), mummu::partition::DEFAULT_CLUSTERS, |i, n| {
-            if i % 8 == 0 {
-                eprintln!("  partition layer {i}/{n}  ({:.0}s)", t.elapsed().as_secs_f32());
-            }
-        })
+        mummu::partition::partition_pack(
+            &mut pack,
+            &qwen35::ffn_names(trunk),
+            mummu::partition::DEFAULT_CLUSTERS,
+            |i, n| {
+                if i % 8 == 0 {
+                    eprintln!(
+                        "  partition layer {i}/{n}  ({:.0}s)",
+                        t.elapsed().as_secs_f32()
+                    );
+                }
+            },
+        )
         .unwrap_or_else(|e| {
             eprintln!("partition failed: {e}");
             std::process::exit(1);

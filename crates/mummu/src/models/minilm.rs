@@ -19,7 +19,7 @@ use burn::store::{ModuleAdapter, PyTorchToBurnAdapter, PytorchStore, Safetensors
 use burn::tensor::{Device, Int, Tensor, TensorData, activation};
 
 use crate::import::{
-    CastFloatAdapter, ImportError, WeightsFile, load_checked, required_file, weights_file,
+    FloatCastAdapter, ImportError, WeightsFile, load_checked, required_file, weights_file,
 };
 
 /// BERT hyperparameters, read from the checkpoint's `config.json`.
@@ -176,7 +176,7 @@ pub fn load_from_dir(dir: &Path, device: &Device) -> Result<LoadedMiniLm, Import
     match weights_file(dir)? {
         WeightsFile::Safetensors(weights) => {
             let mut store = SafetensorsStore::from_file(weights.clone())
-                .with_from_adapter(PyTorchToBurnAdapter.chain(CastFloatAdapter::new(target_float)))
+                .with_from_adapter(PyTorchToBurnAdapter.chain(FloatCastAdapter::to(target_float)))
                 .allow_partial(true);
             for (pattern, replacement) in KEY_REMAPS {
                 store = store.with_key_remapping(*pattern, *replacement);
@@ -308,7 +308,7 @@ impl LoadedMiniLm {
         normalized
             .into_data()
             .convert::<f32>()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .map_err(|e| format!("embedding readback: {e:?}"))
     }
 }

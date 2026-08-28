@@ -194,7 +194,7 @@ async fn real_qwen3_gguf_loads_and_agrees_with_safetensors() {
         gguf_model
             .forward(&prompt, 0, &mut cache, &device)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .expect("logits read back")
     };
     drop(gguf_model);
@@ -205,7 +205,7 @@ async fn real_qwen3_gguf_loads_and_agrees_with_safetensors() {
         st_model
             .forward(&prompt, 0, &mut cache, &device)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .expect("logits read back")
     };
     drop(st_model);

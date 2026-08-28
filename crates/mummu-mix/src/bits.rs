@@ -141,8 +141,7 @@ pub fn allocate_bits_integer(
             if bits[i] >= max_bits || counts[i] > left {
                 continue;
             }
-            let gain =
-                sensitivity[i] * 0.75 * (-2.0 * f64::from(bits[i])).exp2();
+            let gain = sensitivity[i] * 0.75 * (-2.0 * f64::from(bits[i])).exp2();
             if best.is_none_or(|(_, g)| gain > g) {
                 best = Some((i, gain));
             }
@@ -326,7 +325,10 @@ mod tests {
         let n = [5u64, 5, 5];
         assert!((amgm_ratio(&[3.0, 3.0, 3.0], &n) - 1.0).abs() < 1e-12);
         let spread = amgm_ratio(&[10.0, 1.0, 0.1], &n);
-        assert!(spread > 1.2, "an order-of-magnitude spread predicts a win, got {spread}");
+        assert!(
+            spread > 1.2,
+            "an order-of-magnitude spread predicts a win, got {spread}"
+        );
         // Weighting matters: the same spread carried by tiny tensors
         // shrinks the predicted win.
         let lopsided = amgm_ratio(&[10.0, 1.0, 0.1], &[1, 1000, 1]);

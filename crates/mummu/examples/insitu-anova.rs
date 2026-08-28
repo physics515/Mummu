@@ -143,30 +143,43 @@ fn main() {
     // Main-effect contrasts: pool each factor's levels (medians of cell
     // medians would hide reps; pool the raw medians per level instead).
     let pooled = |pick: &dyn Fn(&(String, usize, bool, bool, CellStats)) -> bool| -> CellStats {
-        let ms: Vec<f64> = cells.iter().filter(|c| pick(c)).map(|c| c.4.median_ms).collect();
+        let ms: Vec<f64> = cells
+            .iter()
+            .filter(|c| pick(c))
+            .map(|c| c.4.median_ms)
+            .collect();
         cell_stats(&ms)
     };
     println!();
-    let c_threads = main_effect(
-        &pooled(&|c| c.1 == 4),
-        &pooled(&|c| c.1 == 16),
-    );
+    let c_threads = main_effect(&pooled(&|c| c.1 == 4), &pooled(&|c| c.1 == 16));
     println!(
         "contrast threads (4 vs 16):        {:+.2} ms {}",
         c_threads.delta_ms,
-        if c_threads.clear { "(clear)" } else { "(within noise)" }
+        if c_threads.clear {
+            "(clear)"
+        } else {
+            "(within noise)"
+        }
     );
     let c_prio = main_effect(&pooled(&|c| c.2), &pooled(&|c| !c.2));
     println!(
         "contrast priority (below vs norm): {:+.2} ms {}",
         c_prio.delta_ms,
-        if c_prio.clear { "(clear)" } else { "(within noise)" }
+        if c_prio.clear {
+            "(clear)"
+        } else {
+            "(within noise)"
+        }
     );
     let c_cont = main_effect(&pooled(&|c| c.3), &pooled(&|c| !c.3));
     println!(
         "contrast contender (on vs off):    {:+.2} ms {}",
         c_cont.delta_ms,
-        if c_cont.clear { "(clear)" } else { "(within noise)" }
+        if c_cont.clear {
+            "(clear)"
+        } else {
+            "(within noise)"
+        }
     );
 
     // The decision rule. Quiet = widest pool, normal priority, no
@@ -192,7 +205,5 @@ fn main() {
         live_gbps / quiet_gbps,
     );
     let _ = kernel_innocent(quiet_gbps, roofline_gbps, live_gbps);
-    println!(
-        "largest |contrast| is the first code change (SPEC P1.1's decision rule)."
-    );
+    println!("largest |contrast| is the first code change (SPEC P1.1's decision rule).");
 }

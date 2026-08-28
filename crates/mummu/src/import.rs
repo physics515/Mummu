@@ -8,14 +8,11 @@
 //! of silently zero-initing — a partial load is a quietly broken model.
 
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 
 use burn::module::Module;
 use burn::store::{
     ModuleAdapter, ModuleSnapshot, ModuleStore, PyTorchToBurnAdapter, SafetensorsStore,
-    TensorSnapshot,
 };
-use burn::tensor::DType;
 
 use crate::gguf::{GgufFile, GgufMap, GgufTensorInfo};
 
@@ -146,50 +143,14 @@ pub fn logit_sanity(logits: &[f32], expected_vocab: usize) -> Result<SanitySmoke
 
 /// Cast bf16/f16/f64 float tensors to a target dtype on load. HF checkpoints
 /// are commonly stored in **bf16**; `burn-store` keeps the source dtype, which
-/// the wgpu backend can't ingest. Mirrors Burn's `HalfPrecisionAdapter` but
-/// covers bf16 → f32/f16 too. Non-float tensors pass through untouched.
-#[derive(Clone)]
-pub struct CastFloatAdapter {
-    target: DType,
-}
-
-impl CastFloatAdapter {
-    #[must_use]
-    pub fn new(target: DType) -> Self {
-        assert!(
-            matches!(target, DType::F16 | DType::F32 | DType::F64 | DType::BF16),
-            "CastFloatAdapter: target must be a float dtype, got {target:?}"
-        );
-        Self { target }
-    }
-}
-
-impl ModuleAdapter for CastFloatAdapter {
-    fn adapt(&self, snapshot: &TensorSnapshot) -> TensorSnapshot {
-        let is_float = matches!(
-            snapshot.dtype,
-            DType::BF16 | DType::F16 | DType::F32 | DType::F64
-        );
-        if !is_float || snapshot.dtype == self.target {
-            return snapshot.clone();
-        }
-        let target = self.target;
-        let data_fn = snapshot.clone_data_fn();
-        let cast = Rc::new(move || Ok(data_fn()?.convert_dtype(target)));
-        TensorSnapshot::from_closure(
-            cast,
-            target,
-            snapshot.shape.clone(),
-            snapshot.path_stack.clone().unwrap_or_default(),
-            snapshot.container_stack.clone().unwrap_or_default(),
-            snapshot.tensor_id.unwrap_or_default(),
-        )
-    }
-
-    fn clone_box(&self) -> Box<dyn ModuleAdapter> {
-        Box::new(self.clone())
-    }
-}
+/// the wgpu backend can't ingest.
+///
+/// Was Mummu's own `CastFloatAdapter` until burn 0.22.0-pre.3, which ships the
+/// same thing upstream — same rule (non-float and already-target tensors pass
+/// through), same lazy composition onto the byte source, and it tracks the
+/// store's own `PackTensor` redesign for free. Re-exported here so the ports
+/// keep importing their adapters from one place.
+pub use burn::store::FloatCastAdapter;
 
 /// Load `store` (any format: safetensors, PyTorch state dict, …) into
 /// `module`, refusing partial results: any missing param or per-tensor error
@@ -352,7 +313,7 @@ pub fn gguf_store(
     };
     let total_f32_bytes: u64 = f.tensors.iter().map(|t| t.element_count() * 4).sum();
     let target_float = crate::backend::float_dtype(device);
-    let adapter = PyTorchToBurnAdapter.chain(CastFloatAdapter::new(target_float));
+    let adapter = PyTorchToBurnAdapter.chain(FloatCastAdapter::to(target_float));
 
     match sink.resolve(total_f32_bytes) {
         DequantSink::Memory => {
@@ -468,6 +429,7 @@ mod tests {
     }
 
     use super::*;
+    use burn::tensor::DType;
 
     #[test]
     fn required_file_finds_present_and_rejects_absent() {
@@ -483,7 +445,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "float dtype")]
     fn cast_adapter_rejects_non_float_target() {
-        let _ = CastFloatAdapter::new(DType::I32);
+        let _ = FloatCastAdapter::to(DType::I32);
     }
 
     #[test]

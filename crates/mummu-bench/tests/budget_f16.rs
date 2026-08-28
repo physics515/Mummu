@@ -39,6 +39,11 @@ const TTFT_BUDGET_MS: f64 = 60.0;
 const DECODE_BUDGET_TOKENS_PER_S: f64 = 12.0;
 const DECODE_STEPS: usize = 32;
 
+/// The f16 row's own need, from `bench/BASELINE.md`: ~3.6 GiB of runner
+/// inside a 6.75 GiB whole-card peak — less than half the f32 gate's, which
+/// is why the two ask separately rather than sharing one constant.
+const VRAM_NEED_MIB: u64 = 3686;
+
 fn qwen2_dir() -> Option<PathBuf> {
     let dir = PathBuf::from(std::env::var_os("MUMMU_QWEN2_DIR")?);
     dir.is_dir().then_some(dir)
@@ -50,6 +55,10 @@ async fn qwen2_f16_stays_inside_its_perf_budgets() {
     let Some(dir) = qwen2_dir() else {
         panic!("set MUMMU_QWEN2_DIR to a dir with config.json/tokenizer.json/model.safetensors");
     };
+
+    if !mummu_bench::gpu_has_room_for(VRAM_NEED_MIB, "budget/f16") {
+        return;
+    }
     if !inventory().any_shader_f16() {
         eprintln!("[budget/f16] no SHADER_F16 adapter — skipping");
         return;
@@ -97,8 +106,9 @@ async fn qwen2_f16_stays_inside_its_perf_budgets() {
     }
     let tok_per_s = DECODE_STEPS as f64 / start.elapsed().as_secs_f64();
 
+    let features = mummu_bench::gpu_feature_set();
     eprintln!(
-        "[budget/f16] TTFT {ttft_ms:.1} ms (budget {TTFT_BUDGET_MS} ms), \
+        "[budget/f16/{features}] TTFT {ttft_ms:.1} ms (budget {TTFT_BUDGET_MS} ms), \
          decode {tok_per_s:.1} tok/s (budget {DECODE_BUDGET_TOKENS_PER_S} tok/s)"
     );
     assert!(

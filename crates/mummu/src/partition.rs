@@ -85,7 +85,9 @@ fn balanced_kmeans(features: &[f32], n: usize, d: usize, k: usize) -> Vec<usize>
     let mut dist = vec![0f32; n * k];
     for _ in 0..KMEANS_ITERS {
         // Distances, parallel over points.
-        let threads = std::thread::available_parallelism().map_or(4, |p| p.get()).min(32);
+        let threads = std::thread::available_parallelism()
+            .map_or(4, |p| p.get())
+            .min(32);
         let chunk = n.div_ceil(threads).max(1);
         std::thread::scope(|s| {
             for (ti, slab) in dist.chunks_mut(chunk * k).enumerate() {
@@ -130,7 +132,10 @@ fn balanced_kmeans(features: &[f32], n: usize, d: usize, k: usize) -> Vec<usize>
         centroids.iter_mut().for_each(|v| *v = 0.0);
         for p in 0..n {
             let c = assign[p];
-            for (acc, v) in centroids[c * d..(c + 1) * d].iter_mut().zip(&features[p * d..(p + 1) * d]) {
+            for (acc, v) in centroids[c * d..(c + 1) * d]
+                .iter_mut()
+                .zip(&features[p * d..(p + 1) * d])
+            {
                 *acc += v;
             }
         }
@@ -157,7 +162,9 @@ pub fn cluster_neurons(
     // Features: JL projection of the 2·hidden-long neuron vector (gate col ‖ up col).
     let proj = projection(2 * hidden, seed);
     let mut features = vec![0f32; inter * PROJ_DIMS];
-    let threads = std::thread::available_parallelism().map_or(4, |p| p.get()).min(32);
+    let threads = std::thread::available_parallelism()
+        .map_or(4, |p| p.get())
+        .min(32);
     let chunk = inter.div_ceil(threads).max(1);
     std::thread::scope(|s| {
         for (ti, slab) in features.chunks_mut(chunk * PROJ_DIMS).enumerate() {
@@ -172,7 +179,8 @@ pub fn cluster_neurons(
                         for h in 0..hidden {
                             let g = gate[h * inter + j];
                             let u = up[h * inter + j];
-                            acc += g * proj[h * PROJ_DIMS + f] + u * proj[(hidden + h) * PROJ_DIMS + f];
+                            acc += g * proj[h * PROJ_DIMS + f]
+                                + u * proj[(hidden + h) * PROJ_DIMS + f];
                         }
                         *o = acc;
                     }
@@ -266,14 +274,26 @@ pub fn partition_pack(
             names.push([n.gate.clone(), n.up.clone(), n.down.clone()]);
             continue;
         }
-        let gate_e = pack.entry(&n.gate).ok_or_else(|| format!("missing {}", n.gate))?.clone();
-        let up_e = pack.entry(&n.up).ok_or_else(|| format!("missing {}", n.up))?.clone();
-        let down_e = pack.entry(&n.down).ok_or_else(|| format!("missing {}", n.down))?.clone();
+        let gate_e = pack
+            .entry(&n.gate)
+            .ok_or_else(|| format!("missing {}", n.gate))?
+            .clone();
+        let up_e = pack
+            .entry(&n.up)
+            .ok_or_else(|| format!("missing {}", n.up))?
+            .clone();
+        let down_e = pack
+            .entry(&n.down)
+            .ok_or_else(|| format!("missing {}", n.down))?
+            .clone();
         let &[hidden, inter] = gate_e.shape.as_slice() else {
             return Err(format!("{} is not 2-D", n.gate));
         };
         if up_e.shape != vec![hidden, inter] || down_e.shape != vec![inter, hidden] {
-            return Err(format!("layer {li}: FFN shapes disagree ({:?} / {:?} / {:?})", gate_e.shape, up_e.shape, down_e.shape));
+            return Err(format!(
+                "layer {li}: FFN shapes disagree ({:?} / {:?} / {:?})",
+                gate_e.shape, up_e.shape, down_e.shape
+            ));
         }
         let clusters = cluster_count(inter, want, crate::pack::BLOCK);
         let gate = pack.read_f32(&gate_e)?;
@@ -286,14 +306,23 @@ pub fn partition_pack(
             before: [fingerprint(&gate), fingerprint(&up), fingerprint(&down)],
             done: false,
         };
-        std::fs::write(&journal, serde_json::to_string(&entry).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
+        std::fs::write(
+            &journal,
+            serde_json::to_string(&entry).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
         pack.rewrite_entry(&gate_e, &permute_cols(&gate, hidden, inter, &perm))?;
         pack.rewrite_entry(&up_e, &permute_cols(&up, hidden, inter, &perm))?;
         pack.rewrite_entry(&down_e, &permute_rows(&down, inter, hidden, &perm))?;
-        let entry = LayerJournal { done: true, ..entry };
-        std::fs::write(&journal, serde_json::to_string(&entry).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
+        let entry = LayerJournal {
+            done: true,
+            ..entry
+        };
+        std::fs::write(
+            &journal,
+            serde_json::to_string(&entry).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
         spans_per_layer.push(spans);
         names.push([n.gate.clone(), n.up.clone(), n.down.clone()]);
     }
@@ -334,17 +363,31 @@ fn fingerprint(values: &[f32]) -> u64 {
 /// If `journal` exists, finish that layer: entries still matching their
 /// pre-rewrite fingerprint get permuted, the rest are already done.
 /// Returns the layer's spans, or `None` when there was no journal.
-fn repair_layer(pack: &Pack, n: &FfnNames, journal: &std::path::Path) -> Result<Option<Vec<ClusterSpan>>, String> {
+fn repair_layer(
+    pack: &Pack,
+    n: &FfnNames,
+    journal: &std::path::Path,
+) -> Result<Option<Vec<ClusterSpan>>, String> {
     let Ok(text) = std::fs::read_to_string(journal) else {
         return Ok(None);
     };
-    let j: LayerJournal = serde_json::from_str(&text).map_err(|e| format!("journal {}: {e}", journal.display()))?;
+    let j: LayerJournal =
+        serde_json::from_str(&text).map_err(|e| format!("journal {}: {e}", journal.display()))?;
     if j.done {
         return Ok(Some(j.spans));
     }
-    let gate_e = pack.entry(&n.gate).ok_or_else(|| format!("missing {}", n.gate))?.clone();
-    let up_e = pack.entry(&n.up).ok_or_else(|| format!("missing {}", n.up))?.clone();
-    let down_e = pack.entry(&n.down).ok_or_else(|| format!("missing {}", n.down))?.clone();
+    let gate_e = pack
+        .entry(&n.gate)
+        .ok_or_else(|| format!("missing {}", n.gate))?
+        .clone();
+    let up_e = pack
+        .entry(&n.up)
+        .ok_or_else(|| format!("missing {}", n.up))?
+        .clone();
+    let down_e = pack
+        .entry(&n.down)
+        .ok_or_else(|| format!("missing {}", n.down))?
+        .clone();
     let (hidden, inter) = (gate_e.shape[0], gate_e.shape[1]);
     for (i, e) in [&gate_e, &up_e, &down_e].into_iter().enumerate() {
         let vals = pack.read_f32(e)?;
@@ -358,7 +401,11 @@ fn repair_layer(pack: &Pack, n: &FfnNames, journal: &std::path::Path) -> Result<
         }
     }
     let done = LayerJournal { done: true, ..j };
-    std::fs::write(journal, serde_json::to_string(&done).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    std::fs::write(
+        journal,
+        serde_json::to_string(&done).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
     Ok(Some(done.spans))
 }
 
@@ -375,7 +422,11 @@ pub fn cluster_costs(pack: &Pack, layer: usize) -> Result<Vec<crate::tier::Exper
     let mut per_neuron: BTreeMap<Precision, u64> = BTreeMap::new();
     for name in names {
         let e = pack.entry(name).ok_or_else(|| format!("missing {name}"))?;
-        let inter = if e.shape[0] > e.shape[1] { e.shape[0] } else { e.shape[1] };
+        let inter = if e.shape[0] > e.shape[1] {
+            e.shape[0]
+        } else {
+            e.shape[1]
+        };
         let numel = e.shape.iter().product::<usize>() as u64;
         for (&p, blob) in &e.precisions {
             let bytes = match p {
@@ -395,7 +446,10 @@ pub fn cluster_costs(pack: &Pack, layer: usize) -> Result<Vec<crate::tier::Exper
     Ok(spans
         .iter()
         .map(|s| crate::tier::ExpertCost {
-            bytes: per_neuron.iter().map(|(&p, &b)| (p, b * s.len as u64)).collect(),
+            bytes: per_neuron
+                .iter()
+                .map(|(&p, &b)| (p, b * s.len as u64))
+                .collect(),
         })
         .collect())
 }
@@ -432,7 +486,10 @@ mod tests {
         let a = balanced_kmeans(&f, 32, 2, 4);
         for g in 0..4 {
             let first = a[g * 8];
-            assert!((0..8).all(|i| a[g * 8 + i] == first), "group {g} split: {a:?}");
+            assert!(
+                (0..8).all(|i| a[g * 8 + i] == first),
+                "group {g} split: {a:?}"
+            );
         }
         let mut counts = [0; 4];
         a.iter().for_each(|&c| counts[c] += 1);
@@ -442,18 +499,27 @@ mod tests {
     #[test]
     fn permutation_covers_every_neuron_once_in_contiguous_spans() {
         let (hidden, inter) = (6, 64);
-        let gate: Vec<f32> = (0..hidden * inter).map(|i| ((i as f32) * 0.3).sin()).collect();
-        let up: Vec<f32> = (0..hidden * inter).map(|i| ((i as f32) * 0.7).cos()).collect();
+        let gate: Vec<f32> = (0..hidden * inter)
+            .map(|i| ((i as f32) * 0.3).sin())
+            .collect();
+        let up: Vec<f32> = (0..hidden * inter)
+            .map(|i| ((i as f32) * 0.7).cos())
+            .collect();
         let (perm, spans) = cluster_neurons(&gate, &up, hidden, inter, 4, 1);
         let mut sorted = perm.clone();
         sorted.sort_unstable();
         assert_eq!(sorted, (0..inter).collect::<Vec<_>>());
         assert_eq!(spans.len(), 4);
         assert!(spans.iter().all(|s| s.len == 16));
-        assert_eq!(spans.iter().map(|s| s.start).collect::<Vec<_>>(), vec![0, 16, 32, 48]);
+        assert_eq!(
+            spans.iter().map(|s| s.start).collect::<Vec<_>>(),
+            vec![0, 16, 32, 48]
+        );
         // Permuting columns then rows keeps the SwiGLU sum: check one input.
         let x: Vec<f32> = (0..hidden).map(|h| (h as f32 + 1.0) * 0.1).collect();
-        let down: Vec<f32> = (0..inter * hidden).map(|i| ((i as f32) * 0.11).sin()).collect();
+        let down: Vec<f32> = (0..inter * hidden)
+            .map(|i| ((i as f32) * 0.11).sin())
+            .collect();
         let silu = |v: f32| v / (1.0 + (-v).exp());
         let dense = |g: &[f32], u: &[f32], d: &[f32]| -> Vec<f32> {
             let mut out = vec![0f32; hidden];

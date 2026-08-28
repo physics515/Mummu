@@ -24,7 +24,10 @@ fn main() {
         std::process::exit(2);
     };
     let dir = PathBuf::from(dir);
-    let clusters = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_CLUSTERS);
+    let clusters = args
+        .get(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_CLUSTERS);
     let mut pack = Pack::open(&dir).unwrap_or_else(|e| {
         eprintln!("{}: {e}", dir.display());
         std::process::exit(1);

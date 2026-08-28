@@ -138,11 +138,21 @@ mod tests {
     use super::*;
 
     fn dev(name: &str, throughput: f64, capacity_units: usize) -> Device {
-        Device { name: name.into(), throughput, capacity_units, preload_units: 0 }
+        Device {
+            name: name.into(),
+            throughput,
+            capacity_units,
+            preload_units: 0,
+        }
     }
 
     fn busy(name: &str, throughput: f64, capacity_units: usize, preload_units: usize) -> Device {
-        Device { name: name.into(), throughput, capacity_units, preload_units }
+        Device {
+            name: name.into(),
+            throughput,
+            capacity_units,
+            preload_units,
+        }
     }
 
     /// With memory to spare, work splits in proportion to speed — so every
@@ -197,12 +207,19 @@ mod tests {
     #[test]
     fn a_preloaded_device_is_given_less_work() {
         let idle = vec![dev("a", 1.0, 1000), dev("b", 1.0, 1000)];
-        assert_eq!(divide(&idle, 100).units, vec![50, 50], "equal when both idle");
+        assert_eq!(
+            divide(&idle, 100).units,
+            vec![50, 50],
+            "equal when both idle"
+        );
 
         // Same speeds, but `b` already owes 40 units of work.
         let loaded = vec![dev("a", 1.0, 1000), busy("b", 1.0, 1000, 40)];
         let plan = divide(&loaded, 100);
-        assert!(plan.units[0] > plan.units[1], "the busy device takes less: {plan:?}");
+        assert!(
+            plan.units[0] > plan.units[1],
+            "the busy device takes less: {plan:?}"
+        );
         // ...and they still finish together, which is the point.
         let finish = |i: usize| (loaded[i].preload_units + plan.units[i]) as f64;
         assert!((finish(0) - finish(1)).abs() <= 1.0, "{plan:?}");

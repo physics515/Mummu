@@ -571,7 +571,9 @@ impl GatedDeltaNet {
             }
         };
         let host = |t: Tensor<3>| -> Vec<f32> {
-            t.into_data().to_vec::<f32>().expect("flex activations are f32")
+            t.into_data()
+                .try_to_vec::<f32>()
+                .expect("flex activations are f32")
         };
         let (mixed, z, beta, alpha) = (host(mixed_t), host(z_t), host(beta_t), host(alpha_t));
 
@@ -579,13 +581,16 @@ impl GatedDeltaNet {
         // (prefill ran the tensor path) or zero-initialized (no prefix).
         if cache.host_conv.is_none() {
             cache.host_conv = Some(match cache.conv.take() {
-                Some(tc) => tc.into_data().to_vec::<f32>().expect("conv window is f32"),
+                Some(tc) => tc
+                    .into_data()
+                    .try_to_vec::<f32>()
+                    .expect("conv window is f32"),
                 None => vec![0f32; middle.ring_len()],
             });
         }
         if cache.host_state.is_none() {
             cache.host_state = Some(match cache.state.take() {
-                Some(ts) => ts.into_data().to_vec::<f32>().expect("state is f32"),
+                Some(ts) => ts.into_data().try_to_vec::<f32>().expect("state is f32"),
                 None => vec![0f32; middle.state_len()],
             });
         }
@@ -604,8 +609,7 @@ impl GatedDeltaNet {
         drop(_s);
 
         let _s_out = crate::prof::scope("delta.out");
-        let gated_t =
-            Tensor::<3>::from_data(TensorData::new(gated, [1, 1, cfg.d_inner]), device);
+        let gated_t = Tensor::<3>::from_data(TensorData::new(gated, [1, 1, cfg.d_inner]), device);
         qlinear(&self.out_proj, gated_t)
     }
 
@@ -614,7 +618,7 @@ impl GatedDeltaNet {
     /// layer — cached on the [`DeltaState`].
     fn fused_middle(&self, cfg: &Qwen35Config) -> crate::flex::gdn::GdnMiddle {
         let host = |t: Tensor<1>| -> Vec<f32> {
-            t.into_data().to_vec::<f32>().expect("params are f32")
+            t.into_data().try_to_vec::<f32>().expect("params are f32")
         };
         // Conv1d weight is [conv_dim, 1, kk] row-major: channel-major with
         // the taps fastest — exactly the [c][tap] layout the FIR reads.
@@ -871,7 +875,11 @@ fn gdn_recurrence_chunked(
         // o_t = P_t·S₀ᵀq_t + Σ_{j≤t} (P_t/P_j)·(q_t·k_j)·u_j — inclusive
         // j ≤ t is exactly the unit diagonal of `decay`.
         let qk = qc.clone().matmul(kc.clone().swap_dims(2, 3)).mul(decay);
-        let o_c = p.clone().mul(qc).matmul(s.clone()).add(qk.matmul(u.clone()));
+        let o_c = p
+            .clone()
+            .mul(qc)
+            .matmul(s.clone())
+            .add(qk.matmul(u.clone()));
         outs.push(o_c);
 
         // S_C = P_C·S₀ + Σ_j (P_C/P_j)·k_j u_jᵀ, again via log differences.
@@ -2036,7 +2044,7 @@ impl LoadedQwen35 {
                         .max()
                         .into_data()
                         .convert::<f32>()
-                        .to_vec::<f32>()
+                        .try_to_vec::<f32>()
                         .map(|v| v[0])
                         .unwrap_or(f32::NAN)
                 };
@@ -2153,7 +2161,7 @@ impl LoadedQwen35 {
                             t.sum()
                                 .into_data()
                                 .convert::<f32>()
-                                .to_vec::<f32>()
+                                .try_to_vec::<f32>()
                                 .map(|v| v[0])
                                 .unwrap_or(f32::NAN)
                         };
@@ -2211,7 +2219,7 @@ impl LoadedQwen35 {
                         .sum_dim(2)
                         .into_data()
                         .convert::<f32>()
-                        .to_vec::<f32>()
+                        .try_to_vec::<f32>()
                         .expect("local gate energy")
                 } else {
                     Vec::new()
@@ -2348,7 +2356,7 @@ mod tests {
         let full = m
             .forward(&ids, 0, &mut full_cache, &device)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
 
         let mut cache = m.new_cache();
@@ -2358,7 +2366,7 @@ mod tests {
             last = m
                 .forward(&[id], i, &mut cache, &device)
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap();
         }
         assert_eq!(full.len(), last.len());
@@ -2380,12 +2388,12 @@ mod tests {
         let a = m
             .forward(&[5], 3, &mut c1, &device)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         let b = m
             .forward(&[5], 3, &mut c2, &device)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         let max_diff = a
             .iter()
@@ -2402,7 +2410,7 @@ mod tests {
             .max()
             .into_data()
             .convert::<f32>()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap()[0]
     }
 
@@ -2429,7 +2437,11 @@ mod tests {
             l2(Tensor::<4>::random(dims, uni, device)),
             l2(Tensor::<4>::random(dims, uni, device)),
             Tensor::<4>::random(dims, uni, device),
-            Tensor::<3>::random([b, t, hv], Distribution::Uniform(g_range.0, g_range.1), device),
+            Tensor::<3>::random(
+                [b, t, hv],
+                Distribution::Uniform(g_range.0, g_range.1),
+                device,
+            ),
             Tensor::<3>::random([b, t, hv], Distribution::Uniform(0.05, 0.95), device),
         )
     }
@@ -2506,7 +2518,7 @@ mod tests {
         let full = m
             .forward(&ids, 0, &mut full_cache, &device)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
 
         let mut cache = m.new_cache();
@@ -2516,7 +2528,7 @@ mod tests {
             last = m
                 .forward(&[id], i, &mut cache, &device)
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap();
         }
         assert_eq!(full.len(), last.len());
@@ -2551,7 +2563,7 @@ mod tests {
         let full = m
             .forward(&ids, 0, &mut c1, &device)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
 
         let mut c2 = m.new_cache();
@@ -2559,7 +2571,7 @@ mod tests {
         let stepped = m
             .forward(&ids[4..], 4, &mut c2, &device)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         for (i, (f, s)) in full.iter().zip(&stepped).enumerate() {
             assert!((f - s).abs() < 1e-4, "logit {i}: full {f} vs advanced {s}");
@@ -2603,7 +2615,7 @@ mod tests {
                 .map(|(i, &id)| {
                     m.forward(&[id], prefix.len() + i, &mut cache, &device)
                         .into_data()
-                        .to_vec::<f32>()
+                        .try_to_vec::<f32>()
                         .unwrap()
                 })
                 .collect()
@@ -2638,7 +2650,7 @@ mod tests {
             let _ = m.forward(&[4, 9], 4, &mut cache, &device); // t = 2: tensor path
             m.forward(&[8], 6, &mut cache, &device)
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap()
         };
         let tensor = run(false);

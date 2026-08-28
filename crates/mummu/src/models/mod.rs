@@ -129,7 +129,7 @@ pub trait CausalLm {
                 .await
                 .map_err(|e| format!("logits readback: {e:?}"))?
                 .convert::<f32>()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .map_err(|e| format!("logits readback: {e:?}"))?;
             Ok(top_k_ids(&v, k))
         }
@@ -161,7 +161,7 @@ pub trait CausalLm {
                 .await
                 .map_err(|e| format!("logits readback: {e:?}"))?
                 .convert::<f32>()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .map_err(|e| format!("logits readback: {e:?}"))?;
             crate::import::logit_sanity(&v, expected_vocab).map_err(|e| e.to_string())
         }
@@ -206,22 +206,22 @@ pub trait CausalLm {
             "warm_up: {steps} steps exceeds the {MAX_WARM_UP_STEPS} bound"
         );
         async move {
-        let mut cache = self.new_cache();
-        let logits = self.forward(probe_ids, 0, &mut cache, device);
-        let mut next = argmax_id(logits).await?;
-        let mut forwards = 1usize;
-        for past in (probe_ids.len()..).take(steps) {
-            let logits = self.forward(&[next], past, &mut cache, device);
-            next = argmax_id(logits).await?;
-            forwards += 1;
-        }
+            let mut cache = self.new_cache();
+            let logits = self.forward(probe_ids, 0, &mut cache, device);
+            let mut next = argmax_id(logits).await?;
+            let mut forwards = 1usize;
+            for past in (probe_ids.len()..).take(steps) {
+                let logits = self.forward(&[next], past, &mut cache, device);
+                next = argmax_id(logits).await?;
+                forwards += 1;
+            }
 
-        debug_assert_eq!(
-            forwards,
-            steps + 1,
-            "warm_up must run exactly one prefill plus `steps` decode forwards"
-        );
-        Ok(forwards)
+            debug_assert_eq!(
+                forwards,
+                steps + 1,
+                "warm_up must run exactly one prefill plus `steps` decode forwards"
+            );
+            Ok(forwards)
         }
     }
 }

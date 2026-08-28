@@ -64,15 +64,9 @@ impl QuantPolicy {
         match std::env::var("MUMMU_QUANT") {
             Err(_) => Ok(Self::Off),
             Ok(v) if v.is_empty() || v.eq_ignore_ascii_case("off") => Ok(Self::Off),
-            Ok(v) if v.eq_ignore_ascii_case("q8") || v.eq_ignore_ascii_case("int8") => {
-                Ok(Self::Q8)
-            }
-            Ok(v) if v.eq_ignore_ascii_case("q4") || v.eq_ignore_ascii_case("int4") => {
-                Ok(Self::Q4)
-            }
-            Ok(v) if v.eq_ignore_ascii_case("q2") || v.eq_ignore_ascii_case("int2") => {
-                Ok(Self::Q2)
-            }
+            Ok(v) if v.eq_ignore_ascii_case("q8") || v.eq_ignore_ascii_case("int8") => Ok(Self::Q8),
+            Ok(v) if v.eq_ignore_ascii_case("q4") || v.eq_ignore_ascii_case("int4") => Ok(Self::Q4),
+            Ok(v) if v.eq_ignore_ascii_case("q2") || v.eq_ignore_ascii_case("int2") => Ok(Self::Q2),
             Ok(v) if v.eq_ignore_ascii_case("f16") || v.eq_ignore_ascii_case("fp16") => {
                 Ok(Self::F16)
             }
@@ -162,9 +156,6 @@ impl QuantPolicy {
             && dims[1].is_multiple_of(BLOCK)
     }
 }
-
-
-
 
 /// What a tensor is, for the purpose of deciding how much precision it
 /// deserves. Coarse on purpose — a finer split would need per-tensor
@@ -414,10 +405,7 @@ mod tests {
     #[test]
     fn a_model_that_fits_is_left_at_the_ceiling() {
         let ts: Vec<_> = (1..9).map(|l| ffn(1 << 20, l)).collect();
-        let need: u64 = ts
-            .iter()
-            .map(|t| bytes_at(t.params, QuantPolicy::Q8))
-            .sum();
+        let need: u64 = ts.iter().map(|t| bytes_at(t.params, QuantPolicy::Q8)).sum();
         let p = plan(&ts, 10, need, QuantPolicy::Q8, QuantPolicy::Q2);
         assert!(p.precision.iter().all(|&q| q == QuantPolicy::Q8));
         assert_eq!(p.bytes, need);
@@ -429,10 +417,7 @@ mod tests {
     #[test]
     fn ffn_is_demoted_before_attention_of_equal_size() {
         let ts = vec![ffn(1 << 22, 5), attn(1 << 22, 5)];
-        let full: u64 = ts
-            .iter()
-            .map(|t| bytes_at(t.params, QuantPolicy::Q8))
-            .sum();
+        let full: u64 = ts.iter().map(|t| bytes_at(t.params, QuantPolicy::Q8)).sum();
         // Shave enough that exactly one of the two must drop a rung.
         let budget = full - bytes_at(1 << 22, QuantPolicy::Q8) / 3;
         let p = plan(&ts, 10, budget, QuantPolicy::Q8, QuantPolicy::Q2);
@@ -453,10 +438,7 @@ mod tests {
     #[test]
     fn middle_layers_are_demoted_before_the_edges() {
         let ts = vec![ffn(1 << 22, 0), ffn(1 << 22, 8), ffn(1 << 22, 15)];
-        let full: u64 = ts
-            .iter()
-            .map(|t| bytes_at(t.params, QuantPolicy::Q8))
-            .sum();
+        let full: u64 = ts.iter().map(|t| bytes_at(t.params, QuantPolicy::Q8)).sum();
         let budget = full - bytes_at(1 << 22, QuantPolicy::Q8) / 3;
         let p = plan(&ts, 16, budget, QuantPolicy::Q8, QuantPolicy::Q2);
         assert_eq!(
@@ -521,10 +503,7 @@ mod tests {
                 }
             })
             .collect();
-        let full: u64 = ts
-            .iter()
-            .map(|t| bytes_at(t.params, QuantPolicy::Q8))
-            .sum();
+        let full: u64 = ts.iter().map(|t| bytes_at(t.params, QuantPolicy::Q8)).sum();
         let mut previous: Option<Plan> = None;
         for step in 1..12 {
             let p = plan(

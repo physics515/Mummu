@@ -74,7 +74,11 @@ pub fn record(k: usize, n: usize, m: usize, bytes: usize, dur: Duration) {
     e.calls += 1;
     e.bytes += bytes as u128;
     e.total_ns += u128::from(ns);
-    e.best_ns = if e.best_ns == 0 { ns } else { e.best_ns.min(ns) };
+    e.best_ns = if e.best_ns == 0 {
+        ns
+    } else {
+        e.best_ns.min(ns)
+    };
     if e.recent_ns.len() < RING {
         e.recent_ns.push(ns);
     } else {
@@ -235,9 +239,7 @@ pub fn main_effect(a: &CellStats, b: &CellStats) -> Contrast {
 /// ratio under 0.4 says the environment owes the rest.
 #[must_use]
 pub fn kernel_innocent(quiet_gbps: f64, roofline_gbps: f64, live_gbps: f64) -> bool {
-    roofline_gbps > 0.0
-        && quiet_gbps >= 0.85 * roofline_gbps
-        && live_gbps / quiet_gbps < 0.4
+    roofline_gbps > 0.0 && quiet_gbps >= 0.85 * roofline_gbps && live_gbps / quiet_gbps < 0.4
 }
 
 #[cfg(test)]
@@ -248,13 +250,7 @@ mod tests {
     fn ledger_accumulates_and_reports() {
         reset();
         // 1 GiB in 0.1 s = 10.74 GB/s (decimal GB).
-        record(
-            5120,
-            17408,
-            1,
-            1 << 30,
-            Duration::from_millis(100),
-        );
+        record(5120, 17408, 1, 1 << 30, Duration::from_millis(100));
         record(5120, 17408, 1, 1 << 30, Duration::from_millis(50));
         let rows = shape_reports();
         assert_eq!(rows.len(), 1);

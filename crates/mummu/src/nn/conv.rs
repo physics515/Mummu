@@ -54,12 +54,7 @@ impl ShortConvConfig {
 impl ShortConv {
     /// Cache-aware forward. `x` is `[b, t, d]`: the whole prompt at prefill,
     /// one token per decode step after. Rolls `state` forward either way.
-    pub fn forward(
-        &self,
-        x: Tensor<3>,
-        kernel_len: usize,
-        state: &mut ConvState,
-    ) -> Tensor<3> {
+    pub fn forward(&self, x: Tensor<3>, kernel_len: usize, state: &mut ConvState) -> Tensor<3> {
         let [b, t, d] = x.dims();
         let kk = kernel_len;
         assert!(kk >= 2, "ShortConv forward: kernel_len must be >= 2");
@@ -165,7 +160,7 @@ mod tests {
         let full = c
             .forward(x.clone(), K, &mut ref_state)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
 
         // Cached: prefill 4, then decode 5th..7th one at a time.
@@ -175,7 +170,7 @@ mod tests {
             let out = c
                 .forward(x.clone().narrow(1, pos, 1), K, &mut state)
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap();
             let expect = &full[pos * D..(pos + 1) * D];
             for (i, (got, want)) in out.iter().zip(expect).enumerate() {
@@ -201,7 +196,7 @@ mod tests {
         let full = c
             .forward(x.clone(), K, &mut ref_state)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
 
         // Chunks of 4 + 3 + 2, all t > 1.
@@ -211,7 +206,7 @@ mod tests {
             got.extend(
                 c.forward(x.clone().narrow(1, start, len), K, &mut state)
                     .into_data()
-                    .to_vec::<f32>()
+                    .try_to_vec::<f32>()
                     .unwrap(),
             );
         }
@@ -233,12 +228,12 @@ mod tests {
         let o1 = c
             .forward(x1, K, &mut s1)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         let o2 = c
             .forward(x2, K, &mut s2)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         for i in 0..4 * D {
             assert!((o1[i] - o2[i]).abs() < 1e-6, "past row changed at {i}");
@@ -257,7 +252,7 @@ mod tests {
         let via_decode = c
             .forward(x.clone(), K, &mut s_decode)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
 
         // Same single token inside a longer prefill whose first position it is.
@@ -266,7 +261,7 @@ mod tests {
         let via_prefill = c
             .forward(longer, K, &mut s_pre)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
 
         for i in 0..D {

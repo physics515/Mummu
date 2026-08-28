@@ -24,7 +24,7 @@ repository = "https://github.com/physics515/Mummu"
 # `fusion` + `autotune` are the throughput levers: fusion compiles streams of tensor ops
 # into far fewer GPU kernels and autotune picks the fastest kernel variant; with `fusion`,
 # `Wgpu` transparently becomes `Fusion<Wgpu>`.
-burn = { version = "0.22.0-pre.2", default-features = false, features = [
+burn = { version = "0.22.0-pre.3", default-features = false, features = [
 	"std",
 	"wgpu",
 	# burn 0.22 selects backends at runtime through `Device`, so the flex
@@ -40,14 +40,14 @@ burn = { version = "0.22.0-pre.2", default-features = false, features = [
 ] }
 # Kernel authoring for the packed Q4 GEMV: burn-cubecl for CubeTensor /
 # quantized_handles / empty_device, cubecl for the #[cube] macro. Exact `=`
-# pins: pre-release caret semantics would accept a -pre.3 that the burn
+# pins: pre-release caret semantics would accept a newer pre-release that the burn
 # crates' own `=` pins then refuse to unify with.
-burn-cubecl = { version = "=0.22.0-pre.2", default-features = false }
-cubecl = { version = "=0.11.0-pre.2", default-features = false, features = ["wgpu"] }
+burn-cubecl = { version = "=0.22.0-pre.3", default-features = false }
+cubecl = { version = "=0.11.0-pre.3", default-features = false, features = ["wgpu"] }
 # The fusion wrapper for the same op (Fusion<B> re-enters the stream via
 # CustomOpIr) — only compiled under mummu's `fusion` feature.
-burn-fusion = { version = "=0.22.0-pre.2", default-features = false }
-burn-ir = { version = "=0.22.0-pre.2", default-features = false }
+burn-fusion = { version = "=0.22.0-pre.3", default-features = false }
+burn-ir = { version = "=0.22.0-pre.3", default-features = false }
 derive-new = { version = "0.7", default-features = false }
 rayon = "1" 
 # `vulkan` switches CubeCL's kernel compiler on Vulkan adapters from
@@ -63,7 +63,7 @@ rayon = "1"
 # (0.21 release notes); swapped in 2026-07-10 after the MiniLM Candle-parity
 # gate passed on it bit-for-bit-equivalent (cosine 0.99999994, max component
 # diff 1.3e-7) with all 80 unit tests green.
-burn-flex = "0.22.0-pre.2"
+burn-flex = "0.22.0-pre.3"
 # The two schedulers, as their own crates: A divides work across devices,
 # B decides the precision of the weights on each. Both are dependency-free —
 # see their crate docs — which is why they are separate rather than modules.
@@ -72,7 +72,7 @@ mummu-schedule = { path = "crates/mummu-schedule" }
 # Direct handle on burn-store (the same crate burn's `store` feature pulls) to
 # turn on its `pytorch` feature: .pth / pytorch_model.bin state-dict loading
 # for models never re-shipped as safetensors (feature-unified, no duplicate).
-burn-store = { version = "0.22.0-pre.2", default-features = false, features = [
+burn-store = { version = "0.22.0-pre.3", default-features = false, features = [
 	"std",
 	"safetensors",
 	"pytorch",
@@ -83,7 +83,7 @@ burn-store = { version = "0.22.0-pre.2", default-features = false, features = [
 # CubeCL itself discovers — `crate::tune` reports and clears it. Feature-
 # unified, so this adds no compile time; hardcoding the discovery rule instead
 # would drift from cubecl's the first time it changes.
-cubecl-runtime = "0.11.0-pre.2"
+cubecl-runtime = "0.11.0-pre.3"
 
 # Direct handle on wgpu (the same version Burn resolves) for the cheap startup
 # adapter probe: enumerate GPUs to decide GPU vs CPU before building a backend.

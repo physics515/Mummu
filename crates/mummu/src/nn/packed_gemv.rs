@@ -28,21 +28,21 @@
 //! puts on a device (pack.rs `quantized_tensor_data`). Weights are
 //! `[K, N]` row-major with blocks along N; blocks never straddle rows.
 
-use burn::backend::backend_extension;
-use burn::backend::tensor::{FloatTensor, QuantizedTensor};
-use burn::backend::{Backend, Flex, Wgpu};
 #[cfg(feature = "cuda")]
 use burn::backend::Cuda;
 #[cfg(feature = "vulkan-spirv")]
 use burn::backend::Vulkan;
+use burn::backend::backend_extension;
+use burn::backend::tensor::{FloatTensor, QuantizedTensor};
+use burn::backend::{Backend, Flex, Wgpu};
+use burn::tensor::quantization::{QuantScheme, QuantStore, QuantValue, ScaleDtype};
 use burn::tensor::{DType, Tensor};
-use burn::tensor::quantization::{QuantLevel, QuantParam, QuantScheme, QuantStore, QuantValue};
 
 /// Is a weight tensor in the one packed format this module reads?
 fn scheme_supported(scheme: &QuantScheme) -> bool {
     matches!(scheme.value, QuantValue::Q4S | QuantValue::Q8S)
-        && matches!(scheme.level, QuantLevel::Block(b) if b.to_dim_vec(1) == [32])
-        && matches!(scheme.param, QuantParam::F32)
+        && scheme.block_size().is_some_and(|b| b.to_dim_vec(1) == [32])
+        && scheme.scale_dtype() == ScaleDtype::F32
         // PackedU32(0) is what accelerators hold; flex re-tags Native after
         // unpacking to i8 — both are exactly what the per-backend impls read.
         && matches!(scheme.store, QuantStore::PackedU32(0) | QuantStore::Native)
@@ -371,9 +371,15 @@ mod cube_impl {
         let l2 = u64::from(props.hardware.max_shared_memory_size as u32)
             .checked_mul(0)
             .and(None::<u64>)
-            .or_else(|| std::env::var("MUMMU_L2_MIB").ok().and_then(|v| v.parse::<u64>().ok()).map(|m| m << 20))
+            .or_else(|| {
+                std::env::var("MUMMU_L2_MIB")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .map(|m| m << 20)
+            })
             .map(|b| b / 4 * 3);
-        let weight_bytes = (n_words as u64 * k_len as u64 * 4) + (w_scales.meta.num_elements() as u64 * 4);
+        let weight_bytes =
+            (n_words as u64 * k_len as u64 * 4) + (w_scales.meta.num_elements() as u64 * 4);
 
         let mut best = (1usize, f64::INFINITY);
         for cand in split_candidates(weight_bytes, l2) {
@@ -381,15 +387,12 @@ mod cube_impl {
                 continue;
             }
             let run = || {
-                let out = empty_device::<R, f32>(
-                    client.clone(),
-                    x.device.clone(),
-                    Shape::new([1, n]),
-                );
+                let out =
+                    empty_device::<R, f32>(client.clone(), x.device.clone(), Shape::new([1, n]));
                 packed_gemv_kernel::launch::<R>(
                     client,
                     CubeCount::Static((n_words as u32).div_ceil(32), 1, 1),
-                    CubeDim { x: 32, y: cand as u32, z: 1 },
+                    CubeDim::new_2d(32, cand as u32),
                     w_vals.clone().into_tensor_arg(),
                     w_scales.clone().into_tensor_arg(),
                     x.clone().into_tensor_arg(),
@@ -450,24 +453,12 @@ mod cube_impl {
         // does not divide k, so odd shapes keep the exact split-1 path.
         let k_len = x.meta.shape()[1];
         let mut split = gemv_split_for(
-            &client,
-            &x.device,
-            &w_vals,
-            &w_scales,
-            &x,
-            n,
-            n_words,
-            k_len,
-            per_word,
+            &client, &x.device, &w_vals, &w_scales, &x, n, n_words, k_len, per_word,
         );
         if split == 0 || k_len % split != 0 {
             split = 1;
         }
-        let cube_dim = CubeDim {
-            x: 32,
-            y: split as u32,
-            z: 1,
-        };
+        let cube_dim = CubeDim::new_2d(32, split as u32);
         let cubes = (n_words as u32).div_ceil(32);
         debug_assert_eq!(
             n_words * per_word,
@@ -542,7 +533,11 @@ mod flex_impl {
     fn host_rows(x: &FloatTensor<Flex>) -> Vec<f32> {
         match x.as_slice::<f32>() {
             Some(s) => s.to_vec(),
-            None => x.clone().into_data().to_vec::<f32>().expect("f32 activations"),
+            None => x
+                .clone()
+                .into_data()
+                .try_to_vec::<f32>()
+                .expect("f32 activations"),
         }
     }
 
@@ -564,7 +559,7 @@ mod flex_impl {
             let xs: &[f32] = match x.as_slice::<f32>() {
                 Some(s) => s,
                 None => {
-                    xs_owned = x.into_data().to_vec::<f32>().expect("f32 activations");
+                    xs_owned = x.into_data().try_to_vec::<f32>().expect("f32 activations");
                     &xs_owned
                 }
             };
@@ -583,7 +578,13 @@ mod flex_impl {
             {
                 let mut out = vec![0f32; n];
                 crate::flex::kernels::gemv_q4n_auto(&packed, xs, &mut out);
-                crate::flex::insitu::record(k_len, n, 1, packed.streamed_bytes(), started.elapsed());
+                crate::flex::insitu::record(
+                    k_len,
+                    n,
+                    1,
+                    packed.streamed_bytes(),
+                    started.elapsed(),
+                );
                 return FlexTensor::from_data(TensorData::new(out, [1, n]));
             }
             let mut out = vec![0f32; n];
@@ -609,7 +610,7 @@ mod flex_impl {
             let xs: &[f32] = match x.as_slice::<f32>() {
                 Some(s) => s,
                 None => {
-                    xs_owned = x.into_data().to_vec::<f32>().expect("f32 activations");
+                    xs_owned = x.into_data().try_to_vec::<f32>().expect("f32 activations");
                     &xs_owned
                 }
             };
@@ -633,21 +634,24 @@ mod flex_impl {
             static HOT: Mutex<Option<crate::flex::head::HotSet>> = Mutex::new(None);
             let k = crate::flex::head::effective_k();
             let seeds = {
-                let mut hot = HOT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut hot = HOT
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 hot.get_or_insert_with(crate::flex::head::HotSet::new)
                     .seeds(n.div_ceil(crate::flex::head::TILE), 4)
             };
             let top = crate::flex::head::head_topk(&packed, &meta, xs, k, &seeds);
             {
-                let mut hot = HOT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut hot = HOT
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(h) = hot.as_mut() {
                     h.observe(xs, &top);
                 }
             }
             // The pruning ratio is the whole point — the ledger records the
             // bytes actually streamed, which is what the report divides by.
-            let evaluated_bytes = (packed.streamed_bytes() as u128
-                * top.evaluated_rows as u128
+            let evaluated_bytes = (packed.streamed_bytes() as u128 * top.evaluated_rows as u128
                 / n.max(1) as u128) as usize;
             crate::flex::insitu::record(k_len, n, 1, evaluated_bytes, started.elapsed());
             let mut out = vec![crate::flex::head::SENTINEL; n];
@@ -678,7 +682,13 @@ mod flex_impl {
                 crate::flex::kernels::gemm_q4n_auto(&packed, &xs, m, &mut out);
                 // The whole point of the GEMM: the weight streams ONCE for
                 // the batch — record it that way.
-                crate::flex::insitu::record(k_len, n, m, packed.streamed_bytes(), started.elapsed());
+                crate::flex::insitu::record(
+                    k_len,
+                    n,
+                    m,
+                    packed.streamed_bytes(),
+                    started.elapsed(),
+                );
                 return FlexTensor::from_data(TensorData::new(out, [m, n]));
             }
             // Non-Q4S (or twin disabled): the i8 loop per row. Correct, and
@@ -748,7 +758,11 @@ mod fusion_impl {
             let out = TensorIr::uninit(client.create_empty_handle(), shape_out, DType::F32);
             let desc = CustomOpIr::new("mummu_q4s_gemv", &[x.into_ir(), w.into_ir()], &[out]);
             client
-                .register(stream, OperationIr::Custom(desc.clone()), Gemv::<B>::new(desc))
+                .register(
+                    stream,
+                    OperationIr::Custom(desc.clone()),
+                    Gemv::<B>::new(desc),
+                )
                 .output()
         }
     }
@@ -797,9 +811,9 @@ mod tests {
             .abs()
             .max()
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap()[0];
-        let scale = want.abs().max().into_data().to_vec::<f32>().unwrap()[0].max(1e-6);
+        let scale = want.abs().max().into_data().try_to_vec::<f32>().unwrap()[0].max(1e-6);
         assert!(
             diff / scale < 1e-4,
             "packed vs reference rel err {} (abs {diff})",
@@ -830,13 +844,19 @@ mod tests {
             .abs()
             .max()
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap()[0];
         assert_eq!(rep, 0.0, "twin path must be deterministic call to call");
 
         let want = x.matmul(wq.dequantize());
-        let diff = a.sub(want.clone()).abs().max().into_data().to_vec::<f32>().unwrap()[0];
-        let scale = want.abs().max().into_data().to_vec::<f32>().unwrap()[0].max(1e-6);
+        let diff = a
+            .sub(want.clone())
+            .abs()
+            .max()
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap()[0];
+        let scale = want.abs().max().into_data().try_to_vec::<f32>().unwrap()[0].max(1e-6);
         assert!(
             diff / scale < 0.05,
             "twin vs device-grid reference rel err {} (abs {diff}) — outside the \
@@ -853,7 +873,10 @@ mod tests {
         let wf = Tensor::<2>::random([64, 64], Distribution::Uniform(-1.0, 1.0), &device);
         assert!(try_q4s_gemv(&x2, &wf).is_none(), "m=2 float must decline");
         let x1 = Tensor::<2>::random([1, 64], Distribution::Uniform(-1.0, 1.0), &device);
-        assert!(try_q4s_gemv(&x1, &wf).is_none(), "float weight must decline");
+        assert!(
+            try_q4s_gemv(&x1, &wf).is_none(),
+            "float weight must decline"
+        );
     }
 
     /// The host GEMM path (m > 1 on flex) equals m stacked single-row calls
@@ -883,9 +906,9 @@ mod tests {
             .abs()
             .max()
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap()[0];
-        let scale = stacked.abs().max().into_data().to_vec::<f32>().unwrap()[0].max(1e-6);
+        let scale = stacked.abs().max().into_data().try_to_vec::<f32>().unwrap()[0].max(1e-6);
         assert!(
             diff / scale < 1e-5,
             "gemm vs stacked gemvs rel err {} (abs {diff})",
@@ -924,7 +947,7 @@ mod tests {
             .abs()
             .max()
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap()[0];
         assert_eq!(diff, 0.0, "full-coverage bounded head must equal dense");
     }
@@ -955,7 +978,7 @@ mod tests {
             .abs()
             .max()
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap()[0];
         assert!(diff < 1e-5, "i8 gemm vs stacked gemvs abs err {diff}");
     }

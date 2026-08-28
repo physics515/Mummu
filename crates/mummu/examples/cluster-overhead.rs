@@ -59,7 +59,7 @@ fn main() {
     let one = timed(20, || {
         let y = x.clone().matmul(whole.clone());
         // Force completion: an async queue would otherwise time nothing.
-        let _ = y.into_data().convert::<f32>().to_vec::<f32>().ok();
+        let _ = y.into_data().convert::<f32>().try_to_vec::<f32>().ok();
     });
     println!("  one full-width matmul          {one:7.2} ms");
 
@@ -75,7 +75,7 @@ fn main() {
             });
         }
         if let Some(a) = acc {
-            let _ = a.into_data().convert::<f32>().to_vec::<f32>().ok();
+            let _ = a.into_data().convert::<f32>().try_to_vec::<f32>().ok();
         }
     });
     println!(
@@ -114,7 +114,7 @@ fn main() {
                 });
             }
             if let Some(a) = acc {
-                let _ = a.into_data().convert::<f32>().to_vec::<f32>().ok();
+                let _ = a.into_data().convert::<f32>().try_to_vec::<f32>().ok();
             }
         });
         println!(
@@ -132,7 +132,7 @@ fn main() {
         let qw = mummu::quant::quantize_weight(policy, whole.clone());
         let ms = timed(20, || {
             let y = x.clone().matmul(qw.clone());
-            let _ = y.into_data().convert::<f32>().to_vec::<f32>().ok();
+            let _ = y.into_data().convert::<f32>().try_to_vec::<f32>().ok();
         });
         println!(
             "  one full-width at {policy:?}          {ms:7.2} ms   ({:.2}x f32)",
@@ -149,7 +149,7 @@ fn main() {
         let xh = x.clone().cast(burn::tensor::DType::F16);
         let ms = timed(20, || {
             let y = xh.clone().matmul(half.clone());
-            let _ = y.into_data().convert::<f32>().to_vec::<f32>().ok();
+            let _ = y.into_data().convert::<f32>().try_to_vec::<f32>().ok();
         });
         println!(
             "  one full-width at F16            {ms:7.2} ms   ({:.2}x f32)",
