@@ -76,8 +76,22 @@ impl ShortConv {
         let bx = bb.mul(xx).swap_dims(1, 2); // input gate, channel-major [b, d, t]
 
         let conv_out = if t > 1 {
-            // Prefill: the padded depthwise Conv1d gives the full causal output.
-            self.conv.forward(bx.clone()).narrow(2, 0, t) // [b, d, t]
+            match state.as_ref() {
+                // Continuation (a later prefill chunk, or a prompt after
+                // decode): the first K-1 positions' windows reach into the
+                // cached span. Convolve [cached | new] and take the outputs
+                // aligned to the new span — the uninterrupted conv exactly.
+                // (The fresh-start branch used to take every continuation
+                // too, convolving those positions against zero history —
+                // the same boundary bug found in qwen35's DeltaNet conv.)
+                Some(prev) => {
+                    let ext = Tensor::cat(vec![prev.clone(), bx.clone()], 2);
+                    self.conv.forward(ext).narrow(2, kk - 1, t)
+                }
+                // Fresh prefill: the padded depthwise Conv1d gives the full
+                // causal output.
+                None => self.conv.forward(bx.clone()).narrow(2, 0, t), // [b, d, t]
+            }
         } else {
             // Decode: weighted sum over the last K inputs = [cached (K-1), new (1)].
             // Equivalent to the padded conv at the new position.
@@ -170,6 +184,40 @@ mod tests {
                     "pos {pos} elem {i}: cached {got} vs full {want}"
                 );
             }
+        }
+    }
+
+    /// Chunked prefill equivalence: feeding the prompt in t > 1 slices
+    /// must reproduce the one-shot forward — the continuation branch reads
+    /// the cached window, so a chunk boundary is invisible. (This is the
+    /// test that would have caught the zero-history boundary bug.)
+    #[test]
+    fn chunked_prefill_matches_one_shot() {
+        let device = crate::backend::cpu_device();
+        let c = conv(&device);
+        let x = input(9, 2.0, &device);
+
+        let mut ref_state: ConvState = None;
+        let full = c
+            .forward(x.clone(), K, &mut ref_state)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+
+        // Chunks of 4 + 3 + 2, all t > 1.
+        let mut state: ConvState = None;
+        let mut got = Vec::new();
+        for (start, len) in [(0usize, 4usize), (4, 3), (7, 2)] {
+            got.extend(
+                c.forward(x.clone().narrow(1, start, len), K, &mut state)
+                    .into_data()
+                    .to_vec::<f32>()
+                    .unwrap(),
+            );
+        }
+        assert_eq!(got.len(), full.len());
+        for (i, (g, f)) in got.iter().zip(&full).enumerate() {
+            assert!((g - f).abs() < 1e-5, "elem {i}: chunked {g} vs full {f}");
         }
     }
 

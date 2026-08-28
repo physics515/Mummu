@@ -11,7 +11,10 @@ mod mlp;
 mod moe;
 mod rope;
 
-pub use attention::{GqaAttention, GqaAttentionConfig, LayerKv, causal_mask, repeat_kv};
+pub use attention::{
+    GqaAttention, GqaAttentionConfig, LayerKv, causal_mask, kv_append, kv_append_as,
+    kv_f16_enabled, repeat_kv,
+};
 pub use conv::{ConvState, ShortConv, ShortConvConfig};
 pub use mlp::{SwiGluMlp, SwiGluMlpConfig};
 pub mod packed_gemv;

@@ -218,9 +218,15 @@ pub fn prefill_chunk_len() -> usize {
 /// [`prefill_chunk_len`]), then one token per iteration. Emits each accepted
 /// token through `on_token`; a `Break` return cancels cooperatively *before*
 /// the next forward. EOS is never emitted.
-/// `step(new_ids, past)` returns `[1, vocab]` logits for the last position.
+///
+/// `step(new_ids, past, need_logits)` advances the cache; it must return
+/// `Some([1, vocab] logits)` for the last position whenever `need_logits`
+/// is true, and MAY return `None` when it is false — the non-final chunks
+/// of a chunked prefill, where a computed head projection is a throwaway
+/// (~68 ms/token of host head on the 27B, once per chunk). Models plug in
+/// via `CausalLm::forward` / `CausalLm::forward_advance`.
 pub async fn generate_loop(
-    mut step: impl FnMut(&[u32], usize) -> Tensor<2>,
+    mut step: impl FnMut(&[u32], usize, bool) -> Option<Tensor<2>>,
     prompt_ids: &[u32],
     max_tokens: usize,
     opts: &SamplerOptions,
@@ -242,14 +248,19 @@ pub async fn generate_loop(
         // resident layers, every token, forever. Exact by the same invariant
         // the caches are tested on (prefill+decode ≡ full forward): the KV
         // cat, the conv window and the DeltaNet state all carry across
-        // calls. Cost: each non-final chunk computes one throwaway lm_head
-        // projection (`CausalLm::forward` has no skip-head mode yet).
+        // calls. Non-final chunks advance with `need_logits = false`, so a
+        // model with a skip-head mode never computes their throwaway
+        // lm_head projections (the 27B's host head is ~68 ms per chunk).
         let chunk = prefill_chunk_len();
         let mut done = 0usize;
         let mut last = None;
         while done < prompt_ids.len() {
             let end = done.saturating_add(chunk).min(prompt_ids.len());
-            last = Some(step(&prompt_ids[done..end], done));
+            let is_final = end == prompt_ids.len();
+            let out = step(&prompt_ids[done..end], done, is_final);
+            if is_final {
+                last = Some(out.expect("step must return logits when need_logits is true"));
+            }
             done = end;
         }
         last.expect("non-empty prompt")
@@ -298,7 +309,7 @@ pub async fn generate_loop(
         tokio::task::yield_now().await;
         logits = {
             let _s = crate::prof::scope("step");
-            step(&[next], past)
+            step(&[next], past, true).expect("step must return logits when need_logits is true")
         };
     }
     debug_assert!(out.len() <= max_tokens);
@@ -417,13 +428,18 @@ mod tests {
 
     /// A fixed toy vocab where the "model" always prefers id 2, then id 3
     /// after seeing 2 — enough to drive the loop without weights.
-    fn toy_step(device: &burn::tensor::Device) -> impl FnMut(&[u32], usize) -> Tensor<2> {
+    fn toy_step(
+        device: &burn::tensor::Device,
+    ) -> impl FnMut(&[u32], usize, bool) -> Option<Tensor<2>> {
         let device = device.clone();
-        move |new_ids: &[u32], _past: usize| {
+        move |new_ids: &[u32], _past: usize, need_logits: bool| {
+            if !need_logits {
+                return None;
+            }
             let peak = if new_ids.last() == Some(&2) { 3 } else { 2 };
             let mut v = vec![0.0f32; 8];
             v[peak] = 9.0;
-            Tensor::<1>::from_floats(v.as_slice(), &device).reshape([1, 8])
+            Some(Tensor::<1>::from_floats(v.as_slice(), &device).reshape([1, 8]))
         }
     }
 

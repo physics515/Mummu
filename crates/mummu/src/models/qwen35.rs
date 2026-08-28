@@ -287,23 +287,19 @@ impl GatedAttention {
         drop(_s_rope);
         let _s_kv = crate::prof::scope("fa.kv");
 
-        let (k_all, v_all) = match kv.take() {
-            Some((pk, pv)) => (
-                Tensor::cat(vec![pk, k_new], 2),
-                Tensor::cat(vec![pv, v_new], 2),
-            ),
-            None => (k_new, v_new),
-        };
-        *kv = Some((k_all.clone(), v_all.clone()));
+        // Storage dtype (f16 KV when enabled) is the cache helper's call;
+        // scores upcast to the f32 island below and the value matmul
+        // upcasts to ambient, so precision here is storage-only.
+        let ambient = q.dtype();
+        let (k_all, v_all) = crate::nn::kv_append(kv, k_new, v_new);
 
         let group = nh / nkv;
         let k = repeat_kv(k_all, group);
-        let v = repeat_kv(v_all, group);
+        let v = repeat_kv(v_all, group).cast(ambient);
         drop(_s_kv);
         let _s_scores = crate::prof::scope("fa.scores");
 
         // f32 island for the scores — the same overflow guard as GqaAttention.
-        let ambient = q.dtype();
         let scale = 1.0 / (hd as f32).sqrt();
         let mut scores = q
             .cast(DType::F32)
@@ -432,7 +428,24 @@ impl GatedDeltaNet {
         let _s_conv = crate::prof::scope("delta.conv");
         let mix_cm = mixed.swap_dims(1, 2); // channel-major [b, conv_dim, t]
         let conv_out = if t > 1 {
-            self.conv1d.forward(mix_cm.clone()).narrow(2, 0, t)
+            match &cache.conv {
+                // Continuation (a later prefill chunk, or a prompt after
+                // decode steps): the first kk-1 positions' windows reach
+                // into the PREVIOUS span, which the rolling cache holds.
+                // Running the conv over [cached | new] and taking the
+                // outputs aligned to the new span reproduces the
+                // uninterrupted conv exactly. The old code fell into the
+                // fresh-start branch here and convolved those positions
+                // against zero history — wrong at every chunk boundary
+                // (found by the forward_advance equivalence test; the
+                // chunked-prefill exactness claim held only for prompts
+                // within one chunk).
+                Some(prev) => {
+                    let ext = Tensor::cat(vec![prev.clone(), mix_cm.clone()], 2);
+                    self.conv1d.forward(ext).narrow(2, kk - 1, t)
+                }
+                None => self.conv1d.forward(mix_cm.clone()).narrow(2, 0, t),
+            }
         } else {
             let window = match &cache.conv {
                 Some(prev) => Tensor::cat(vec![prev.clone(), mix_cm.clone()], 2),
@@ -1858,6 +1871,34 @@ impl CausalLm for LoadedQwen35 {
         cache: &mut Self::Cache,
         device: &Device,
     ) -> Tensor<2> {
+        self.forward_impl(new_ids, past, cache, device, true)
+            .expect("forward_impl returns logits when need_logits is true")
+    }
+
+    fn forward_advance(
+        &self,
+        new_ids: &[u32],
+        past: usize,
+        cache: &mut Self::Cache,
+        device: &Device,
+    ) {
+        let _ = self.forward_impl(new_ids, past, cache, device, false);
+    }
+}
+
+impl LoadedQwen35 {
+    /// The shared body of `forward` / `forward_advance`: runs the trunk,
+    /// and computes the final norm + lm_head only when `need_logits` —
+    /// a non-final prefill chunk advances every cache without paying the
+    /// head projection (~68 ms/call on the 27B's host head).
+    fn forward_impl(
+        &self,
+        new_ids: &[u32],
+        past: usize,
+        cache: &mut Vec<Qwen35Kv>,
+        device: &Device,
+        need_logits: bool,
+    ) -> Option<Tensor<2>> {
         let t = new_ids.len();
         assert!(t >= 1, "qwen35 forward: need at least one token");
         assert!(
@@ -2179,6 +2220,12 @@ impl CausalLm for LoadedQwen35 {
                 pct(la_a3),
             );
         }
+        // Advance-only calls stop here: every cache (KV, conv window,
+        // recurrent state) is updated; the final norm and head are the
+        // only work skipped, and nothing downstream reads them.
+        if !need_logits {
+            return None;
+        }
         // The final norm and head may live elsewhere than the last layer.
         let head_device = self.model.norm.gamma.val().device();
         let x = if x.device() == head_device {
@@ -2197,7 +2244,7 @@ impl CausalLm for LoadedQwen35 {
         // [1, 5120] x [5120, 248320] f32 matmul, and it runs on whichever
         // device holds the embedding table — the HOST, for a split model.
         let _s = crate::prof::scope("lm_head");
-        match &self.model.lm_head {
+        Some(match &self.model.lm_head {
             // The bounded-exact host head (SPEC P4.3/P4.4) engages when
             // serve opted in and the weight is packed on flex; every
             // consulted coordinate equals the dense head's value (see
@@ -2219,7 +2266,7 @@ impl CausalLm for LoadedQwen35 {
                     .matmul(e.swap_dims(0, 1))
                     .to_device(&out_device)
             }
-        }
+        })
     }
 }
 
@@ -2468,6 +2515,34 @@ mod tests {
         real.full_attention_interval = 4;
         let attn: Vec<usize> = (0..8).filter(|&i| real.is_attention(i)).collect();
         assert_eq!(attn, vec![3, 7]);
+    }
+
+    /// The skip-head advance (non-final prefill chunks) updates every
+    /// cache exactly like a full forward: advancing over a prefix and then
+    /// stepping must equal the one-shot forward.
+    #[test]
+    fn forward_advance_then_forward_matches_full() {
+        let m = toy_model();
+        let device = crate::backend::cpu_device();
+        let ids: Vec<u32> = vec![3, 17, 42, 9, 60, 11];
+
+        let mut c1 = m.new_cache();
+        let full = m
+            .forward(&ids, 0, &mut c1, &device)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+
+        let mut c2 = m.new_cache();
+        m.forward_advance(&ids[..4], 0, &mut c2, &device);
+        let stepped = m
+            .forward(&ids[4..], 4, &mut c2, &device)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        for (i, (f, s)) in full.iter().zip(&stepped).enumerate() {
+            assert!((f - s).abs() < 1e-4, "logit {i}: full {f} vs advanced {s}");
+        }
     }
 
     /// Serializes the tests that toggle the fused-GDN force switch — it is
