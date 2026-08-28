@@ -5,5 +5,7 @@
 //! pays, evaluated with AVX-512 VNNI integer dot products (scalar fallback
 //! everywhere else). See the module docs in [`kernels`].
 
+pub mod gdn;
+pub mod insitu;
 pub mod kernels;
 pub mod registry;

@@ -574,6 +574,256 @@ pub fn act_error_bound(w: &PackedQ4, acts: &Q8Acts) -> Vec<f32> {
 }
 
 // ---------------------------------------------------------------------------
+// Packed GEMM, m > 1 (SPEC P5.1): stream the weight once, reuse it across
+// every prompt row.
+// ---------------------------------------------------------------------------
+
+/// A batch of activation rows, each quantized on ITS OWN per-32-group grid —
+/// exactly the grid the m=1 path would use for that row, so the GEMM is
+/// bit-compatible with m independent GEMVs (the scalar test pins this).
+pub struct Q8ActsBatch {
+    pub rows: Vec<Q8Acts>,
+    /// Worst per-row quality statistic — the dispatch gate for the batch.
+    pub worst_quality: f32,
+}
+
+impl Q8ActsBatch {
+    /// Quantize `m` rows of length `k` (row-major `x`).
+    #[must_use]
+    pub fn quantize(x: &[f32], m: usize, k: usize) -> Self {
+        assert_eq!(x.len(), m * k, "activation batch shape");
+        let rows: Vec<Q8Acts> = x.chunks_exact(k).map(Q8Acts::quantize).collect();
+        let worst_quality = rows.iter().fold(0.0f32, |w, r| w.max(r.quality));
+        Self {
+            rows,
+            worst_quality,
+        }
+    }
+}
+
+/// `Y = X · W` over the packed representation, `X: [m, k]`, `Y: [m, n]`
+/// row-major. The point against the row-looped GEMV: the weight bytes
+/// stream from DRAM **once** for the whole batch instead of once per row —
+/// at m = 64 that is 64x less weight traffic, which is the entire prefill
+/// gap on host layers (decode GEMV is byte-bound; a prompt is GEMM
+/// territory from m ≈ 2 up).
+///
+/// Dispatch mirrors [`gemv_q4n_auto`]: the batch takes the integer path
+/// only when every row's quantization quality clears the limit; a batch
+/// with one pathological row goes wholesale to the exact-f32 path (which
+/// is ALSO weight-stream-once here — the fallback keeps GEMM economics).
+pub fn gemm_q4n_auto(w: &PackedQ4, x: &[f32], m: usize, out: &mut [f32]) {
+    assert_eq!(x.len(), m * w.k, "activation batch shape");
+    assert_eq!(out.len(), m * w.n, "output batch shape");
+    if m == 0 {
+        return;
+    }
+    let acts = Q8ActsBatch::quantize(x, m, w.k);
+    if acts.worst_quality > quality_limit() || !vnni_available() {
+        log_fallback(w.k, w.n, acts.worst_quality);
+        gemm_q4n_f32(w, x, m, out);
+        return;
+    }
+    gemm_q4n_vnni(w, &acts, out);
+}
+
+/// Row-block width the VNNI GEMM holds in registers: 8 f32 accumulators of
+/// 16 lanes each, beside the unpacked weight chunk and scale temporaries —
+/// 17 of 32 zmm registers live.
+const GEMM_MR: usize = 8;
+
+/// Output-column panel per rayon task. A 64-row panel's packed bytes
+/// (64 · k/2 ≈ 160 KB at k = 5120) stay L2-resident across the row blocks,
+/// so DRAM sees the weight once while every m-block re-reads it from cache.
+const GEMM_PANEL: usize = 64;
+
+/// The VNNI GEMM. Loop structure (the memory argument, which is the whole
+/// design): rayon tasks own disjoint `GEMM_PANEL`-column slices of W; a
+/// task iterates m in blocks of [`GEMM_MR`]; within a block it walks its
+/// panel's rows once, so the panel streams from DRAM on the first block
+/// and from L2 after; activations for the current block (8 rows · k bytes
+/// ≈ 40 KB) sit in L1/L2 throughout. Net DRAM traffic: weights once,
+/// activations once.
+pub fn gemm_q4n_vnni(w: &PackedQ4, acts: &Q8ActsBatch, out: &mut [f32]) {
+    let m = acts.rows.len();
+    assert_eq!(out.len(), m * w.n, "output batch shape");
+    if !vnni_available() {
+        gemm_q4n_scalar(w, acts, out);
+        return;
+    }
+    for r in &acts.rows {
+        assert_eq!(r.qs.len(), w.k, "activation row length");
+    }
+    let groups = w.groups();
+    let n = w.n;
+
+    // Tasks write disjoint (row, column-panel) elements of `out`; the
+    // panels interleave within each output row, so no contiguous split
+    // exists. SAFETY: every task writes only columns in its own panel —
+    // element-disjoint by construction.
+    struct SendPtr(*mut f32);
+    unsafe impl Send for SendPtr {}
+    unsafe impl Sync for SendPtr {}
+    let out_ptr = SendPtr(out.as_mut_ptr());
+
+    let panels = n.div_ceil(GEMM_PANEL);
+    (0..panels).into_par_iter().for_each(|p| {
+        let _ = &out_ptr; // capture the wrapper, not the raw pointer
+        let col0 = p * GEMM_PANEL;
+        let cols = GEMM_PANEL.min(n - col0);
+        let mut combined = vec![0.0f32; GEMM_MR * groups];
+        let mut mb = 0usize;
+        while mb < m {
+            let mrl = GEMM_MR.min(m - mb);
+            for c in 0..cols {
+                let col = col0 + c;
+                let rs = w.row_scales(col);
+                // combined[r][g] = sw(col, g) · sx(mb + r, g).
+                for r in 0..mrl {
+                    let sx = &acts.rows[mb + r].scales;
+                    let dst = &mut combined[r * groups..(r + 1) * groups];
+                    for g in 0..groups {
+                        dst[g] = rs[g].to_f32() * sx[g];
+                    }
+                }
+                // SAFETY: vnni_available() checked; slices sized by the
+                // asserts above; each (row, col) written exactly once.
+                unsafe {
+                    let mut ys = [0.0f32; GEMM_MR];
+                    row_dot_vnni_mr(
+                        w.row_qs(col),
+                        &acts.rows[mb..mb + mrl],
+                        &combined,
+                        groups,
+                        &mut ys[..mrl],
+                    );
+                    for (r, &y) in ys[..mrl].iter().enumerate() {
+                        *out_ptr.0.add((mb + r) * n + col) = y;
+                    }
+                }
+            }
+            mb += mrl;
+        }
+    });
+}
+
+/// One weight row against up to [`GEMM_MR`] activation rows: the m=1
+/// kernel's structure with the unpack hoisted out of the row loop, so the
+/// weight chunk is decoded once and multiplied [`GEMM_MR`] times.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512dq,avx512vnni,avx2,fma")]
+unsafe fn row_dot_vnni_mr(
+    qs: &[u8],
+    act_rows: &[Q8Acts],
+    combined: &[f32],
+    groups: usize,
+    ys: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    let mrl = act_rows.len();
+    debug_assert!(mrl <= GEMM_MR && ys.len() == mrl);
+    let k = act_rows[0].qs.len();
+    let full = k / CHUNK;
+    unsafe {
+        let lo_mask = _mm256_set1_epi8(0x0F);
+        let eights = _mm512_set1_epi8(8);
+        let zero = _mm512_setzero_si512();
+        let mut acc = [_mm512_setzero_ps(); GEMM_MR];
+        for c in 0..full {
+            let wv = _mm256_loadu_si256(qs.as_ptr().add(c * GROUP).cast());
+            let lo = _mm256_and_si256(wv, lo_mask);
+            let hi = _mm256_and_si256(_mm256_srli_epi16(wv, 4), lo_mask);
+            let q = _mm512_inserti64x4(_mm512_castsi256_si512(lo), hi, 1);
+            for r in 0..mrl {
+                let xa = _mm512_loadu_si512(act_rows[r].qs.as_ptr().add(c * CHUNK).cast());
+                let dot = _mm512_sub_epi32(
+                    _mm512_dpbusd_epi32(zero, q, xa),
+                    _mm512_dpbusd_epi32(zero, eights, xa),
+                );
+                let cs = combined.as_ptr().add(r * groups + 2 * c);
+                let s0 = _mm256_set1_ps(*cs);
+                let s1 = _mm256_set1_ps(*cs.add(1));
+                let sc = _mm512_insertf32x8(_mm512_castps256_ps512(s0), s1, 1);
+                acc[r] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(dot), sc, acc[r]);
+            }
+        }
+        for r in 0..mrl {
+            let mut y = _mm512_reduce_add_ps(acc[r]);
+            if k % CHUNK != 0 {
+                let base = full * CHUNK;
+                let ob = full * GROUP;
+                let qx = &act_rows[r].qs;
+                let mut dot = 0i32;
+                for j in 0..GROUP / 2 {
+                    let b = *qs.get_unchecked(ob + j);
+                    dot += (i32::from(b & 0x0F) - 8) * i32::from(*qx.get_unchecked(base + j));
+                    dot += (i32::from(b >> 4) - 8)
+                        * i32::from(*qx.get_unchecked(base + GROUP / 2 + j));
+                }
+                y += *combined.get_unchecked(r * groups + 2 * full) * dot as f32;
+            }
+            ys[r] = y;
+        }
+    }
+}
+
+/// Scalar GEMM: exactly `m` independent scalar GEMVs (same integer dots per
+/// row), so `gemm ≡ m × gemv` holds by construction — the reference the
+/// SIMD path is tested against.
+pub fn gemm_q4n_scalar(w: &PackedQ4, acts: &Q8ActsBatch, out: &mut [f32]) {
+    let m = acts.rows.len();
+    assert_eq!(out.len(), m * w.n, "output batch shape");
+    for (r, row_acts) in acts.rows.iter().enumerate() {
+        gemv_q4n_scalar(w, row_acts, &mut out[r * w.n..(r + 1) * w.n]);
+    }
+}
+
+/// The exact-in-f32 GEMM over the same packed bytes — the batch fallback.
+/// Still weight-stream-once: each task unpacks its output row a single
+/// time and multiplies it against every activation row.
+pub fn gemm_q4n_f32(w: &PackedQ4, x: &[f32], m: usize, out: &mut [f32]) {
+    assert_eq!(x.len(), m * w.k, "activation batch shape");
+    assert_eq!(out.len(), m * w.n, "output batch shape");
+    let groups = w.groups();
+    let n = w.n;
+    struct SendPtr(*mut f32);
+    unsafe impl Send for SendPtr {}
+    unsafe impl Sync for SendPtr {}
+    let out_ptr = SendPtr(out.as_mut_ptr());
+    (0..n.div_ceil(16)).into_par_iter().for_each(|t| {
+        let _ = &out_ptr;
+        let col0 = t * 16;
+        let cols = 16.min(n - col0);
+        let mut row = vec![0u8; w.k];
+        let mut wf = vec![0.0f32; w.k];
+        for c in 0..cols {
+            let col = col0 + c;
+            unpack_row(w.row_qs(col), &mut row);
+            let rs = w.row_scales(col);
+            for g in 0..groups {
+                let s = rs[g].to_f32();
+                for j in 0..GROUP {
+                    let kk = g * GROUP + j;
+                    wf[kk] = (i32::from(row[kk]) - 8) as f32 * s;
+                }
+            }
+            for r in 0..m {
+                let xr = &x[r * w.k..(r + 1) * w.k];
+                let mut acc = 0.0f32;
+                for kk in 0..w.k {
+                    acc += wf[kk] * xr[kk];
+                }
+                // SAFETY: each (r, col) is written exactly once by the one
+                // task owning `col`.
+                unsafe {
+                    *out_ptr.0.add(r * n + col) = acc;
+                }
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Split calibration (SPEC 1, algorithm B seam)
 // ---------------------------------------------------------------------------
 
@@ -816,6 +1066,101 @@ mod tests {
                 deq[i]
             );
         }
+    }
+
+    /// The scalar GEMM is m independent GEMVs by construction: identical
+    /// outputs, bit for bit.
+    #[test]
+    fn gemm_scalar_is_exactly_m_gemvs() {
+        let (k, n, m) = (160, 40, 5); // k % 64 == 32: tail path in play
+        let vals = wave(k * n, 0.23);
+        let w = PackedQ4::from_f32(&vals, k, n);
+        let x: Vec<f32> = wave(m * k, 0.013);
+        let acts = Q8ActsBatch::quantize(&x, m, k);
+        let mut gemm = vec![0.0f32; m * n];
+        gemm_q4n_scalar(&w, &acts, &mut gemm);
+        for r in 0..m {
+            let row_acts = Q8Acts::quantize(&x[r * k..(r + 1) * k]);
+            let mut gemv = vec![0.0f32; n];
+            gemv_q4n_scalar(&w, &row_acts, &mut gemv);
+            assert_eq!(&gemm[r * n..(r + 1) * n], &gemv[..], "row {r}");
+        }
+    }
+
+    /// The VNNI GEMM computes the same integer dots as the scalar path —
+    /// agreement to f32 fold order, across row-block and panel boundaries
+    /// (m and n chosen to exercise partial blocks on both axes).
+    #[test]
+    fn gemm_vnni_matches_scalar() {
+        if !vnni_available() {
+            eprintln!("[skip] no AVX-512 VNNI on this host");
+            return;
+        }
+        for (k, n, m) in [(64, 16, 2), (128, 96, 8), (192, 130, 11), (5120, 80, 9)] {
+            let vals = wave(k * n, 0.171);
+            let w = PackedQ4::from_f32(&vals, k, n);
+            let x = wave(m * k, 0.0077);
+            let acts = Q8ActsBatch::quantize(&x, m, k);
+            let mut simd = vec![0.0f32; m * n];
+            gemm_q4n_vnni(&w, &acts, &mut simd);
+            let mut scalar = vec![0.0f32; m * n];
+            gemm_q4n_scalar(&w, &acts, &mut scalar);
+            let scale = scalar.iter().fold(1e-6f32, |mx, v| mx.max(v.abs()));
+            for i in 0..m * n {
+                assert!(
+                    (simd[i] - scalar[i]).abs() / scale < 1e-5,
+                    "[{k}x{n} m{m}] elem {i}: {} vs {}",
+                    simd[i],
+                    scalar[i]
+                );
+            }
+        }
+    }
+
+    /// The auto GEMM stays inside the per-row activation error bounds
+    /// against the dequantized reference (the same contract as the GEMV),
+    /// and a batch with one adversarial row takes the exact path wholesale.
+    #[test]
+    fn gemm_auto_bounds_and_dispatch() {
+        let (k, n, m) = (256, 48, 4);
+        let vals = wave(k * n, 0.37);
+        let w = PackedQ4::from_f32(&vals, k, n);
+        let deq = w.dequantize();
+        let x = wave(m * k, 0.019);
+        let mut got = vec![0.0f32; m * n];
+        gemm_q4n_auto(&w, &x, m, &mut got);
+        for r in 0..m {
+            let xr = &x[r * k..(r + 1) * k];
+            let want = ref_gemv(&deq, k, n, xr);
+            let acts = Q8Acts::quantize(xr);
+            let bounds = act_error_bound(&w, &acts);
+            for i in 0..n {
+                let err = (got[r * n + i] - want[i]).abs();
+                let slack = 1e-5 * want[i].abs().max(1.0);
+                assert!(
+                    err <= bounds[i] + slack,
+                    "row {r} col {i}: err {err} > bound {}",
+                    bounds[i]
+                );
+            }
+        }
+
+        // One outlier-dominated row must push the WHOLE batch to the exact
+        // f32 path: bitwise equality with gemm_q4n_f32 proves the dispatch.
+        let mut x_bad = x.clone();
+        for g in 0..k / GROUP {
+            x_bad[k + g * GROUP] = 1000.0; // row 1 becomes adversarial
+            for j in 1..GROUP {
+                x_bad[k + g * GROUP + j] = 1e-4;
+            }
+        }
+        let acts_bad = Q8ActsBatch::quantize(&x_bad, m, k);
+        assert!(acts_bad.worst_quality > quality_limit());
+        let mut auto_out = vec![0.0f32; m * n];
+        gemm_q4n_auto(&w, &x_bad, m, &mut auto_out);
+        let mut exact = vec![0.0f32; m * n];
+        gemm_q4n_f32(&w, &x_bad, m, &mut exact);
+        assert_eq!(auto_out, exact, "dispatch must have taken the exact path");
     }
 
     /// calibrate_split returns a valid split and gemv_q4n_split(s) computes
