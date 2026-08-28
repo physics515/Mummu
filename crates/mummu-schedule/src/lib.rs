@@ -32,6 +32,8 @@
 //! size that removes the unchunked ~855 MB activation peak from the
 //! reserve entirely.
 
+pub mod choices;
+pub mod governor;
 pub mod p2;
 pub mod placement;
 pub mod prefill;

@@ -12,6 +12,9 @@
 //! about without a GPU. The one thing that genuinely needs burn — turning a
 //! rung into a `QuantScheme` — stays in `mummu::quant`.
 
+pub mod bits;
+pub mod scales;
+
 /// Which quantization the keep-quantized path applies on import.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuantPolicy {
