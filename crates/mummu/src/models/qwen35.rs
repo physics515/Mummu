@@ -1373,6 +1373,19 @@ pub fn load_from_pack_layered(
     let build_host = crate::backend::cpu_device();
     let mut model = build(&config, &build_host, untied);
 
+    // A cold load is a multi-minute disk read (~17 GB for the 27B off an
+    // HDD), and nothing else prints between the fit plan and "resident" —
+    // without these lines a slow load is indistinguishable from a hang.
+    // Bytes come from the pack's own read counter, so the line reports what
+    // actually came off the disk.
+    let expected = expected_tensor_count(&config, untied);
+    let load_started = std::time::Instant::now();
+    let mut last_progress = std::time::Instant::now();
+    // Announce before the first read: the embedding is a single multi-GiB
+    // range near the front of the manifest, so the first between-tensor
+    // progress check can be tens of seconds out.
+    eprintln!("[mummu] load: assigning {expected} tensors from the pack");
+
     let mut assigned = 0usize;
     for entry in &pack.manifest.tensors {
         let Some(path) = pack_param_path(&entry.name, trunk) else {
@@ -1407,6 +1420,15 @@ pub fn load_from_pack_layered(
         };
         assign_param(&mut model, &path, src, QuantPolicy::Off, &device).map_err(parse)?;
         assigned += 1;
+        if last_progress.elapsed().as_secs() >= 15 {
+            let gib = pack.bytes_read() as f64 / f64::from(1u32 << 30);
+            let secs = load_started.elapsed().as_secs_f64();
+            eprintln!(
+                "[mummu] load: {assigned}/{expected} tensors — {gib:.2} GiB off the pack in {secs:.0}s ({:.0} MB/s)",
+                pack.bytes_read() as f64 / f64::from(1u32 << 20) / secs,
+            );
+            last_progress = std::time::Instant::now();
+        }
     }
     // Every parameter above was assigned onto its own device. Pin the three
     // specials, which the pack may not cover on every path; `to_device` is a
@@ -1416,7 +1438,6 @@ pub fn load_from_pack_layered(
     if let Some(h) = model.lm_head.take() {
         model.lm_head = Some(h.to_device(head_device));
     }
-    let expected = expected_tensor_count(&config, untied);
     if assigned != expected {
         return Err(parse(format!(
             "pack supplied {assigned} trunk tensors, the architecture needs {expected}"

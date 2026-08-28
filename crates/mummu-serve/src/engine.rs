@@ -1694,10 +1694,26 @@ fn mixed_precision(
     // resource: give it the ceiling rather than a pressure-driven rung.
     for t in &pack.manifest.tensors {
         chosen.entry(t.name.clone()).or_insert_with(|| {
-            if matches!(t.role, Role::Embedding | Role::Vector | Role::Conv) {
-                mummu::pack::Precision::F32
-            } else {
-                precision_for(ceiling)
+            match t.role {
+                // The embedding lands in host RAM at the backend's float
+                // dtype either way — the stored level only sets the bytes
+                // off the disk that a cold load is bound by, and f16 holds
+                // a quantization-born source's values to well under its own
+                // quant error (measured 0.0000 relative on the 4-bit-born
+                // 27B; ~2^-12 worst case for an 8-bit-born one, an order
+                // below the Q8 rung — see `precision_for`): 2.55 GiB read
+                // instead of 5.09. A float-born source (f16/bf16/f32
+                // checkpoint) keeps f32 — f16's narrower exponent could
+                // clip a bf16 outlier — and so does a pack whose
+                // `source_bytes` is 0 (unknown source, below 1 bit/param).
+                Role::Embedding
+                    if (1.0..16.0).contains(&source_bits)
+                        && t.precisions.contains_key(&mummu::pack::Precision::F16) =>
+                {
+                    mummu::pack::Precision::F16
+                }
+                Role::Embedding | Role::Vector | Role::Conv => mummu::pack::Precision::F32,
+                Role::Linear | Role::Expert { .. } => precision_for(ceiling),
             }
         });
     }
