@@ -26,7 +26,7 @@
 //! to hold twice.
 //!
 //! Source dtypes are preserved verbatim — the bf16→backend-float cast stays
-//! where it already lives, in `CastFloatAdapter` on the load pipeline.
+//! where it already lives, in `FloatCastAdapter` on the load pipeline.
 
 use std::collections::HashMap;
 use std::fs::File;

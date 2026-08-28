@@ -61,7 +61,7 @@ fn autotune_picks_are_persisted_where_we_report_and_clearing_removes_them() {
             .sum()
             .into_data()
             .convert::<f32>()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .expect("matmul readback");
         assert_eq!(sum.len(), 1, "sum reduces to one element");
         assert!(sum[0].is_finite(), "matmul produced a non-finite sum");

@@ -36,13 +36,13 @@ use burn::backend::Cuda;
 #[cfg(feature = "vulkan-spirv")]
 use burn::backend::Vulkan;
 use burn::tensor::{DType, Tensor};
-use burn::tensor::quantization::{QuantLevel, QuantParam, QuantScheme, QuantStore, QuantValue};
+use burn::tensor::quantization::{QuantScheme, QuantStore, QuantValue, ScaleDtype};
 
 /// Is a weight tensor in the one packed format this module reads?
 fn scheme_supported(scheme: &QuantScheme) -> bool {
     matches!(scheme.value, QuantValue::Q4S | QuantValue::Q8S)
-        && matches!(scheme.level, QuantLevel::Block(b) if b.to_dim_vec(1) == [32])
-        && matches!(scheme.param, QuantParam::F32)
+        && scheme.block_size().is_some_and(|b| b.to_dim_vec(1) == [32])
+        && scheme.scale_dtype() == ScaleDtype::F32
         // PackedU32(0) is what accelerators hold; flex re-tags Native after
         // unpacking to i8 — both are exactly what the per-backend impls read.
         && matches!(scheme.store, QuantStore::PackedU32(0) | QuantStore::Native)
@@ -322,7 +322,7 @@ mod cube_impl {
                 packed_gemv_kernel::launch::<R>(
                     client,
                     CubeCount::Static((n_words as u32).div_ceil(32), 1, 1),
-                    CubeDim { x: 32, y: cand as u32, z: 1 },
+                    CubeDim::new_2d(32, cand as u32),
                     w_vals.clone().into_tensor_arg(),
                     w_scales.clone().into_tensor_arg(),
                     x.clone().into_tensor_arg(),
@@ -396,11 +396,7 @@ mod cube_impl {
         if split == 0 || k_len % split != 0 {
             split = 1;
         }
-        let cube_dim = CubeDim {
-            x: 32,
-            y: split as u32,
-            z: 1,
-        };
+        let cube_dim = CubeDim::new_2d(32, split as u32);
         let cubes = (n_words as u32).div_ceil(32);
         debug_assert_eq!(
             n_words * per_word,
@@ -448,7 +444,7 @@ mod flex_impl {
             let xs: &[f32] = match x.as_slice::<f32>() {
                 Some(s) => s,
                 None => {
-                    xs_owned = x.into_data().to_vec::<f32>().expect("f32 activations");
+                    xs_owned = x.into_data().try_to_vec::<f32>().expect("f32 activations");
                     &xs_owned
                 }
             };
@@ -600,9 +596,9 @@ mod tests {
             .abs()
             .max()
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap()[0];
-        let scale = want.abs().max().into_data().to_vec::<f32>().unwrap()[0].max(1e-6);
+        let scale = want.abs().max().into_data().try_to_vec::<f32>().unwrap()[0].max(1e-6);
         assert!(
             diff / scale < 1e-4,
             "packed vs reference rel err {} (abs {diff})",
@@ -633,13 +629,13 @@ mod tests {
             .abs()
             .max()
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap()[0];
         assert_eq!(rep, 0.0, "twin path must be deterministic call to call");
 
         let want = x.matmul(wq.dequantize());
-        let diff = a.sub(want.clone()).abs().max().into_data().to_vec::<f32>().unwrap()[0];
-        let scale = want.abs().max().into_data().to_vec::<f32>().unwrap()[0].max(1e-6);
+        let diff = a.sub(want.clone()).abs().max().into_data().try_to_vec::<f32>().unwrap()[0];
+        let scale = want.abs().max().into_data().try_to_vec::<f32>().unwrap()[0].max(1e-6);
         assert!(
             diff / scale < 0.05,
             "twin vs device-grid reference rel err {} (abs {diff}) — outside the \

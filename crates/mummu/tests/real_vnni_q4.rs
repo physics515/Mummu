@@ -74,7 +74,7 @@ fn real_weight_tensor_through_the_twin_stays_inside_its_bound_and_is_faster() {
             let _ = mummu::nn::try_q4s_gemv(&x, &wq).expect("packed path engages");
             best = best.min(t0.elapsed().as_secs_f64() * 1e3);
         }
-        let v = y.into_data().to_vec::<f32>().expect("readback");
+        let v = y.into_data().try_to_vec::<f32>().expect("readback");
         eprintln!("[real_vnni_q4/{label}] [{in_w} x {out_w}] {best:.3} ms/call");
         (v, best)
     };
@@ -89,7 +89,7 @@ fn real_weight_tensor_through_the_twin_stays_inside_its_bound_and_is_faster() {
     //  (1) requantization along K: per output n, Σ_k |W_dev − W_twin|·|x_k|
     //      with both grids rebuilt from the same bytes the paths read;
     //  (2) activation quantization: the per-row ε bound from the kernel.
-    let dev_grid = wq.dequantize().into_data().to_vec::<f32>().expect("device grid");
+    let dev_grid = wq.dequantize().into_data().try_to_vec::<f32>().expect("device grid");
     let (qi8, qscales) =
         mummu::pack::quantize_blocks(&dev_grid, out_w, mummu::pack::Precision::Q4);
     let twin_pack = mummu::flex::kernels::PackedQ4::from_q4s_slab(&qi8, &qscales, in_w, out_w);

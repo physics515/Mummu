@@ -106,7 +106,7 @@ pub trait CausalLm {
                 .await
                 .map_err(|e| format!("logits readback: {e:?}"))?
                 .convert::<f32>()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .map_err(|e| format!("logits readback: {e:?}"))?;
             Ok(top_k_ids(&v, k))
         }
@@ -138,7 +138,7 @@ pub trait CausalLm {
                 .await
                 .map_err(|e| format!("logits readback: {e:?}"))?
                 .convert::<f32>()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .map_err(|e| format!("logits readback: {e:?}"))?;
             crate::import::logit_sanity(&v, expected_vocab).map_err(|e| e.to_string())
         }

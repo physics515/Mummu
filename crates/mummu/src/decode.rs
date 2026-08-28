@@ -26,7 +26,7 @@ pub async fn argmax_id(logits: Tensor<2>) -> Result<u32, String> {
         .await
         .map_err(|e| format!("argmax readback: {e:?}"))?
         .convert::<i64>()
-        .to_vec::<i64>()
+        .try_to_vec::<i64>()
         .map_err(|e| format!("argmax readback: {e:?}"))?;
     debug_assert!(data.len() == 1, "argmax over [1, vocab] must yield one id");
     let id = data.first().copied().ok_or("argmax returned no data")?;
@@ -272,7 +272,7 @@ pub async fn generate_loop(
                 .await
                 .map_err(|e| format!("logits readback: {e:?}"))?
                 .convert::<f32>()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .map_err(|e| format!("logits readback: {e:?}"))?;
             sample_id(&v, opts, &mut rng)
         };

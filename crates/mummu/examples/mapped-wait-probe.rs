@@ -35,7 +35,7 @@ fn main() {
         let ten = ten.add_scalar(0.0);
         let d_touch = t2.elapsed();
         let t3 = Instant::now();
-        let v = ten.into_data().to_vec::<f32>().unwrap();
+        let v = ten.into_data().try_to_vec::<f32>().unwrap();
         println!(
             "round {round}: into_data {d_read:?} | from_data {d_build:?} | first touch {d_touch:?} | final read {:?} (v0={:.3})",
             t3.elapsed(),

@@ -116,7 +116,7 @@ fn qwen2_first_forward_top_k_matches_candle_reference() {
         .forward(&prompt_ids, 0, &mut cache, &device)
         .into_data()
         .convert::<f32>()
-        .to_vec::<f32>()
+        .try_to_vec::<f32>()
         .expect("logits readback");
 
     let expected: Vec<(usize, f32)> = fixture["top_k"]

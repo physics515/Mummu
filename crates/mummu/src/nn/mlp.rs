@@ -81,7 +81,7 @@ mod tests {
         }
         .init(&device);
         let x = Tensor::<3>::zeros([1, 2, 4], &device);
-        let out = mlp.forward(x).into_data().to_vec::<f32>().unwrap();
+        let out = mlp.forward(x).into_data().try_to_vec::<f32>().unwrap();
         assert!(
             out.iter().all(|&v| v == 0.0),
             "bias-free SwiGLU must map 0 to 0"
@@ -104,8 +104,8 @@ mod tests {
         let double =
             Tensor::<1>::from_data(TensorData::new([row.clone(), row].concat(), [8]), &device)
                 .reshape([1, 2, 4]);
-        let s = mlp.forward(single).into_data().to_vec::<f32>().unwrap();
-        let d = mlp.forward(double).into_data().to_vec::<f32>().unwrap();
+        let s = mlp.forward(single).into_data().try_to_vec::<f32>().unwrap();
+        let d = mlp.forward(double).into_data().try_to_vec::<f32>().unwrap();
         assert_eq!(s.as_slice(), &d[..4]);
         assert_eq!(s.as_slice(), &d[4..]);
     }

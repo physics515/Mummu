@@ -37,8 +37,8 @@ fn main() {
 
         let got = try_q4s_gemv(&x, &wq).expect("packed path must engage");
         let want = x.clone().matmul(wq.clone().dequantize());
-        let diff = got.clone().sub(want.clone()).abs().max().into_data().to_vec::<f32>().unwrap()[0];
-        let scale = want.abs().max().into_data().to_vec::<f32>().unwrap()[0].max(1e-6);
+        let diff = got.clone().sub(want.clone()).abs().max().into_data().try_to_vec::<f32>().unwrap()[0];
+        let scale = want.abs().max().into_data().try_to_vec::<f32>().unwrap()[0].max(1e-6);
         println!("  parity vs dequant reference: rel {:.2e}", diff / scale);
 
         let packed = bench("packed q4s_gemv", 50, &mut || try_q4s_gemv(&x, &wq).unwrap());

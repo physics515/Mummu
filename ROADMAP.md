@@ -57,6 +57,27 @@ are folded into the items below: **#1423 "Disable persistent tune cache option"*
 in-memory-per-process) and **#1422 "Feat/autotune throughput"** (throughput-based autotuning, beside
 #1408 "Peak device throughput") — https://github.com/tracel-ai/cubecl/releases ·
 https://github.com/tracel-ai/cubecl/pull/1423*
+*(2026-08-28) Pin watch — the stack moved to **burn 0.22.0-pre.3 / cubecl 0.11.0-pre.3** this run
+(0.21.0 is still the newest STABLE burn; the tree has ridden the 0.22 pre-release line since
+2026-08-25, so this is ordinary freshness inside a line already adopted, not a new gate). Three
+consequences worth knowing. **(1) wgpu 30 is IN** — burn 0.22 resolves it transitively (30.0.1 in the
+graph), so the long-standing "not ours to pick" pin resolved itself exactly as the note above
+predicted; the `SHADER_F16`-in-WGSL win it unlocks is still unmeasured here (we run the SPIR-V path).
+**(2) `fusion` runs parity again** — the 2026-08-25 blocker (burn-fusion
+`stream/execution/ordering.rs:49`, "Ordering is bigger than operations", which made the DEFAULT
+feature set unable to complete a single forward) is fixed upstream; both feature sets now pass the
+GGUF gate byte-for-byte, numbers in the P7 item below. **(3) The migration cost was four API deltas,
+all mechanical**: `QuantScheme`'s `level`/`param` fields collapsed into the private
+`tensor`/`block` pair reached through `per_tensor(dtype)` / `per_block(block, dtype)` +
+`block_size()` / `scale_dtype()` (two-level scales are the feature this bought);
+`burn::store::TensorSnapshot` became `burn_pack::Tensor` and `ModuleAdapter::adapt` gained a
+`ModuleContext` — which cost us nothing because burn-store now ships **`FloatCastAdapter`**, the
+exact thing Mummu's `CastFloatAdapter` was, so ours was deleted rather than ported; `CubeDim` became
+a tuple struct over `Dim3` (`CubeDim::new_2d(x, y)`); and `TensorData::{to_vec,into_vec}` are
+deprecated for `try_{to,into}_vec` (~140 call sites, a pure rename). Newly available and NOT yet
+evaluated: a **graph-capture backend producing `GraphIr`** — the named lever for the dispatch-bound
+decode item above — and the deprecation of `burn-ndarray` (we are on `burn-flex`, unaffected).
+— https://github.com/tracel-ai/burn/releases/tag/v0.22.0-pre.3*
 
 ## North Star
 
@@ -1056,6 +1077,34 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       currently **8x8 f32 only** — too narrow to be the decode lever yet, but it is the seam a
       tensor-core matmul would eventually ride, so watch the supported configurations grow.
       — https://docs.rs/burn-store/latest/burn_store/ · https://github.com/gfx-rs/wgpu/releases
+      *(2026-08-28) Three of this item's named sub-questions are now ANSWERED, on 0.22.0-pre.3.
+      (a) **`FloatCastAdapter`: adopted, ours deleted.** burn-store now ships it, and it is the same
+      thing `CastFloatAdapter` was — arbitrary float target, non-float and already-target tensors pass
+      through, the cast composed lazily onto the byte source rather than run at adapt time. The 40-line
+      local copy is gone and every loader's `PyTorchToBurnAdapter.chain(...)` now names upstream's; the
+      `should_panic` guard on a non-float target survives because upstream asserts the same thing.
+      (b) **`TensorSnapshot` is `burn_pack::Tensor`** and `ModuleAdapter::adapt` takes it BY VALUE plus
+      a `ModuleContext<'_>` (the container stack at that point in the traversal) — a real redesign, but
+      it cost Mummu nothing precisely because (a) deleted our only implementor. An adapter that changes
+      dtype or shape must now go through `burn_store::bridge::map_data` so the writer can reserve
+      `byte_len` before any provider runs; note that for whatever adapter comes next.
+      (c) **wgpu 30 arrived with the bump**, as this item predicted — no separate action, and no second
+      wgpu in the graph. Still open here: the dtype-pinning / alias story (the `Gpu`/`GpuF16` seam) and
+      the graph-capture measurement, which pre-3 now makes possible — see the new item below.*
+- [ ] **Measure burn 0.22's graph capture on the decode step — the named lever for dispatch-bound
+      decode.** 0.22.0-pre.3 ships a **graph-capture backend producing `GraphIr`** (plus a fix to
+      preserve initializers across capture scopes), and it is now in the tree rather than a
+      release-note promise, so the measurement the perf section has been deferring since 2026-08-06 is
+      finally runnable. The argument for it is unchanged and still the strongest one on the board: a
+      kernel launch costs ~5-10 µs of CPU time, a forward dispatches hundreds, batch-1 decode is where
+      that sequencing dominates — and every per-kernel substitution tried instead (SPIR-V aside) has
+      failed to move the number, most recently the flash-attention A/B. Shape of the work: capture ONE
+      decode step (`t == 1`, shape-stable — the same property `CausalLm::warm_up` already relies on),
+      replay it per token, and A/B against the recorded f32 60.0 ms/token and f16 20.5. Gate exactly
+      like every other numeric change: `tests/parity_gguf.rs` on BOTH feature sets and
+      `bench/BASELINE.md` budgets, because a captured graph that skips a readback is precisely the
+      shape of a fast wrong answer. Prefill is NOT a candidate (kernels key on prompt length).
+      *(2026-08-28 research.)* — https://github.com/tracel-ai/burn/releases/tag/v0.22.0-pre.3
 - [x] Silence the pre-existing `LNK4098` (LIBCMT defaultlib conflict) the 2026-07 nightly toolchain's
       new `linker_messages` lint now surfaces when linking the `mummu` lib-test binary — find which
       native dep object embeds the static-CRT directive (tokenizers' C++ deps are the suspects) and
@@ -2564,6 +2613,20 @@ that fits the model AND uses every device to the fullest.
       cheap version is a second invocation of the same gates with the flag flipped; the honest version
       records both numbers in `bench/BASELINE.md` so a divergence between them is itself a regression.
       *(2026-08-25.)*
+      *(2026-08-28) **The blocker it was written about is GONE, and the divergence it feared is not
+      there.** burn 0.22.0-pre.3 fixes the fusion stream-ordering panic, so the GGUF parity gate was
+      run twice this run on the same binary, same fixtures, same idle card — once with the default
+      feature set (`fusion`) and once `--no-default-features --features vulkan-spirv`. Both pass with
+      top-5 ids exact in order and the 24-token greedy completion byte-identical to llama.cpp; the
+      logprob deltas agree to four significant figures across the two sets:
+      **qwen2** 2.6619045283301324e-1 (fusion) vs 2.66160628951464e-1 (spirv),
+      **qwen3** 4.015074138812089e-1 vs 4.015169464318422e-1 — both within a hair of the 0.22.0-pre.2
+      f32 numbers recorded above (2.6617605580289094e-1 / 4.015608155114805e-1), so the bump moved
+      nothing numerically either. The item stays OPEN because this was a manual double-run of ONE
+      gate: what it asks for is the second invocation wired into the routine's verify step and both
+      numbers recorded in `bench/BASELINE.md`, which is still not done. Worth noting for whoever does:
+      the fusion arm took 167 s against the SPIR-V arm's 43 s on a warm build — fusion's first-forward
+      cost is real and belongs in the recorded numbers, not hidden in a timeout.*
 - [ ] **The Ollama greedy leg has no fixture on this machine** — `parity_qwen2`'s second leg fails
       with `model 'qwen2.5:1.5b-instruct-fp16' not found` while its logits leg passes. That is the
       missing-fixture-vs-wrong-answer confusion the P3 item above is about, hit in the field: the run

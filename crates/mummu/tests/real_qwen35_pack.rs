@@ -36,7 +36,7 @@ fn argmax(t: &Tensor<2>) -> u32 {
         .clone()
         .into_data()
         .convert::<f32>()
-        .to_vec::<f32>()
+        .try_to_vec::<f32>()
         .unwrap();
     v.iter()
         .enumerate()

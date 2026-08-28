@@ -40,7 +40,7 @@ fn probe(label: &str, device: &Device) {
             .matmul(w.clone())
             .into_data()
             .convert::<f32>()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .expect("f32 readback")
     })) {
         Ok(v) => v,
@@ -79,7 +79,7 @@ fn probe(label: &str, device: &Device) {
         // (1) does a QUANTIZED matmul run at all?
         let direct = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let warm = x.clone().matmul(qw.clone()).into_data();
-            let out = warm.convert::<f32>().to_vec::<f32>().expect("q readback");
+            let out = warm.convert::<f32>().try_to_vec::<f32>().expect("q readback");
             let t = Instant::now();
             for _ in 0..N {
                 let _ = x.clone().matmul(qw.clone()).into_data();
@@ -90,7 +90,7 @@ fn probe(label: &str, device: &Device) {
         // The workaround we ship today: dequantize on-device, then matmul.
         let deq = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let warm = x.clone().matmul(qw.clone().dequantize()).into_data();
-            let out = warm.convert::<f32>().to_vec::<f32>().expect("deq readback");
+            let out = warm.convert::<f32>().try_to_vec::<f32>().expect("deq readback");
             let t = Instant::now();
             for _ in 0..N {
                 let _ = x.clone().matmul(qw.clone().dequantize()).into_data();

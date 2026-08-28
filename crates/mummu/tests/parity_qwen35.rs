@@ -111,7 +111,7 @@ async fn qwen35_first_forward_topk_matches_llama_cpp() {
             .forward(&ids, 0, &mut cache, &device)
             .into_data()
             .convert::<f32>()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .expect("logits readback")
     };
 

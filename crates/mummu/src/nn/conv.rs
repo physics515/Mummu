@@ -151,7 +151,7 @@ mod tests {
         let full = c
             .forward(x.clone(), K, &mut ref_state)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
 
         // Cached: prefill 4, then decode 5th..7th one at a time.
@@ -161,7 +161,7 @@ mod tests {
             let out = c
                 .forward(x.clone().narrow(1, pos, 1), K, &mut state)
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap();
             let expect = &full[pos * D..(pos + 1) * D];
             for (i, (got, want)) in out.iter().zip(expect).enumerate() {
@@ -185,12 +185,12 @@ mod tests {
         let o1 = c
             .forward(x1, K, &mut s1)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         let o2 = c
             .forward(x2, K, &mut s2)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         for i in 0..4 * D {
             assert!((o1[i] - o2[i]).abs() < 1e-6, "past row changed at {i}");
@@ -209,7 +209,7 @@ mod tests {
         let via_decode = c
             .forward(x.clone(), K, &mut s_decode)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
 
         // Same single token inside a longer prefill whose first position it is.
@@ -218,7 +218,7 @@ mod tests {
         let via_prefill = c
             .forward(longer, K, &mut s_pre)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
 
         for i in 0..D {

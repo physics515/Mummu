@@ -300,7 +300,7 @@ mod tests {
             &mut kv,
         )
         .into_data()
-        .to_vec::<f32>()
+        .try_to_vec::<f32>()
         .unwrap()
     }
 
@@ -309,7 +309,7 @@ mod tests {
         let device = crate::backend::cpu_device();
         let m = causal_mask(3, 2, &device);
         assert_eq!(m.dims(), [1, 1, 3, 5]);
-        let v = m.into_data().to_vec::<f32>().unwrap();
+        let v = m.into_data().try_to_vec::<f32>().unwrap();
         for i in 0..3 {
             for j in 0..5 {
                 let expect = if j > 2 + i { -1e4 } else { 0.0 };
@@ -320,7 +320,7 @@ mod tests {
         let one = causal_mask(1, 4, &device);
         assert!(
             one.into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap()
                 .iter()
                 .all(|&x| x == 0.0)
@@ -334,7 +334,7 @@ mod tests {
         let y = repeat_kv(x, 2); // -> 4 heads
         assert_eq!(y.dims(), [1, 4, 1, 2]);
         assert_eq!(
-            y.into_data().to_vec::<f32>().unwrap(),
+            y.into_data().try_to_vec::<f32>().unwrap(),
             vec![1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0]
         );
     }
@@ -373,7 +373,7 @@ mod tests {
             let out = a
                 .forward(step, HEADS, KV_HEADS, HEAD_DIM, &cos1, &sin1, None, &mut kv)
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap();
 
             for (i, (c, f)) in out.iter().zip(last_full).enumerate() {

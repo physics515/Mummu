@@ -66,7 +66,7 @@ fn main() {
             x.matmul(w)
                 .into_data()
                 .convert::<f32>()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap()
         };
         let scale = want.iter().map(|v| v.abs()).fold(1e-6, f32::max);
@@ -89,14 +89,14 @@ fn main() {
                             .matmul(w.clone())
                             .into_data()
                             .convert::<f32>()
-                            .to_vec::<f32>()
+                            .try_to_vec::<f32>()
                             .ok()?;
                         let started = std::time::Instant::now();
                         let _ = x
                             .matmul(w)
                             .into_data()
                             .convert::<f32>()
-                            .to_vec::<f32>()
+                            .try_to_vec::<f32>()
                             .ok()?;
                         Some((first, started.elapsed().as_secs_f32() * 1000.0))
                     }))

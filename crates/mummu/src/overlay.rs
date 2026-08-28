@@ -1362,7 +1362,7 @@ mod tests {
                     .clone()
                     .into_data()
                     .convert::<f32>()
-                    .to_vec::<f32>()
+                    .try_to_vec::<f32>()
                     .expect("payload reads back");
                 assert!(
                     data.iter().all(|v| close(f64::from(*v), l as f64)),

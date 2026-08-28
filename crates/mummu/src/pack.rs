@@ -998,7 +998,7 @@ mod tests {
             let scheme = p.policy().scheme().unwrap();
             let data = quantized_tensor_data(&q, &scales, [rows, cols], scheme);
             let t = Tensor::<2>::from_data(data, &device);
-            let back = t.dequantize().into_data().to_vec::<f32>().unwrap();
+            let back = t.dequantize().into_data().try_to_vec::<f32>().unwrap();
             assert_eq!(back.len(), n, "{p:?} [{rows}, {cols}]");
             for (i, (&qq, &b)) in q.iter().zip(&back).enumerate().step_by(97) {
                 let ours = f32::from(qq) * scales[i / BLOCK];
@@ -1099,7 +1099,7 @@ mod tests {
             .tensor_cols(&ge, Precision::F32, &ranges, &device)
             .unwrap();
         assert_eq!(cslab.dims(), [rows, 64]);
-        let got = cslab.into_data().to_vec::<f32>().unwrap();
+        let got = cslab.into_data().try_to_vec::<f32>().unwrap();
         for r in 0..rows {
             for (k, &(start, len)) in ranges.iter().enumerate() {
                 let base: usize = ranges[..k].iter().map(|x| x.1).sum();
@@ -1117,7 +1117,7 @@ mod tests {
             .tensor_rows(&de, Precision::F32, &ranges, &device)
             .unwrap();
         assert_eq!(rslab.dims(), [64, rows]);
-        let gotr = rslab.into_data().to_vec::<f32>().unwrap();
+        let gotr = rslab.into_data().try_to_vec::<f32>().unwrap();
         for (k, &(start, len)) in ranges.iter().enumerate() {
             let base: usize = ranges[..k].iter().map(|x| x.1).sum();
             for i in 0..len {
@@ -1134,7 +1134,7 @@ mod tests {
         let cq = pack
             .tensor_cols(&ge, Precision::Q8, &ranges, &device)
             .unwrap();
-        let dq = cq.dequantize().into_data().to_vec::<f32>().unwrap();
+        let dq = cq.dequantize().into_data().try_to_vec::<f32>().unwrap();
         for r in 0..rows {
             for (k, &(start, len)) in ranges.iter().enumerate() {
                 let base: usize = ranges[..k].iter().map(|x| x.1).sum();

@@ -84,7 +84,7 @@ pub async fn compare_against_llama_cpp<M, C>(
         .forward(&ids, 0, &mut cache, device)
         .into_data()
         .convert::<f32>()
-        .to_vec::<f32>()
+        .try_to_vec::<f32>()
         .expect("logits readback");
     drop(cache);
 

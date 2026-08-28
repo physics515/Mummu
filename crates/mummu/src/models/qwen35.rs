@@ -1801,7 +1801,7 @@ impl CausalLm for LoadedQwen35 {
                         .max()
                         .into_data()
                         .convert::<f32>()
-                        .to_vec::<f32>()
+                        .try_to_vec::<f32>()
                         .map(|v| v[0])
                         .unwrap_or(f32::NAN)
                 };
@@ -1918,7 +1918,7 @@ impl CausalLm for LoadedQwen35 {
                             t.sum()
                                 .into_data()
                                 .convert::<f32>()
-                                .to_vec::<f32>()
+                                .try_to_vec::<f32>()
                                 .map(|v| v[0])
                                 .unwrap_or(f32::NAN)
                         };
@@ -1976,7 +1976,7 @@ impl CausalLm for LoadedQwen35 {
                         .sum_dim(2)
                         .into_data()
                         .convert::<f32>()
-                        .to_vec::<f32>()
+                        .try_to_vec::<f32>()
                         .expect("local gate energy")
                 } else {
                     Vec::new()
@@ -2100,7 +2100,7 @@ mod tests {
         let full = m
             .forward(&ids, 0, &mut full_cache, &device)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
 
         let mut cache = m.new_cache();
@@ -2110,7 +2110,7 @@ mod tests {
             last = m
                 .forward(&[id], i, &mut cache, &device)
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap();
         }
         assert_eq!(full.len(), last.len());
@@ -2132,12 +2132,12 @@ mod tests {
         let a = m
             .forward(&[5], 3, &mut c1, &device)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         let b = m
             .forward(&[5], 3, &mut c2, &device)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         let max_diff = a
             .iter()
@@ -2154,7 +2154,7 @@ mod tests {
             .max()
             .into_data()
             .convert::<f32>()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap()[0]
     }
 
@@ -2258,7 +2258,7 @@ mod tests {
         let full = m
             .forward(&ids, 0, &mut full_cache, &device)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
 
         let mut cache = m.new_cache();
@@ -2268,7 +2268,7 @@ mod tests {
             last = m
                 .forward(&[id], i, &mut cache, &device)
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap();
         }
         assert_eq!(full.len(), last.len());

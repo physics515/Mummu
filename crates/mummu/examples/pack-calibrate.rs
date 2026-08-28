@@ -40,7 +40,7 @@ fn log_softmax(t: &Tensor<2>) -> Vec<f32> {
         .clone()
         .into_data()
         .convert::<f32>()
-        .to_vec::<f32>()
+        .try_to_vec::<f32>()
         .unwrap();
     let m = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let lse = m + v.iter().map(|x| (x - m).exp()).sum::<f32>().ln();

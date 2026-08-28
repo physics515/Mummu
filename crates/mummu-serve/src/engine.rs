@@ -1866,7 +1866,7 @@ fn probe_projection_ms(
     let touch = |y: burn::tensor::Tensor<2>| {
         // Force the device to finish; wgpu readbacks are deferred-mapped, so
         // the fence surfaces at the first touch of the bytes, not here.
-        let _ = y.into_data().to_vec::<f32>();
+        let _ = y.into_data().try_to_vec::<f32>();
     };
     touch(gemv());
     touch(gemv());

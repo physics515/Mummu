@@ -24,7 +24,7 @@ use burn::tensor::{Device, Int, Tensor, TensorData};
 use crate::attn_config::{RopeScaling, check_sliding_window, sliding_window_from_gguf};
 use crate::gguf::{GgufFile, GgufMap, GgufTensorInfo, GgufValue};
 use crate::import::{
-    CastFloatAdapter, DequantSink, ImportError, gguf_store, load_checked, required_file,
+    FloatCastAdapter, DequantSink, ImportError, gguf_store, load_checked, required_file,
 };
 use crate::models::CausalLm;
 use crate::models::qwen2::{EosIds, gguf_f32, gguf_usize};
@@ -305,7 +305,7 @@ pub fn load_from_dir(dir: &Path, device: &Device) -> Result<LoadedQwen3, ImportE
     let target_float = crate::backend::float_dtype(device);
     let mut store = install_remaps(
         SafetensorsStore::from_file(weights.clone())
-            .with_from_adapter(PyTorchToBurnAdapter.chain(CastFloatAdapter::new(target_float)))
+            .with_from_adapter(PyTorchToBurnAdapter.chain(FloatCastAdapter::to(target_float)))
             .allow_partial(true),
     );
     load_checked(&mut model, &mut store, &weights)?;
@@ -591,7 +591,7 @@ mod tests {
         let step = loaded
             .forward(&[42], prompt.len(), &mut cache, &device)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
 
         let mut full_cache = loaded.new_cache();
@@ -599,7 +599,7 @@ mod tests {
         let full = loaded
             .forward(&all, 0, &mut full_cache, &device)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
 
         assert_eq!(step.len(), full.len());

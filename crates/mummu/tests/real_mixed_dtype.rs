@@ -92,7 +92,7 @@ async fn f32_model_survives_an_f16_model_having_locked_the_device_policy() {
     );
     let strict: Vec<f32> = logits
         .into_data()
-        .to_vec()
+        .try_to_vec()
         .expect("strict f32 readback (the 2026-07-23 TypeMismatch site)");
     assert_eq!(strict.len(), model.config.vocab_size, "full logit row");
     let smoke = model
