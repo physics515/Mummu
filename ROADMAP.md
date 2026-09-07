@@ -1169,6 +1169,70 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       (P5.5): the chunk cost model (launch + linear + quadratic + Neumann-cubic·log terms) and
       its argmin — feed it three timed chunk sizes and let it replace the fixed C=64 when the
       measurement disagrees.
+- [x] **Parity legs re-run on the merged optimization branch: all six runnable legs green,
+      byte-for-byte.** *(2026-08-28, gating PR #42's merge.)* `parity_qwen35` ×2 (top-5 exact in
+      order, 24-token greedy byte-identical, max |Δlogprob| 5.018e-2 — the recorded 5.02e-2 to
+      the digit), `parity_f16` ×2 (ids exact, greedy byte-identical, 2.677e-1 / 3.782e-1),
+      `parity_gguf` qwen2+qwen3 (2.6616e-1 / 4.0151e-1 vs recorded 2.6618e-1 / 4.0156e-1 — the
+      shared attention/decode refactors moved nothing). lfm2 leg: no local fixture (standing);
+      OLMoE leg skipped (30 GB commit, untouched paths). All `--no-default-features --features
+      vulkan-spirv` per the fusion-cannot-parity rule.
+- [x] **Same-session 27B benchmark, merged build vs ollama: ~3.3×.** *(2026-08-28, back-to-back
+      on the box, ambient ~3.0-3.4 GiB, 47/64 layers, warm, 64-token greedy.)* mummu warm
+      0.71–0.76 s/token best runs (elapsed incl. a ~25-token prefill; three runs per config,
+      third-request warm — the first burst after a load still runs 2-3× slow, the standing
+      warm-up curve). ollama 0.32.15 same GGUF, same session: **205–212 ms/token decode** at a
+      32%/68% CPU/GPU split (its ctx 65536 config inflates KV and spills more than the recorded
+      13%/87% @ 4096, whose quiet record is 121-128 ms). Prefill: ollama ~200 prompt-tok/s;
+      mummu's host prefill rides the new packed GEMM (m=21 rows at 4.7-5.5 GB/s effective
+      per the in-situ ledger — one weight stream per batch where the row loop paid one per row).
+- [x] **The RAYON=8 pin is lifted: 16 threads, by the re-sweep the pin's own comment asked
+      for.** *(2026-08-28)* The ANOVA (kernel innocent at 96% of roofline; priority and memory
+      contention within noise) measured the packed GEMV at 26.3/~30/37.4 GB/s at 4/8/16 threads —
+      the 8-pin was a ~20% host-bandwidth tax whose SMT rationale described the dead pre-VNNI
+      kernel. End-to-end 8-vs-16 on the 27B: within noise at n=3 (host work is ~1/3 of the token;
+      +20% host bandwidth predicts ~7% end-to-end — below this box's session variance), so the
+      launcher ships 16: microbench-clear, end-to-end neutral-or-better. `RUST_BACKTRACE=1` is
+      now standing in the launcher (see the OOM entry below — it names the asker for free).
+- [x] **The bounded head is OFF in serve, by its own ledger — the instrument caught its first
+      regression and its own fix's limits in one day.** *(2026-08-28)* First live run: 469
+      ms/call, ~91% of rows evaluated (serial walk + k=1024 threshold too deep to prune). PR #43
+      fixed both mechanisms (parallel batched bound walk; per-request k — greedy k=1 where the
+      threshold is the running max)… and the ledger then showed **~92% of rows STILL evaluated at
+      k=1** (0.67 GiB, ~98 ms/call vs the dense head's 68): this model's near-uniform row norms
+      swamp the logit margins, so Cauchy–Schwarz tile bounds prune nothing on real head geometry
+      at any k. Serve keeps the dense head; the machinery stays behind `MUMMU_HEAD_BOUND=1` for
+      cooperative geometries; the real head win on this model remains GPU pinning when VRAM opens
+      (`choices::admit_head`). Also fixed en route: `warm_host_twins` now warms the head twin —
+      it was the one host projection the warm skipped, so every fresh process lazily repacked
+      ~700 MiB on its FIRST token.
+- [ ] **The 512 MiB pool-dead-zone OOM: fully decoded, shape-conditional, self-healing —
+      requester still unnamed.** *(2026-08-28, found during the benchmark; a 14-agent source hunt
+      decoded every constant.)* Post-merge builds intermittently panic-loop on `DSD-4-0`:
+      `failed to reserve 536870912 bytes ... allocating 4210294784`. Decoded: 536,870,912 = 2^29
+      is the TRUE byte size of one recurring client-side tensor create (no rounding — cubecl's
+      ContiguousMemoryLayoutPolicy sums descriptor sizes); it exceeds the largest sliced-pool
+      max_slice (526,286,848 = heap/4/8) by 10.1 MiB, and `reserve` tries exactly ONE pool, so
+      the ask can only be served by the terminal pool — whose page = heap/4 = 4,210,294,784
+      (this card's device-local heap is exactly 4× that: 16,841,179,136). A 3.92 GiB page next
+      to ~10.5 GiB of resident weights can never fit → panic per attempt, recovered each time at
+      ~10× decode cost. Both constants are structural, which is why they never varied with
+      placement. The trigger is SHAPE-CONDITIONAL: fresh prompt lengths re-fire it, runs on a
+      warm autotune cache stay clean — consistent with an autotune-workspace candidate paying
+      the dead zone once per new (kernel-checksum, shape) key, then persisting a winner (the
+      autotune-cache-is-first-suspect lesson, in a new costume). Falsified along the way, each
+      by measurement or source: the kv_append same-dtype cast (burn short-circuits it above the
+      backend — cast.rs:26-31), the chunked-GDN threshold (panics with it restored to t>64), the
+      bounded head (panics with it off), per-thread pool init (constants don't fit), and CWD/
+      cache-discovery (all runs shared the pinned cache). Release binaries strip panic frames,
+      so naming the asker needs the client-side capture: `RUST_BACKTRACE=1` is now standing in
+      the launcher (cubecl embeds the alloc-site backtrace in the error Display), and the next
+      cold-tune firing names the op in the log. Follow-ups: (a) a `[patch.crates-io]`
+      cubecl-runtime capture at the four `initialize_memory` callers for sizes in the dead zone
+      (526,286,849..=3.4G) — one debug-build repro names it deterministically; (b) upstream: the
+      pool ladder has a 10 MiB dead zone at exactly 2^29 on 16 GiB cards — worth an issue with
+      today's arithmetic; (c) deploy protocol: warm every fresh binary through one request per
+      shape class before calling it live (the panics self-heal once tuned).
 - [ ] **What the specs asked for and this box refuses, with reasons.** *(2026-08-28)* NUMA
       first-touch/interleave and transparent huge pages (P1.4): the reference machine is a
       single-socket 7950X3D on Windows — no second NUMA domain to interleave across, no THP (and
