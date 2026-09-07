@@ -229,7 +229,7 @@ fn orthonormalize(x: &mut [f64], n: usize, rank: usize) {
         if norm < 1e-12 {
             // Re-seed deterministically and re-orthogonalize this column.
             for j in 0..n {
-                let q = (j * 31 + t * 17 + 7) as f64 * 0.754_877_666_246_692_9;
+                let q = (j * 31 + t * 17 + 7) as f64 * 0.754_877_666_246_693;
                 x[j * rank + t] = q.fract() - 0.5;
             }
             for p in 0..t {

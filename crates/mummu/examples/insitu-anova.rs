@@ -22,6 +22,9 @@
 //! GPU loop when hunting a wgpu-specific interaction.
 
 use mummu::flex::insitu::{CellStats, cell_stats, kernel_innocent, main_effect};
+
+/// One ANOVA cell: `(shape, batch, fusion, autotune, stats)`.
+type Cell = (String, usize, bool, bool, CellStats);
 use mummu::flex::kernels::{self, PackedQ4};
 
 fn wave(len: usize, f: f32) -> Vec<f32> {
@@ -99,7 +102,7 @@ fn main() {
     };
 
     const REPS: usize = 30;
-    let mut cells: Vec<(String, usize, bool, bool, CellStats)> = Vec::new();
+    let mut cells: Vec<Cell> = Vec::new();
     for &threads in &[4usize, 8, 16] {
         for &below in &[true, false] {
             for &contend in &[false, true] {
@@ -142,7 +145,7 @@ fn main() {
 
     // Main-effect contrasts: pool each factor's levels (medians of cell
     // medians would hide reps; pool the raw medians per level instead).
-    let pooled = |pick: &dyn Fn(&(String, usize, bool, bool, CellStats)) -> bool| -> CellStats {
+    let pooled = |pick: &dyn Fn(&Cell) -> bool| -> CellStats {
         let ms: Vec<f64> = cells
             .iter()
             .filter(|c| pick(c))

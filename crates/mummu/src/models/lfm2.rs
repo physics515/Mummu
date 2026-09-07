@@ -304,8 +304,13 @@ pub struct Lfm2 {
 /// Per-layer decode cache: conv layers roll the last `K-1` gated inputs,
 /// attention layers keep the running k/v.
 pub enum HybridKv {
-    Conv(ConvState),
-    Attn(LayerKv),
+    /// Both variants are boxed. Unboxed they are ~320 bytes (`Conv`) against
+    /// ~576 (`Attn`), so every entry of the per-layer cache would size to the
+    /// larger one whichever way round it is left. The indirection costs one
+    /// deref per layer per token, against tensor work orders of magnitude
+    /// larger.
+    Conv(Box<ConvState>),
+    Attn(Box<LayerKv>),
 }
 
 /// A weight-loaded LFM2 plus its config.
@@ -516,9 +521,9 @@ impl CausalLm for LoadedLfm2 {
         (0..self.config.num_hidden_layers)
             .map(|i| {
                 if self.config.is_attention(i) {
-                    HybridKv::Attn(None)
+                    HybridKv::Attn(Box::new(None))
                 } else {
-                    HybridKv::Conv(None)
+                    HybridKv::Conv(Box::new(None))
                 }
             })
             .collect()
@@ -559,7 +564,7 @@ impl CausalLm for LoadedLfm2 {
         for (layer, kv) in self.model.layers.iter().zip(cache.iter_mut()) {
             let h = layer.operator_norm.forward(x.clone());
             let h = match (&layer.conv, &layer.self_attn, kv) {
-                (Some(conv), None, HybridKv::Conv(state)) => conv.forward(h, kk, state),
+                (Some(conv), None, HybridKv::Conv(state)) => conv.forward(h, kk, state.as_mut()),
                 (None, Some(attn), HybridKv::Attn(kv_state)) => attn.forward(
                     h,
                     cfg.num_attention_heads,
@@ -568,7 +573,7 @@ impl CausalLm for LoadedLfm2 {
                     &cos,
                     &sin,
                     mask.as_ref(),
-                    kv_state,
+                    kv_state.as_mut(),
                 ),
                 // Layer kind and cache kind disagree — a caller bug.
                 _ => unreachable!("LFM2 forward: layer/cache kind mismatch"),

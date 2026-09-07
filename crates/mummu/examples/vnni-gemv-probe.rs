@@ -9,9 +9,9 @@
 //! ```
 //!
 //! Prints, per shape: ms/call, effective GB/s counted as the bytes each path
-//! actually streams (packed nibbles + f16 scales for the VNNI path; i8 slab
-//! + f32 scales for the incumbent), and the ratio. The DRAM roofline for the
-//! ratio's denominator is whatever this box's memory system sustains —
+//! actually streams (packed nibbles + f16 scales for the VNNI path;
+//! i8 slab + f32 scales for the incumbent), and the ratio. The DRAM roofline
+//! for the ratio's denominator is whatever this box's memory system sustains —
 //! measure it with a plain stream over the same buffer (printed first) so
 //! the roofline fraction is honest for THIS machine, not a spec sheet.
 

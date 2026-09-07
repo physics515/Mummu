@@ -810,7 +810,7 @@ mod tests {
             config: cfg,
             tokenizer_config: None,
         };
-        let _ = loaded.warm_up(&[1, 2, 3], crate::models::MAX_WARM_UP_STEPS + 1, &device);
+        let _future = loaded.warm_up(&[1, 2, 3], crate::models::MAX_WARM_UP_STEPS + 1, &device);
     }
 
     #[tokio::test]

@@ -166,7 +166,7 @@ pub fn best_chunk(
         }
         let t = time_at(c);
         // Strict improvement only: ties keep the smaller, cheaper-in-memory c.
-        if best.map_or(true, |(_, bt)| t < bt) {
+        if best.is_none_or(|(_, bt)| t < bt) {
             best = Some((c, t));
         }
     }
@@ -448,7 +448,6 @@ mod tests {
         let got = best_gdn_chunk(4096, a0, a1, a2, a3, 256).unwrap();
         let model = |c: usize| {
             let cf = c as f64;
-            4096f64.div_euclid(cf).max(0.0); // silence: use div_ceil below
             (4096usize.div_ceil(c)) as f64
                 * (a0 + a1 * cf + a2 * cf * cf + a3 * cf * cf * cf * cf.log2().max(0.0))
         };

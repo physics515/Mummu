@@ -400,7 +400,7 @@ pub fn head_topk(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     let mut cursor = 0usize;
-    let mut batch_target = k.div_ceil(TILE).max(1).min(BATCH);
+    let mut batch_target = k.div_ceil(TILE).clamp(1, BATCH);
     while cursor < order.len() {
         let mut batch: Vec<u32> = Vec::with_capacity(batch_target);
         let mut stop = false;
@@ -502,10 +502,14 @@ impl HotSet {
 // Sidecar: metadata per packed twin
 // ---------------------------------------------------------------------------
 
+/// Packed-head metadata keyed by the twin's allocation address. The `Weak`
+/// is the liveness proof: a dropped twin cannot resurrect stale bounds.
+type MetaByAlloc = HashMap<usize, (Weak<PackedQ4>, Arc<HeadMeta>)>;
+
 /// Metadata for a packed head, keyed by the twin's allocation and verified
 /// through a `Weak` so a dropped twin cannot resurrect stale bounds.
 pub fn meta_for(packed: &Arc<PackedQ4>) -> Arc<HeadMeta> {
-    static MAP: OnceLock<Mutex<HashMap<usize, (Weak<PackedQ4>, Arc<HeadMeta>)>>> = OnceLock::new();
+    static MAP: OnceLock<Mutex<MetaByAlloc>> = OnceLock::new();
     let map = MAP.get_or_init(|| Mutex::new(HashMap::new()));
     let key = Arc::as_ptr(packed) as usize;
     {

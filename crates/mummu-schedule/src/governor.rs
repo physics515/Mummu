@@ -190,8 +190,8 @@ fn solve(a: &[Vec<f64>], rhs: &[Vec<f64>]) -> Vec<Vec<f64>> {
         );
         aug.swap(col, pivot);
         let inv = 1.0 / aug[col][col];
-        for j in col..n + m {
-            aug[col][j] *= inv;
+        for v in &mut aug[col][col..n + m] {
+            *v *= inv;
         }
         for row in 0..n {
             if row != col && aug[row][col] != 0.0 {

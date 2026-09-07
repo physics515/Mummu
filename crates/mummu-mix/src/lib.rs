@@ -350,8 +350,8 @@ pub fn plan(
 
     while bytes > budget {
         let mut best: Option<(f64, usize, u64, QuantPolicy)> = None;
-        for i in 0..tensors.len() {
-            if let Some((ratio, freed, to)) = step(i, precision[i])
+        for (i, &pi) in precision[..tensors.len()].iter().enumerate() {
+            if let Some((ratio, freed, to)) = step(i, pi)
                 && best.is_none_or(|(b, ..)| ratio < b)
             {
                 best = Some((ratio, i, freed, to));

@@ -1330,6 +1330,89 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       0.22.2 tokenizers it pulls). Nothing to fix — it is a normal, harmless artifact of Burn shipping a
       Candle backend behind a feature we never turn on; it costs zero compile time (never built) and would
       only disappear if Burn stopped declaring the optional dep. *(2026-07-17)*
+- [x] **The Windows -> Linux migration left the working tree CRLF against LF blobs — 181 files of pure
+      line-ending noise, and it was also the "never run a bare `cargo fmt` here" hazard.** `git status`
+      in the main checkout reported 181 modified files, **91,840 insertions + 91,840 deletions**, modes
+      unchanged (`100644 -> 100644`); `git diff --ignore-cr-at-eol --stat` came back **empty**, proving
+      the whole diff was line endings and zero content. Cause: the tree was checked out on the Windows
+      host under `core.autocrlf=true` (CRLF in the working tree, LF in the blobs) and copied verbatim
+      onto the btrfs volume, where `core.autocrlf` is unset — so every CRLF line reads as a change. A
+      fresh `git clone` on this host was clean, which is the control. Fixed both ways: the main checkout
+      was restored from the blobs (lossless, per the `--ignore-cr-at-eol` proof) and `.gitattributes`
+      now pins `* text=auto eol=lf` (plus `binary` for png/ico/icns), so a checkout is deterministic
+      regardless of anyone's local `core.autocrlf`. Second-order win: this was ALSO why a bare
+      `cargo fmt` buried small changes under thousands of noise lines — rustfmt was rewriting every line
+      ending, not the code. With LF restored `cargo fmt --check` reports **0 diffs**; the repo is
+      rustfmt-clean and `cargo fmt` is safe again. *(2026-09-07)*
+- [x] **Clippy back to zero: 61 warnings cleared, and five of them were real defects, not lint noise.**
+      The tree was clippy-clean when written; rustc 1.100.0-nightly (2026-08-29) moved the lint set under
+      it. Four were genuine bugs. (1) **`flex/kernels.rs` module docs rendered as a blockquote** — a
+      wrapped line began `>> 4`, so rustdoc swallowed the rest of the packing explanation into a quote;
+      `vnni-gemv-probe.rs` had the same shape with a line starting `+ f32 scales…` becoming a markdown
+      list. Both fixed by reflowing so the operator is not line-initial. (2) **`prefill.rs` carried a
+      statement that did nothing** — `4096f64.div_euclid(cf).max(0.0);` under a "silence" comment.
+      (3) **`engine.rs::layers_that_fit` was dead but still documented as live** — superseded by
+      `layer_prefix_that_fits` (the actual caller) and orphaned in that refactor, while a doc link and a
+      design comment still named it; deleted and both references repointed. (4) **`kernels.rs`'s
+      `overflow_budget_holds` asserted a compile-time tautology** (`4 * 15 * 127 < i32::MAX / 1024`),
+      testing nothing; it now derives the worst-case lane sum at runtime and names the budget it checks.
+      Two were clippy false positives and were NOT papered over: `qwen2.rs`'s `let _ = warm_up(..)` only
+      looks like a dropped future — `warm_up` validates eagerly *outside* the future precisely so a
+      `should_panic` test sees the panic (its own comment says so), so only the binding was renamed; and
+      `redundant_field_names` fired inside `derive_new`'s expansion pointing at a struct field
+      *declaration* with a suggestion that is not valid Rust, so the derive was replaced with a
+      hand-written `new`. The rest were mechanical (`is_multiple_of`, `is_none_or`, `clamp`,
+      `checked_div`, iterator-over-index in the AVX-512 kernels, four `type` aliases, a 9-argument
+      signature folded into a `GemvShape`, and both `HybridKv` variants boxed — boxing only the larger
+      one merely inverts the imbalance). One `#[allow(dead_code)]` was necessary: `llama_ref`'s
+      `Completion::content` is read by `parity_lfm2` but not by the other three parity binaries that
+      include the module, and `#[expect]` would fire "unfulfilled" in the one that does read it. Gate
+      after: `clippy --all-targets` 0 warnings, `fmt --check` 0 diffs, **397 tests passed / 0 failed**
+      across 43 binaries. *(2026-09-07)*
+- [x] **`burn-candle` is gone in 0.22, and with it the `candle-core` lock entries** — retiring the
+      2026-07-17 item above, which correctly explained those entries as the closure of burn's *optional*
+      `burn-candle` backend. burn 0.22 removed that backend outright, so
+      `grep -c 'name = "candle-core"' Cargo.lock` is now **0**. Nothing to do: that item predicted the
+      entries "would only disappear if Burn stopped declaring the optional dep", and it did.
+      *(2026-09-07 research)* — https://github.com/tracel-ai/burn/releases/tag/v0.22.0-pre.3
+- [ ] **The model fixture cache did not survive the migration.** `~/.cache/mummu-models/` did not exist
+      on this host and no `.gguf` file existed anywhere on the volume, so every `#[ignore]` real-model
+      test and the whole `bench/BASELINE.md` suite was unrunnable. **Qwen2.5-1.5B-Instruct was refetched
+      this run** (2.9 GB — `model.safetensors` 3,087,467,144 B plus tokenizer/config/merges), restoring
+      `MUMMU_QWEN2_DIR`: the `parity_qwen2` legs, `real_inference`, `budget.rs` and the criterion bench.
+      Still missing, each blocking its own gate until refetched: `qwen3-0.6b` + `Qwen3-0.6B-Q4_K_M.gguf`,
+      `qwen2.5-0.5b-instruct`, `lfm2.5-1.2b`, `qwen3-4b-q4km`, `flan-t5-small-tok`, `tinyllama-tok`,
+      `olmoe-1b-7b-0125-instruct` (both the 4.21 GB GGUF and the 13.84 GB safetensors twin), `olmoe-tok`
+      and `qwen2.5-1.5b-instruct-q4km`. The fixture-backed parity tests are unaffected — their reference
+      logits are committed under `crates/mummu/tests/fixtures/`, which is exactly the property that
+      design was chosen for. *(2026-09-07)*
+- [ ] **Linking is the memory peak of this build, and the linker is `rust-lld`, not `ld`.** Worth
+      writing down because it cost this run three failed gates and two wrong diagnoses. `cc` execs
+      GCC's `collect2` (a ~2.6 MB wrapper) which execs
+      `~/.rustup/toolchains/*/lib/rustlib/x86_64-unknown-linux-gnu/bin/gcc-ld/ld` -> **`rust-lld`**, so
+      any monitor grepping for `ld`/`collect2` measures nothing and silently reports the *compile*
+      phase instead. Measured: **6.9–7.2 GB RSS for one link**, ~14.9 GB across four concurrent links,
+      against 80–97 GB MemAvailable — so `-j` should be chosen against ~7 GB per concurrent link, not
+      against compile RSS. Three runs died with `collect2: fatal error: ld terminated with signal 9`,
+      on a **different example each time** (`packed-gemv-probe`, `pack-import`, `fromdata-probe`),
+      including at `-j 1` with a single linker and ~88 GB free. Not memory and not a resource limit:
+      **zero** kernel OOM records for the whole boot and **zero** `systemd-oomd` kills since it started
+      2026-09-05, and a later `cargo build --examples -j 6` completed clean (`EXIT=0`, 0 kills, peak
+      6.9 GB). The open question is what sends the SIGKILL; the leading candidate is cross-session
+      interference — this box runs 17 scheduled routines, a sibling (`nanna-nightly`) was building
+      throughout, every agent session shares the one `app-com.anthropic.Claude-*.scope` cgroup as the
+      same user, and a broad `pkill` from any of them takes out another's linker (this run demonstrated
+      the reverse: its own `pkill -9 rustc` killed the Nanna build's compiles). Until it is pinned down,
+      treat a lone `signal: 9` at link as transient and retry before believing it. *(2026-09-07)*
+- [ ] **`crates/mummu/examples/src/` is a 25,984-line dead duplicate of `crates/mummu/src/`** — added by
+      commit `769d218` ("stuff", 2026-08-31), which landed on `main` outside the PR process. Cargo never
+      builds it: a subdirectory of `examples/` is only a target when it contains `main.rs`, and
+      `find crates/mummu/examples/src -name main.rs` returns **0**. It has already diverged from the real
+      source (`diff crates/mummu/src/gguf.rs crates/mummu/examples/src/gguf.rs` reports they differ), so
+      it is stale weight that silently pollutes every `grep`/`rg` over the crate — it cost this run a
+      wrong read of where `TensorSnapshot` is used, and doubled the apparent site count when auditing
+      `HybridKv`/`ParamSrc`. Delete it, or promote whichever files were meant to be examples into real
+      example targets. *(2026-09-07)*
 
 ### P1 — Backends & device *(ex-laurelane)*
 - [x] Backend abstraction generic over `B: Backend`; one binary compiling BOTH `Wgpu` (Vulkan/DX12/Metal,

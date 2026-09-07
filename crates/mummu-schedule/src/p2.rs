@@ -150,8 +150,8 @@ impl P2Quantile {
 
         // 2. Every marker above the cell has one more sample at or below
         //    it now; 3. every desired position advances by its increment.
-        for i in (k + 1)..5 {
-            self.positions[i] += 1.0;
+        for p in &mut self.positions[(k + 1)..5] {
+            *p += 1.0;
         }
         for i in 0..5 {
             self.desired[i] += self.increments[i];

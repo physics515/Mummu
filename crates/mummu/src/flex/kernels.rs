@@ -42,9 +42,9 @@
 //! row, in 32-byte chunks covering 64 consecutive k each: byte `j` of chunk
 //! `c` carries `k = 64c + j` in its LOW nibble and `k = 64c + 32 + j` in its
 //! HIGH nibble. This is the offline interleave that makes the unpack free:
-//! `lo = bytes & 0x0F` yields elements `64c..64c+32` in order, `hi = bytes
-//! >> 4` yields `64c+32..64c+64`, and `[lo | hi]` as one zmm is perfectly
-//! sequential in k — the activation vector is loaded with a single
+//! `lo = bytes & 0x0F` yields elements `64c..64c+32` in order,
+//! `hi = bytes >> 4` yields `64c+32..64c+64`, and `[lo | hi]` as one zmm is
+//! perfectly sequential in k — the activation vector is loaded with a single
 //! unpermuted 64-byte read. Group boundaries land exactly on the zmm
 //! halves, so the two groups' partial sums occupy i32 lanes 0..8 and 8..16
 //! and the per-group scale applies as a vertical f32 multiply — the
@@ -276,13 +276,13 @@ impl PackedQ4 {
                 } else {
                     unpack_row(self.row_qs(n), &mut row);
                     let mut y = 0.0f32;
-                    for g in 0..groups {
+                    for (g, &cg) in combined[..groups].iter().enumerate() {
                         let mut dot = 0i32;
                         for j in 0..GROUP {
                             let kk = g * GROUP + j;
                             dot += (i32::from(row[kk]) - 8) * i32::from(acts.qs[kk]);
                         }
-                        y += combined[g] * dot as f32;
+                        y += cg * dot as f32;
                     }
                     out[i] = y;
                 }
@@ -293,8 +293,8 @@ impl PackedQ4 {
                 unpack_row(self.row_qs(n), &mut row);
                 let rs = self.row_scales(n);
                 let mut y = 0.0f32;
-                for g in 0..groups {
-                    let s = rs[g].to_f32();
+                for (g, sg) in rs[..groups].iter().enumerate() {
+                    let s = sg.to_f32();
                     let mut acc = 0.0f32;
                     for j in 0..GROUP {
                         let kk = g * GROUP + j;
@@ -319,7 +319,7 @@ fn pack_row(row_q: &[u8], out: &mut [u8]) {
         }
     }
     // K % 64 == 32 tail: one group, lo = j, hi = j + 16.
-    if k % CHUNK != 0 {
+    if !k.is_multiple_of(CHUNK) {
         let base = full * CHUNK;
         let ob = full * GROUP;
         for j in 0..GROUP / 2 {
@@ -339,7 +339,7 @@ fn unpack_row(packed: &[u8], row_q: &mut [u8]) {
             row_q[c * CHUNK + GROUP + j] = b >> 4;
         }
     }
-    if k % CHUNK != 0 {
+    if !k.is_multiple_of(CHUNK) {
         let base = full * CHUNK;
         let ob = full * GROUP;
         for j in 0..GROUP / 2 {
@@ -574,7 +574,7 @@ unsafe fn row_dot_vnni(qs: &[u8], qx: &[i8], combined: &[f32]) -> f32 {
         }
         let mut y = _mm512_reduce_add_ps(accf);
         // K % 64 == 32 tail: one group, packed lo = j, hi = j + 16.
-        if k % CHUNK != 0 {
+        if !k.is_multiple_of(CHUNK) {
             let base = full * CHUNK;
             let ob = full * GROUP;
             let mut dot = 0i32;
@@ -597,7 +597,7 @@ pub fn gemv_q4n_scalar(w: &PackedQ4, acts: &Q8Acts, out: &mut [f32]) {
     assert_eq!(out.len(), w.n);
     let groups = w.groups();
     let mut row = vec![0u8; w.k];
-    for n in 0..w.n {
+    for (n, o) in out.iter_mut().enumerate() {
         unpack_row(w.row_qs(n), &mut row);
         let rs = w.row_scales(n);
         let mut y = 0.0f32;
@@ -609,7 +609,7 @@ pub fn gemv_q4n_scalar(w: &PackedQ4, acts: &Q8Acts, out: &mut [f32]) {
             }
             y += rs[g].to_f32() * acts.scales[g] * dot as f32;
         }
-        out[n] = y;
+        *o = y;
     }
 }
 
@@ -629,8 +629,8 @@ pub fn gemv_q4n_f32(w: &PackedQ4, x: &[f32], out: &mut [f32]) {
             unpack_row(w.row_qs(n), &mut row);
             let rs = w.row_scales(n);
             let mut y = 0.0f32;
-            for g in 0..groups {
-                let s = rs[g].to_f32();
+            for (g, sg) in rs[..groups].iter().enumerate() {
+                let s = sg.to_f32();
                 let mut acc = 0.0f32;
                 for j in 0..GROUP {
                     let kk = g * GROUP + j;
@@ -858,7 +858,7 @@ unsafe fn row_dot_vnni_mr(
         }
         for r in 0..mrl {
             let mut y = _mm512_reduce_add_ps(acc[r]);
-            if k % CHUNK != 0 {
+            if !k.is_multiple_of(CHUNK) {
                 let base = full * CHUNK;
                 let ob = full * GROUP;
                 let qx = &act_rows[r].qs;
@@ -909,8 +909,8 @@ pub fn gemm_q4n_f32(w: &PackedQ4, x: &[f32], m: usize, out: &mut [f32]) {
             let col = col0 + c;
             unpack_row(w.row_qs(col), &mut row);
             let rs = w.row_scales(col);
-            for g in 0..groups {
-                let s = rs[g].to_f32();
+            for (g, sg) in rs[..groups].iter().enumerate() {
+                let s = sg.to_f32();
                 for j in 0..GROUP {
                     let kk = g * GROUP + j;
                     wf[kk] = (i32::from(row[kk]) - 8) as f32 * s;
@@ -1041,7 +1041,14 @@ mod tests {
     fn overflow_budget_holds() {
         // stored ∈ [1,15], |qx| ≤ 127, 4 products per lane, one group per
         // lane per accumulate.
-        assert!(4 * 15 * 127 < i32::MAX / 1024);
+        let max_stored = 15i32;
+        let max_abs_qx = 127i32;
+        let products_per_lane = 4i32;
+        let worst_lane = products_per_lane * max_stored * max_abs_qx;
+        assert!(
+            worst_lane < i32::MAX / 1024,
+            "vpdpbusd lane sum {worst_lane} exceeds the i32 headroom budget"
+        );
     }
 
     /// Scalar integer path vs the exact f32 path: only activation ε apart,

@@ -92,7 +92,7 @@ fn main() {
   cluster width sweep (same total arithmetic):"
     );
     for width in [544usize, 1088, 2176, 4352, 8704] {
-        if INTER % width != 0 {
+        if !INTER.is_multiple_of(width) {
             continue;
         }
         let n = INTER / width;

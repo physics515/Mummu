@@ -57,8 +57,11 @@ struct ShapeStats {
     cursor: usize,
 }
 
-fn ledger() -> &'static Mutex<HashMap<(usize, usize, usize), ShapeStats>> {
-    static MAP: OnceLock<Mutex<HashMap<(usize, usize, usize), ShapeStats>>> = OnceLock::new();
+/// Per-shape call statistics, keyed by `(k, n, m)`.
+type ShapeLedger = HashMap<(usize, usize, usize), ShapeStats>;
+
+fn ledger() -> &'static Mutex<ShapeLedger> {
+    static MAP: OnceLock<Mutex<ShapeLedger>> = OnceLock::new();
     MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 

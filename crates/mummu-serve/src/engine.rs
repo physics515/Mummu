@@ -1044,7 +1044,7 @@ fn pack_layer_bytes(
 /// Device memory held back from weights for everything that is not a weight:
 /// activations, KV and recurrent state, dequantize temporaries, and the
 /// allocator's own chunking. Sized from the failure it prevents — see
-/// [`layers_that_fit`].
+/// [`layer_prefix_that_fits`].
 /// Card bytes held back from weights for everything that is not a weight:
 /// activations, KV/recurrent state, and cubecl's ~1 GiB pool chunking.
 ///
@@ -1068,25 +1068,6 @@ fn activation_reserve() -> u64 {
 }
 
 /// How many whole layers fit `budget_bytes`, leaving room for activations.
-fn layers_that_fit(layer_bytes: &[u64], budget_bytes: u64) -> usize {
-    // Activations, KV/recurrent state and kernel workspaces are not weights.
-    // 1 GiB was too little and produced `out of device memory` mid-generation
-    // with 12.03 GiB of weights placed on a card with 15.2 GiB free: a
-    // dequantize of one [5120, 17408] slab alone is 356 MB, several are live
-    // at once, and the pooled allocator reserves in ~1 GiB chunks on top.
-    let usable = budget_bytes.saturating_sub(activation_reserve());
-    let mut used = 0u64;
-    let mut n = 0usize;
-    for &b in layer_bytes {
-        if used + b > usable {
-            break;
-        }
-        used += b;
-        n += 1;
-    }
-    n
-}
-
 /// Load a dense qwen35 pack with **whole layers** on the device — as many as
 /// VRAM holds — and the rest on the host.
 ///
@@ -1944,7 +1925,7 @@ fn charge_trunk_to_its_device(
                 n += 1;
             }
         }
-        if n == 0 { 0 } else { total / n }
+        total.checked_div(n).unwrap_or(0)
     };
     if cluster_bytes == 0 {
         return;
@@ -2897,7 +2878,7 @@ fn plan_fit(spec: &ModelSpec, models_root: &Path) -> Result<FitPlan, String> {
     // Without tiering this does not apply: the whole model goes to one device
     // and the fastest one that fits is simply the right answer.
     let tiering = tiered_pack.is_some();
-    // Layer-granular placement spills BY CONSTRUCTION: `layers_that_fit`
+    // Layer-granular placement spills BY CONSTRUCTION: `layer_prefix_that_fits`
     // decides how much of the model the card takes and the host carries the
     // rest, so "does the whole trunk fit?" is the wrong question to gate it
     // on — asking it sends the model to the host entire. Hand that path the
