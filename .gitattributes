@@ -1,0 +1,16 @@
+# The repository is stored with LF and checked out with LF on every platform.
+#
+# Why this file exists: the 2026-09 Windows -> Linux host migration copied a
+# working tree that had been checked out under `core.autocrlf=true`, so every
+# tracked text file landed on the Linux box with CRLF while the blobs behind
+# them are LF. Git reported 181 files as fully rewritten (91,840 insertions and
+# 91,840 deletions, mode unchanged) — a diff made entirely of line endings,
+# which buries any real change and makes a surgical `git add` impossible.
+# Pinning `eol=lf` makes the checkout deterministic regardless of the local
+# `core.autocrlf`, so the failure cannot recur on a future host move.
+* text=auto eol=lf
+
+# Binary assets: never touch their bytes.
+*.png binary
+*.ico binary
+*.icns binary
