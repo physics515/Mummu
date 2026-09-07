@@ -1199,8 +1199,14 @@ fn linear_weight(
 /// transposed/quantized here) or a ready 2-D tensor (the pack path — already
 /// `[in, out]` at its chosen precision).
 pub enum ParamSrc {
-    F32 { values: Vec<f32>, shape: Vec<usize> },
-    Ready2(Tensor<2>),
+    F32 {
+        values: Vec<f32>,
+        shape: Vec<usize>,
+    },
+    /// Boxed: a ready tensor is ~256 bytes against `F32`'s ~48. This is a
+    /// load-time value, so the extra allocation is free and the enum stops
+    /// carrying the larger variant's footprint everywhere.
+    Ready2(Box<Tensor<2>>),
 }
 
 /// A linear weight from either source.
@@ -1230,7 +1236,7 @@ fn assign_param(
 
     let (values, shape_vec, ready): (Vec<f32>, Vec<usize>, Option<Tensor<2>>) = match src {
         ParamSrc::F32 { values, shape } => (values, shape, None),
-        ParamSrc::Ready2(t) => (Vec::new(), t.dims().to_vec(), Some(t)),
+        ParamSrc::Ready2(t) => (Vec::new(), t.dims().to_vec(), Some(*t)),
     };
     let shape = shape_vec.as_slice();
 
@@ -1607,9 +1613,9 @@ pub fn load_from_pack_layered(
             }
         };
         let src = match entry.role {
-            Role::Linear | Role::Expert { .. } | Role::Embedding => {
-                ParamSrc::Ready2(pack.tensor::<2>(entry, precision, &device).map_err(parse)?)
-            }
+            Role::Linear | Role::Expert { .. } | Role::Embedding => ParamSrc::Ready2(Box::new(
+                pack.tensor::<2>(entry, precision, &device).map_err(parse)?,
+            )),
             Role::Vector | Role::Conv => ParamSrc::F32 {
                 values: pack.read_f32(entry).map_err(parse)?,
                 shape: entry.shape.clone(),
@@ -1819,7 +1825,7 @@ fn load_from_pack_inner(
             assign_param(
                 &mut model,
                 &path,
-                ParamSrc::Ready2(t),
+                ParamSrc::Ready2(Box::new(t)),
                 QuantPolicy::Off,
                 device,
             )
@@ -1843,13 +1849,13 @@ fn load_from_pack_inner(
         let src = match entry.role {
             // The embedding may live somewhere else entirely — see
             // `load_from_pack_partitioned_split`.
-            Role::Embedding => ParamSrc::Ready2(
+            Role::Embedding => ParamSrc::Ready2(Box::new(
                 pack.tensor::<2>(entry, precision, embed_device.unwrap_or(device))
                     .map_err(parse)?,
-            ),
-            Role::Linear | Role::Expert { .. } => {
-                ParamSrc::Ready2(pack.tensor::<2>(entry, precision, device).map_err(parse)?)
-            }
+            )),
+            Role::Linear | Role::Expert { .. } => ParamSrc::Ready2(Box::new(
+                pack.tensor::<2>(entry, precision, device).map_err(parse)?,
+            )),
             Role::Vector | Role::Conv => ParamSrc::F32 {
                 values: pack.read_f32(entry).map_err(parse)?,
                 shape: entry.shape.clone(),
@@ -1924,7 +1930,7 @@ impl LoadedQwen35 {
         &self,
         new_ids: &[u32],
         past: usize,
-        cache: &mut Vec<Qwen35Kv>,
+        cache: &mut [Qwen35Kv],
         device: &Device,
         need_logits: bool,
     ) -> Option<Tensor<2>> {

@@ -334,6 +334,20 @@ mod cube_impl {
         }
     }
 
+    /// The autotune answers, keyed by `(device, n, k_len, per_word)`.
+    type SplitCache = std::collections::HashMap<(String, usize, usize, usize), usize>;
+
+    /// The packed-GEMV problem the split is chosen for: output width `n`,
+    /// `n_words` packed weight words, contraction length `k_len`, and the
+    /// `per_word` element count implied by the quantization scheme.
+    #[derive(Clone, Copy)]
+    struct GemvShape {
+        n: usize,
+        n_words: usize,
+        k_len: usize,
+        per_word: usize,
+    }
+
     /// The measured best split for one (device, shape, packing), cached for
     /// the process.
     ///
@@ -348,17 +362,19 @@ mod cube_impl {
         w_vals: &CubeTensor<R>,
         w_scales: &CubeTensor<R>,
         x: &CubeTensor<R>,
-        n: usize,
-        n_words: usize,
-        k_len: usize,
-        per_word: usize,
+        shape: GemvShape,
     ) -> usize {
+        let GemvShape {
+            n,
+            n_words,
+            k_len,
+            per_word,
+        } = shape;
         if let Some(forced) = gemv_split_override() {
             return forced;
         }
-        static CACHE: std::sync::OnceLock<
-            std::sync::Mutex<std::collections::HashMap<(String, usize, usize, usize), usize>>,
-        > = std::sync::OnceLock::new();
+        static CACHE: std::sync::OnceLock<std::sync::Mutex<SplitCache>> =
+            std::sync::OnceLock::new();
         let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
         let key = (format!("{device:?}"), n, k_len, per_word);
         if let Some(&hit) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
@@ -383,7 +399,7 @@ mod cube_impl {
 
         let mut best = (1usize, f64::INFINITY);
         for cand in split_candidates(weight_bytes, l2) {
-            if k_len % cand != 0 {
+            if !k_len.is_multiple_of(cand) {
                 continue;
             }
             let run = || {
@@ -436,7 +452,7 @@ mod cube_impl {
         // 4 bytes for Q8S. Derived, not assumed — the values view's own
         // shape below must agree with it.
         let per_word: usize = match w.dtype {
-            burn::tensor::DType::QFloat(scheme) => 32 / scheme.value.size_bits() as usize,
+            burn::tensor::DType::QFloat(scheme) => 32 / scheme.value.size_bits(),
             other => unreachable!("packed gemv on a non-quantized weight: {other:?}"),
         };
         let x = into_contiguous(x);
@@ -453,9 +469,19 @@ mod cube_impl {
         // does not divide k, so odd shapes keep the exact split-1 path.
         let k_len = x.meta.shape()[1];
         let mut split = gemv_split_for(
-            &client, &x.device, &w_vals, &w_scales, &x, n, n_words, k_len, per_word,
+            &client,
+            &x.device,
+            &w_vals,
+            &w_scales,
+            &x,
+            GemvShape {
+                n,
+                n_words,
+                k_len,
+                per_word,
+            },
         );
-        if split == 0 || k_len % split != 0 {
+        if split == 0 || !k_len.is_multiple_of(split) {
             split = 1;
         }
         let cube_dim = CubeDim::new_2d(32, split as u32);
@@ -734,10 +760,18 @@ mod fusion_impl {
             let client = x.client.clone();
             let shape_out = Shape::new([x.shape[0], w.shape[1]]);
 
-            #[derive(derive_new::new, Clone, Debug)]
+            #[derive(Clone, Debug)]
             struct Gemv<B> {
                 desc: CustomOpIr,
                 _b: core::marker::PhantomData<B>,
+            }
+            impl<B> Gemv<B> {
+                fn new(desc: CustomOpIr) -> Self {
+                    Self {
+                        desc,
+                        _b: core::marker::PhantomData,
+                    }
+                }
             }
             impl<B1: FusionBackend + Q4GemvOps> Operation<B1::FusionRuntime> for Gemv<B1> {
                 fn execute(

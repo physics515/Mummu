@@ -2,7 +2,7 @@
 //! does it return deferred-mapped bytes whose first CPU touch pays the
 //! fence? Submit ~hundreds of ms of GPU work, then time into_data, the
 //! flex from_data, and the first byte-touch separately.
-use burn::tensor::{Tensor, TensorData};
+use burn::tensor::Tensor;
 use mummu::backend;
 use std::time::Instant;
 
@@ -24,7 +24,7 @@ fn main() {
             let m = t.clone().max().reshape([1, 1]);
             t = t.sub(m.expand([2048, 2048]));
         }
-        let small = t.slice([0..1, 0..5120.min(2048)]);
+        let small = t.slice([0..1, 0..2048]);
         let t0 = Instant::now();
         let data = small.into_data();
         let d_read = t0.elapsed();

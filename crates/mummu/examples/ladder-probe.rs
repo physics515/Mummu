@@ -57,7 +57,7 @@ fn main() {
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
 
-    let mut report = |how: &str, w: Option<Tensor<2>>, bits: usize| {
+    let report = |how: &str, w: Option<Tensor<2>>, bits: usize| {
         let verdict = match w {
             None => "PANIC".to_string(),
             Some(w) => {

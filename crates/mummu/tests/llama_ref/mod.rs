@@ -147,7 +147,12 @@ impl LlamaServer {
 
 /// One raw completion: the greedy text plus, per generated position, the
 /// top-k `(token id, natural-log probability)` pairs, best first.
+#[derive(Debug)]
 pub struct Completion {
+    // `llama_ref` is included by four parity binaries (gguf, f16, lfm2,
+    // qwen35) but only `parity_lfm2` compares the greedy text, so the other
+    // three see this field as dead. It is real reference data, not cruft.
+    #[allow(dead_code)]
     pub content: String,
     pub steps: Vec<Vec<(u32, f64)>>,
 }

@@ -114,7 +114,6 @@ mod tests {
         assert_eq!(QuantPolicy::Off.promote(), None);
     }
 
-    use super::*;
     use burn::tensor::Distribution;
 
     #[test]
