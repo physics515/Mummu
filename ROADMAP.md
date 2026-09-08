@@ -1468,15 +1468,17 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       same user, and a broad `pkill` from any of them takes out another's linker (this run demonstrated
       the reverse: its own `pkill -9 rustc` killed the Nanna build's compiles). Until it is pinned down,
       treat a lone `signal: 9` at link as transient and retry before believing it. *(2026-09-07)*
-- [ ] **`crates/mummu/examples/src/` is a 25,984-line dead duplicate of `crates/mummu/src/`** — added by
-      commit `769d218` ("stuff", 2026-08-31), which landed on `main` outside the PR process. Cargo never
-      builds it: a subdirectory of `examples/` is only a target when it contains `main.rs`, and
-      `find crates/mummu/examples/src -name main.rs` returns **0**. It has already diverged from the real
-      source (`diff crates/mummu/src/gguf.rs crates/mummu/examples/src/gguf.rs` reports they differ), so
-      it is stale weight that silently pollutes every `grep`/`rg` over the crate — it cost this run a
-      wrong read of where `TensorSnapshot` is used, and doubled the apparent site count when auditing
-      `HybridKv`/`ParamSrc`. Delete it, or promote whichever files were meant to be examples into real
-      example targets. *(2026-09-07)*
+- [x] **`crates/mummu/examples/src/` was a 25,984-line dead duplicate of `crates/mummu/src/` — deleted.**
+      Added by commit `769d218` ("stuff", 2026-08-31), which landed on `main` outside the PR process.
+      Cargo never built it: a subdirectory of `examples/` is only a target when it contains `main.rs`,
+      and `find crates/mummu/examples/src -name main.rs` returned **0**. It had already diverged from the
+      real source (`diff crates/mummu/src/gguf.rs crates/mummu/examples/src/gguf.rs` reported a
+      difference), so it was stale weight that silently polluted every `grep`/`rg` over the crate — it
+      cost the 2026-09-07 run a wrong read of where `TensorSnapshot` is used and doubled the apparent
+      site count when auditing `HybridKv`/`ParamSrc`. Proof the delete is inert: no `[[example]]` entry
+      anywhere (auto-discovery only), no `include!`/`#[path]` reference from outside the tree, and
+      `cargo metadata` reports the **same 30 example targets before and after**, none named `src`.
+      40 files, 25,984 deletions. *(2026-09-07)*
 
 ### P1 — Backends & device *(ex-laurelane)*
 - [x] Backend abstraction generic over `B: Backend`; one binary compiling BOTH `Wgpu` (Vulkan/DX12/Metal,
