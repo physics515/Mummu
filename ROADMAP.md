@@ -1389,11 +1389,25 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       predicted. This also **refines the "~84 us/launch" figure** from the 2026-09-11 Flash-Next
       assessment: the *removable CPU-side* part of a launch is ~14 us, not the whole 84.
       Probe: `crates/mummu/examples/graph-capture-probe.rs`
-      (`cargo run -p mummu --example graph-capture-probe`). Measured on the `dev` profile, which is
-      sound here because every code path in the timed loop is an optimized dependency
-      (`[profile.dev.package."*"] opt-level = 2` covers burn/cubecl/wgpu); only the probe's own
-      trivial driver is -O0. Caveat recorded rather than hidden: a release-profile confirmation has
-      NOT been run.
+      (`cargo run -p mummu --example graph-capture-probe`).
+      **Confirmed in `--release`, on a quiet box** (load 8.7, GPU idle) — us per dispatch:
+      | side | uncaptured | replayed | saved | share |
+      |-----:|-----------:|---------:|------:|------:|
+      |   64 |      22.85 |     6.32 | 16.53 |   72% |
+      |  128 |      21.94 |    13.62 |  8.32 |   38% |
+      |  256 |      41.90 |    31.87 | 10.04 |   24% |
+      |  512 |      81.73 |    69.16 | 12.57 |   15% |
+      | 1024 |     194.86 |   183.25 | 11.61 |  6.0% |
+      The strongest evidence that this measures what it claims: the **replayed column is
+      profile-independent** — 6.32/13.62/31.87/69.16/183.25 in release against
+      7.15/14.23/32.22/68.95/183.64 in dev, i.e. within noise at every size. That is what must happen
+      if the replay path runs entirely in optimized dependency code, and it is why the dev numbers
+      were trustworthy in the first place (`[profile.dev.package."*"] opt-level = 2` covers
+      burn/cubecl/wgpu; only the probe's own driver is -O0). The *uncaptured* arm does shrink in
+      release at the small sizes (22.85 vs 36.45 at side 64), so the honest headline across both
+      profiles and both load conditions is **a constant ~8-17 us/dispatch saved**, not a single
+      figure — and the shape (flat in absolute terms, large share when small, negligible when
+      GPU-bound) reproduces in both.
       **What this does NOT yet say** is what a real decode step wins, because that needs the dispatch
       count per token, and the applied work is gated on a hard constraint this probe sidesteps: a
       captured graph replays against **the exact device buffers captured**, so a decode step can only
