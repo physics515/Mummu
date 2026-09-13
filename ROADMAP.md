@@ -1408,12 +1408,36 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       profiles and both load conditions is **a constant ~8-17 us/dispatch saved**, not a single
       figure — and the shape (flat in absolute terms, large share when small, negligible when
       GPU-bound) reproduces in both.
-      **What this does NOT yet say** is what a real decode step wins, because that needs the dispatch
-      count per token, and the applied work is gated on a hard constraint this probe sidesteps: a
+      **(2026-09-13, same run) The dispatch count is now MEASURED too, so the us/dispatch above
+      converts into ms/token.** `crates/mummu/examples/decode-dispatch-count.rs` counts CubeCL's own
+      execution log (`[profiling.logger] level = "minimal"`, which logs exactly the kernels that run
+      and no timing) across two token counts and subtracts, so the model load, the warm-up and the
+      prefill cancel instead of having to be modelled. Qwen2.5-1.5B-Instruct, f32, release:
+      **1289 GPU dispatches per decode token** — 6343 at 4 tokens, 8921 at 6, 12788 at 9, i.e. a
+      slope of exactly **1289.0 over every interval**, with the 6-token point predicted to the
+      dispatch before it was run. That is ~46 dispatches per layer over 28 layers.
+      Two confounds had to be removed first and are worth recording, because both make the count
+      non-linear and neither is obvious: **autotune** executes candidate kernels that the log counts
+      as real dispatches (the first, cold, run read 7000 where the warm run reads 6343, and slopes
+      swung between 17 and 726 per token), and **EOS** silently caps generation, so a run asking for
+      20 tokens returned 9 and the requested count is the wrong denominator. Warm the cache and use
+      tokens *returned* and the measurement becomes bit-reproducible — two independent runs at each
+      point returned identical counts.
+      **What that buys, stated as a bound rather than a promise.** Against `bench/BASELINE.md` for
+      this exact model: f32 decode 60.0 ms/token is **46.5 us per dispatch**, f16 20.5 ms/token is
+      **15.9 us per dispatch**. The capture probe's removable constant is ~8-17 us/dispatch. So on
+      **f32** the ceiling is roughly **10-22 ms/token (17-37%)** — the single largest lever measured
+      on this path to date. On **f16** the entire per-dispatch budget (15.9 us) is already inside the
+      probe's removable band, which says f16 decode is close to purely launch-bound and that the
+      constant cannot be subtracted in full there; the realizable f16 win is however much of that
+      15.9 us is CPU-side, and bounding it needs the applied experiment, not arithmetic. Note also
+      that #1504's info-uniform caching overlaps this saving, so the two must be measured together.
+      **What this still does NOT say** is what an applied decode step actually wins, because the
+      applied work is gated on a hard constraint both probes sidestep: a
       captured graph replays against **the exact device buffers captured**, so a decode step can only
       be captured once its KV cache, token buffer and logits buffer are *pinned* across steps and
       refreshed in place on the capture stream. Mummu's caches grow per step today. Next, in order:
-      (a) count dispatches per decode token to convert 14 us/dispatch into ms/token; (b) pin the
+      (a) DONE — 1289 dispatches/token, above; (b) pin the
       decode step's buffers; (c) capture and A/B against the recorded f32 60.0 / f16 20.5 ms/token,
       gated on `tests/parity_gguf.rs` on BOTH feature sets — a captured graph that skips a readback is
       exactly the shape of a fast wrong answer.
