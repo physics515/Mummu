@@ -78,6 +78,17 @@ deprecated for `try_{to,into}_vec` (~140 call sites, a pure rename). Newly avail
 evaluated: a **graph-capture backend producing `GraphIr`** — the named lever for the dispatch-bound
 decode item above — and the deprecation of `burn-ndarray` (we are on `burn-flex`, unaffected).
 — https://github.com/tracel-ai/burn/releases/tag/v0.22.0-pre.3*
+*(2026-09-13) Pin watch: still **burn 0.22.0-pre.3 / cubecl 0.11.0-pre.3** — no pre.4 and still no
+stable 0.22 on crates.io, and `cargo upgrade --incompatible` offers nothing at all (32 packages
+already latest, 4 local). The freshness sweep was therefore a pure `cargo update`: ~45 transitive
+patch/minor bumps, of which the ones worth naming are **tokenizers 0.23.1 -> 0.23.2**, `reqwest`
+0.13.5, `rustls` 0.23.44, `wasm-bindgen` 0.2.128 and `zstd-sys` 2.1.0. tokenizers' own notes call
+0.23.2 **the last v0 release** — a 1.0 is the next major, so budget a tokenizer byte-gate + full
+parity re-run for that bump rather than taking it as a drive-by. 0.23.2 itself adds an opt-in
+"parity-aware BPE" variant and touches no normalizer / pre-tokenizer / Unigram path we ride. Five
+crates stay behind latest and are NOT ours to move — `generic-array` 0.14.7, `matchit` 0.8.4, `toml`
+0.8.2, `toml_datetime` 0.6.3, `toml_edit` 0.20.2 — each held by a transitive dependant's own
+requirement, not by a pin of ours. — https://github.com/huggingface/tokenizers/releases*
 
 ## North Star
 
@@ -1345,6 +1356,54 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       `bench/BASELINE.md` budgets, because a captured graph that skips a readback is precisely the
       shape of a fast wrong answer. Prefill is NOT a candidate (kernels key on prompt length).
       *(2026-08-28 research.)* — https://github.com/tracel-ai/burn/releases/tag/v0.22.0-pre.3
+      *(2026-09-13) MEASURED, and this item named the WRONG mechanism.* Two different things ship
+      under "graph capture" in 0.22.0-pre.3, and the `GraphIr` one above is not the lever.
+      **(1) `Device::capture()` / `Device::capture_scope`** (burn-tensor, feature `capture`) is a
+      **non-executing recorder**: it produces a `CapturedGraph`/`GraphIr` by recording ops instead of
+      running them. Its only executing consumer is `burn-remote`'s server worker, and that path's
+      `Graph::replay` hands each bound op to `TensorInterpreter::register_op` **one at a time**
+      (`burn-router/src/graph.rs`) — it saves re-serializing the op graph across the wire, not kernel
+      launches. On a local wgpu device there is no wire, so it buys nothing.
+      **(2) `burn::tensor::capture(device, closure) -> Graph::replay()`** (NOT feature-gated) is the
+      real lever, and it reaches wgpu: `Backend::graph_{prepare,start_capture,stop_capture,replay}`
+      are implemented by burn-cubecl over cubecl's `ComputeClient::{start,stop}_capture`, and
+      `cubecl-wgpu` implements them as a **software graph** (`WgpuGraph`) — WebGPU has no
+      re-submittable command buffer, so replay stays O(n) in dispatches and only the per-launch
+      constant shrinks: pipeline lookup, binding resolution, info-uniform upload and bind-group
+      creation all happen once at record time.
+      **The number, on this card (RTX 4070 Ti SUPER, Vulkan/SPIR-V, `fusion` on):** a dependent
+      32-matmul chain, 50 timed iterations with a device sync after each (the honest decode shape —
+      every token ends in a readback), swept over square side. Capture **is supported** — every row
+      took the graph path, not the fallback, which contradicts burn-tensor's own doc claim that
+      hardware graphs are "CUDA/HIP" and everything else "simply re-executes the closure".
+      | side | uncaptured us/dispatch | replayed us/dispatch | saved | share |
+      |-----:|-----------------------:|---------------------:|------:|------:|
+      |   64 |                  36.45 |                 7.15 | 29.30 |   80% |
+      |  128 |                  30.42 |                14.23 | 16.19 |   53% |
+      |  256 |                  46.66 |                32.22 | 14.44 |   31% |
+      |  512 |                  82.54 |                69.19 | 13.35 |   16% |
+      | 1024 |                 199.16 |               183.64 | 15.52 |  7.8% |
+      The saving is **a constant ~13-16 us per dispatch** — flat across a 16x span of GPU work, which
+      is what a launch-overhead win must look like — and it is 80% of the pass in the small-tensor
+      regime batch-1 decode actually lives in, vanishing into the GPU-bound rows as the control
+      predicted. This also **refines the "~84 us/launch" figure** from the 2026-09-11 Flash-Next
+      assessment: the *removable CPU-side* part of a launch is ~14 us, not the whole 84.
+      Probe: `crates/mummu/examples/graph-capture-probe.rs`
+      (`cargo run -p mummu --example graph-capture-probe`). Measured on the `dev` profile, which is
+      sound here because every code path in the timed loop is an optimized dependency
+      (`[profile.dev.package."*"] opt-level = 2` covers burn/cubecl/wgpu); only the probe's own
+      trivial driver is -O0. Caveat recorded rather than hidden: a release-profile confirmation has
+      NOT been run.
+      **What this does NOT yet say** is what a real decode step wins, because that needs the dispatch
+      count per token, and the applied work is gated on a hard constraint this probe sidesteps: a
+      captured graph replays against **the exact device buffers captured**, so a decode step can only
+      be captured once its KV cache, token buffer and logits buffer are *pinned* across steps and
+      refreshed in place on the capture stream. Mummu's caches grow per step today. Next, in order:
+      (a) count dispatches per decode token to convert 14 us/dispatch into ms/token; (b) pin the
+      decode step's buffers; (c) capture and A/B against the recorded f32 60.0 / f16 20.5 ms/token,
+      gated on `tests/parity_gguf.rs` on BOTH feature sets — a captured graph that skips a readback is
+      exactly the shape of a fast wrong answer.
+      — https://docs.rs/burn-tensor/0.22.0-pre.3/burn_tensor/fn.capture.html
 - [x] Silence the pre-existing `LNK4098` (LIBCMT defaultlib conflict) the 2026-07 nightly toolchain's
       new `linker_messages` lint now surfaces when linking the `mummu` lib-test binary — find which
       native dep object embeds the static-CRT directive (tokenizers' C++ deps are the suspects) and
@@ -1450,6 +1509,18 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       and `qwen2.5-1.5b-instruct-q4km`. The fixture-backed parity tests are unaffected — their reference
       logits are committed under `crates/mummu/tests/fixtures/`, which is exactly the property that
       design was chosen for. *(2026-09-07)*
+      *(2026-09-13) Mostly RESTORED — this item's "still missing" list is now stale.* An unattended run
+      on 2026-09-10 refetched most of the cache but died before committing its roadmap tick, so the
+      text above understated what is on disk. Present and verified this run: `qwen3-0.6b` (1.5 GB),
+      `Qwen3-0.6B-Q4_K_M.gguf` (379 MB), `qwen2.5-0.5b-instruct` (954 MB), `lfm2.5-1.2b` (2.2 GB,
+      safetensors + tokenizer + chat template), `qwen2.5-1.5b-instruct-q4km` (1.1 GB),
+      `qwen2.5-1.5b-instruct` (2.9 GB), `flan-t5-small-tok`, `tinyllama-tok` — 8 of the 10 entries,
+      which restores the `parity_qwen3`/`parity_lfm2`/GGUF legs and the CPU budget gate alongside the
+      qwen2 ones. **Still missing, each still blocking its own gate: `qwen3-4b-q4km`,
+      `olmoe-1b-7b-0125-instruct` (the 4.21 GB GGUF and its 13.84 GB safetensors twin), and
+      `olmoe-tok`** — i.e. the MoE gates specifically. Also still absent and tracked separately: the
+      qwen3.5-2b BF16 fixture `parity_qwen35` wants. Refetching the OLMoE pair costs ~18 GB against
+      8.5 TB free, so it is bandwidth, not space, that gates it.
 - [ ] **Linking is the memory peak of this build, and the linker is `rust-lld`, not `ld`.** Worth
       writing down because it cost this run three failed gates and two wrong diagnoses. `cc` execs
       GCC's `collect2` (a ~2.6 MB wrapper) which execs
@@ -1468,6 +1539,40 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       same user, and a broad `pkill` from any of them takes out another's linker (this run demonstrated
       the reverse: its own `pkill -9 rustc` killed the Nanna build's compiles). Until it is pinned down,
       treat a lone `signal: 9` at link as transient and retry before believing it. *(2026-09-07)*
+      *(2026-09-13) The default `-j` is the actual hazard, and it is self-inflicted — no co-tenant
+      needed.* A plain `cargo build --workspace --all-targets` in a fresh worktree reached the example
+      link phase and spawned **16 concurrent `rust-lld`** (this workspace has ~30 example targets, and
+      cargo sizes `-j` from the 7950X3D's thread count, not from link RSS). Measured here at
+      **~4.2-4.9 GB RSS each**, that is ~58 GB of linkers at once; with the box at 124 GB total but
+      only ~48 GB available behind the household-server co-tenants, the build went to swap and the
+      load average reached **258**, where it sat making almost no progress for ~25 minutes. Capping to
+      `-j 6` — the same figure the 2026-09-07 note arrived at from the ~7 GB/link measurement — linked
+      the whole thing without swapping. So the standing advice should be stronger than "choose `-j`
+      against ~7 GB per link": **this workspace's example count makes the DEFAULT `-j` unsafe on this
+      host**, and an unattended run should pass `-j 6` rather than discover it. Worth a `[build] jobs`
+      entry in the workspace `.cargo/config.toml` so no future run has to rediscover it — filed as its
+      own to-do below. One more operational note, since a killed build leaves debris: `rust-lld`
+      children **survive** their `cargo` parent's death (16 orphans still held ~58 GB after cargo
+      exited), so a run that aborts a build must reap them by PID — and per the never-broad-`pkill`
+      rule above, by PID filtered on this worktree's path, never by name.
+      *(2026-09-13, same run — the REAL root cause, and it is not `-j`.)* Capping to `-j 6` did not
+      fix it: the six remaining linkers then sat for **50+ minutes at 2-3% CPU each**, main thread in
+      `futex_do_wait`, while `vmstat` read **64-71% iowait with ~99 blocked**. They were not CPU-bound
+      and not memory-bound — they were starved on disk. `/mnt/deepmem` is a **4-device btrfs spanning
+      `sda`+`sdb`+`sdc`+`sdd`, and all four are SPINNING DISKS** (`lsblk -o NAME,ROTA` reports
+      `ROTA=1`; `btrfs filesystem show` reports the span). So every household co-tenant on that volume
+      — qbittorrent, Plex, duplicati all live there — contends with the build at the *filesystem*
+      level, and a saturated `sdb` stalls a build whose files sit on `sdd`. That is the same
+      113-194 MB/s-collapses-to-1-5 MB/s signature already recorded for cold model loads; it applies
+      to **linking** just as hard, and 30 example targets plus 30 integration-test binaries is the
+      most link-heavy phase this workspace has.
+      **The fix is the target directory, not the job count.** `/` is NVMe (`omarchy_root`, 559 GB
+      free). Re-running the identical `cargo test --workspace` with
+      `CARGO_TARGET_DIR=/var/tmp/mummu-nightly-target` flipped the machine from 64-71% iowait to
+      **73% user / 1% iowait**, and compiled 96 crates in ~3 minutes against ~25 minutes for the same
+      work on the array. An unattended run should put the target dir on NVMe and remove it at the end
+      (the routine's own "never leave a multi-GB target behind" rule then applies to `/var/tmp`, where
+      33 GB matters more than it does on a 15 TB array). Filed as a to-do below.
 - [ ] **`crates/mummu/examples/src/` is a 25,984-line dead duplicate of `crates/mummu/src/`** — added by
       commit `769d218` ("stuff", 2026-08-31), which landed on `main` outside the PR process. Cargo never
       builds it: a subdirectory of `examples/` is only a target when it contains `main.rs`, and
@@ -1477,6 +1582,21 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       wrong read of where `TensorSnapshot` is used, and doubled the apparent site count when auditing
       `HybridKv`/`ParamSrc`. Delete it, or promote whichever files were meant to be examples into real
       example targets. *(2026-09-07)*
+- [ ] **Pin `-j` for this workspace in `.cargo/config.toml`.** Following from the linker note above:
+      add a `[build] jobs = 6` (or a documented host-specific override) so the default parallelism
+      cannot spawn ~16 concurrent `rust-lld` at ~4.5 GB each and swap the box. Needs a check that it
+      does not throttle the *compile* phase unacceptably — compiles are ~0.5 GB each and happily run
+      at full width, so the honest fix may be per-phase rather than a blanket cap, in which case
+      record why a blanket cap was chosen anyway. *(2026-09-13)*
+- [ ] **Put the build's target directory on NVMe, not the HDD array.** Following from the iowait
+      finding above: `/mnt/deepmem` is four spinning disks shared with the household server stack, and
+      the link phase starves on it (50+ min/link at 2-3% CPU), while the same build on
+      `/var/tmp/mummu-nightly-target` (NVMe) runs CPU-bound. Decide the durable form — a
+      `CARGO_TARGET_DIR` in the nightly routine, a `[build] target-dir` in `.cargo/config.toml`, or a
+      symlink — and make it clean up after itself so a 33 GB target does not accumulate on the root
+      filesystem. Note the tradeoff this trades INTO: a target dir off the worktree is shared state
+      again, so if it is made global it re-creates the concurrent-routine collision the per-worktree
+      layout was chosen to avoid; per-worktree-under-NVMe keeps both properties. *(2026-09-13)*
 
 ### P1 — Backends & device *(ex-laurelane)*
 - [x] Backend abstraction generic over `B: Backend`; one binary compiling BOTH `Wgpu` (Vulkan/DX12/Metal,
