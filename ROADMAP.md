@@ -1404,6 +1404,23 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       gated on `tests/parity_gguf.rs` on BOTH feature sets — a captured graph that skips a readback is
       exactly the shape of a fast wrong answer.
       — https://docs.rs/burn-tensor/0.22.0-pre.3/burn_tensor/fn.capture.html
+      *(2026-09-13 research)* The upstream changelog corroborates the mechanism split measured above
+      and names two more wgpu launch-cost levers landing in the SAME pinned cubecl 0.11.0-pre.3, so
+      they are available now rather than pending a bump. **#1505 "wgpu graph capture"** is the
+      software graph this run measured (CUDA's is #1469, HIP's #1415 — separate implementations, which
+      is why burn-tensor's "CUDA/HIP only" doc comment is merely stale rather than describing a
+      missing wgpu path). **#1504 "metadata info uniforms caching"** is the per-dispatch info-uniform
+      upload being cached — i.e. part of the ~14 us this probe measures as *removable* is already
+      being attacked outside capture, so the two overlap and should be re-measured together rather
+      than summed. Two autotune entries bear directly on the warmup discipline this probe needed and
+      on the standing stale-cache hazard: **#1449** adaptive autotune scheduling with early
+      elimination and **#1462** roofline bounds (scoring candidates against a measured device
+      ceiling). Also worth tracking but NOT yet evaluated here: the tree already carries **`cubek`
+      0.3.0-pre.3** (a whole kernel family — `cubek-matmul`, `cubek-attention`, `cubek-convolution`,
+      …), whose stated aim is to move hardware specialization and error handling OUT of every launch
+      and into JIT compile time, caching kernel specializations on first compile. That is the same
+      dispatch-cost target from a different direction, and nothing in Mummu currently measures it.
+      — https://github.com/tracel-ai/cubecl/releases
 - [x] Silence the pre-existing `LNK4098` (LIBCMT defaultlib conflict) the 2026-07 nightly toolchain's
       new `linker_messages` lint now surfaces when linking the `mummu` lib-test binary — find which
       native dep object embeds the static-CRT directive (tokenizers' C++ deps are the suspects) and
