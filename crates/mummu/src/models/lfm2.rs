@@ -764,6 +764,8 @@ mod tests {
             }],
             alignment: 32,
             data_offset: 0,
+            // Single-file fixture: no split set behind it.
+            shards: Vec::new(),
         }
     }
 
