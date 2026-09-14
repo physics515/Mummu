@@ -4,10 +4,17 @@
 #   docker build -f crates/mummu-serve/Dockerfile -t mummu-serve:local .
 #
 # GPU strategy (settled empirically 2026-08-21):
-#   - The binary carries BOTH GPU backends. wgpu/Vulkan stays the default
-#     (`MUMMU_BACKEND` unset = auto): on native Linux the nvidia container
-#     runtime injects the real NVIDIA Vulkan ICD and the parity-validated
-#     wgpu stack just works.
+#   - The binary carries BOTH GPU backends. wgpu/Vulkan is the default
+#     (`MUMMU_BACKEND` unset = auto).
+#     CORRECTION 2026-09-14: this used to claim that on native Linux the
+#     nvidia container runtime injects the real NVIDIA Vulkan ICD and the
+#     parity-validated wgpu stack "just works". Measured on the DeepStack
+#     Linux host, it does NOT come up in-container. Two faults: the ICD
+#     needs Xlib (fixed below, libx11-6/libxext6), and past that the loader
+#     still cannot resolve vkCreateInstance via vk_icdGetInstanceProcAddr
+#     despite every library and device node being present and identical to
+#     the host's. Until that is solved, a container wanting the GPU must
+#     set MUMMU_BACKEND=cuda even on native Linux.
 #   - Docker Desktop / WSL2 exposes NO NVIDIA Vulkan ICD to containers. The
 #     mesa dzn (Vulkan-on-D3D12) route was built and tried: with a patched
 #     conformance version, an x11-WSI build for VK_KHR_swapchain, and a
@@ -34,10 +41,21 @@ RUN cargo build --release -p mummu-serve --features cuda
 # the headers (cuda_fp16.h et al.) NVRTC includes while compiling kernels.
 # libvulkan1 stays for the native-Linux wgpu path.
 FROM nvidia/cuda:12.6.3-base-ubuntu24.04
+# libx11-6 + libxext6 are load-bearing for the wgpu path, not decoration:
+# NVIDIA's Vulkan ICD is libGLX_nvidia.so.0, which links against Xlib. Without
+# them the loader logs "libX11.so.6: cannot open shared object file", DISCARDS
+# the only driver ("vkCreateInstance: Found no drivers!"), and wgpu silently
+# falls back to CPU — /api/health reports `"device":"CPU (flex)","gpus":[]` on
+# a host whose GPU is fully injected and whose nvidia-smi works in-container.
+# Diagnosed 2026-09-14 deploying to the DeepStack Linux host: the GPU-strategy
+# note above claiming the wgpu stack "just works" natively was wrong by exactly
+# these two packages.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
         libvulkan1 \
+        libx11-6 \
+        libxext6 \
         cuda-nvrtc-12-6 \
         cuda-nvrtc-dev-12-6 \
         cuda-cudart-dev-12-6 \
