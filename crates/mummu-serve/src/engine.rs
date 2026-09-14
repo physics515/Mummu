@@ -2180,6 +2180,21 @@ fn choose_prefix(feasible_max: usize, accel_ms: Option<f64>, host_ms: Option<f64
 /// overlay/deferral schedule (peer review, 2026-08-26 — "contention-broken
 /// pairs contribute 0, not t_a, to the hide window").
 fn probe_contention(pack: &mummu::pack::Pack) {
+    // A wgpu device must not be CONSTRUCTED where no wgpu adapter exists.
+    // `gpu_device()` is infallible by signature but its cubecl device-server
+    // thread is not: with no adapter it panics "No possible adapter available
+    // for backend ... requested_backends: Backends(VULKAN)", and because that
+    // lands on the DSD server thread (not the caller), the request's tokio
+    // worker then dies on `RecvError` and the HTTP request NEVER RETURNS while
+    // /api/health happily keeps reporting "ok". Measured 2026-09-14 on the
+    // DeepStack container: MUMMU_BACKEND=cuda, a 27B pack load reached here
+    // and every chat request hung with no response and no error to the user.
+    // The inventory already knows the answer, so ask it. This costs nothing
+    // real: the contention figure is logged and, as the doc above says, not
+    // yet consumed by any decision.
+    if !mummu::backend::use_gpu() {
+        return;
+    }
     let gpu = mummu::backend::gpu_device();
     let host = mummu::backend::cpu_device();
     let solo_gpu = probe_projection_ms(pack, &gpu, mummu::pack::Precision::Q4);
