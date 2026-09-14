@@ -377,6 +377,80 @@ struct PlannedTensor {
     len: u64,
 }
 
+/// Upper bound on shards in one split GGUF. `gguf-split` sets are a handful
+/// of files (the 111 GB Flash-Next release is 4); this only exists so a
+/// corrupt `split.count` cannot drive an unbounded open loop.
+const MAX_GGUF_SHARDS: u64 = 64;
+
+/// Every shard path of a split set, derived from one member's filename.
+///
+/// `gguf-split` names shards `<stem>-%05d-of-%05d.gguf`, so the set is found
+/// by rewriting the index in place rather than by scanning the directory —
+/// which would also sweep up unrelated models sharing it. Returns paths in
+/// shard order, 1..=count.
+fn shard_paths(member: &Path, count: usize) -> Result<Vec<std::path::PathBuf>, GgufError> {
+    let bad = |reason: String| GgufError::BadValue {
+        path: member.display().to_string(),
+        key: "split filename".into(),
+        reason,
+    };
+    let dir = member.parent().unwrap_or_else(|| Path::new("."));
+    let name = member
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| bad("shard filename is not valid UTF-8".into()))?;
+    // `<stem>-00002-of-00004.gguf` -> stem `<stem>`. Split from the RIGHT:
+    // a model name may itself contain "-of-".
+    let stem = name
+        .strip_suffix(".gguf")
+        .ok_or_else(|| bad("shard filename does not end in .gguf".into()))?;
+    let (head, _tail) = stem.rsplit_once("-of-").ok_or_else(|| {
+        bad(format!(
+            "{name}: split.count > 1 but the name has no -of- index"
+        ))
+    })?;
+    let (base, _index) = head
+        .rsplit_once('-')
+        .ok_or_else(|| bad(format!("{name}: no -NNNNN- shard index before -of-")))?;
+    let mut out = Vec::with_capacity(count);
+    for i in 1..=count {
+        out.push(dir.join(format!("{base}-{i:05}-of-{count:05}.gguf")));
+    }
+    // Positive space: every shard the set claims must actually be present,
+    // and saying so here beats a confusing parse error on a missing file.
+    for p in &out {
+        if !p.is_file() {
+            return Err(bad(format!("missing shard {}", p.display())));
+        }
+    }
+    assert_eq!(out.len(), count, "one path per shard");
+    out.first()
+        .map(|_| ())
+        .ok_or_else(|| bad("a split set needs at least one shard".into()))?;
+    Ok(out)
+}
+
+/// One shard's payload, for a model split across several `.gguf` files
+/// (llama.cpp's `gguf-split` layout: `<stem>-00001-of-0000N.gguf`, with
+/// `split.no` / `split.count` / `split.tensors.count` in each shard's KV).
+///
+/// A tensor's `offset` is relative to the payload base of **its own shard**,
+/// not the first one, so the file and the base have to travel together.
+/// [`GgufFile::shards`] is EMPTY for an ordinary single-file GGUF, where
+/// `GgufFile::{path, data_offset}` already locate every tensor — that keeps
+/// every existing caller and every hand-built test fixture correct by
+/// construction rather than by remembering to fill a field in.
+#[derive(Debug, Clone)]
+pub struct GgufShard {
+    /// The `.gguf` file holding this shard's payload.
+    pub path: std::path::PathBuf,
+    /// Absolute offset in `path` where this shard's tensor payload begins.
+    pub data_offset: u64,
+    /// Half-open range into [`GgufFile::tensors`] owned by this shard.
+    /// Ranges partition the table in shard order and never overlap.
+    pub tensors: std::ops::Range<usize>,
+}
+
 /// A parsed GGUF header: typed metadata + the located tensor table.
 #[derive(Debug)]
 pub struct GgufFile {
@@ -390,6 +464,9 @@ pub struct GgufFile {
     pub alignment: u64,
     /// Absolute file offset where the aligned tensor payload blob begins.
     pub data_offset: u64,
+    /// Payload location per shard when this header came from a SPLIT model
+    /// (see [`GgufShard`]). Empty for a single-file GGUF.
+    pub shards: Vec<GgufShard>,
 }
 
 impl GgufFile {
@@ -413,22 +490,132 @@ impl GgufFile {
         Ok(parsed)
     }
 
+    /// Open a GGUF that may be SPLIT across several files, presenting the
+    /// whole set as one logical tensor namespace.
+    ///
+    /// `path` may be any shard of the set (conventionally the first). When
+    /// the header carries no `split.count`, or claims a count of 1, this is
+    /// exactly [`Self::open`] and `shards` stays empty — so pointing this at
+    /// an ordinary single-file GGUF costs one extra metadata lookup and
+    /// changes nothing else.
+    ///
+    /// Shards are located by llama.cpp's `gguf-split` naming
+    /// (`<stem>-00001-of-0000N.gguf`) rather than by trusting `split.no`
+    /// ordering, then each is opened and its tensor table appended in shard
+    /// order. Metadata is taken from the shard that HAS it: `gguf-split`
+    /// writes the full KV into the first shard and a stub into the rest, and
+    /// a real 4-shard model was observed with **0 tensors in shard 1**, so
+    /// neither "metadata lives with tensors" nor "every shard has tensors"
+    /// can be assumed.
+    pub fn open_sharded(path: &Path) -> Result<Self, GgufError> {
+        let first = Self::open(path)?;
+        let Some(count) = first.get("split.count").and_then(GgufValue::as_u64) else {
+            return Ok(first);
+        };
+        if count <= 1 {
+            return Ok(first);
+        }
+        // Bounded: a split set is a handful of files. Refusing an absurd
+        // count keeps a corrupt header from driving an unbounded open loop.
+        if count > MAX_GGUF_SHARDS {
+            return Err(GgufError::BadValue {
+                path: path.display().to_string(),
+                key: "split.count".into(),
+                reason: format!("{count} shards exceeds the {MAX_GGUF_SHARDS} bound"),
+            });
+        }
+        let count = usize::try_from(count).map_err(|_| GgufError::OverBound {
+            path: path.display().to_string(),
+            what: "split.count",
+            count,
+            bound: usize::MAX as u64,
+        })?;
+        let paths = shard_paths(path, count)?;
+        assert_eq!(paths.len(), count, "one path per declared shard");
+
+        let mut merged: Option<Self> = None;
+        let mut tensors: Vec<GgufTensorInfo> = Vec::new();
+        let mut shards: Vec<GgufShard> = Vec::with_capacity(count);
+        for shard_path in &paths {
+            let shard = Self::open(shard_path)?;
+            let start = tensors.len();
+            tensors.extend(shard.tensors.iter().cloned());
+            shards.push(GgufShard {
+                path: shard_path.clone(),
+                data_offset: shard.data_offset,
+                tensors: start..tensors.len(),
+            });
+            // Keep the header whose metadata is the real one: the richest KV
+            // wins, which is the full-metadata shard regardless of position.
+            let better = merged
+                .as_ref()
+                .is_none_or(|m| shard.metadata.len() > m.metadata.len());
+            if better {
+                merged = Some(shard);
+            }
+        }
+        let mut out = merged.expect("at least one shard opened");
+
+        // Negative space: a duplicate name would make lookup order decide
+        // which payload is read, i.e. silently wrong weights.
+        let mut seen: std::collections::HashSet<&str> =
+            std::collections::HashSet::with_capacity(tensors.len());
+        for t in &tensors {
+            if !seen.insert(t.name.as_str()) {
+                return Err(GgufError::BadValue {
+                    path: path.display().to_string(),
+                    key: t.name.clone(),
+                    reason: "tensor name appears in more than one shard".into(),
+                });
+            }
+        }
+        // Cross-check against the count the writer recorded, when it did.
+        if let Some(declared) = first
+            .get("split.tensors.count")
+            .and_then(GgufValue::as_u64)
+            .or_else(|| {
+                first
+                    .get("split.tensors.count")
+                    .and_then(|v| v.as_i64().and_then(|i| u64::try_from(i).ok()))
+            })
+            && declared != tensors.len() as u64
+        {
+            return Err(GgufError::BadValue {
+                path: path.display().to_string(),
+                key: "split.tensors.count".into(),
+                reason: format!(
+                    "header declares {declared} tensors, shards carry {}",
+                    tensors.len()
+                ),
+            });
+        }
+
+        out.tensors = tensors;
+        out.shards = shards;
+        Ok(out)
+    }
+
     /// Read one tensor's payload and dequantize it to f32, in the on-disk
     /// (ggml fastest-varying-first) element order.
     pub fn read_tensor_f32(&self, name: &str) -> Result<Vec<f32>, GgufError> {
         use std::io::SeekFrom;
-        let info = self.tensor(name).ok_or_else(|| GgufError::BadValue {
+        let index = self.tensor_index(name).ok_or_else(|| GgufError::BadValue {
             path: self.path.display().to_string(),
             key: name.to_string(),
             reason: "no such tensor".into(),
         })?;
-        let mut file = File::open(&self.path).map_err(|source| GgufError::Io {
-            path: self.path.display().to_string(),
+        let info = &self.tensors[index];
+        // Split models keep each tensor's offset relative to ITS OWN shard's
+        // payload base, so the file and the base must be resolved together.
+        let (payload_path, payload_base) = self.payload_location(index);
+        let payload_path = payload_path.to_path_buf();
+        let mut file = File::open(&payload_path).map_err(|source| GgufError::Io {
+            path: payload_path.display().to_string(),
             source,
         })?;
-        file.seek(SeekFrom::Start(self.data_offset + info.offset))
+        file.seek(SeekFrom::Start(payload_base + info.offset))
             .map_err(|source| GgufError::Io {
-                path: self.path.display().to_string(),
+                path: payload_path.display().to_string(),
                 source,
             })?;
         let byte_len = usize::try_from(info.byte_len()).map_err(|_| GgufError::OverBound {
@@ -693,6 +880,51 @@ impl GgufFile {
     pub fn tensor(&self, name: &str) -> Option<&GgufTensorInfo> {
         self.tensors.iter().find(|t| t.name == name)
     }
+
+    /// Index of a tensor by exact name — the shard-aware sibling of
+    /// [`Self::tensor`], since locating a payload needs the position, not
+    /// just the info.
+    #[must_use]
+    pub fn tensor_index(&self, name: &str) -> Option<usize> {
+        self.tensors.iter().position(|t| t.name == name)
+    }
+
+    /// Which file holds tensor `index`'s payload, and that file's payload
+    /// base. On a single-file GGUF this is always `(self.path,
+    /// self.data_offset)`; on a split model it is the owning shard's.
+    ///
+    /// # Panics
+    ///
+    /// Never for an index produced by [`Self::tensor_index`] on a header
+    /// this type built: shard ranges partition the tensor table by
+    /// construction, which the debug assertion below restates.
+    #[must_use]
+    pub fn payload_location(&self, index: usize) -> (&Path, u64) {
+        debug_assert!(index < self.tensors.len(), "tensor index in range");
+        if self.shards.is_empty() {
+            return (&self.path, self.data_offset);
+        }
+        let shard = self
+            .shards
+            .iter()
+            .find(|s| s.tensors.contains(&index))
+            .unwrap_or_else(|| {
+                // Negative space: a split header whose ranges do not cover
+                // every tensor is a parse bug, not a user error — reading
+                // from the wrong shard would return silent garbage.
+                panic!(
+                    "tensor {index} belongs to no shard ({} shards)",
+                    self.shards.len()
+                )
+            });
+        (&shard.path, shard.data_offset)
+    }
+
+    /// Number of shards backing this header (1 for a single-file GGUF).
+    #[must_use]
+    pub fn shard_count(&self) -> usize {
+        self.shards.len().max(1)
+    }
 }
 
 /// Sequential little-endian reader over the header bytes.
@@ -862,6 +1094,9 @@ impl Reader {
             tensors,
             alignment,
             data_offset,
+            // One file parsed here. `open_sharded` is what fills this in;
+            // empty means "single file", which is the truth for this parse.
+            shards: Vec::new(),
         })
     }
 
@@ -1480,6 +1715,171 @@ mod tests {
             buf.extend_from_slice(payload);
             buf
         }
+    }
+
+    /// Write a split GGUF SET to a temp dir under `gguf-split`'s naming and
+    /// run `f` on the first shard's path. `shards` is one (bytes) per shard,
+    /// in shard order.
+    fn with_split_set<R>(shards: &[Vec<u8>], f: impl FnOnce(&Path) -> R) -> R {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "mummu-gguf-split-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let n = shards.len();
+        let mut first = None;
+        for (i, bytes) in shards.iter().enumerate() {
+            let path = dir.join(format!("m-{:05}-of-{n:05}.gguf", i + 1));
+            let mut fh = std::fs::File::create(&path).expect("shard file");
+            fh.write_all(bytes).expect("write shard");
+            if i == 0 {
+                first = Some(path);
+            }
+        }
+        let out = f(first.as_deref().expect("at least one shard"));
+        let _ = std::fs::remove_dir_all(&dir);
+        out
+    }
+
+    /// Two shards, each carrying one f32 tensor, with `split.*` KV as
+    /// `gguf-split` writes it.
+    fn two_shard_set() -> Vec<Vec<u8>> {
+        // 8 f32 = 32 bytes, one per shard, each at its OWN shard's offset 0 —
+        // which is the property that makes a per-shard payload base necessary.
+        let a: Vec<u8> = (0..8u32).flat_map(|i| (i as f32).to_le_bytes()).collect();
+        let b: Vec<u8> = (0..8u32)
+            .flat_map(|i| (100.0 + i as f32).to_le_bytes())
+            .collect();
+        let s0 = TestGguf::new()
+            .kv_str("general.architecture", "qwen4exp")
+            .kv_u32("split.count", 2)
+            .kv_u32("split.no", 0)
+            .kv_u32("split.tensors.count", 2)
+            .tensor("a.weight", &[8], 0, 0)
+            .build_with_payload(&a);
+        // Shard 2 carries a STUB kv set, exactly as the real tool writes it.
+        let s1 = TestGguf::new()
+            .kv_u32("split.count", 2)
+            .kv_u32("split.no", 1)
+            .tensor("b.weight", &[8], 0, 0)
+            .build_with_payload(&b);
+        vec![s0, s1]
+    }
+
+    #[test]
+    fn open_sharded_merges_both_shards_into_one_namespace() {
+        with_split_set(&two_shard_set(), |first| {
+            let f = GgufFile::open_sharded(first).expect("split set opens");
+            assert_eq!(f.shard_count(), 2, "both shards counted");
+            assert_eq!(f.tensors.len(), 2, "tensor tables concatenated");
+            assert!(f.tensor("a.weight").is_some(), "shard 1 tensor visible");
+            assert!(f.tensor("b.weight").is_some(), "shard 2 tensor visible");
+            // Metadata comes from the richest shard, not shard order.
+            assert_eq!(f.architecture(), Some("qwen4exp"));
+        });
+    }
+
+    #[test]
+    fn a_tensor_reads_from_its_own_shards_payload_base() {
+        // The regression this whole feature exists to prevent: both tensors
+        // sit at offset 0 of their own shard, so resolving either against
+        // shard 1's base returns the WRONG shard's bytes rather than failing.
+        with_split_set(&two_shard_set(), |first| {
+            let f = GgufFile::open_sharded(first).expect("split set opens");
+            let a = f.read_tensor_f32("a.weight").expect("shard 1 payload");
+            let b = f.read_tensor_f32("b.weight").expect("shard 2 payload");
+            assert_eq!(a[0], 0.0, "shard 1 tensor reads shard 1 bytes");
+            assert_eq!(b[0], 100.0, "shard 2 tensor reads SHARD 2 bytes");
+            assert_eq!(a.len(), 8);
+            assert_eq!(b.len(), 8);
+        });
+    }
+
+    #[test]
+    fn a_single_file_gguf_is_unchanged_by_the_sharded_path() {
+        let bytes = TestGguf::new()
+            .kv_str("general.architecture", "qwen2")
+            .tensor("only.weight", &[8], 0, 0)
+            .build_with_payload(
+                &(0..8u32)
+                    .flat_map(|i| (i as f32).to_le_bytes())
+                    .collect::<Vec<u8>>(),
+            );
+        with_split_set(&[bytes], |first| {
+            let f = GgufFile::open_sharded(first).expect("single file opens");
+            // No split.count => no shard table at all, and shard_count() still
+            // reports 1 so callers need no special case.
+            assert!(f.shards.is_empty(), "single file records no shards");
+            assert_eq!(f.shard_count(), 1);
+            assert_eq!(f.read_tensor_f32("only.weight").expect("payload")[0], 0.0);
+        });
+    }
+
+    #[test]
+    fn a_missing_shard_is_refused_by_name_not_discovered_late() {
+        let mut set = two_shard_set();
+        set.truncate(1); // declares split.count = 2, only shard 1 written
+        with_split_set(&set, |first| {
+            // The set still names itself -00001-of-00001 because only one file
+            // was written, so rewrite the path to what the KV claims.
+            let dir = first.parent().expect("dir");
+            let claimed = dir.join("m-00001-of-00002.gguf");
+            std::fs::rename(first, &claimed).expect("rename to claimed name");
+            let err = GgufFile::open_sharded(&claimed).expect_err("missing shard refused");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("missing shard"),
+                "names the absent file: {msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_duplicate_tensor_name_across_shards_is_refused() {
+        // Two shards both claiming "a.weight": lookup order would silently
+        // decide which payload wins, i.e. wrong weights with no error.
+        let payload: Vec<u8> = (0..8u32).flat_map(|i| (i as f32).to_le_bytes()).collect();
+        let dup = TestGguf::new()
+            .kv_u32("split.count", 2)
+            .kv_u32("split.no", 1)
+            .tensor("a.weight", &[8], 0, 0)
+            .build_with_payload(&payload);
+        let set = vec![two_shard_set().remove(0), dup];
+        with_split_set(&set, |first| {
+            let err = GgufFile::open_sharded(first).expect_err("duplicate refused");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("more than one shard"),
+                "explains the clash: {msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_tensor_count_that_disagrees_with_the_shards_is_refused() {
+        let mut set = two_shard_set();
+        // Claim 3 tensors while the shards carry 2.
+        set[0] = TestGguf::new()
+            .kv_str("general.architecture", "qwen4exp")
+            .kv_u32("split.count", 2)
+            .kv_u32("split.no", 0)
+            .kv_u32("split.tensors.count", 3)
+            .tensor("a.weight", &[8], 0, 0)
+            .build_with_payload(
+                &(0..8u32)
+                    .flat_map(|i| (i as f32).to_le_bytes())
+                    .collect::<Vec<u8>>(),
+            );
+        with_split_set(&set, |first| {
+            let err = GgufFile::open_sharded(first).expect_err("count mismatch refused");
+            assert!(
+                format!("{err}").contains("declares 3"),
+                "reports both counts"
+            );
+        });
     }
 
     /// Write `bytes` to a fresh temp file and run `f` on the parse result
