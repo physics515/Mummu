@@ -2133,6 +2133,65 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       cache silently invalidates both for the same layers. —
       https://huggingface.co/docs/transformers/main/en/internal/rope_utils ·
       https://github.com/ggml-org/llama.cpp/pull/13194
+- [ ] **Qwen3.8-Flash-Next (`qwen4exp`) port — OWNER-REQUESTED 2026-09-14, the headline target.**
+      The 2026-09-11/12 assessment measured this model on this box but changed no code and folded
+      nothing into this file, so its findings lived only in session memory until now. Restated here as
+      the plan, with the parts that are already built called out — the port is NOT from zero.
+      **The model as shipped** (unsloth UD-Q4_K_XL, headers parsed): `general.architecture = qwen4exp`,
+      48 layers, hidden 2560, **4 shards totalling 111 GB**, 1224 tensors, `tokenizer.ggml.pre = qwen35`,
+      eos 248046, **no MTP/nextn and no vision tensors**. Composition: **36 Gated-DeltaNet layers**
+      (hk16/hv48/d128/conv4 — the 27B's exact shape), **12 gated-attention layers** (24q/2kv/256, rope
+      64, QSA indexer top-k 2048), a **512-expert top-10 MoE plus a sigmoid-gated shared expert in
+      EVERY layer**, **4-stream hyper-connections** (low-rank 320; the final mixer is the output norm),
+      and a **PLE at layer 1** — `per_layer_token_embd.weight` IQ4_NL [160, 320001536] = **28.8 GB**,
+      90-byte rows, 16 hashed rows per token, hash multipliers/primes/offsets in the
+      `qwen4exp.ple.*` GGUF KV. Expert storage gate/up Q4_K (47) or Q5_K (1), **down Q5_1 (43) or Q8_0
+      (5)** (K=640 cannot be a K-quant); trunk/head/shared/HC Q8_0, router F32, indexer BF16.
+      Resident: experts 77.0 / 67.9 GB, GPU trunk+head 4.83 GB Q8_0 (2.8 Q4S), n-gram table 28.8 GB
+      on disk. Host floor 28-39 ms at 39-48 GB/s.
+      **Already built and reusable — this is why the estimate is weeks, not months:** the GDN layers
+      are `qwen35`'s (that port is llama.cpp-parity-PASSED); sparse top-k MoE routing with per-expert
+      quantized storage is `olmoe`'s; **every quant type id it uses is already in `gguf.rs`,
+      IQ4_NL (id 20) included**, so the 28.8 GB PLE table needs no new decoder; and `pack`/`tier`/
+      `partition` already place a model across CPU+GPU, which is the only way 77 GB of experts fits a
+      124 GB / 16 GB box.
+      **Prerequisites, both hard gates, neither is engineering:**
+      - [ ] Fetch the model — 111 GB, 4 shards, to `/mnt/deepmem/AI Models` (8.5 TB free). Not on the
+            box: verified 2026-09-14, no qwen4exp file and no GGUF over 40 GB anywhere on the array.
+      - [ ] **Multi-shard GGUF support does not exist** — `gguf.rs` opens a single file (its only
+            `split` calls slice bytes inside a quant block). A 4-shard model cannot be opened at all
+            today, so this blocks even reading the header set. Shard 1 carries 0 tensors (metadata
+            only), so the loader must treat the shard set as one logical tensor namespace.
+      - [ ] Parity reference: **ollama 0.34.0's bundled `/usr/lib/ollama/llama-server` is the only
+            qwen4exp-capable llama.cpp on this box**, and it lives inside the image rather than on the
+            host. Stand it up deliberately before any numeric claim, or the gate cannot run.
+      **Then, in order, each parity-gated against that reference before the next starts:**
+      - [ ] `qwen4exp` architecture detection + tensor-name map + `Architecture` registry entry.
+      - [ ] **PLE (per-layer token embedding)** — the hashed 16-rows-per-token lookup over a 28.8 GB
+            IQ4_NL table, hash parameters read from the GGUF KV rather than hardcoded. Gate: the
+            embedding output for a fixed token set byte-matches the reference.
+      - [ ] **4-stream hyper-connections** (low-rank 320), final mixer = output norm.
+      - [ ] **Gated attention with the QSA indexer** (top-k 2048). Exploit the assessment's finding
+            that the indexer is **bit-identical to dense attention while <= 2051 cached tokens**: ship
+            DENSE first and gate it at short context, then add the indexer as a separate, separately
+            gated change. That splits the riskiest mechanism into two provable steps.
+      - [ ] **512-expert top-10 MoE + sigmoid-gated shared expert per layer** — `olmoe`'s router
+            generalized; the new parts are the expert count, the shared expert, and the sigmoid gate.
+      - [ ] Placement: fit 77 GB of experts + 4.83 GB trunk across 124 GB RAM + 16 GB VRAM via the
+            existing tier/pack machinery.
+      **Performance is a SEPARATE question from correctness and must not gate the port.** The
+      assessment's verdict was "parity plausible; a <= 0.9x win needs ALL FOUR of" (1) an in-situ host
+      expert stream at >= 80% of roofline despite 48 GPU gaps/token (needs a spin-then-park expert
+      pool — rayon parking plus C3 exit was called the likeliest killer), (2) GPU trunk <= 18 ms
+      (launch-COUNT bound: ~65 launches/layer with fusion, 115-185 without), (3) a one-rounding
+      PackedQ4 twin's 12% byte advantage passing the existing tolerance gate, (4) two coalesced fences
+      per layer. Projected 46-72 ms/token against ollama 0.34.0's expected 50-70 ms here.
+      **Already KILLED by verification, do not re-chase:** GPU hot-expert LRU (llama.cpp PR #27861 --
+      no exploitable static skew on this model; ~295 MB/token uploads at 4.4 GB/s), a direct-device
+      crossing / cubecl fork, MTP as a planned lever (there are no MTP tensors; it is a separate
+      GGUF), and IQ1/IQ2 ids on the critical path.
+      **Estimate: ~60-80 engineer-days to the parity-band deliverable** — carried over from the
+      assessment, unrevised. *(2026-09-14, folding in the 2026-09-11/12 assessment.)*
 - [ ] **Llama-family decoder port (`llama`)** *(mistral.rs parity)* — the loader that multiplies
       checkpoint coverage most per unit of new surface: Llama 2/3.x and the wide Mistral/TinyLlama-style
       fine-tune space share one architecture shape, and it is strictly a subset of blocks Mummu already
