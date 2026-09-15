@@ -83,10 +83,51 @@ fn the_shipped_header_parses_to_the_expected_config() {
         c.ple_ngram_size,
         "one hash multiplier per n-gram position"
     );
+    // SIXTEEN head vocabularies, not eight: `heads_per_ngram` is 8 but the
+    // table carries 16 slices, which is the "16 rows per token" the 2026-09-11
+    // assessment measured. Asserted against the file so the two never drift.
     assert_eq!(
         c.ple_head_offsets.len(),
-        8,
-        "eight head vocabularies, per the header"
+        16,
+        "sixteen PLE head vocabularies"
+    );
+    assert_eq!(c.ple_head_vocab_sizes.len(), 16);
+    // Each head's vocabulary is a distinct prime near 20 M and the offsets are
+    // a CONTIGUOUS partition of the table — offset[i+1] == offset[i] +
+    // vocab[i]. That is the property a row lookup depends on, so prove it
+    // rather than assume it: a header where it fails would index the wrong
+    // head's slice and return plausible-but-wrong embeddings.
+    for i in 0..c.ple_head_offsets.len() - 1 {
+        assert_eq!(
+            c.ple_head_offsets[i + 1],
+            c.ple_head_offsets[i] + c.ple_head_vocab_sizes[i],
+            "PLE head {i} does not abut head {}",
+            i + 1
+        );
+    }
+    assert_eq!(c.ple_total_rows(), 320_001_446, "summed head vocabularies");
+
+    // Tie the config to the tensor it indexes. The table is stored padded:
+    // the header's vocabularies sum to fewer rows than the tensor carries,
+    // because IQ4_NL blocks 32 elements and the row count is rounded up. A
+    // lookup must therefore bound on the SUMMED vocab, not the tensor's dim.
+    let ple = f
+        .tensor("per_layer_token_embd.weight")
+        .expect("PLE table present");
+    println!(
+        "PLE tensor dims {:?} dtype {:?}; header rows {} (pad {})",
+        ple.dims,
+        ple.dtype,
+        c.ple_total_rows(),
+        ple.dims[1] - c.ple_total_rows()
+    );
+    assert_eq!(
+        ple.dims[0], c.ple_row_width as u64,
+        "row width matches header"
+    );
+    assert!(
+        ple.dims[1] >= c.ple_total_rows(),
+        "tensor must hold at least every head's vocabulary"
     );
     println!(
         "qwen4exp: {} layers ({} attn), {} experts top-{}, PLE {} rows x {} wide",

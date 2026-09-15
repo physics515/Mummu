@@ -21,11 +21,15 @@
 //! * **Hyper-connections**: 4 streams, low-rank 320.
 //! * **A sparse-attention indexer** on the attention layers: 4 heads, key
 //!   width 128, top-k 2048.
-//! * **PLE** (per-layer embeddings) at layer 1: an n-gram hashed lookup,
-//!   `ngram_size` 3 and 8 heads per n-gram over 8 head-vocabularies, each
-//!   row 160 wide. The multipliers/offsets/vocab sizes are DATA in the
-//!   header, not constants — a port that hardcodes them is wrong by
-//!   construction, so they are carried here verbatim.
+//! * **PLE** (per-layer embeddings) at layer 1: an n-gram hashed lookup.
+//!   `ngram_size` 3 with 3 hash multipliers, and — measured against the
+//!   shipped file, NOT inferred from `heads_per_ngram` (which is 8) — **16
+//!   head vocabularies**, each a distinct prime near 20 M, whose offsets form
+//!   a contiguous partition of a **320,001,446-row** table 160 wide. That is
+//!   the "16 rows per token" the 2026-09-11 assessment measured. The
+//!   multipliers/offsets/vocab sizes are DATA in the header, not constants —
+//!   a port that hardcodes them silently selects wrong rows, so they are
+//!   carried here verbatim.
 //!
 //! Not present, and worth stating because both were once assumed: there are
 //! **no MTP/nextn tensors** and **no vision tensors**.
