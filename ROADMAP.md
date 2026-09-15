@@ -2156,17 +2156,38 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       `partition` already place a model across CPU+GPU, which is the only way 77 GB of experts fits a
       124 GB / 16 GB box.
       **Prerequisites, both hard gates, neither is engineering:**
-      - [ ] Fetch the model — 111 GB, 4 shards, to `/mnt/deepmem/AI Models` (8.5 TB free). Not on the
-            box: verified 2026-09-14, no qwen4exp file and no GGUF over 40 GB anywhere on the array.
-      - [ ] **Multi-shard GGUF support does not exist** — `gguf.rs` opens a single file (its only
-            `split` calls slice bytes inside a quant block). A 4-shard model cannot be opened at all
-            today, so this blocks even reading the header set. Shard 1 carries 0 tensors (metadata
-            only), so the loader must treat the shard set as one logical tensor namespace.
-      - [ ] Parity reference: **ollama 0.34.0's bundled `/usr/lib/ollama/llama-server` is the only
-            qwen4exp-capable llama.cpp on this box**, and it lives inside the image rather than on the
-            host. Stand it up deliberately before any numeric claim, or the gate cannot run.
+      - [x] Fetch the model — 111 GB, 4 shards, now at
+            `/mnt/deepmem/AI Models/qwen3.8-flash-next` (10,946,624 + 49,859,583,136 + 49,376,141,504
+            + 12,087,983,520 B, every shard's size matching the published set). *(2026-09-15.)*
+            Operational note for the next big fetch: the transfer STALLED once with the connection
+            still open and `--retry` never fired, because a hung transfer is not an error — the fix is
+            `--speed-limit`/`--speed-time` so a stall aborts and the retry engages, with `-C -` to
+            resume rather than restart 111 GB.
+      - [x] **Multi-shard GGUF support** — `GgufFile::open_sharded` joins a `gguf-split` set into one
+            tensor namespace, with each tensor's payload resolved against ITS OWN shard's base.
+            Verified against the shipped model: 4 shards, **1224 tensors**, `token_embd.weight`
+            resolving out of a later shard. Three header facts it had to handle, all confirmed real:
+            `split.count`/`split.no` are **U16**, `split.tensors.count` is **I32 (signed)**, and
+            shard 1 carries **0 tensors**. *(2026-09-15, PR #55.)*
+      - [x] Parity reference **available**: `tools/flash-next-reference.sh` runs ollama 0.34.0's
+            bundled `llama-server` from inside the image (the binary needs its libggml/libllama
+            siblings, so extracting it is worse than mounting the model in). qwen4exp capability
+            confirmed by `grep -c qwen4exp /usr/lib/ollama/libllama.so` -> 3. *(2026-09-15, PR #56.)*
+            **NOT yet exercised against the model**, deliberately: 111 GB of weights on a 124 GB box
+            already running 63 containers needs a memory plan first (`--n-gpu-layers` and how much of
+            the host is free), or the reference run itself takes the box down. That measurement is the
+            next step, not an assumption.
       **Then, in order, each parity-gated against that reference before the next starts:**
-      - [ ] `qwen4exp` architecture detection + tensor-name map + `Architecture` registry entry.
+      - [x] `qwen4exp` config parse — `models::qwen4exp::Qwen4expConfig::from_gguf`, every value read
+            from the shipped header and gated against it (`tests/real_qwen4exp.rs`). *(2026-09-15,
+            PR #56/#57.)* Corrected while gating: the PLE table has **16** head vocabularies, not the
+            8 that `heads_per_ngram` suggests — each a distinct prime near 20 M, offsets forming a
+            contiguous partition of **320,001,446** rows, and the TENSOR is padded 90 rows beyond that
+            (`[160, 320001536]` IQ4_NL, 32-element blocks), so a lookup must bound on the summed
+            vocabulary rather than the tensor dim.
+      - [ ] Tensor-name map + `Architecture::Qwen4Exp` registry entry — deliberately deferred: that
+            enum drives the serve engine's loader dispatch, so it lands WITH the loader rather than as
+            stub match arms at six sites. The 1224 tensor names are now readable to build the map.
       - [ ] **PLE (per-layer token embedding)** — the hashed 16-rows-per-token lookup over a 28.8 GB
             IQ4_NL table, hash parameters read from the GGUF KV rather than hardcoded. Gate: the
             embedding output for a fixed token set byte-matches the reference.
