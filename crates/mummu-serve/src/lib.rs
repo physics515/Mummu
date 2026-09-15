@@ -173,6 +173,10 @@ pub async fn serve_on<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    // Start watching host memory as soon as we are serving: the pressure it
+    // guards against arrives from OTHER processes, so it must not depend on
+    // this one receiving traffic. See `engine::spawn_host_pressure_watch`.
+    engine::spawn_host_pressure_watch();
     // One trigger, two listeners: `with_graceful_shutdown` consumes a
     // future, and futures aren't cloneable, so the trigger fans out through
     // a watch channel.
