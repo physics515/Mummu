@@ -633,6 +633,10 @@ pub struct Pack {
     blobs: Mutex<BTreeMap<Precision, Arc<std::fs::File>>>,
     /// Blob bytes read through this pack, for load-progress reporting.
     bytes_read: AtomicU64,
+    /// Optional NVMe cache in front of the blobs (see [`crate::diskcache`]).
+    /// `None` unless `MUMMU_DISK_CACHE_DIR` asked for one — this writes tens
+    /// of GB, so it is never started implicitly.
+    disk_cache: Option<crate::diskcache::DiskCache>,
 }
 
 impl Pack {
@@ -651,6 +655,7 @@ impl Pack {
             manifest,
             blobs: Mutex::new(BTreeMap::new()),
             bytes_read: AtomicU64::new(0),
+            disk_cache: crate::diskcache::from_env(),
         }
     }
 
@@ -888,12 +893,35 @@ impl Pack {
     }
 
     fn read_range(&self, precision: Precision, offset: u64, len: u64) -> Result<Vec<u8>, String> {
+        // NVMe tier first, when one is configured. A pack on bulk storage
+        // (this host's is a 4-disk spinning array) pays a seek for every
+        // range; the same range is read again on every token, so a hit here
+        // is the difference between HDD and NVMe latency for the bytes that
+        // are actually hot. A miss costs one failed lookup and nothing else.
+        let blob = precision.blob_name();
+        if let Some(cache) = &self.disk_cache
+            && let Some(bytes) = cache.get(blob, offset, len)
+        {
+            // Counted as read: `bytes_read` reports what the LOAD pulled, and
+            // a progress line that stopped advancing on cache hits would read
+            // as a stall.
+            self.bytes_read.fetch_add(len, Ordering::Relaxed);
+            return Ok(bytes);
+        }
         let file = self.blob(precision)?;
         let mut buf = vec![0u8; usize::try_from(len).expect("blob fits")];
-        read_exact_at(&file, &mut buf, offset)
-            .map_err(|e| format!("read {}: {e}", precision.blob_name()))?;
+        read_exact_at(&file, &mut buf, offset).map_err(|e| format!("read {blob}: {e}"))?;
         self.bytes_read.fetch_add(len, Ordering::Relaxed);
+        if let Some(cache) = &self.disk_cache {
+            cache.put(blob, offset, len, &buf);
+        }
         Ok(buf)
+    }
+
+    /// The NVMe cache in front of this pack's blobs, when one is configured.
+    #[must_use]
+    pub fn disk_cache(&self) -> Option<&crate::diskcache::DiskCache> {
+        self.disk_cache.as_ref()
     }
 
     /// The f32 values of a tensor read from the REQUESTED float level when
@@ -1040,6 +1068,58 @@ impl Pack {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pack read must return the SAME bytes whether they came off the
+    /// blob or out of the NVMe cache, and the second read of a range must
+    /// actually be served by the cache. This is the property that makes the
+    /// tier safe to enable: placement affects speed, never contents.
+    #[test]
+    fn the_disk_cache_serves_the_second_read_and_returns_identical_bytes() {
+        use std::io::Write;
+        use std::sync::atomic::AtomicU64;
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("mummu-packdc-{}-{n}", std::process::id()));
+        let pack_dir = root.join("pack");
+        let cache_dir = root.join("cache");
+        std::fs::create_dir_all(&pack_dir).expect("pack dir");
+
+        // A blob of known bytes; the manifest is irrelevant to read_range.
+        let payload: Vec<u8> = (0..4096u32).map(|i| (i % 253) as u8).collect();
+        let mut f =
+            std::fs::File::create(pack_dir.join(Precision::Q4.blob_name())).expect("blob file");
+        f.write_all(&payload).expect("write blob");
+        drop(f);
+
+        let manifest = Manifest {
+            version: PACK_VERSION,
+            source_file: "t.gguf".into(),
+            source_bytes: 0,
+            architecture: "test".into(),
+            precisions: vec![Precision::Q4],
+            tensors: Vec::new(),
+            ffn_partition: None,
+        };
+        let mut pack = Pack::new(pack_dir.clone(), manifest);
+        pack.disk_cache =
+            Some(crate::diskcache::DiskCache::open(&cache_dir, 1 << 20).expect("cache opens"));
+
+        let first = pack.read_range(Precision::Q4, 64, 512).expect("first read");
+        let (h0, m0, _, _) = pack.disk_cache().expect("cache").stats();
+        assert_eq!(h0, 0, "first read cannot hit");
+        assert_eq!(m0, 1, "first read is a miss");
+
+        let second = pack
+            .read_range(Precision::Q4, 64, 512)
+            .expect("second read");
+        let (h1, _, _, _) = pack.disk_cache().expect("cache").stats();
+        assert_eq!(h1, 1, "second read is served by the cache");
+
+        assert_eq!(first, second, "cached bytes are identical to blob bytes");
+        assert_eq!(first, payload[64..576], "and identical to the file's bytes");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn block_quantizer_roundtrips_within_half_scale() {
