@@ -3071,6 +3071,28 @@ that fits the model AND uses every device to the fullest.
       device boundary between stages, KV-cache per shard, and a micro-batch/pipeline schedule so the GPUs
       overlap rather than idle. *(Tensor-parallel within a layer is the stretch goal; layer/pipeline split is
       the tractable first cut.)*
+- [ ] **The 27B pack load is NOT I/O-bound — fix the LOADER, not the disk.** Measured 2026-09-15
+      A/B'ing `mummu::diskcache` against the 193 GB qwen3.8-27b pack on the spinning array, and the
+      result kills the premise the cache was reached for here:
+      | run | resident | effective rate |
+      |---|---:|---:|
+      | baseline, no cache (HDD) | **144 s** | ~118 MB/s |
+      | cache populating (HDD read + NVMe write) | 204 s | 89 MB/s |
+      | cache WARM (served from NVMe) | **166 s** | ~108 MB/s |
+      The warm cache is **SLOWER than the array**. It is not per-file overhead: `cat`-ing the exact
+      same 849 cache files off the NVMe measures **1825 MiB/s** (14 GiB in 7 s). Two sources differing
+      ~16x in bandwidth producing the same ~110 MB/s effective load rate is the signature of a
+      bottleneck that is **not I/O at all** — it is the loader: dequantize, the VNNI repack (the logs
+      show "lazy repack ... second 4-bit rounding" on 7 projections plus "195 host projections packed
+      in 8.9 s"), and placement. So the ~144 s load has maybe 20 s of disk in it and the rest is CPU.
+      Actions this implies, in order: (a) profile the load path with `mummu::prof` to split
+      read / dequant / repack / place — the flame graph exists for exactly this and has never been
+      pointed at load; (b) the "register the float level at load to avoid it" note the repack itself
+      logs is a standing, unactioned fix that this measurement now prices; (c) only then revisit disk.
+      **`diskcache` itself is not disproven** — it is disproven FOR THIS WORKLOAD. The case it was
+      built for is streaming (MoE expert paging), where bytes are re-read per token instead of once
+      per load; that is also the case that produced the 63 s/token Flash-Next figure. Keep it opt-in
+      and measure it there. *(2026-09-15.)*
 - [ ] **Preload into the NVMe tier (the half `diskcache` does not do yet).** `mummu::diskcache`
       (2026-09-15) makes NVMe a read-through cache in front of a pack on bulk storage, so the model
       no longer has to be MOVED to fast disk. It is read-through ONLY: it populates on miss and never
