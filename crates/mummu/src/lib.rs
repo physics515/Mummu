@@ -18,6 +18,7 @@ pub mod backend;
 pub mod cache;
 pub mod chat;
 pub mod decode;
+pub mod diskcache;
 /// Host CPU kernels: the packed-nibble Q4 GEMV at the DRAM roofline
 /// (AVX-512 VNNI) and its calibration machinery (SPEC 1).
 pub mod flex;

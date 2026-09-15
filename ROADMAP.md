@@ -3071,6 +3071,18 @@ that fits the model AND uses every device to the fullest.
       device boundary between stages, KV-cache per shard, and a micro-batch/pipeline schedule so the GPUs
       overlap rather than idle. *(Tensor-parallel within a layer is the stretch goal; layer/pipeline split is
       the tractable first cut.)*
+- [ ] **Preload into the NVMe tier (the half `diskcache` does not do yet).** `mummu::diskcache`
+      (2026-09-15) makes NVMe a read-through cache in front of a pack on bulk storage, so the model
+      no longer has to be MOVED to fast disk. It is read-through ONLY: it populates on miss and never
+      prefetches. The access order is known in advance — manifest order, the same property
+      `workingset` already exploits for RAM->VRAM — so preload is the natural completion:
+      (a) warm the cache along manifest order at load, bounded by capacity and by how much of the
+      load is still ahead; (b) for MoE, pin the routed hot set using the router's early output, which
+      is the selectivity that makes streaming pay at all; (c) measure hit rate against the existing
+      `stats()`/`hit_rate()` before and after, since a preloader that evicts a hot entry to stage a
+      cold one is worse than no preloader. Also still open from the research: `O_DIRECT` (the OS page
+      cache hurts once the model exceeds RAM) and per-session ownership of the residency pool
+      (concurrent decodes sharing one streamed model corrupt each other). *(2026-09-15.)*
 - [ ] **Third tier: stream weights from NVMe** *(colibri parity)* — the placement plan above stops at
       GPU→CPU-RAM spill; colibri's core result is that **disk is a usable third tier**: VRAM/RAM/NVMe as
       one hierarchy ("a JIT for weights") with a per-layer LRU residency cache, a *learned* pinned hot
