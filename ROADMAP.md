@@ -2173,10 +2173,28 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
             bundled `llama-server` from inside the image (the binary needs its libggml/libllama
             siblings, so extracting it is worse than mounting the model in). qwen4exp capability
             confirmed by `grep -c qwen4exp /usr/lib/ollama/libllama.so` -> 3. *(2026-09-15, PR #56.)*
-            **NOT yet exercised against the model**, deliberately: 111 GB of weights on a 124 GB box
-            already running 63 containers needs a memory plan first (`--n-gpu-layers` and how much of
-            the host is free), or the reference run itself takes the box down. That measurement is the
-            next step, not an assumption.
+            **RUN 2026-09-15 — it works, and it is I/O-starved, not compute-starved.** First qwen4exp
+            inference on this box: `model loaded` at 11m39s, correct greedy output ("2+2 equals 4.")
+            — so the parity gate is viable. But **9 tokens took 570 s = 63 s/token**, against the
+            assessment's projection of 50-70 ms/token for ollama here. Three measurements explain the
+            1000x, and the third is the actionable one:
+            (1) The bundled llama-server is **CPU-ONLY** — it logs "no usable GPU found ... compiled
+            without GPU support", so `--n-gpu-layers` is ignored and the card is irrelevant to the
+            reference.
+            (2) A first attempt under a **40 GiB** cgroup cap was **OOM-killed** (`oom_reaper ...
+            llama-server`), which also disproves the assumption that mmap makes this safe by itself:
+            file-backed pages are reclaimable, but the fault rate outran reclaim. At **48 GiB** with
+            `--load-mode mmap` it loaded and sat pinned at 45.9/48 GiB — i.e. hard against the cap,
+            with the assessment's ~77 GB expert working set paging continuously.
+            (3) **The model lives on the spinning HDD array** (`/mnt/deepmem/AI Models`), so every one
+            of those page faults is an HDD seek. That, not CPU, is the 63 s/token.
+            **Next, and cheap:** `/` is NVMe with ~530 GB free — enough for the 111 GB set. Moving it
+            there (or a copy for reference runs) should move this by orders of magnitude, and it is a
+            file copy rather than any engineering. Re-measure before concluding anything about
+            qwen4exp throughput on this host.
+            Operational note: the cgroup cap did its job — the host floored at 8 GiB and recovered to
+            50 GiB on stop, with all 63 containers intact. Running this WITHOUT a cap would have taken
+            the stack down.
       **Then, in order, each parity-gated against that reference before the next starts:**
       - [x] `qwen4exp` config parse — `models::qwen4exp::Qwen4expConfig::from_gguf`, every value read
             from the shipped header and gated against it (`tests/real_qwen4exp.rs`). *(2026-09-15,
