@@ -45,13 +45,32 @@ for i in 1 2 3 4; do
   [ -f "$DIR/$f" ] || { echo "reference: missing shard $f" >&2; exit 1; }
 done
 
+# Memory plan, because this is 111 GB of weights on a 124 GB box that is also
+# hosting ~63 containers:
+#   * mmap stays ON (llama.cpp's default; --no-mmap would force a ~111 GB
+#     anonymous allocation and OOM the host). Mapped weights are FILE-backed,
+#     so the kernel reclaims clean pages under pressure instead of killing.
+#   * MEM_CAP is a cgroup ceiling so the reference cannot evict the whole
+#     stack's page cache. Override for a bigger run once it is proven.
+#   * --n-gpu-layers defaults to 0 so the card stays free for mummu; set
+#     REF_NGL to offload once VRAM is known to be spare.
+# Only ~10 of 512 experts per layer are touched per token, so the ACTIVE
+# working set is far below the 111 GB on disk — the cap is about protecting
+# the host, not about fitting the model.
+MEM_CAP="${REF_MEM_CAP:-40g}"
+NGL="${REF_NGL:-0}"
+CTX="${REF_CTX:-2048}"
+
 echo "reference: llama-server (qwen4exp) on :$PORT from $IMAGE"
+echo "           mem cap $MEM_CAP, ctx $CTX, gpu layers $NGL, mmap on"
 exec docker run --rm --gpus all \
+  --name flash-next-reference \
+  --memory "$MEM_CAP" --memory-swap "$MEM_CAP" \
   -p "$PORT:$PORT" \
   -v "$DIR:/models:ro" \
   --entrypoint /usr/lib/ollama/llama-server \
   "$IMAGE" \
   --model "/models/$SHARD" \
   --host 0.0.0.0 --port "$PORT" \
-  --ctx-size 4096 \
-  --n-gpu-layers 0
+  --ctx-size "$CTX" \
+  --n-gpu-layers "$NGL"

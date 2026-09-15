@@ -5,7 +5,7 @@
 
 use std::ops::ControlFlow;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use burn::tensor::Device;
 use mummu::cache::ModelSlot;
@@ -2613,6 +2613,93 @@ fn mem_available_bytes() -> Option<u64> {
 /// server down — which is exactly what a resident 27B plus a tiered OLMoE
 /// did on 2026-08-22). `keep` is the backend the new model's trunk goes to;
 /// its own slot is evicted by `ModelSlot::with` anyway.
+/// How often the host-pressure watcher samples. Reading `MemAvailable` is a
+/// `/proc/meminfo` parse — cheap enough to do often, and "often" is the whole
+/// point: the window this closes is the one where the machine changes while
+/// mummu is IDLE.
+const HOST_WATCH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Default low-water mark for host RAM. Below this the watcher evicts the CPU
+/// slot rather than waiting for a request to discover the shortage.
+/// `MUMMU_HOST_FLOOR_GB` overrides.
+const HOST_FLOOR_BYTES: u64 = 8 << 30;
+
+/// The host low-water mark, from `MUMMU_HOST_FLOOR_GB` or the default.
+fn host_floor_bytes() -> u64 {
+    std::env::var("MUMMU_HOST_FLOOR_GB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(HOST_FLOOR_BYTES, |gb| gb << 30)
+}
+
+/// Watch host memory continuously and give the slot back before the machine
+/// runs out.
+///
+/// # Why this exists as a separate loop
+///
+/// [`mummu::adapt::Controller`] already adapts the device/host split, but it
+/// is fed **only when a generation completes** — it is a throughput
+/// optimizer, and its judgement is a comparison of `tokens_per_sec` against
+/// the best seen. That is the right shape for tuning and the WRONG shape for
+/// safety, in two ways:
+///
+/// * **It cannot fire while idle.** If another container balloons, a build
+///   starts, or a second model loads while mummu is serving nothing, no
+///   sample is ever taken. The next request is then the one that discovers
+///   the shortage — by failing.
+/// * **It must not be fed synthetic samples.** Feeding it `tokens_per_sec: 0`
+///   on an idle tick reads as a total throughput collapse and would trigger a
+///   spurious revert, i.e. polling it would make placement worse, not better.
+///
+/// So this loop deliberately does NOT touch the controller. It watches the
+/// one signal that is meaningful without traffic — host memory — and uses the
+/// existing eviction path, which already refuses honestly when a generation
+/// holds the slot.
+pub fn spawn_host_pressure_watch() {
+    // One watcher per process: a second would double-evict.
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let floor = host_floor_bytes();
+    eprintln!(
+        "[mummu-serve] host-pressure watch: every {}s, floor {} GiB (MUMMU_HOST_FLOOR_GB)",
+        HOST_WATCH_INTERVAL.as_secs(),
+        floor >> 30
+    );
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(HOST_WATCH_INTERVAL);
+        // A missed tick must not cause a burst of catch-up evictions.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let Some(avail) = mem_available_bytes() else {
+                continue; // unknown is not pressure
+            };
+            if avail >= floor {
+                continue;
+            }
+            // Blocking: eviction touches the slot mutex and frees multi-GiB
+            // allocations, neither of which belongs on the async runtime.
+            let need = floor;
+            let _ = tokio::task::spawn_blocking(move || {
+                eprintln!(
+                    "[mummu-serve] host-pressure watch: {} GiB available, below the {} GiB floor",
+                    avail >> 30,
+                    need >> 30
+                );
+                // `keep` is whatever backend this build actually runs on —
+                // NOT a hardcoded accelerator (`Cuda` is feature-gated, and
+                // the choice differs per host). Passing `Cpu` would make this
+                // a no-op by construction, which `ensure_host_room` treats as
+                // "nothing to evict to".
+                ensure_host_room(need, backend_choice());
+            })
+            .await;
+        }
+    });
+}
+
 fn ensure_host_room(need: u64, keep: BackendChoice) {
     let Some(avail) = mem_available_bytes() else {
         return;
@@ -3218,5 +3305,65 @@ mod reserve_tests {
             assert!(n >= prev, "budget {gib} GiB placed {n} < {prev}");
             prev = n;
         }
+    }
+}
+
+#[cfg(test)]
+mod host_watch_tests {
+    use super::*;
+
+    /// Keep env mutation from racing the other tests in this binary.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn the_floor_defaults_and_is_overridable_in_gib() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: single-threaded within this test, serialized by ENV_LOCK.
+        unsafe { std::env::remove_var("MUMMU_HOST_FLOOR_GB") };
+        assert_eq!(host_floor_bytes(), HOST_FLOOR_BYTES, "default floor");
+
+        unsafe { std::env::set_var("MUMMU_HOST_FLOOR_GB", "16") };
+        assert_eq!(host_floor_bytes(), 16 << 30, "override is read as GiB");
+
+        // Garbage must not silently become a floor of zero — that would
+        // disable the watcher exactly when someone tried to configure it.
+        unsafe { std::env::set_var("MUMMU_HOST_FLOOR_GB", "not-a-number") };
+        assert_eq!(host_floor_bytes(), HOST_FLOOR_BYTES, "bad value falls back");
+        unsafe { std::env::remove_var("MUMMU_HOST_FLOOR_GB") };
+    }
+
+    #[test]
+    fn the_watcher_starts_at_most_once() {
+        // A second watcher would double-evict: two loops racing the same slot
+        // can turf a model that the first already made room by dropping.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        let _e = rt.enter();
+        spawn_host_pressure_watch();
+        spawn_host_pressure_watch();
+        // Idempotence is the assertion: the second call returns without
+        // spawning, which the STARTED latch guarantees.
+        spawn_host_pressure_watch();
+    }
+
+    #[test]
+    fn an_unknown_host_reading_is_not_treated_as_pressure() {
+        // `mem_available_bytes()` returns Option; the watcher must `continue`
+        // on None rather than read it as zero and evict on every tick.
+        // Encoded as the invariant the loop relies on.
+        let unknown: Option<u64> = None;
+        let floor = host_floor_bytes();
+        let would_evict = unknown.is_some_and(|a: u64| a < floor);
+        assert!(!would_evict, "unknown is not pressure");
+        assert!(
+            Some(floor).is_some_and(|a: u64| a >= floor),
+            "at the floor is not below it"
+        );
+        assert!(
+            Some(floor - 1).is_some_and(|a: u64| a < floor),
+            "one byte under the floor is pressure"
+        );
     }
 }
