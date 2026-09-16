@@ -28,7 +28,9 @@
 //!    naive order takes three. Heads are independent and run across the
 //!    rayon pool.
 //! 4. **Gated RMSNorm fused into the head epilogue**: `RMS(o) * gamma *
-//!    silu(z)` per head, written straight into the output slice.
+//!    act(z)` per head, written straight into the output slice. `act` is
+//!    the layer's [`GdnGate`]: `silu` for qwen35, `sigmoid` for qwen4exp —
+//!    the one numerical difference between the two families' DeltaNets.
 //!
 //! The projections stay OUTSIDE this function on purpose: they already run
 //! as single packed-GEMV dispatches (the VNNI twin path), and keeping them
@@ -43,6 +45,36 @@
 //! kill switch tests use.
 
 use rayon::prelude::*;
+
+/// The activation applied to the gate `z` in the DeltaNet's gated output
+/// RMSNorm (`RMS(o) * gamma * act(z)`).
+///
+/// Two families share every other line of the GDN block and differ only
+/// here: llama.cpp's `qwen35` graph builds `ggml_silu(z)`, its `qwen4exp`
+/// graph `ggml_sigmoid(z)` (`build_norm_gated` in each). The GGUF header
+/// carries no key for it — the architecture name decides — so the loader
+/// that knows the architecture sets it. Deliberately no `Default`: a config
+/// literal that forgets to choose must fail to compile, not silently run
+/// the other family's gate (that error is invisible until a parity run).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GdnGate {
+    /// `z * sigmoid(z)` — qwen35 / Qwen3.5-family checkpoints.
+    Silu,
+    /// `sigmoid(z)` — qwen4exp (Qwen3.8-Flash-Next).
+    Sigmoid,
+}
+
+impl GdnGate {
+    /// The gate activation at one scalar.
+    #[inline]
+    #[must_use]
+    pub fn apply(self, z: f32) -> f32 {
+        match self {
+            Self::Silu => silu(z),
+            Self::Sigmoid => sigmoid(z),
+        }
+    }
+}
 
 /// Everything the fused middle needs besides the per-token activations:
 /// dimensions and the small per-layer weights, extracted once per layer at
@@ -77,6 +109,8 @@ pub struct GdnMiddle {
     pub a: Vec<f32>,
     /// Gated RMSNorm gain over `ds`.
     pub gamma: Vec<f32>,
+    /// Activation on `z` in the gated RMSNorm epilogue.
+    pub gate: GdnGate,
 }
 
 impl GdnMiddle {
@@ -275,11 +309,23 @@ pub fn gdn_step(
                 }
             }
 
-            // Gated RMSNorm epilogue: RMS(o) * gamma_norm * silu(z).
+            // Gated RMSNorm epilogue: RMS(o) * gamma_norm * act(z). The
+            // gate match sits outside the loop so each arm stays a plain
+            // inlined scalar loop — the qwen35 (silu) arm is the loop that
+            // was here before the gate became a parameter.
             let ms = o.iter().map(|x| x * x).sum::<f32>() / ds as f32;
             let inv = 1.0 / (ms + p.norm_eps).sqrt();
-            for j in 0..ds {
-                out[j] = o[j] * inv * p.gamma[j] * silu(zh[j]);
+            match p.gate {
+                GdnGate::Silu => {
+                    for j in 0..ds {
+                        out[j] = o[j] * inv * p.gamma[j] * silu(zh[j]);
+                    }
+                }
+                GdnGate::Sigmoid => {
+                    for j in 0..ds {
+                        out[j] = o[j] * inv * p.gamma[j] * sigmoid(zh[j]);
+                    }
+                }
             }
         });
 }
@@ -312,6 +358,7 @@ mod tests {
             dt_bias: vec![0.0],
             a: vec![0.0], // gamma = exp(softplus(0)*0) = 1: no decay
             gamma: vec![1.0],
+            gate: GdnGate::Silu,
         };
         let mut ring = vec![
             1.0, 2.0, // channel 0: oldest 1, newer 2
@@ -403,6 +450,89 @@ mod tests {
         }
     }
 
+    /// The gated RMSNorm epilogue applies the configured gate and nothing
+    /// else: with a zero state, no decay, β = ½ and q = k (so q·k = 1), the
+    /// head output is `o = ½·silu(v_mix)` exactly, and the step must write
+    /// `RMS(o)·gamma·sigmoid(z)` for [`GdnGate::Sigmoid`] and
+    /// `RMS(o)·gamma·silu(z)` for [`GdnGate::Silu`] — the expectations are
+    /// computed here from the textbook formulas, not the module's helpers.
+    /// The recurrent state must not depend on the gate (it only shapes the
+    /// output), and the two gates must actually disagree on these inputs,
+    /// so a gate field that is ignored cannot pass.
+    #[test]
+    fn epilogue_applies_the_configured_gate() {
+        let middle = |gate: GdnGate| GdnMiddle {
+            hk: 1,
+            hv: 1,
+            ds: 2,
+            kk: 2,
+            conv_dim: 6, // 2*key_dim + d_inner = 2*2 + 2
+            key_dim: 2,
+            d_inner: 2,
+            l2_eps: 1e-6,
+            norm_eps: 1e-6,
+            scale: 1.0,
+            // Every channel passes its newest mix value straight through.
+            conv_w: [0.0, 1.0].repeat(6),
+            dt_bias: vec![0.0],
+            a: vec![0.0], // decay exp(softplus(0)*0) = 1
+            gamma: vec![0.7, -1.3],
+            gate,
+        };
+        // [q (2) | k (2) | v (2)]: q == k, so the normalized q.k is 1.
+        let v_mix = [1.2f32, -0.7];
+        let mixed = [0.8, -0.3, 0.8, -0.3, v_mix[0], v_mix[1]];
+        let z = [-3.0f32, 2.5];
+        let run = |gate: GdnGate| {
+            let p = middle(gate);
+            let mut ring = vec![0.0f32; p.ring_len()];
+            let mut state = vec![0.0f32; p.state_len()];
+            let mut out = vec![0.0f32; p.d_inner];
+            gdn_step(
+                &p,
+                &mixed,
+                &z,
+                &[0.0],
+                &[0.0],
+                &mut ring,
+                &mut state,
+                &mut out,
+            );
+            (out, state)
+        };
+
+        let ref_sigmoid = |x: f32| 1.0 / (1.0 + (-x).exp());
+        let ref_silu = |x: f32| x * ref_sigmoid(x);
+        // S = 0 and gamma = 1: o = (q.k) * beta * v = 0.5 * silu(v_mix).
+        let o: Vec<f32> = v_mix.iter().map(|&m| 0.5 * ref_silu(m)).collect();
+        let inv = 1.0 / (o.iter().map(|x| x * x).sum::<f32>() / 2.0 + 1e-6).sqrt();
+        let gamma = [0.7f32, -1.3];
+
+        let (out_sig, state_sig) = run(GdnGate::Sigmoid);
+        let (out_silu, state_silu) = run(GdnGate::Silu);
+        for j in 0..2 {
+            let want_sig = o[j] * inv * gamma[j] * ref_sigmoid(z[j]);
+            let want_silu = o[j] * inv * gamma[j] * ref_silu(z[j]);
+            assert!(
+                (out_sig[j] - want_sig).abs() < 1e-5,
+                "sigmoid epilogue at {j}: got {} want {want_sig}",
+                out_sig[j]
+            );
+            assert!(
+                (out_silu[j] - want_silu).abs() < 1e-5,
+                "silu epilogue at {j}: got {} want {want_silu}",
+                out_silu[j]
+            );
+            assert!(
+                (out_sig[j] - out_silu[j]).abs() > 1e-2,
+                "the gates must disagree at {j}: {} vs {}",
+                out_sig[j],
+                out_silu[j]
+            );
+        }
+        assert_eq!(state_sig, state_silu, "the gate must not touch the state");
+    }
+
     /// Stable transcendentals at the extremes.
     #[test]
     fn gates_are_stable_at_extremes() {
@@ -412,5 +542,8 @@ mod tests {
         assert!(sigmoid(100.0) <= 1.0 && sigmoid(-100.0) >= 0.0);
         assert!((sigmoid(0.0) - 0.5).abs() < 1e-7);
         assert!(silu(-100.0).abs() < 1e-6);
+        assert!((GdnGate::Sigmoid.apply(-100.0)).abs() < 1e-6);
+        assert!((GdnGate::Sigmoid.apply(100.0) - 1.0).abs() < 1e-6);
+        assert!((GdnGate::Silu.apply(100.0) - 100.0).abs() < 1e-3);
     }
 }
