@@ -254,6 +254,78 @@ fn noise_realizations_of_the_first_forward() {
     }
 }
 
+/// The port's own consistency on the REAL weights, which no recorded
+/// reference covers: a ~300-token prompt fed one-shot must give the same
+/// last-token logits as the same prompt fed in uneven prefill chunks (the
+/// chunked GDN prefill crosses its 64-token chunk boundary, attention reads
+/// cached KV, the PLE hash and conv carry across calls) finished by a
+/// single-token cached decode step. Exact f32 arithmetic on both sides, so
+/// only float rounding may differ.
+#[test]
+#[ignore = "needs MUMMU_QWEN4EXP_DIR and ~25 GB RAM"]
+fn chunked_prefill_and_cached_decode_match_one_shot_on_the_real_model() {
+    let Some(first) = first_shard() else {
+        eprintln!("skipped: set MUMMU_QWEN4EXP_DIR to the shard directory");
+        return;
+    };
+    let (model, tok) = load(&first);
+    let device = mummu::backend::cpu_device();
+    let paragraph = "The lighthouse keeper counted the ships that passed each night, \
+        writing their names in a ledger that had outlived three keepers before him. \
+        Some nights the fog hid everything but the horn, and he wrote only the time. ";
+    let text: String = std::iter::repeat_n(paragraph, 6).collect();
+    let (_, ids) = qwen4exp_fixture::render_prompt_ids(&tok, &text);
+    let n = ids.len();
+    assert!((250..2000).contains(&n), "prompt is {n} tokens");
+
+    let t0 = Instant::now();
+    let mut cache = model.new_cache();
+    let one_shot = readback(model.forward(&ids, 0, &mut cache, &device));
+    let one_shot_s = t0.elapsed().as_secs_f64();
+    drop(cache);
+
+    // Uneven chunks: 1, 70 (crosses 64), 129, the rest but one, then decode.
+    let t1 = Instant::now();
+    let mut cache = model.new_cache();
+    let cuts = [0, 1, 71, 200, n - 1];
+    for w in cuts.windows(2) {
+        model.forward_advance(&ids[w[0]..w[1]], w[0], &mut cache, &device);
+    }
+    let stepped = readback(model.forward(&ids[n - 1..], n - 1, &mut cache, &device));
+    let stepped_s = t1.elapsed().as_secs_f64();
+
+    let max_logit = one_shot
+        .iter()
+        .zip(&stepped)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    let top_one = top(&one_shot, 10);
+    let top_step = top(&stepped, 10);
+    let max_lp = top_one
+        .iter()
+        .zip(logprobs_at(
+            &stepped,
+            &top_one.iter().map(|e| e.0).collect::<Vec<_>>(),
+        ))
+        .map(|(a, b)| (a.1 - b).abs())
+        .fold(0f64, f64::max);
+    eprintln!(
+        "[consistency/qwen4exp] {n} tokens: one-shot {one_shot_s:.1} s, chunked+decode {stepped_s:.1} s; \
+         max |dlogit| {max_logit:e}, max |dlogprob| over one-shot top-10 {max_lp:e}\n  one-shot top-5 {:?}\n  stepped  top-5 {:?}",
+        &top_one[..5],
+        &top_step[..5]
+    );
+    assert_eq!(
+        top_one.iter().map(|e| e.0).collect::<Vec<_>>(),
+        top_step.iter().map(|e| e.0).collect::<Vec<_>>(),
+        "top-10 ids differ between one-shot and chunked+decode"
+    );
+    assert!(
+        max_lp < 1e-2,
+        "chunked+decode logprobs drift {max_lp} from one-shot"
+    );
+}
+
 /// llama.cpp's own first forward under mathematically equivalent settings,
 /// recorded by `tools/qwen4exp_reference_variants.py`.
 const VARIANTS_PATH: &str = concat!(
