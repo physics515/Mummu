@@ -181,7 +181,9 @@ impl Qwen35Config {
         Ok(cfg)
     }
 
-    fn validate(&self) -> Result<(), String> {
+    /// Layout invariants both blocks rely on. `pub(crate)` so qwen4exp's
+    /// adapter config is held to the same checks.
+    pub(crate) fn validate(&self) -> Result<(), String> {
         if self.d_inner != self.n_v_heads * self.d_state {
             return Err(format!(
                 "ssm.inner_size ({}) != n_v_heads ({}) · d_state ({}) — layout not implemented",

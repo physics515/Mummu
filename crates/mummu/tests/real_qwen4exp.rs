@@ -106,6 +106,20 @@ fn the_shipped_header_parses_to_the_expected_config() {
         );
     }
     assert_eq!(c.ple_total_rows(), 320_001_446, "summed head vocabularies");
+    // The PLE window resets on ITS OWN token, which is not the tokenizer
+    // EOS: hashing with 248046 would select wrong rows after every
+    // document boundary.
+    assert_eq!(c.ple_eos_token_id, 248_044, "qwen4exp.ple.eos_token_id");
+    assert_eq!(c.eos_token_id, 248_046, "tokenizer.ggml.eos_token_id");
+    assert_eq!(c.ple_image_token_id, Some(248_056));
+    assert_eq!(c.vocab_size, 248_320);
+    assert_eq!(c.ple_embed_width(), 2560, "16 rows of 160 per token");
+    // QSA block size 4 on exactly the 12 attention layers, so dense
+    // attention is exact up to 2048 + 4 - 1 cached tokens.
+    for (l, &r) in c.attention_compress_ratios.iter().enumerate() {
+        assert_eq!(r, if c.is_attention(l) { 4 } else { 0 }, "layer {l} ratio");
+    }
+    assert_eq!(c.dense_attention_limit(), Some(2051));
 
     // Tie the config to the tensor it indexes. The table is stored padded:
     // the header's vocabularies sum to fewer rows than the tensor carries,
