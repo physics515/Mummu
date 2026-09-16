@@ -53,6 +53,15 @@ use crate::models::qwen35::{GdnGate, Qwen35Config};
 /// unbounded allocation.
 const MAX_PLE_TABLE: usize = 1024;
 
+/// An integer header value as u64 whatever its stored width or signedness,
+/// refusing negatives. The shipped file stores `attention.compress_ratios`
+/// as a SIGNED array (a strict unsigned read refused the real header), and
+/// converters are free to pick either for ids.
+fn non_negative(v: &GgufValue) -> Option<u64> {
+    v.as_u64()
+        .or_else(|| v.as_i64().and_then(|x| u64::try_from(x).ok()))
+}
+
 /// Hyperparameters of the `qwen4exp` architecture.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Qwen4expConfig {
@@ -252,8 +261,8 @@ impl Qwen4expConfig {
             }
             vals.iter()
                 .map(|v| {
-                    v.as_u64()
-                        .ok_or_else(|| format!("{key} holds a non-integer entry"))
+                    non_negative(v)
+                        .ok_or_else(|| format!("{key} holds a non-integer or negative entry"))
                 })
                 .collect()
         };
@@ -362,13 +371,13 @@ impl Qwen4expConfig {
             // Required, never defaulted to the tokenizer EOS (they differ).
             ple_eos_token_id: u32::try_from(
                 f.get("qwen4exp.ple.eos_token_id")
-                    .and_then(GgufValue::as_u64)
+                    .and_then(non_negative)
                     .ok_or("GGUF metadata missing qwen4exp.ple.eos_token_id")?,
             )
             .map_err(|_| "PLE eos token id does not fit u32".to_string())?,
             ple_image_token_id: f
                 .get("qwen4exp.ple.image_token_id")
-                .and_then(GgufValue::as_u64)
+                .and_then(non_negative)
                 .map(|v| u32::try_from(v).map_err(|_| "PLE image token id does not fit u32"))
                 .transpose()?,
             attention_compress_ratios,
@@ -546,6 +555,16 @@ mod tests {
         assert_eq!(b.gdn_gate, GdnGate::Sigmoid);
         assert_eq!(b.conv_dim(), 10_240);
         assert_eq!((b.hidden_size, b.head_dim, b.rope_dim), (2560, 256, 64));
+    }
+
+    #[test]
+    fn header_integers_are_read_whatever_their_signedness() {
+        // The shipped file stores attention.compress_ratios as a SIGNED
+        // array; a strict unsigned read refused the real header.
+        assert_eq!(non_negative(&GgufValue::I32(4)), Some(4));
+        assert_eq!(non_negative(&GgufValue::U32(248_044)), Some(248_044));
+        assert_eq!(non_negative(&GgufValue::I32(-1)), None, "negatives refused");
+        assert_eq!(non_negative(&GgufValue::F32(4.0)), None, "floats refused");
     }
 
     #[test]

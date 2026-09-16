@@ -662,11 +662,26 @@ impl LoadedQwen4exp {
                 .expect("activation readback")
         };
         let logits = qlinear(&layer.router, m.clone()); // [b, t, n_experts]
+        let logits = host(logits);
+        if trace_enabled() {
+            // The last token's routing, as llama.cpp's ffn_moe_topk /
+            // ffn_moe_weights_norm print it (slot order, best first).
+            let n_exp = self.config.expert_count;
+            let last = &logits[(b * t - 1) * n_exp..];
+            if let Ok(r) = experts::route(last, 1, n_exp, self.config.expert_used_count) {
+                let w: Vec<String> = r.weights.iter().map(|v| format!("{v:.4}")).collect();
+                eprintln!(
+                    "[qwen4exp-trace] ffn_moe_topk-{li} last token: {:?} weights [{}]",
+                    r.ids,
+                    w.join(", ")
+                );
+            }
+        }
         let routed = self
             .experts
             .routed_moe(
                 li,
-                &host(logits),
+                &logits,
                 &host(m.clone()),
                 b * t,
                 self.config.expert_used_count,
