@@ -34,6 +34,12 @@
 //! Not present, and worth stating because both were once assumed: there are
 //! **no MTP/nextn tensors** and **no vision tensors**.
 
+// Forward-pass building blocks, one file each so they can be built and
+// oracle-tested independently of the model assembly in this file.
+pub mod experts;
+pub mod hc;
+pub mod ple;
+
 use crate::gguf::{GgufFile, GgufValue};
 
 /// Upper bound on PLE hash tables carried in the header. The shipped model
