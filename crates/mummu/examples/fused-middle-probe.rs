@@ -15,7 +15,7 @@
 //!
 //! Quiet-box rules apply; read ratios, not absolutes.
 
-use mummu::flex::gdn::{GdnMiddle, gdn_step};
+use mummu::flex::gdn::{GdnGate, GdnMiddle, gdn_step};
 use mummu::flex::kernels::{PackedQ4, gemm_q4n_auto, gemv_q4n_auto};
 
 fn wave(len: usize, f: f32) -> Vec<f32> {
@@ -57,6 +57,8 @@ fn main() {
         dt_bias: wave(hv, 0.7),
         a: wave(hv, 0.3).iter().map(|v| -v.abs() - 0.1).collect(),
         gamma: wave(ds, 0.11),
+        // The qwen35 (27B) gate, which these dims model.
+        gate: GdnGate::Silu,
     };
     let mixed = wave(conv_dim, 0.017);
     let z = wave(d_inner, 0.023);
