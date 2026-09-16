@@ -54,11 +54,18 @@ use crate::gguf::{self, GgmlType, GgufFile};
 /// allowed; `0` disables the cache).
 pub const CACHE_ENV: &str = "MUMMU_QWEN4EXP_EXPERT_CACHE_GB";
 
-/// Cache ceiling when [`CACHE_ENV`] is unset or unparseable: ~100 experts.
-/// Deliberately small — this box hosts dozens of services, and a hot-expert
-/// cache that crowds out the page cache under the NVMe reads it is meant to
-/// save gains nothing.
-pub const DEFAULT_CACHE_GB: f64 = 2.0;
+/// Cache ceiling when [`CACHE_ENV`] is unset or unparseable: OFF.
+///
+/// Measured on the real model (release, 15-token prompts + 24-token greedy,
+/// warm page cache, two sessions on 2026-09-16, co-tenant load 7-14): the
+/// 2 GiB cache this default used to be made prefill 4.4x slower (9.4 s vs
+/// 2.1 s) and decode 2.3x slower (~2.0 vs ~0.87 s/token) with bit-identical
+/// logits, and raised peak RSS from 19.2 to 22.3 GiB. A miss dequantizes and
+/// stores the whole 19.7 MB expert, and ~100 cached experts churn against
+/// the hundreds a prompt routes to per layer, so hits are too rare to repay
+/// it. Opt back in with [`CACHE_ENV`] to measure a workload where they are
+/// not.
+pub const DEFAULT_CACHE_GB: f64 = 0.0;
 
 /// Floor on the selected-probability sum before renormalizing: llama.cpp's
 /// `ggml_clamp(weights_sum, 6.103515625e-5, INF)` — the smallest positive
@@ -1534,6 +1541,7 @@ mod tests {
         assert_eq!(parse(" 0.5 "), 0.5);
         assert_eq!(parse("-1"), DEFAULT_CACHE_GB);
         assert_eq!(parse("lots"), DEFAULT_CACHE_GB);
+        assert_eq!(DEFAULT_CACHE_GB, 0.0, "the measured default is off");
     }
 
     // ---- GGUF-backed banks ------------------------------------------------
