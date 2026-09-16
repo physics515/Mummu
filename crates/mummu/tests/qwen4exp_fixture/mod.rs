@@ -29,6 +29,21 @@ pub const FIXTURE_PATH: &str = concat!(
     "/tests/fixtures/qwen4exp_ud_q4kxl_parity.json"
 );
 
+/// The recorded long-prompt reference: one ~560-token leg whose prefill
+/// crosses nine 64-token GDN chunks and whose attention reads ~560 cached
+/// positions, which the two short legs never exercise.
+pub const LONG_FIXTURE_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/qwen4exp_long_prompt_reference.json"
+);
+
+/// Greedy tokens recorded (and compared id for id) on the long leg.
+pub const LONG_MAX_TOKENS: usize = 16;
+
+/// The long leg's user message: invented local-history notes plus a
+/// question, so the continuation depends on the whole context.
+pub const LONG_PROMPT: &str = include_str!("long_prompt.txt");
+
 /// The shard name both sides open; llama.cpp and `GgufFile::open_sharded`
 /// each follow the `-of-` naming to the other three.
 pub const FIRST_SHARD: &str = "Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf";
@@ -145,10 +160,14 @@ pub struct TopEntry {
 impl Fixture {
     /// Read and parse the committed fixture, refusing a stale format.
     pub fn load() -> Self {
-        let text = std::fs::read_to_string(FIXTURE_PATH)
-            .unwrap_or_else(|e| panic!("read {FIXTURE_PATH}: {e}"));
-        let f: Self =
-            serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {FIXTURE_PATH}: {e}"));
+        Self::load_from(FIXTURE_PATH)
+    }
+
+    /// [`Self::load`] for another recorded fixture of the same shape
+    /// (e.g. [`LONG_FIXTURE_PATH`]).
+    pub fn load_from(path: &str) -> Self {
+        let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        let f: Self = serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {path}: {e}"));
         assert_eq!(
             f.format, FORMAT,
             "fixture format {} but this replay reads {FORMAT} — re-record it",

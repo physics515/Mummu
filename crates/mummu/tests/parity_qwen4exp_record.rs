@@ -39,8 +39,9 @@ use gguf_compare::{MAX_TOKENS, PROMPT, TOP_K};
 use llama_ref::{LlamaServer, parse_completion};
 use mummu::gguf::GgufFile;
 use qwen4exp_fixture::{
-    FIRST_SHARD, FIXTURE_PATH, FORMAT, Fixture, LEGS, Leg, ModelInfo, N_PROBS, ReferenceInfo, Step,
-    TopEntry, compare_leg, render_prompt_ids,
+    FIRST_SHARD, FIXTURE_PATH, FORMAT, Fixture, LEGS, LONG_FIXTURE_PATH, LONG_MAX_TOKENS,
+    LONG_PROMPT, Leg, ModelInfo, N_PROBS, ReferenceInfo, Step, TopEntry, compare_leg,
+    render_prompt_ids,
 };
 
 /// Shard 1 of the split set, when `MUMMU_QWEN4EXP_DIR` names a directory
@@ -92,93 +93,7 @@ fn record_the_qwen4exp_fixture_from_a_running_llama_server() {
 
     let mut legs = Vec::new();
     for (name, prompt) in LEGS {
-        let (rendered, ids) = render_prompt_ids(&tok, prompt);
-        let request = serde_json::json!({
-            "prompt": ids,
-            "n_predict": MAX_TOKENS,
-            "n_probs": N_PROBS,
-            "temperature": 0.0,
-            "top_k": 1,
-            "cache_prompt": false,
-            "return_tokens": true,
-        });
-        eprintln!(
-            "[record/qwen4exp/{name}] {} prompt ids, requesting {MAX_TOKENS} tokens",
-            ids.len()
-        );
-        let started = std::time::Instant::now();
-        let v = server
-            .raw_completion(&request)
-            .expect("reference completion");
-        eprintln!(
-            "[record/qwen4exp/{name}] answered in {:.1} s",
-            started.elapsed().as_secs_f64()
-        );
-
-        // The shared parser is the transport contract every live gate relies
-        // on; running it over this response re-checks its field names and
-        // the no-BOS-injection invariant against the build being recorded.
-        let parsed = parse_completion(&v, ids.len()).expect("response parses like a live gate's");
-        let greedy_ids: Vec<u32> = v["tokens"]
-            .as_array()
-            .expect("return_tokens yields a tokens array")
-            .iter()
-            .map(|t| t.as_u64().expect("token id") as u32)
-            .collect();
-        assert_eq!(
-            parsed.chosen, greedy_ids,
-            "per-position sampled ids disagree with the returned tokens"
-        );
-
-        let positions = v["completion_probabilities"]
-            .as_array()
-            .expect("n_probs yields completion_probabilities");
-        let steps: Vec<Step> = positions
-            .iter()
-            .map(|pos| Step {
-                id: pos["id"].as_u64().expect("position id") as u32,
-                token: token_text(pos),
-                logprob: pos["logprob"].as_f64().expect("position logprob"),
-                top: pos["top_logprobs"]
-                    .as_array()
-                    .expect("top_logprobs")
-                    .iter()
-                    .map(|e| TopEntry {
-                        id: e["id"].as_u64().expect("entry id") as u32,
-                        token: token_text(e),
-                        logprob: e["logprob"].as_f64().expect("entry logprob"),
-                    })
-                    .collect(),
-            })
-            .collect();
-
-        let greedy_text_mummu = tok.decode(&greedy_ids, true).expect("decode");
-        let content = parsed.content;
-        if greedy_text_mummu != content {
-            eprintln!(
-                "[record/qwen4exp/{name}] NOTE server content differs from mummu's decode \
-                 of the same ids:\n  server: {content:?}\n  mummu : {greedy_text_mummu:?}"
-            );
-        }
-        eprintln!("[record/qwen4exp/{name}] greedy: {content:?}");
-        eprintln!("[record/qwen4exp/{name}] timings: {}", v["timings"]);
-
-        let leg = Leg {
-            name: name.to_string(),
-            prompt: prompt.to_string(),
-            rendered,
-            prompt_ids: ids,
-            tokens_evaluated: v["tokens_evaluated"].as_u64().expect("tokens_evaluated") as usize,
-            request,
-            steps,
-            greedy_ids,
-            content,
-            greedy_text_mummu,
-            stop_type: v["stop_type"].as_str().unwrap_or_default().to_string(),
-            timings: v["timings"].clone(),
-        };
-        assert_leg_is_self_consistent(&leg);
-        legs.push(leg);
+        legs.push(record_leg(&server, &tok, name, prompt, MAX_TOKENS));
     }
 
     let fixture = Fixture {
@@ -200,10 +115,156 @@ fn record_the_qwen4exp_fixture_from_a_running_llama_server() {
     eprintln!("[record/qwen4exp] wrote {FIXTURE_PATH}");
 }
 
+/// The long-prompt reference (`LONG_FIXTURE_PATH`), recorded from the same
+/// running server as the short legs: one leg named `long`, [`LONG_PROMPT`]
+/// trimmed, [`LONG_MAX_TOKENS`] greedy tokens. Same variables as
+/// [`record_the_qwen4exp_fixture_from_a_running_llama_server`]; run it with
+/// `--ignored record_the_qwen4exp_long_prompt_reference`.
+#[test]
+#[ignore = "needs a running qwen4exp llama-server (MUMMU_QWEN4EXP_REF_URL) + the shards (MUMMU_QWEN4EXP_DIR)"]
+fn record_the_qwen4exp_long_prompt_reference_from_a_running_llama_server() {
+    let Some(first) = first_shard() else {
+        eprintln!("skipped: set MUMMU_QWEN4EXP_DIR to the shard directory");
+        return;
+    };
+    let Some(url) = std::env::var_os("MUMMU_QWEN4EXP_REF_URL") else {
+        eprintln!("skipped: set MUMMU_QWEN4EXP_REF_URL to a running qwen4exp llama-server");
+        return;
+    };
+    let env_or =
+        |var: &str| std::env::var(var).unwrap_or_else(|_| format!("unrecorded (set {var})"));
+    let tok = tokenizer(&first);
+    let server = LlamaServer::attach(&url.to_string_lossy()).expect("reference server is healthy");
+    let props = server.get_json("/props").expect("GET /props");
+    let leg = record_leg(&server, &tok, "long", LONG_PROMPT.trim(), LONG_MAX_TOKENS);
+    let fixture = Fixture {
+        format: FORMAT,
+        model: ModelInfo {
+            first_shard: FIRST_SHARD.to_string(),
+            ftype: props["model_ftype"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        },
+        reference: ReferenceInfo {
+            image: env_or("MUMMU_QWEN4EXP_REF_IMAGE"),
+            build_info: props["build_info"]
+                .as_str()
+                .expect("/props carries build_info")
+                .to_string(),
+            server_args: env_or("MUMMU_QWEN4EXP_REF_ARGS"),
+        },
+        legs: vec![leg],
+    };
+    let mut json = serde_json::to_string_pretty(&fixture).expect("fixture serializes");
+    json.push('\n');
+    std::fs::write(LONG_FIXTURE_PATH, json).expect("write long fixture");
+    eprintln!("[record/qwen4exp] wrote {LONG_FIXTURE_PATH}");
+}
+
+/// Ask the attached reference for one greedy leg (`max_tokens` generated,
+/// [`N_PROBS`] logprobs per position) on mummu's own ids for `prompt`, and
+/// return it checked for self-consistency.
+fn record_leg(
+    server: &LlamaServer,
+    tok: &tokenizers::Tokenizer,
+    name: &str,
+    prompt: &str,
+    max_tokens: usize,
+) -> Leg {
+    let (rendered, ids) = render_prompt_ids(tok, prompt);
+    let request = serde_json::json!({
+        "prompt": ids,
+        "n_predict": max_tokens,
+        "n_probs": N_PROBS,
+        "temperature": 0.0,
+        "top_k": 1,
+        "cache_prompt": false,
+        "return_tokens": true,
+    });
+    eprintln!(
+        "[record/qwen4exp/{name}] {} prompt ids, requesting {max_tokens} tokens",
+        ids.len()
+    );
+    let started = std::time::Instant::now();
+    let v = server
+        .raw_completion(&request)
+        .expect("reference completion");
+    eprintln!(
+        "[record/qwen4exp/{name}] answered in {:.1} s",
+        started.elapsed().as_secs_f64()
+    );
+
+    // The shared parser is the transport contract every live gate relies
+    // on; running it over this response re-checks its field names and
+    // the no-BOS-injection invariant against the build being recorded.
+    let parsed = parse_completion(&v, ids.len()).expect("response parses like a live gate's");
+    let greedy_ids: Vec<u32> = v["tokens"]
+        .as_array()
+        .expect("return_tokens yields a tokens array")
+        .iter()
+        .map(|t| t.as_u64().expect("token id") as u32)
+        .collect();
+    assert_eq!(
+        parsed.chosen, greedy_ids,
+        "per-position sampled ids disagree with the returned tokens"
+    );
+
+    let positions = v["completion_probabilities"]
+        .as_array()
+        .expect("n_probs yields completion_probabilities");
+    let steps: Vec<Step> = positions
+        .iter()
+        .map(|pos| Step {
+            id: pos["id"].as_u64().expect("position id") as u32,
+            token: token_text(pos),
+            logprob: pos["logprob"].as_f64().expect("position logprob"),
+            top: pos["top_logprobs"]
+                .as_array()
+                .expect("top_logprobs")
+                .iter()
+                .map(|e| TopEntry {
+                    id: e["id"].as_u64().expect("entry id") as u32,
+                    token: token_text(e),
+                    logprob: e["logprob"].as_f64().expect("entry logprob"),
+                })
+                .collect(),
+        })
+        .collect();
+
+    let greedy_text_mummu = tok.decode(&greedy_ids, true).expect("decode");
+    let content = parsed.content;
+    if greedy_text_mummu != content {
+        eprintln!(
+            "[record/qwen4exp/{name}] NOTE server content differs from mummu's decode \
+             of the same ids:\n  server: {content:?}\n  mummu : {greedy_text_mummu:?}"
+        );
+    }
+    eprintln!("[record/qwen4exp/{name}] greedy: {content:?}");
+    eprintln!("[record/qwen4exp/{name}] timings: {}", v["timings"]);
+
+    let leg = Leg {
+        name: name.to_string(),
+        prompt: prompt.to_string(),
+        rendered,
+        prompt_ids: ids,
+        tokens_evaluated: v["tokens_evaluated"].as_u64().expect("tokens_evaluated") as usize,
+        request,
+        steps,
+        greedy_ids,
+        content,
+        greedy_text_mummu,
+        stop_type: v["stop_type"].as_str().unwrap_or_default().to_string(),
+        timings: v["timings"].clone(),
+    };
+    assert_leg_is_self_consistent(&leg, max_tokens);
+    leg
+}
+
 /// Invariants a replayable leg must satisfy, checked when recording AND on
 /// the committed file (so a hand edit or a partial re-record fails here, not
 /// as a confusing parity divergence later).
-fn assert_leg_is_self_consistent(leg: &Leg) {
+fn assert_leg_is_self_consistent(leg: &Leg, max_tokens: usize) {
     let name = &leg.name;
     assert_eq!(
         leg.tokens_evaluated,
@@ -212,7 +273,7 @@ fn assert_leg_is_self_consistent(leg: &Leg) {
     );
     assert!(!leg.steps.is_empty(), "[{name}] no generated positions");
     assert!(
-        leg.steps.len() <= MAX_TOKENS,
+        leg.steps.len() <= max_tokens,
         "[{name}] more positions than requested"
     );
     assert_eq!(
@@ -267,7 +328,7 @@ fn the_committed_qwen4exp_fixture_is_self_consistent() {
     );
     assert_eq!(fixture.model.first_shard, FIRST_SHARD);
     for leg in &fixture.legs {
-        assert_leg_is_self_consistent(leg);
+        assert_leg_is_self_consistent(leg, MAX_TOKENS);
         assert!(
             leg.rendered.ends_with("<|im_start|>assistant\n"),
             "[{}] the rendering opens the assistant turn",
@@ -304,4 +365,30 @@ fn the_reference_replayed_against_itself_passes_the_gate() {
         }
         compare_leg(leg, &logits, &leg.greedy_ids, &tok);
     }
+}
+
+/// The committed long-prompt reference parses and is internally consistent,
+/// and its prompt is still [`LONG_PROMPT`]. Default test pass, no model.
+#[test]
+fn the_committed_long_prompt_reference_is_self_consistent() {
+    let fixture = Fixture::load_from(LONG_FIXTURE_PATH);
+    assert_eq!(fixture.legs.len(), 1, "one long leg");
+    let leg = fixture.leg("long");
+    assert_eq!(
+        leg.prompt,
+        LONG_PROMPT.trim(),
+        "the recorded prompt is LONG_PROMPT"
+    );
+    assert_eq!(
+        leg.greedy_ids.len(),
+        LONG_MAX_TOKENS,
+        "no early stop recorded"
+    );
+    assert!(
+        leg.prompt_ids.len() > 512,
+        "the long leg must cross several 64-token GDN chunks: {} ids",
+        leg.prompt_ids.len()
+    );
+    assert_leg_is_self_consistent(leg, LONG_MAX_TOKENS);
+    assert_eq!(fixture.model.first_shard, FIRST_SHARD);
 }

@@ -430,3 +430,71 @@ fn the_gate_is_tighter_than_llama_cpps_own_spread_on_this_model() {
         "the recorded variants no longer replay as measured"
     );
 }
+
+/// Long-context structure against llama.cpp: the recorded ~560-token leg
+/// (`qwen4exp_fixture::LONG_FIXTURE_PATH`) crosses nine GDN chunks and
+/// attends over hundreds of cached positions, which the two short legs never
+/// reach. The verdict is the part of the reference that is NOT arithmetic
+/// noise: the first forward's top-1 and all [`qwen4exp_fixture::LONG_MAX_TOKENS`]
+/// greedy ids, id for id. The tail logprobs are printed, not bounded (at
+/// -20 nats they sit inside llama.cpp's own spread; see
+/// `the_gate_is_tighter_than_llama_cpps_own_spread_on_this_model`).
+#[test]
+#[ignore = "needs MUMMU_QWEN4EXP_DIR and ~25 GB RAM"]
+fn long_prompt_greedy_matches_the_recorded_llama_cpp_reference() {
+    let Some(first) = first_shard() else {
+        eprintln!("skipped: set MUMMU_QWEN4EXP_DIR to the shard directory");
+        return;
+    };
+    let fx = Fixture::load_from(qwen4exp_fixture::LONG_FIXTURE_PATH);
+    let leg = fx.leg("long");
+    let (model, tok) = load(&first);
+    let (rendered, ids) = qwen4exp_fixture::render_prompt_ids(&tok, &leg.prompt);
+    assert_eq!(
+        rendered, leg.rendered,
+        "ChatMl::qwen3() renders differently"
+    );
+    assert_eq!(
+        ids, leg.prompt_ids,
+        "our tokenizer no longer produces the recorded ids"
+    );
+    let device = mummu::backend::cpu_device();
+
+    let t0 = Instant::now();
+    let mut cache = model.new_cache();
+    let logits = readback(model.forward(&leg.prompt_ids, 0, &mut cache, &device));
+    let prefill = t0.elapsed().as_secs_f64();
+    drop(cache);
+    let t1 = Instant::now();
+    let greedy = pollster::block_on(model.greedy_generate(
+        &leg.prompt_ids,
+        qwen4exp_fixture::LONG_MAX_TOKENS,
+        &device,
+    ))
+    .expect("greedy decode");
+    let generate = t1.elapsed().as_secs_f64();
+    let ours_top = top(&logits, 5);
+    let ref_top = leg.first_forward_top();
+    let (rss, hwm) = rss_mib();
+    eprintln!(
+        "[long/qwen4exp] {} prompt tokens: prefill {prefill:.1} s ({:.3} s/token); greedy {} tokens in \
+         {generate:.1} s (~{:.2} s/decode token after its prefill); RSS {rss} MiB, peak {hwm} MiB\n\
+         [long/qwen4exp] ours top-5 {ours_top:?}\n[long/qwen4exp] ref  top-5 {ref_top:?}\n\
+         [long/qwen4exp] ours greedy {greedy:?} {:?}\n[long/qwen4exp] ref  greedy {:?} {:?}",
+        leg.prompt_ids.len(),
+        prefill / leg.prompt_ids.len() as f64,
+        greedy.len(),
+        (generate - prefill).max(0.0) / greedy.len().saturating_sub(1).max(1) as f64,
+        tok.decode(&greedy, true).unwrap_or_default(),
+        leg.greedy_ids,
+        leg.content,
+    );
+    assert_eq!(
+        ours_top[0].0, ref_top[0].0,
+        "first-forward top-1 differs from llama.cpp on the long prompt"
+    );
+    assert_eq!(
+        greedy, leg.greedy_ids,
+        "greedy ids differ from llama.cpp on the long prompt"
+    );
+}
