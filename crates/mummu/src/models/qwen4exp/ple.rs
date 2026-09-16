@@ -1574,13 +1574,91 @@ mod tests {
         let emb = table.embed(&hash, &[], &tokens).expect("embed");
         assert_eq!(emb.len(), 3 * 2560, "16 x 160 per token");
         assert!(emb.iter().all(|v| v.is_finite()), "finite values");
-        let mean_abs = emb.iter().map(|v| v.abs()).sum::<f32>() / emb.len() as f32;
-        println!("3-token PLE embedding: mean |x| = {mean_abs:.5}");
-        assert!(mean_abs > 0.0, "not an all-zero read");
+        let sum_abs: f64 = emb.iter().map(|v| f64::from(v.abs())).sum();
+        println!(
+            "3-token PLE embedding: mean |x| = {:.5}, sum |x| = {sum_abs:.6}",
+            sum_abs / emb.len() as f64
+        );
+        // Pinned to an independent read of the same shard: the numpy
+        // transformers transcription (tools/qwen4exp_ple_rows.py) for the row
+        // ids, a hand-written numpy IQ4_NL decode for the values (2026-09-16).
+        // This proves the payload base, the 90-byte row stride and the head
+        // concatenation order on the real file, not just on synthetic bytes.
+        assert_eq!(
+            hash.rows_for_span(&[], &tokens[..1]),
+            [
+                16_410_909,
+                39_682_429,
+                55_103_279,
+                60_931_720,
+                87_006_904,
+                116_506_179,
+                131_512_017,
+                152_932_897,
+                169_641_436,
+                182_022_480,
+                209_277_433,
+                237_891_023,
+                256_841_529,
+                277_007_269,
+                290_665_954,
+                300_984_276
+            ],
+            "token 0 rows"
+        );
+        let want: [([f32; 4], f32); 3] = [
+            (
+                [
+                    -0.001_728_534_698_486_328,
+                    0.004_321_336_746_215_82,
+                    -0.011_235_475_540_161_133,
+                    0.004_321_336_746_215_82,
+                ],
+                -0.008_677_840_232_849_121,
+            ),
+            (
+                [
+                    0.007_189_035_415_649_414,
+                    -0.008_647_680_282_592_773,
+                    -0.005_105_257_034_301_758,
+                    0.002_604_722_976_684_570_3,
+                ],
+                -0.010_248_899_459_838_867,
+            ),
+            (
+                [
+                    0.006_341_934_204_101_562_5,
+                    0.014_853_477_478_027_344,
+                    0.008_845_329_284_667_969,
+                    0.008_845_329_284_667_969,
+                ],
+                -0.005_594_491_958_618_164,
+            ),
+        ];
+        for (tok, (first, last)) in want.iter().enumerate() {
+            assert_eq!(
+                &emb[tok * 2560..tok * 2560 + 4],
+                first,
+                "token {tok} head-0 values"
+            );
+            assert_eq!(
+                emb[tok * 2560 + 2559],
+                *last,
+                "token {tok} last value (head 15)"
+            );
+        }
+        assert!((sum_abs - 47.667_745).abs() < 1e-4, "sum |x| = {sum_abs}");
 
         // 1000 random single-token gathers (16 preads + dequant each), with
-        // random predecessors so the rows spread over the whole table.
-        let mut s = 0x5EED_u64;
+        // random predecessors so the rows spread over the whole table. The
+        // seed comes from the clock so the first pass really is cold (a fixed
+        // seed would find its rows in the page cache on every rerun); the
+        // second pass re-reads the same rows warm.
+        let mut s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0x5EED, |d| d.as_nanos() as u64)
+            | 1;
+        println!("gather seed {s:#x}");
         let mut next = move || {
             s ^= s << 13;
             s ^= s >> 7;
@@ -1591,7 +1669,7 @@ mod tests {
             .map(|_| std::array::from_fn(|_| (next() % 248_000) as u32))
             .collect();
         let mut out = vec![0f32; 2560];
-        for pass in ["cold", "warm"] {
+        for pass in ["first pass, cold", "second pass, warm"] {
             let start = std::time::Instant::now();
             for t in &toks {
                 let rows = hash.rows_for_span(&t[..2], &t[2..]);
