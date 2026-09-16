@@ -193,11 +193,14 @@ fn trace_the_primes_prefill() {
 /// exact f32 path under the same perturbations as the control (which must not
 /// move). Compare the printed spread with
 /// `the_gate_is_tighter_than_llama_cpps_own_spread_on_this_model`'s
-/// realizations. Measured 2026-09-16 (11 emulated realizations): primes
-/// `<|im_end|>` mean -14.99, sd 0.49 (llama.cpp's 4 distinct: mean -15.06,
-/// sd 0.33); moon mean -12.33, sd 0.24 (llama.cpp: -12.22, sd 0.30); the
-/// unchanged verdict passed both legs in 5 of 11. `NOISE_SEEDS` (default 8)
-/// and `NOISE_EPS` (default 1e-5) tune the sampling.
+/// realizations. Measured 2026-09-16, 11 emulated realizations per run:
+/// primes `<|im_end|>` mean -14.94, sd 0.61 (llama.cpp's 4 distinct
+/// realizations: -15.06, sd 0.33); moon -12.39, sd 0.21 (llama.cpp: -12.22,
+/// sd 0.30); the unchanged verdict passed both legs in 2 of 11. The same run
+/// before the chunked-GDN solve changed (a 6e-6 move on the exact path) drew
+/// entirely different realizations (means -14.99 / -12.33, both legs in 5 of
+/// 11): the emulated forward is as chaotic as the reference. `NOISE_SEEDS`
+/// (default 8) and `NOISE_EPS` (default 1e-5) tune the sampling.
 #[test]
 #[ignore = "diagnostic: needs MUMMU_QWEN4EXP_DIR and ~25 GB RAM"]
 fn noise_realizations_of_the_first_forward() {
