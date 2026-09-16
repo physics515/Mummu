@@ -18,6 +18,7 @@ pub use attention::{
 pub use conv::{ConvState, ShortConv, ShortConvConfig};
 pub use mlp::{SwiGluMlp, SwiGluMlpConfig};
 pub mod packed_gemv;
+pub mod refarith;
 pub use moe::{
     DeviceExpert, ExpertExec, ExpertPool, ExpertWeights, MoeExperts, Routing, SparseMoe,
     SparseMoeConfig, SparseMoePerExpert, StagedExpert, trace_layer, trace_us,

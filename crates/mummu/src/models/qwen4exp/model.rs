@@ -597,6 +597,15 @@ pub fn load_from_gguf(first_shard: &Path, device: &Device) -> Result<LoadedQwen4
                     info.name, info.dims, spec.ne
                 )));
             }
+            if spec.kind == Kind::Linear && info.dtype != crate::gguf::GgmlType::F32 {
+                // `nn::refarith` needs each quantized linear's file dtype to
+                // pick llama.cpp's activation grid; inert unless enabled.
+                crate::nn::refarith::register_linear(
+                    spec.ne[0] as usize,
+                    spec.ne[1] as usize,
+                    info.dtype,
+                );
+            }
             let values = f
                 .read_tensor_f32(&info.name)
                 .map_err(|e| parse(e.to_string()))?;
@@ -661,7 +670,13 @@ impl LoadedQwen4exp {
                 .try_into_vec::<f32>()
                 .expect("activation readback")
         };
-        let logits = qlinear(&layer.router, m.clone()); // [b, t, n_experts]
+        // F32 router: a plain matmul (never activation-quantized, and its
+        // 2560->512 shape collides with the Q8_0 attn_k/attn_v registry key).
+        let logits = m
+            .clone()
+            .reshape([b * t, e])
+            .matmul(layer.router.weight.val())
+            .reshape([b, t, self.config.expert_count]);
         let logits = host(logits);
         if trace_enabled() {
             // The last token's routing, as llama.cpp's ffn_moe_topk /
@@ -754,6 +769,7 @@ impl LoadedQwen4exp {
         )
         .reshape([1, t]);
         let x = self.model.embed_tokens.forward(input).to_device(device); // [1, t, E]
+        let x = crate::nn::refarith::perturb_embedding(x);
         if trace {
             trace3("model.input_embed", &x, 1);
         }

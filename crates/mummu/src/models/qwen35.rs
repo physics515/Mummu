@@ -220,7 +220,7 @@ pub(crate) fn qlinear(l: &Linear, x: Tensor<3>) -> Tensor<3> {
     let [b, t, d_in] = x.dims();
     let w = l.weight.val(); // [in, out]
     let d_out = w.dims()[1];
-    let x2 = x.reshape([b * t, d_in]);
+    let x2 = crate::nn::refarith::linear_input2(x.reshape([b * t, d_in]), d_in, d_out);
     // Decode-shape quantized weights take the packed GEMV (reads the
     // stored bytes directly; on flex that is the i8 slab at 1.125 B/elem
     // against the 4 B/elem an f32 slab moves). Anything else — prefill,
@@ -236,6 +236,8 @@ pub(crate) fn qlinear(l: &Linear, x: Tensor<3>) -> Tensor<3> {
 pub(crate) fn qlinear2(l: &Linear, x: Tensor<2>) -> Tensor<2> {
     debug_assert!(l.bias.is_none(), "qwen35 projections are bias-free");
     let w = l.weight.val();
+    let [w_in, w_out] = w.dims();
+    let x = crate::nn::refarith::linear_input2(x, w_in, w_out);
     match crate::nn::try_q4s_gemv(&x, &w) {
         Some(y) => y,
         None => x.matmul(w),
@@ -355,23 +357,31 @@ impl GatedAttention {
         let (k_all, v_all) = crate::nn::kv_append(kv, k_new, v_new);
 
         let group = nh / nkv;
-        let k = repeat_kv(k_all, group);
-        let v = repeat_kv(v_all, group).cast(ambient);
-        drop(_s_kv);
-        let _s_scores = crate::prof::scope("fa.scores");
-
-        // f32 island for the scores — the same overflow guard as GqaAttention.
         let scale = 1.0 / (hd as f32).sqrt();
-        let mut scores = q
-            .cast(DType::F32)
-            .matmul(k.cast(DType::F32).swap_dims(2, 3))
-            .mul_scalar(scale);
-        if let Some(m) = mask {
-            scores = scores.add(m.clone().cast(DType::F32));
-        }
-        let probs = activation::softmax(scores, 3).cast(ambient);
-        let ctx = probs.matmul(v); // [b, nh, t, hd]
-        drop(_s_scores);
+        // Diagnostic only (`nn::refarith`, off by default): ggml's CPU flash
+        // attention arithmetic over an f16 cache, host-side.
+        let ctx = if crate::nn::refarith::enabled() {
+            drop(_s_kv);
+            crate::nn::refarith::flash_attn_f16(q, k_all, v_all, scale)
+        } else {
+            let k = repeat_kv(k_all, group);
+            let v = repeat_kv(v_all, group).cast(ambient);
+            drop(_s_kv);
+            let _s_scores = crate::prof::scope("fa.scores");
+
+            // f32 island for the scores — the same overflow guard as GqaAttention.
+            let mut scores = q
+                .cast(DType::F32)
+                .matmul(k.cast(DType::F32).swap_dims(2, 3))
+                .mul_scalar(scale);
+            if let Some(m) = mask {
+                scores = scores.add(m.clone().cast(DType::F32));
+            }
+            let probs = activation::softmax(scores, 3).cast(ambient);
+            let ctx = probs.matmul(v); // [b, nh, t, hd]
+            drop(_s_scores);
+            ctx
+        };
         let _s = crate::prof::scope("fa.out");
 
         // Per-head output gate: out ⊙ sigmoid(gate).

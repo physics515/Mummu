@@ -42,7 +42,7 @@ pub(super) fn linear3(l: &Linear, x: Tensor<3>) -> Tensor<3> {
         w_in, d_in,
         "projection expects {w_in} input features, got {d_in}"
     );
-    let x2 = x.reshape([b * t, d_in]);
+    let x2 = crate::nn::refarith::linear_input2(x.reshape([b * t, d_in]), d_in, d_out);
     let y = match crate::nn::try_q4s_gemv(&x2, &w) {
         Some(y) => y,
         None => x2.matmul(w),

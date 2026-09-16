@@ -768,14 +768,32 @@ impl ExpertWeights<'_> {
 
     /// `down(silu(gate·x) · (up·x))` over `n` rows.
     fn ffn(&self, xs: &[f32], n: usize) -> Result<Vec<f32>, String> {
+        // Diagnostic only (`nn::refarith`, off by default): quantize the
+        // activation to the bank's ggml vec_dot grid first, as llama.cpp's
+        // CPU mul_mat_id does. Only the quantized banks know their dtype,
+        // which is why `expert_ffn` skips the f32 cache while it is on.
+        let fq = |kind: BankKind, v: &[f32]| -> Option<Vec<f32>> {
+            match self {
+                Self::Quant(layer, _) if crate::nn::refarith::enabled() => {
+                    let b = layer.bank(kind);
+                    let mut o = v.to_vec();
+                    crate::nn::refarith::fake_quant_rows(&mut o, b.in_dim(), b.dtype());
+                    Some(o)
+                }
+                _ => None,
+            }
+        };
+        let xg = fq(BankKind::Gate, xs);
+        let xu = fq(BankKind::Up, xs);
         let (g, u) = rayon::join(
-            || self.matvec(BankKind::Gate, xs, n),
-            || self.matvec(BankKind::Up, xs, n),
+            || self.matvec(BankKind::Gate, xg.as_deref().unwrap_or(xs), n),
+            || self.matvec(BankKind::Up, xu.as_deref().unwrap_or(xs), n),
         );
         let (mut h, u) = (g?, u?);
         for (hi, &ui) in h.iter_mut().zip(&u) {
             *hi = silu(*hi) * ui;
         }
+        let h = fq(BankKind::Down, &h).unwrap_or(h);
         self.matvec(BankKind::Down, &h, n)
     }
 }
@@ -960,7 +978,12 @@ impl RoutedExperts {
             return Ok(Vec::new());
         }
         let banks = &self.layers[layer];
-        if let Some(cache) = &self.cache {
+        // The emulation needs the quantized banks' dtypes (see `ffn`).
+        if let Some(cache) = self
+            .cache
+            .as_ref()
+            .filter(|_| !crate::nn::refarith::enabled())
+        {
             let dense = cache.get_or_load((layer, expert), self.dense_expert_bytes(), || {
                 let (gu, down) = rayon::join(
                     || {

@@ -46,6 +46,14 @@ pub const N_PROBS: usize = 10;
 /// product on a K-quant file; our path dequantizes weights to f32 once). The
 /// Flash-Next file is the same K-quant/Q8_0 regime, so the same bound applies
 /// until a measurement on this model says otherwise.
+///
+/// That measurement now exists and says the bound (with the strict top-3
+/// order) is tighter than llama.cpp's own spread on this model:
+/// `parity_qwen4exp::the_gate_is_tighter_than_llama_cpps_own_spread_on_this_model`
+/// replays llama.cpp under `--no-repack` / `-fa off` against this fixture and
+/// three of those settings fail at least one leg (worst rank-aligned
+/// |Δlogprob| 0.94, and top-3 swaps). The value is deliberately unchanged
+/// here: re-scoping the qwen4exp verdict is the owner's call.
 pub const LOGPROB_ABS_TOLERANCE: f64 = 7.5e-1;
 
 /// The recorded legs as `(name, user prompt)`. The first is the prompt every
