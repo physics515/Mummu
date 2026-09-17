@@ -2534,8 +2534,37 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       **Two real bugs found by that parity work, both in code the production 27B shares:**
       (1) **DeltaNet q/k L2 norm form.** mummu used `x / max(|x|, eps)`; llama.cpp master and transformers use
       `x / sqrt(|x|^2 + eps)`. Flash-Next's keys reach |k| ~ 1e-3, where the forms differ by up to 40% per head
-      and the block output by 1.5e-2. Now a parameter (`GdnL2`): qwen4exp uses AddEps; qwen35 keeps ClampNorm
-      (re-measured below: the form is noise-level on qwen35).
+      and the block output by 1.5e-2. Now a parameter (`GdnL2`), and **both families use AddEps** since
+      2026-09-16 (qwen35 kept ClampNorm for one day; the decision and its numbers follow).
+      **qwen35 L2 verdict (2026-09-16): switch to AddEps — the form is below noise on every qwen35 checkpoint
+      measured, so the tie goes to the one that is right when keys are tiny.**
+      *Which form the references use* (source at the exact commits + `--version` of each binary): llama.cpp
+      changed every DeltaNet graph (qwen35, qwen35moe, qwen3next, qwen4exp, kimi-linear, ...) from
+      `ggml_l2_norm` to `build_gdn_l2_norm` in PR #28068 (merged 2026-09-06, citing FLA/FlashQLA, transformers
+      and vLLM, none of which ever clamped). `ghcr.io/ggml-org/llama.cpp:full` b10991 (930e2fa59) is after it:
+      **AddEps**. ollama 0.34.0 pins b10760 = 0f3a71be1 (2026-09-02, `LLAMA_CPP_VERSION`), and neither of its
+      two llama.cpp patches touches a model graph: its bundled llama-server is **ClampNorm**.
+      *Head norms* (`examples/gdn-l2-probe.rs` + the `qwen35::gdn_l2_probe` tap; 6 chat prompts of 15-159
+      tokens: primes, arithmetic, Rust code, a 4-turn JSON request, FR/DE translation, a 150-word summary).
+      Qwen3.8-27B UD-Q4_K_S at Q8 on flex: min |k| **1.4e-2** (layer 44), min |q| 4.1e-2; worst per-head form
+      difference 2.5e-3, no (token, head) of 297,216 at >= 1e-2, 36 at >= 1e-3. Switching moved logprobs by
+      2.4e-4..6.4e-4 with top-5 order identical on all 6 prompts and 12/12 greedy ids identical on all 6.
+      Qwen3.5-2B BF16 (flex and wgpu give the same table): min |k| 6.4e-3 (layer 9), 6 of 111,456 at >= 1e-2;
+      logprobs move <= 2.5e-4, top-5 and 24/24 greedy identical on all 6. Flash-Next's keys are ~14x smaller
+      than the 27B's smallest.
+      *Parity legs* (2B BF16, wgpu, default features, 15-token prompt):
+      | mummu form | reference | leg 1 top-5 | max \|Δlogprob\| | leg 2 greedy |
+      |---|---|---|---:|---|
+      | ClampNorm | ollama b10760 (ClampNorm) | exact | 5.0230e-2 | 24/24 |
+      | ClampNorm | b10991 (AddEps) | **FAIL**, ranks 4/5 swapped | 5.2929e-2 | 24/24 |
+      | AddEps | ollama b10760 | exact | 5.0281e-2 | 24/24 |
+      | AddEps | b10991 | **FAIL**, same swap | 5.2879e-2 | 24/24 |
+      Each form lands ~5e-5 closer to the build that shares it; pass/fail does not move (a repeat on the final
+      AddEps tree read 5.0276e-2 / 5.2874e-2, so same-code runs differ by ~6e-6). The b10991 leg-1
+      failure is NOT the L2 form: the two llama.cpp builds put id 760 at -18.799 vs -18.924 (0.125 apart) and
+      id 16 0.062 apart, while the form moves ours by <= 1.5e-4 and our 248069/760 gap is 0.032. What else
+      changed between b10760 and b10991 for this model is open; until it is known, the qwen35 gate's verdict
+      is a property of (mummu, reference build), not of mummu alone.
       (2) **The chunked DeltaNet prefill could produce NaN.** `gdn_recurrence_chunked` formed `(I+A)^-1`
       as a finite Neumann sum; with repeated keys and weak decay its terms reach binomials ~5e17 and f32
       cancellation returns garbage (unit repro `chunked_recurrence_survives_repeated_keys`: the old code
@@ -2550,8 +2579,8 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       own branch (`fix/qwen35-gdn-chunked-nan`, one commit + a ROADMAP correction under the P5
       chunked-prefill item) so production need not wait for this port. Same run, on the L2 question:
       switching qwen35 to AddEps moves its logprobs by only 1.6e-4..8.4e-4 against a 1.3e-2..7.6e-2
-      residual, in no consistent direction — keep ClampNorm for qwen35; the form only matters where keys
-      are tiny, as on Flash-Next.
+      residual, in no consistent direction. (That run concluded "keep ClampNorm"; the 27B measurement and
+      reference-build check under (1) above reversed it the same day.)
       **Speed on this path (CPU, f32 trunk, warm page cache, box load 8-11 from co-tenants):** load 3.6-4.3 s,
       RSS 19.0 GiB; 15-token prefill 2.1-2.3 s (0.14-0.15 s/token), 559-token prefill 26.5 s (0.047 s/token);
       decode **0.87-0.91 s/token**. The f32 trunk (~20 GB streamed per token) dominates; the experts cost

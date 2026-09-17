@@ -16,8 +16,8 @@
 //! - **Gated DeltaNet** (the rest): one projection mixes q/k/v, a second
 //!   emits the gate `z`; the mix runs through a depthwise causal conv
 //!   (kernel `conv_kernel`, rolling state) + SiLU; q/k are L2-normalized
-//!   per head (`x / max(‖x‖, ε)` here, `x / sqrt(‖x‖² + ε)` for qwen4exp:
-//!   [`Qwen35Config::gdn_l2`]) and tiled from `n_k_heads` to
+//!   per head (`x / sqrt(‖x‖² + ε)`, [`Qwen35Config::gdn_l2`]) and tiled
+//!   from `n_k_heads` to
 //!   `n_v_heads`; the recurrence per head with state `S ∈ R^{d_k×d_v}`:
 //!   `S ← S·exp(g);  v̂ = Sᵀk;  S += k(β(v − v̂))ᵀ;  o = Sᵀ(q/√d_k)` with
 //!   `β = σ(x·Wβ)` and `g = softplus(x·Wα + dt_bias)·a` (`a` holds
@@ -87,8 +87,8 @@ pub struct Qwen35Config {
     /// qwen35, [`GdnGate::Sigmoid`] when qwen4exp drives these blocks.
     pub gdn_gate: GdnGate,
     /// Where `rms_norm_eps` enters the DeltaNet's q/k L2 norms. Not in the
-    /// header either: [`GdnL2::ClampNorm`] for qwen35 (the form its parity
-    /// fixtures were recorded against), [`GdnL2::AddEps`] for qwen4exp.
+    /// header either: [`GdnL2::AddEps`] for both qwen35 and qwen4exp, the
+    /// form the checkpoints were trained with.
     pub gdn_l2: GdnL2,
     pub eos_token_id: EosIds,
 }
@@ -180,11 +180,15 @@ impl Qwen35Config {
             n_v_heads: meta_usize("qwen35.ssm.time_step_rank")?,
             // llama.cpp qwen35.cpp build_norm_gated: ggml_silu(z).
             gdn_gate: GdnGate::Silu,
-            // Unchanged from the parity-checked port. transformers and
-            // llama.cpp master both use GdnL2::AddEps for this family too;
-            // switching needs the qwen35 parity legs rerun, which the
-            // qwen4exp change (found by its teacher-forced dump) did not do.
-            gdn_l2: GdnL2::ClampNorm,
+            // The training-time form (FLA/transformers l2norm) and llama.cpp's
+            // since PR #28068 (b10991 has it; ollama 0.34.0's b10760 does
+            // not). On this family's real weights the choice is below noise —
+            // Qwen3.8-27B's smallest key norm over six prompts is 1.4e-2, and
+            // switching moved its logprobs by <= 6.4e-4 with top-5 and greedy
+            // ids unchanged; the 2B parity legs pass or fail identically
+            // under both forms against both llama.cpp builds — so the tie goes
+            // to the form that stays right when keys are tiny (see GdnL2).
+            gdn_l2: GdnL2::AddEps,
             eos_token_id: EosIds::One(u32::try_from(eos).map_err(|_| "EOS out of u32")?),
         };
         cfg.validate()?;

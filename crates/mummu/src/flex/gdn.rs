@@ -77,12 +77,15 @@ pub enum GdnGate {
 /// for [`GdnGate`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GdnL2 {
-    /// `x / max(‖x‖, ε)` — `ggml_l2_norm`, the form mummu's qwen35 port was
-    /// parity-checked with.
+    /// `x / max(‖x‖, ε)` — `ggml_l2_norm`, which llama.cpp's DeltaNet graphs
+    /// used before PR #28068 (b10760 and older, e.g. ollama 0.34.0's bundled
+    /// llama-server) and qwen35 here used until 2026-09-16. Kept to reproduce
+    /// those references.
     ClampNorm,
-    /// `x / sqrt(‖x‖² + ε)` — transformers' (FLA) `l2norm` and llama.cpp
-    /// master's `build_gdn_l2_norm` (`rms_norm(x, ε/n) / sqrt(n)`), which
-    /// its qwen4exp graph uses.
+    /// `x / sqrt(‖x‖² + ε)` — transformers' (FLA) `l2norm` and llama.cpp's
+    /// `build_gdn_l2_norm` (`rms_norm(x, ε/n) / sqrt(n)`) since PR #28068,
+    /// used by its qwen35 and qwen4exp graphs (b10991 onward). Both mummu
+    /// families use it.
     AddEps,
 }
 
@@ -91,8 +94,8 @@ impl GdnL2 {
     ///
     /// Returned as the norm rather than its inverse so callers divide by it:
     /// `scale / n` and `scale * (1 / n)` differ by one ulp on about a quarter
-    /// of f32 inputs, and the [`GdnL2::ClampNorm`] arm must stay bit-identical
-    /// to the qwen35 fused step its parity fixtures were recorded against.
+    /// of f32 inputs, and the [`GdnL2::ClampNorm`] arm stays bit-identical to
+    /// the fused step qwen35 measurements before 2026-09-16 were taken with.
     #[inline]
     #[must_use]
     pub fn norm(self, sum_sq: f32, eps: f32) -> f32 {
