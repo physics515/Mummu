@@ -186,6 +186,44 @@ fn trace_the_primes_prefill() {
     );
 }
 
+/// Teacher-forced per-op check against a FULL-precision llama.cpp dump of
+/// one leg's prefill (`tools/qwen4exp_dump_tensors.cpp`): every named op
+/// gets llama.cpp's exact input, so each printed `rel` is that op's own
+/// error. `MUMMU_QWEN4EXP_TEACHER=<dump>/<leg>` selects the leg by the
+/// directory name; add `MUMMU_REF_ARITH=1` to use llama.cpp's activation
+/// grids (then a structurally identical op agrees to ~1e-4 or better), and
+/// `MUMMU_QWEN4EXP_TEACHER_FORCE=0` to compare without forcing.
+#[test]
+#[ignore = "diagnostic: needs MUMMU_QWEN4EXP_DIR, MUMMU_QWEN4EXP_TEACHER and ~25 GB RAM"]
+fn teacher_forced_ops_against_a_llama_cpp_dump() {
+    let Some(first) = first_shard() else {
+        eprintln!("skipped: set MUMMU_QWEN4EXP_DIR to the shard directory");
+        return;
+    };
+    let Some(dump) = std::env::var_os("MUMMU_QWEN4EXP_TEACHER").map(PathBuf::from) else {
+        eprintln!("skipped: set MUMMU_QWEN4EXP_TEACHER to a dumped leg directory");
+        return;
+    };
+    let name = dump
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("the dump directory is named after its leg")
+        .to_string();
+    let fx = Fixture::load();
+    let leg = fx.leg(&name);
+    let (model, _tok) = load(&first);
+    let device = mummu::backend::cpu_device();
+    let mut cache = model.new_cache();
+    let t0 = Instant::now();
+    let logits = readback(model.forward(&leg.prompt_ids, 0, &mut cache, &device));
+    eprintln!(
+        "[teacher/qwen4exp/{name}] prefill {:.2} s; ours top-5 {:?}; ref top-5 {:?}",
+        t0.elapsed().as_secs_f64(),
+        top(&logits, 5),
+        leg.first_forward_top()
+    );
+}
+
 /// Is our port inside llama.cpp's noise, or off it? Samples the first
 /// forward of both legs under `mummu::nn::refarith` (llama.cpp's activation
 /// quantization and f16 flash attention, emulated) with tiny embedding

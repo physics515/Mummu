@@ -39,6 +39,7 @@ use super::Qwen4expConfig;
 use super::experts::{self, RoutedExperts};
 use super::hc::HyperConnection;
 use super::ple::{PLE_TABLE_TENSOR, PleBlock, PleConvState, PleHash, PleTable};
+use super::teacher;
 use crate::gguf::GgufFile;
 use crate::import::ImportError;
 use crate::models::CausalLm;
@@ -677,6 +678,7 @@ impl LoadedQwen4exp {
             .reshape([b * t, e])
             .matmul(layer.router.weight.val())
             .reshape([b, t, self.config.expert_count]);
+        let logits = teacher::teach(&format!("ffn_moe_logits-{li}"), 0, logits);
         let logits = host(logits);
         if trace_enabled() {
             // The last token's routing, as llama.cpp's ffn_moe_topk /
@@ -714,7 +716,10 @@ impl LoadedQwen4exp {
                 .matmul(layer.shared_expert_gate.val().reshape([e, 1]))
                 .reshape([b, t, 1]),
         );
+        let sgate = teacher::teach(&format!("shared_expert_gate_sigmoid-{li}"), 0, sgate);
         let shared = shared.mul(sgate.clone());
+        let routed = teacher::teach(&format!("ffn_moe_out-{li}"), 0, routed);
+        let shared = teacher::teach(&format!("ffn_shexp_gated-{li}"), 0, shared);
         if trace_enabled() {
             trace3(&format!("ffn_moe_out-{li}"), &routed, 1);
             trace3(&format!("shared_expert_gate_sigmoid-{li}"), &sgate, 1);
@@ -770,6 +775,7 @@ impl LoadedQwen4exp {
         .reshape([1, t]);
         let x = self.model.embed_tokens.forward(input).to_device(device); // [1, t, E]
         let x = crate::nn::refarith::perturb_embedding(x);
+        let x = teacher::teach("model.input_embed", 0, x);
         if trace {
             trace3("model.input_embed", &x, 1);
         }
@@ -792,6 +798,7 @@ impl LoadedQwen4exp {
                     .table
                     .embed_tensor(&ple.hash, &cache.ple_history, ids, device)
                     .unwrap_or_else(|err| panic!("qwen4exp PLE rows: {err}"));
+                let emb = teacher::teach("ple_embd", 0, emb);
                 if trace {
                     trace3("ple_embd", &emb, 1);
                 }
@@ -799,7 +806,7 @@ impl LoadedQwen4exp {
                     .ple_conv
                     .as_mut()
                     .expect("a PLE model's cache carries the conv history");
-                res = block.forward(res, emb, state);
+                res = teacher::teach_ple_out(li, block.forward(res, emb, state));
                 if trace {
                     trace3(&format!("ple_out-{li}"), &res, h);
                 }
@@ -807,6 +814,8 @@ impl LoadedQwen4exp {
 
             let (m, inject) = layer.hc_attn.mix(res.clone());
             let inject = inject.expect("block mixers carry an inject projection");
+            let m = teacher::teach(&format!("hc_mixed-{li}"), 0, m);
+            let inject = teacher::teach(&format!("hc_inject-{li}"), 0, inject);
             let out = match (&layer.self_attn, &layer.linear_attn, &mut cache.layers[li]) {
                 (Some(attn), None, Qwen35Kv::Attn(kv)) => {
                     attn.forward(m.clone(), &self.blocks, &cos, &sin, mask.as_ref(), kv)
@@ -815,6 +824,11 @@ impl LoadedQwen4exp {
                     delta.forward(m.clone(), &self.blocks, state)
                 }
                 _ => unreachable!("qwen4exp forward: layer/cache kind mismatch at {li}"),
+            };
+            let out = if layer.self_attn.is_some() {
+                teacher::teach(&format!("attn_output-{li}"), 0, out)
+            } else {
+                teacher::teach(&format!("linear_attn_out-{li}"), 0, out)
             };
             if trace {
                 trace3(&format!("hc_mixed-{li} #1"), &m, 1);
@@ -826,22 +840,32 @@ impl LoadedQwen4exp {
                 };
                 trace3(&format!("{kind}-{li}"), &out, 1);
             }
-            res = layer.hc_attn.combine(res, out, inject);
+            res = teacher::teach(
+                &format!("hc_combine-{li}"),
+                0,
+                layer.hc_attn.combine(res, out, inject),
+            );
             if trace {
                 trace3(&format!("hc_combine-{li}"), &res, h);
             }
 
             let (m, inject) = layer.hc_ffn.mix(res.clone());
             let inject = inject.expect("block mixers carry an inject projection");
+            let m = teacher::teach(&format!("hc_mixed-{li}"), 1, m);
+            let inject = teacher::teach(&format!("hc_inject-{li}"), 1, inject);
             if trace {
                 trace3(&format!("hc_mixed-{li} #2"), &m, 1);
                 trace3(&format!("hc_inject-{li} #2"), &inject, 1);
             }
-            let out = self.moe(li, layer, m);
+            let out = teacher::teach(&format!("ffn_out-{li}"), 0, self.moe(li, layer, m));
             if trace {
                 trace3(&format!("ffn_out-{li}"), &out, 1);
             }
-            res = layer.hc_ffn.combine(res, out, inject);
+            res = teacher::teach(
+                &format!("l_last-{li}"),
+                0,
+                layer.hc_ffn.combine(res, out, inject),
+            );
             if trace {
                 trace3(&format!("l_last-{li}"), &res, h);
             }
@@ -857,10 +881,15 @@ impl LoadedQwen4exp {
         // Every op after the last block is per token: mix only the last one.
         let last = res.narrow(1, t - 1, 1); // [1, 1, H·E]
         let (hn, _) = self.model.output_hc.mix(last);
+        let hn = teacher::teach("result_norm", 0, hn);
         if trace {
             trace3("result_norm", &hn, 1);
         }
         let logits = qlinear2(&self.model.lm_head, hn.reshape([1, e]));
+        if teacher::active() {
+            let v = cfg.vocab_size;
+            let _ = teacher::teach("result_output", 0, logits.clone().reshape([1, 1, v]));
+        }
         if trace {
             trace3(
                 "result_output",

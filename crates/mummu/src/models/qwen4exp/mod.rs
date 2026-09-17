@@ -40,6 +40,7 @@ pub mod experts;
 pub mod hc;
 pub mod model;
 pub mod ple;
+mod teacher;
 
 pub use model::{LoadedQwen4exp, Qwen4exp, Qwen4expCache, Qwen4expLayer, load_from_gguf};
 
