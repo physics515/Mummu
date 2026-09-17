@@ -586,6 +586,9 @@ impl GatedDeltaNet {
             }
         });
         let conv_out = activation::silu(conv_out.swap_dims(1, 2)); // [b, t, conv_dim]
+        if gdn_l2_probe::enabled() {
+            gdn_l2_probe::record(&conv_out, cfg);
+        }
         drop(_s_conv);
         let _s_split = crate::prof::scope("delta.split");
 
@@ -798,6 +801,83 @@ fn gdn_chunk() -> Option<usize> {
             }
         }
     })
+}
+
+/// Diagnostic tap on the per-head ‖q‖ and ‖k‖ entering the DeltaNet's L2
+/// normalization — the numbers that decide whether the [`GdnL2`] form
+/// matters on a checkpoint: the two forms differ by `1 − ‖x‖/sqrt(‖x‖²+ε)`
+/// relative, which is 29% at ‖x‖ = 1e-3 and 5e-5 at 0.1 for ε = 1e-6.
+/// Off by default; while on, every tensor-path DeltaNet forward reads its
+/// conv output back to the host. The fused host decode step is not tapped,
+/// so probe prefills (or decode with `MUMMU_FUSED_GDN=0`).
+pub mod gdn_l2_probe {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::Qwen35Config;
+    use burn::tensor::Tensor;
+
+    static ON: AtomicBool = AtomicBool::new(false);
+    static SINK: Mutex<Vec<Record>> = Mutex::new(Vec::new());
+
+    /// One tensor-path DeltaNet forward, in call order: a prefill visits
+    /// the DeltaNet layers in model order, so the `i`-th record of a single
+    /// forward is the `i`-th DeltaNet layer.
+    #[derive(Debug, Clone)]
+    pub struct Record {
+        /// Positions in the forward (`b · t`).
+        pub tokens: usize,
+        /// `n_k_heads`.
+        pub heads: usize,
+        /// Pre-normalization head norms, `[tokens · heads]` token-major.
+        pub q: Vec<f32>,
+        pub k: Vec<f32>,
+    }
+
+    /// Turn the tap on or off (process-wide).
+    pub fn set_enabled(on: bool) {
+        ON.store(on, Ordering::Relaxed);
+    }
+
+    pub(super) fn enabled() -> bool {
+        ON.load(Ordering::Relaxed)
+    }
+
+    /// Drain everything recorded since the last call.
+    pub fn take() -> Vec<Record> {
+        std::mem::take(&mut *SINK.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Read back `conv_out` `[b, t, conv_dim]` (after conv + SiLU) and keep
+    /// the q and k head norms, summed in f64.
+    pub(super) fn record(conv_out: &Tensor<3>, cfg: &Qwen35Config) {
+        let [b, t, _] = conv_out.dims();
+        let (heads, ds, key_dim) = (cfg.n_k_heads, cfg.d_state, cfg.key_dim());
+        let host = conv_out
+            .clone()
+            .narrow(2, 0, 2 * key_dim)
+            .into_data()
+            .convert::<f32>()
+            .try_to_vec::<f32>()
+            .expect("conv output reads back as f32");
+        let tokens = b * t;
+        let (mut q, mut k) = (
+            Vec::with_capacity(tokens * heads),
+            Vec::with_capacity(tokens * heads),
+        );
+        for row in host.chunks_exact(2 * key_dim) {
+            let (qs, ks) = row.split_at(key_dim);
+            let norm = |x: &[f32]| x.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>().sqrt();
+            q.extend(qs.chunks_exact(ds).map(|h| norm(h) as f32));
+            k.extend(ks.chunks_exact(ds).map(|h| norm(h) as f32));
+        }
+        SINK.lock().unwrap_or_else(|e| e.into_inner()).push(Record {
+            tokens,
+            heads,
+            q,
+            k,
+        });
+    }
 }
 
 /// Longest span the sequential recurrence still evaluates when chunking is
