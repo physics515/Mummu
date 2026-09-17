@@ -2203,21 +2203,102 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
             contiguous partition of **320,001,446** rows, and the TENSOR is padded 90 rows beyond that
             (`[160, 320001536]` IQ4_NL, 32-element blocks), so a lookup must bound on the summed
             vocabulary rather than the tensor dim.
-      - [ ] Tensor-name map + `Architecture::Qwen4Exp` registry entry — deliberately deferred: that
-            enum drives the serve engine's loader dispatch, so it lands WITH the loader rather than as
-            stub match arms at six sites. The 1224 tensor names are now readable to build the map.
-      - [ ] **PLE (per-layer token embedding)** — the hashed 16-rows-per-token lookup over a 28.8 GB
-            IQ4_NL table, hash parameters read from the GGUF KV rather than hardcoded. Gate: the
-            embedding output for a fixed token set byte-matches the reference.
-      - [ ] **4-stream hyper-connections** (low-rank 320), final mixer = output norm.
-      - [ ] **Gated attention with the QSA indexer** (top-k 2048). Exploit the assessment's finding
-            that the indexer is **bit-identical to dense attention while <= 2051 cached tokens**: ship
-            DENSE first and gate it at short context, then add the indexer as a separate, separately
-            gated change. That splits the riskiest mechanism into two provable steps.
-      - [ ] **512-expert top-10 MoE + sigmoid-gated shared expert per layer** — `olmoe`'s router
-            generalized; the new parts are the expert count, the shared expert, and the sigmoid gate.
+      - [x] **Tensor map + loader** — `models::qwen4exp::load_from_gguf` streams every trunk
+            tensor to f32 on the device (one tensor at a time), accounts for all **1224** file tensors
+            (1031 trunk, 145 served in place — 144 expert banks + the PLE table — and 48 indexer
+            tensors explicitly skipped while attention runs dense) and refuses a leftover or a
+            mis-shaped tensor. *(2026-09-16.)* The `Architecture::Qwen4Exp` registry/serve dispatch is
+            still NOT wired: nothing but the tests can load this model yet.
+      - [x] **PLE (per-layer token embedding)** — `qwen4exp::ple`: the 16-head n-gram hash with its
+            constants read from the GGUF KV and the reset token `qwen4exp.ple.eos_token_id` = 248044
+            (NOT the tokenizer's 248046), row ids cross-checked against an independent numpy port of
+            transformers on a 40-token sequence with a mid-stream EOS; 90-byte IQ4_NL rows read by
+            positional reads straight from the shard (never loaded: 1.8 ms/token cold, ~0.06 warm, debug build);
+            the gated key/value block and the dilation-3 depthwise conv with a carried 9-column
+            history. *(2026-09-16.)*
+      - [x] **4-stream hyper-connections** — `qwen4exp::hc`: grouped per-stream RMSNorm, the
+            `silu(down·x/4)` low-rank gate, mean collapse, `2·sigmoid(inject/4)` combine; the final
+            mixer is the output norm. *(2026-09-16.)*
+      - [x] **Gated attention, DENSE** — qwen35's block, reused. Refuses loudly past 2051 cached
+            tokens, where llama.cpp's QSA indexer stops selecting every cell.
+      - [ ] **The QSA indexer** (top-k 2048) — the separate, separately gated change above; needs a
+            reference leg longer than 2051 tokens.
+      - [x] **512-expert top-10 MoE + sigmoid-gated shared expert per layer** — `qwen4exp::experts`:
+            softmax over all 512, top-10 renormalized by the sum (no extra scale — the header carries
+            none and llama.cpp applies none), experts computed straight from the GGUF banks (gate/up
+            Q4_K or Q5_K, down Q5_1 or Q8_0) by dequantizing rows in chunks, never loading the 77 GB.
+            *(2026-09-16.)*
       - [ ] Placement: fit 77 GB of experts + 4.83 GB trunk across 124 GB RAM + 16 GB VRAM via the
             existing tier/pack machinery.
+      **MILESTONE 1 (2026-09-16): Flash-Next RUNS in mummu, on the CPU, and matches llama.cpp's
+      greedy output — but the parity gate is NOT green.** Branch `claude/qwen-flash-next-ollama-perf-b351c1`.
+      Reference: `ghcr.io/ggml-org/llama.cpp:full` build 10991 (930e2fa59) — mainline now loads qwen4exp, so
+      the ollama image is no longer the only reference — recorded once into
+      `tests/fixtures/qwen4exp_ud_q4kxl_parity.json` (two 15-token legs) because its 111 GB mmap and our
+      load cannot share this box. Exact CPU path, gate unchanged (`tests/parity_qwen4exp.rs`):
+      | leg | top-3 order | top-5 overlap | max \|Δlogprob\| (bound 0.75) | greedy 24 ids |
+      |---|---|---|---:|---|
+      | primes | exact | 5/5 | **0.879 — FAIL** | identical |
+      | moon | exact | 4/5 | 0.493 — pass | identical |
+      A 559-token leg matches all 16 greedy ids, and on the real weights chunked prefill + cached decode
+      equals one-shot to 2.7e-5. The primes miss is one tail token: `<|im_end|>` at -14.35 against the
+      reference's -15.23, i.e. at ~e^-15 probability.
+      **Why the gap is believed to be the reference's arithmetic, not the port — and why that belief was
+      tested rather than assumed.** llama.cpp's CPU `mul_mat` quantizes every ACTIVATION (Q8_0/Q8_K/Q8_1)
+      before the integer dot; over 48 MoE layers that noise compounds. A cb_eval dumper compiled against the
+      reference's own libllama (`tools/qwen4exp_dump_tensors.cpp`) captured every named tensor at full
+      precision, and a teacher-forced run (`MUMMU_QWEN4EXP_TEACHER`, each op fed llama.cpp's exact input)
+      puts every op within 0.7-2.2e-2 relative on the exact path — the size of that activation rounding —
+      and within 1e-7..3.5e-5 under `nn::refarith`, a diagnostic that emulates ggml's activation
+      quantization (off by default). llama.cpp's OWN mathematically equivalent settings (`--no-repack`,
+      `-fa off`) move these tail logprobs by up to ~1 nat. **Owner decision needed:** keep the 0.75 bound
+      (this model cannot pass it deterministically), or gate qwen4exp on top-1 + identical greedy ids plus
+      a per-op teacher-forced bound — the tooling for either exists.
+      **Two real bugs found by that parity work, both in code the production 27B shares:**
+      (1) **DeltaNet q/k L2 norm form.** mummu used `x / max(|x|, eps)`; llama.cpp master and transformers use
+      `x / sqrt(|x|^2 + eps)`. Flash-Next's keys reach |k| ~ 1e-3, where the forms differ by up to 40% per head
+      and the block output by 1.5e-2. Now a parameter (`GdnL2`): qwen4exp uses AddEps; qwen35 keeps ClampNorm
+      (re-measured below: the form is noise-level on qwen35).
+      (2) **The chunked DeltaNet prefill could produce NaN.** `gdn_recurrence_chunked` formed `(I+A)^-1`
+      as a finite Neumann sum; with repeated keys and weak decay its terms reach binomials ~5e17 and f32
+      cancellation returns garbage (unit repro `chunked_recurrence_survives_repeated_keys`: the old code
+      diverged by 4e29). Replaced by a block-recursive unit-lower-triangular inverse whose intermediates
+      stay bounded. This path serves every qwen35 prefill longer than 4 tokens, so it changes production
+      numbers — and it was re-verified on qwen35 itself (Qwen3.5-2B BF16 fixture, llama.cpp b10991 and the
+      ollama-bundled build, main vs branch, same session): **main is broken, not just imprecise** —
+      all-NaN logits on a 324-token code-review chat prompt and on 256/360/1024-token prompts, on wgpu and
+      flex; the branch is finite everywhere, matches llama.cpp's top-5 order and greedy output on all 9
+      probe prompts, and leaves the 15-token parity legs unchanged (5.0238e-2 vs the ollama-bundled
+      build). Prefill cost on wgpu: +3.5-6% up to ~320 tokens, +20.8% at 1024. The fix is split out as its
+      own branch (`fix/qwen35-gdn-chunked-nan`, one commit + a ROADMAP correction under the P5
+      chunked-prefill item) so production need not wait for this port. Same run, on the L2 question:
+      switching qwen35 to AddEps moves its logprobs by only 1.6e-4..8.4e-4 against a 1.3e-2..7.6e-2
+      residual, in no consistent direction — keep ClampNorm for qwen35; the form only matters where keys
+      are tiny, as on Flash-Next.
+      **Speed on this path (CPU, f32 trunk, warm page cache, box load 8-11 from co-tenants):** load 3.6-4.3 s,
+      RSS 19.0 GiB; 15-token prefill 2.1-2.3 s (0.14-0.15 s/token), 559-token prefill 26.5 s (0.047 s/token);
+      decode **0.87-0.91 s/token**. The f32 trunk (~20 GB streamed per token) dominates; the experts cost
+      ~1 ms each warm. The llama.cpp reference on the same NVMe copy, CPU-only under the 48 GiB cap that keeps
+      the host alive: load 136.5 s, decode **11.0-23.2 s/token**, still paging (~360 MB/s block-in) — 2.7-5.7x
+      better than the 63 s/token it measured off the HDD array, as predicted.
+      **The real bar, measured (2026-09-16, same session):** ollama 0.34.0 (`ollama/ollama:latest`, its llama-server
+      runner on cuda_v13) on the same four shards, imported as a directory (`FROM <dir>`; pointing at shard 1 fails),
+      80 GiB cgroup cap, `num_ctx` 4096, temperature 0, `think: false`, 64 tokens: **66.7-73.0 ms/token warm
+      (13.7-15.0 tok/s)**, 91-97 ms on the first request after an idle gap; cold warm-up request 513 ms/token.
+      Placement from its fit log: dense trunk + head + ~2.5 layers of experts on the card (CUDA0 10.45 GiB of
+      buffers, 14.3 GiB total VRAM in use), 46 layers of experts `CPU_Mapped` (78.0 GiB) plus the lazily read PLE
+      table (27.5 GiB); `ollama ps` 70%/30% CPU/GPU; cgroup peak 60 GiB, no paging once warm. Output coherent and
+      deterministic. **mummu's milestone-1 CPU path on the same prompt, same session: 822-834 ms/token — 10.5-12.4x
+      behind.** That is the expected shape (f32 trunk streamed on the host, experts dequantized on demand, no GPU),
+      and it confirms the assessment's bar (50-70 ms projected) rather than the 11-23 s/token a CPU-only capped
+      llama.cpp run suggested. Next is the perf plan above, in order: trunk off the host (GPU, fused kernels), the
+      grouped packed expert kernel with a hot pool, then placement.
+      **Operational lessons from getting that number:** (1) `ollama create` on a GGUF writes ~3x the model at peak
+      (llama-quantize COPY + a hashed blob copy + the source); a first attempt filled `/` and the desktop Chromium
+      died of SIGBUS — reflinking the shards into the blob store (`cp --reflink=always`) made the import free.
+      (2) `/etc/cdi/nvidia.yaml` on this host is stale (nvidia-uvm major 237, kernel 238 this boot): a `--gpus all`
+      container fails `cuInit` (999) unless it adds `--device-cgroup-rule 'c 238:* rmw'`. Production CUDA
+      containers may be affected; not verified.
       **Performance is a SEPARATE question from correctness and must not gate the port.** The
       assessment's verdict was "parity plausible; a <= 0.9x win needs ALL FOUR of" (1) an in-situ host
       expert stream at >= 80% of roofline despite 48 GPU gaps/token (needs a spin-then-park expert
