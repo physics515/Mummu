@@ -36,6 +36,7 @@
 mod engine;
 pub mod logs;
 mod shim;
+pub mod status;
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -361,31 +362,42 @@ async fn ui() -> Response {
 }
 
 async fn health() -> Response {
-    blocking(|| {
-        let inv = mummu::backend::inventory();
-        let gpus: Vec<_> = inv
-            .gpus
-            .iter()
-            .map(|g| {
-                json!({
-                    "name": g.name,
-                    "api": format!("{:?}", g.backend),
-                    "kind": format!("{:?}", g.device_type),
-                    "shader_f16": g.shader_f16,
-                })
-            })
-            .collect();
-        json_response(
-            200,
+    blocking(|| json_response(200, health_json())).await
+}
+
+/// The health body, as a value.
+///
+/// Split out from the handler so a test can pin the shape without standing up
+/// a runtime — and the shape is worth pinning, because clients read these
+/// fields and a probe silently losing `status` would look like a healthy
+/// server right up until something depended on it.
+fn health_json() -> serde_json::Value {
+    let inv = mummu::backend::inventory();
+    let gpus: Vec<_> = inv
+        .gpus
+        .iter()
+        .map(|g| {
             json!({
-                "status": "ok",
-                "device": engine::device_label(),
-                "gpus": gpus,
-                "cpu_cores": inv.cpu.logical_cores,
-            }),
-        )
+                "name": g.name,
+                "api": format!("{:?}", g.backend),
+                "kind": format!("{:?}", g.device_type),
+                "shader_f16": g.shader_f16,
+            })
+        })
+        .collect();
+    let (version, build) = status::build_json();
+    json!({
+        "status": "ok",
+        "device": engine::device_label(),
+        "gpus": gpus,
+        "cpu_cores": inv.cpu.logical_cores,
+        // "Is the new release deployed?" — asked, and unanswerable from here
+        // until now. The version alone does not settle it (two builds of
+        // 0.3.0 from either side of a fix carry the same string), so the
+        // commit comes with it.
+        "version": version,
+        "build": build,
     })
-    .await
 }
 
 async fn models() -> Response {
@@ -928,6 +940,34 @@ mod tests {
     fn absent_max_tokens_falls_back_to_default() {
         let parsed = chat_request(r#"{"model": "m", "messages": []}"#);
         assert_eq!(parsed.max_tokens(), DEFAULT_MAX_TOKENS);
+    }
+
+    /// `GET /api/health` is the one endpoint other things are wired to. Its
+    /// existing fields are a contract — a client reads `status`, a dashboard
+    /// reads `device`, the UI badge reads `gpus` — and this release ADDS to
+    /// it rather than reshaping it.
+    #[test]
+    fn health_keeps_its_fields_and_now_names_the_build() {
+        let h = health_json();
+        let o = h.as_object().expect("health is an object");
+        for key in ["status", "device", "gpus", "cpu_cores"] {
+            assert!(o.contains_key(key), "health lost its {key} field");
+        }
+        assert_eq!(h["status"], json!("ok"));
+        assert!(h["gpus"].is_array());
+        assert!(h["cpu_cores"].is_u64());
+        // The new half: which release, and which commit of it.
+        assert_eq!(h["version"], json!(status::VERSION));
+        assert_eq!(
+            h["version"],
+            json!("0.3.0"),
+            "this branch ships as v0.3.0; the workspace version is what says so"
+        );
+        let build = h["build"].as_str().expect("build is a string");
+        assert!(
+            !build.is_empty(),
+            "a build with no git to ask reads \"unknown\", never empty"
+        );
     }
 
     #[test]

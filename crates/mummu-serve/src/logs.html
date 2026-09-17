@@ -82,6 +82,41 @@
   }
   #empty { text-align: center; color: var(--dim); margin-top: 12vh; font-family: system-ui, sans-serif; }
   #empty .big { font-size: 40px; }
+
+  /* The load bar and the two memory gauges, pinned under the header and
+     visible ALWAYS — not only during a load. Idle it reads "ready" beside the
+     two gauges, which makes this page double as a live memory monitor, which
+     is the thing it gets left open for.
+
+     Shared, character for character, with ui.html. Both pages are
+     include_str!'d into the binary with no build step (see the comment at the
+     top of this file), so the duplication is deliberate; keep them in step. */
+  #bar {
+    padding: 7px 14px 9px; background: var(--panel); border-bottom: 1px solid var(--border);
+    font: 11.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  .prog .plabel { color: var(--dim); white-space: pre-wrap; word-break: break-word; }
+  .track {
+    height: 6px; background: var(--panel2); border-radius: 3px;
+    overflow: hidden; margin-top: 4px; max-width: 620px;
+  }
+  .track > i {
+    display: block; height: 100%; width: 0; background: var(--accent);
+    border-radius: 3px; transition: width .35s linear;
+  }
+  /* A phase with no count (packing, warming) sweeps instead of lying about a
+     percentage. `transform`, not `width`, so it costs no layout. */
+  .track.indet > i { width: 32%; transition: none; animation: sweep 1.5s ease-in-out infinite; }
+  /* Idle: an inert, empty track rather than an animation that suggests work. */
+  .track.rest > i { width: 0; animation: none; }
+  @keyframes sweep { from { transform: translateX(-110%); } to { transform: translateX(350%); } }
+  .gauges { display: flex; gap: 16px; margin-top: 6px; flex-wrap: wrap; }
+  .gauge { display: flex; align-items: center; gap: 6px; color: var(--dim); }
+  .gauge .gname { letter-spacing: .04em; }
+  .gauge .gtrack { width: 84px; height: 5px; background: var(--panel2); border-radius: 3px; overflow: hidden; }
+  .gauge .gtrack > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .35s linear; }
+  /* No reading at all: the track is visibly inert, never a full-looking 0%. */
+  .gauge .gtrack.na { opacity: .3; }
   footer {
     padding: 6px 14px; background: var(--panel); border-top: 1px solid var(--border);
     font-size: 12px; color: var(--dim); display: flex; gap: 14px; align-items: center; flex-wrap: wrap;
@@ -106,7 +141,12 @@
   <button id="pause" title="Stop polling. The server keeps logging; a gap marker appears if the ring overran while you were paused.">Pause</button>
   <button id="clear" title="Clear what is on screen (the server's ring is untouched)">Clear</button>
   <span id="status" class="badge">…</span>
+  <!-- Which build is actually running. "Is the new release deployed?" was
+       asked and could not be answered from the server at all. -->
+  <span id="build" class="badge" title="running version (git commit)"></span>
 </header>
+
+<div id="bar"></div>
 
 <div id="feed"><div id="empty"><div class="big">𒀯</div>Waiting for the first line…</div></div>
 
@@ -261,6 +301,116 @@ function setStatus(extra) {
   badge.textContent = paused ? "paused" : failures > 0 ? `unreachable (retry ${failures})` : (extra || "live");
 }
 
+// --- the load bar and the memory gauges ------------------------------------
+//
+// Fed by the `status` object that rides this page's existing /api/logs poll,
+// NOT by parsing the lines below it. The loader prints its progress once every
+// 15 seconds — right for `docker logs`, hopeless for a bar, which would sit
+// still for a quarter of a minute and then jump. The status object is fed by
+// atomics the loader updates once per tensor (crates/mummu/src/progress.rs).
+//
+// Kept up even when nothing is loading, so this page is also the answer to
+// "how much RAM is that thing holding right now".
+
+const GIB = 1024 ** 3;
+const MIB = 1024 ** 2;
+
+// GiB with a sensible number of digits: "14.5 GiB", "124 GiB".
+function gib(bytes) {
+  const g = bytes / GIB;
+  return (g >= 100 ? g.toFixed(0) : g.toFixed(1)) + " GiB";
+}
+
+// Seconds as something a person reads off a bar.
+function secs(s) {
+  if (s < 60) return Math.round(s) + " s";
+  const m = Math.floor(s / 60);
+  return m + " min " + String(Math.round(s - m * 60)).padStart(2, "0") + " s";
+}
+
+// Build the bar + gauges into #bar. Everything is written with textContent and
+// style widths — never innerHTML — because a model name the client chose
+// reaches the label.
+const bar = (() => {
+  const el = (tag, cls) => { const e = document.createElement(tag); if (cls) e.className = cls; return e; };
+  const root = el("div", "prog");
+  const label = el("div", "plabel");
+  const track = el("div", "track");
+  const fill = el("i");
+  track.appendChild(fill);
+  const gauges = el("div", "gauges");
+  const gauge = name => {
+    const g = el("div", "gauge");
+    const n = el("span", "gname"); n.textContent = name;
+    const t = el("span", "gtrack");
+    const f = el("i");
+    t.appendChild(f);
+    const v = el("span", "gval");
+    g.append(n, t, v);
+    gauges.appendChild(g);
+    return { track: t, fill: f, value: v };
+  };
+  const ram = gauge("RAM"), vram = gauge("VRAM");
+  root.append(label, track, gauges);
+  $("bar").appendChild(root);
+
+  // One gauge: `used` of `total`, plus an optional "mine" note naming this
+  // process's share. A null reading renders "n/a" with an inert track, never
+  // an empty one that reads as 0%.
+  const setGauge = (g, used, total, mine) => {
+    if (total == null || total <= 0) {
+      g.track.classList.add("na");
+      g.fill.style.width = "0%";
+      g.value.textContent = "n/a";
+      return;
+    }
+    g.track.classList.remove("na");
+    g.fill.style.width = Math.max(0, Math.min(100, (used / total) * 100)).toFixed(1) + "%";
+    g.value.textContent = `${(used / GIB).toFixed(1)} / ${gib(total)}`;
+    if (mine != null) g.value.textContent += ` · mummu ${(mine / GIB).toFixed(1)}`;
+  };
+
+  const render = st => {
+    if (!st) return;
+    $("build").textContent = st.version ? `v${st.version} (${st.build || "unknown"})` : "";
+    setGauge(ram, st.host ? st.host.total - st.host.available : null,
+             st.host ? st.host.total : null, st.host ? st.host.rss : null);
+    setGauge(vram, st.vram ? st.vram.used : null, st.vram ? st.vram.total : null, null);
+
+    const working = st.phase === "loading" || st.phase === "packing" || st.phase === "warming";
+    if (!working) {
+      // Resting, not working. "ready" once a model is resident, "idle" before
+      // the first one — both honest, neither an animation suggesting work.
+      label.textContent = st.phase === "ready"
+        ? (st.model ? `ready — ${st.model}` : "ready")
+        : "idle";
+      track.className = "track rest";
+      fill.style.width = "0%";
+      return;
+    }
+    const parts = [st.model ? `${st.phase} ${st.model}` : st.phase];
+    const determinate = st.total > 0;
+    if (determinate) parts.push(`${st.done}/${st.total} tensors`);
+    if (st.bytes > 0) {
+      // MiB/s labelled "MB/s", matching the server's own load line exactly —
+      // the two sit next to each other on this page and must not disagree.
+      const rate = st.rate_bps == null ? "" : ` at ${(st.rate_bps / MIB).toFixed(0)} MB/s`;
+      parts.push(gib(st.bytes) + rate);
+    }
+    // No eta is rendered as no eta. The server sends null when it cannot know
+    // one (no total, nothing done yet, no measurable time) and the page does
+    // not get to invent a number the server refused to guess.
+    if (st.eta_s != null) parts.push(`about ${secs(st.eta_s)} left`);
+    else if (st.elapsed_s != null) parts.push(`${secs(st.elapsed_s)} so far`);
+    label.textContent = parts.join(" — ");
+    track.className = determinate ? "track" : "track indet";
+    fill.style.width = determinate ? ((st.done / st.total) * 100).toFixed(1) + "%" : "";
+  };
+  render(null);
+  label.textContent = "connecting…";
+  return { render };
+})();
+
 // --- polling ---------------------------------------------------------------
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -270,17 +420,45 @@ function nextDelay() {
   return document.hidden ? HIDDEN_POLL_MS : MIN_POLL_MS;
 }
 
+// ONE poll in flight at a time.
+//
+// Without this, the visibilitychange handler below can fire while the loop's
+// fetch is still open; both reads then start from the SAME `cursor` and append
+// the same lines twice. The window is one fetch round trip — small on
+// localhost, a Cloudflare round trip in production — and a duplicated
+// "load: 673/851 tensors" reads as the server having printed it twice, which
+// is precisely the wrong thing for a page whose job is to be believed.
+//
+// The flag is set before the first await, so nothing can slip between the
+// check and the claim. Returns whether it actually ran, so a skipped poll is
+// not mistaken by the loop for a successful one.
+let inflight = false;
+
 async function pollOnce() {
+  if (inflight) return false;
+  inflight = true;
+  try {
+    await poll();
+    return true;
+  } finally {
+    inflight = false;
+  }
+}
+
+async function poll() {
   // limit = the whole ring: a since-cursor makes the normal answer a handful
   // of lines, and asking for the maximum means a burst can never leave the
   // page a poll behind.
   const resp = await fetch(`/api/logs?since=${cursor}&limit=2000&source=all`, { cache: "no-store" });
   if (!resp.ok) throw new Error("HTTP " + resp.status);
   const page = await resp.json();
+  // Drawn before the lines: on a cold load the bar is what the reader is
+  // watching, and it must not wait behind up to 2000 rows being built.
+  bar.render(page.status);
   // A cursor that comes back LOWER than the one we sent means the server
-  // restarted under us and re-synced us to its newest line — say so, because
-  // the seq numbers either side of that point are unrelated.
-  if (page.cursor < cursor) addNote("⋯ server restarted — the log resumes from its newest line ⋯");
+  // restarted under us and re-synced us to everything it still holds — which
+  // is the new process's startup, the thing you restarted it to watch.
+  if (page.cursor < cursor) addNote("⋯ server restarted — the log resumes from the start of the new process ⋯");
   if (page.dropped > 0) {
     const n = page.dropped;
     addNote(`⋯ ${n} line${n === 1 ? "" : "s"} dropped — the server's ring overran ⋯`);
@@ -299,9 +477,12 @@ async function loop() {
     await sleep(nextDelay());
     if (paused) continue;
     try {
-      await pollOnce();
-      if (failures) { failures = 0; }
-      setStatus();
+      // A skipped poll (one already in flight) is not evidence the server is
+      // reachable, so it must not clear a backoff that a real failure set.
+      if (await pollOnce()) {
+        failures = 0;
+        setStatus();
+      }
     } catch (e) {
       failures++;
       setStatus();

@@ -315,8 +315,8 @@ pub struct Page {
     /// client does not rescan the same span forever. It can also come back
     /// **lower** than the `since` that was sent: that means this process has
     /// never produced a seq that high (the server restarted under a client
-    /// that kept its cursor), and the client has been re-synced to the newest
-    /// line rather than left waiting for seqs that will never arrive.
+    /// that kept its cursor), and the client has been re-synced — see [`read`]
+    /// for where to.
     pub cursor: u64,
     /// Lines after the client's `since` that the ring had already evicted —
     /// i.e. the size of the gap this page starts with. A client shows a marker
@@ -363,8 +363,33 @@ fn read(ring: &Ring, q: &Query) -> Page {
     let oldest = ring.lines.front().map_or(ring.next_seq, |l| l.seq);
     // A cursor from a previous process (or a client that invented one) would
     // otherwise park forever waiting for seqs this process will never reach.
-    let since = q.since.min(newest);
-    let dropped = oldest.saturating_sub(1).saturating_sub(since);
+    //
+    // Re-synced to just before the OLDEST line still held, NOT to `newest`.
+    // The whole situation this handles is "the server restarted under a page
+    // that kept its cursor" — and everything the new process has printed so
+    // far is precisely what that page has not seen: the startup banner, the
+    // adapter inventory, the device policy, the first fit plan. Landing on
+    // `newest` skipped all of it and left the page blank until the next thing
+    // happened to be printed, which for an idle server is half a minute
+    // (Docker's health check) and for a hung one is never. Restarting the
+    // server and watching is the operator's own workflow; it has to work.
+    let resynced = q.since > newest;
+    let since = if resynced {
+        oldest.saturating_sub(1)
+    } else {
+        q.since
+    };
+    // In the re-synced case the client's own cursor came from a different
+    // sequence space, so "the gap since your cursor" is not a question with an
+    // answer. The gap that IS real is measured from the start of this process:
+    // the lines it printed and evicted before this client ever asked, which it
+    // will never see. Reporting them lets the page draw a break instead of
+    // splicing a restart onto an overrun.
+    let dropped = if resynced {
+        oldest.saturating_sub(1)
+    } else {
+        oldest.saturating_sub(1).saturating_sub(since)
+    };
 
     // `lines` is ordered by seq, so the first line to return is a partition
     // point rather than a scan.
@@ -443,11 +468,29 @@ impl LogsParams {
 }
 
 /// `GET /api/logs?since=<seq>&limit=<n>&source=<all|server|api|shim>`.
+///
+/// Carries a `status` object alongside the lines — the load's progress and
+/// the two memory readings (see [`crate::status`]). It rides THIS poll rather
+/// than getting an endpoint of its own because both pages already poll here
+/// once a second; a second loop would double a browser tab's cost to show
+/// numbers that are read in the same glance as the lines beside them.
 pub async fn endpoint(params: axum::extract::Query<LogsParams>) -> Response {
-    match params.resolve() {
-        Ok(q) => json_response(200, query(&q).to_json()),
-        Err(e) => json_response(400, json!({ "error": e })),
-    }
+    let q = match params.resolve() {
+        Ok(q) => q,
+        Err(e) => return json_response(400, json!({ "error": e })),
+    };
+    // On a blocking thread for the same reason `/api/health` is: the status
+    // object reads `/proc` and calls into NVML, which are file and FFI work,
+    // not async work, and an async worker parked on them is a worker not
+    // driving the generation this page is watching.
+    crate::blocking(move || {
+        let mut body = query(&q).to_json();
+        if let Some(object) = body.as_object_mut() {
+            object.insert("status".to_owned(), crate::status::to_json());
+        }
+        json_response(200, body)
+    })
+    .await
 }
 
 /// The logs page, served at `GET /logs`.
@@ -628,20 +671,32 @@ async fn observe(source: Source, req: Request, next: Next) -> Response {
     // Route decisions read the real path; only the *printed* copy is folded.
     let starts = announces_start(&method, &raw_path);
     let path = sanitize(&raw_path);
-    let (req, model) = take_model_hint(req).await;
-    let detail = model.map_or_else(String::new, |m| format!(" model={m}"));
 
     if starts {
-        // Before any engine work. A request that queues behind a cold load
-        // produces nothing for its entire wait, and a feed that only logs
-        // completions shows nothing during the minutes that matter.
+        // On ARRIVAL, before anything else — and in particular before the
+        // model peek below, which buffers the body.
+        //
+        // That ordering is the whole point. A request that queues behind a
+        // cold load produces nothing for its entire wait, and a feed that only
+        // logs completions shows nothing during the minutes that matter. But
+        // waiting for the body first reintroduced exactly that silence at a
+        // smaller scale: a POST /api/chat arriving in two halves four seconds
+        // apart logged NOTHING for those four seconds and then all its lines
+        // at once, and a body that never completed logged nothing at all for
+        // the life of the connection. A stalled upload is a thing an operator
+        // needs to see, so the line goes out when the head arrives. The model
+        // name is not known yet; it is attached to the completion line, which
+        // is the one that can carry it.
         record(
             source,
             Some(Level::Info),
             quiet,
-            format!("{method} {path} → started{detail}"),
+            format!("{method} {path} → started"),
         );
     }
+
+    let (req, model) = take_model_hint(req).await;
+    let detail = model.map_or_else(String::new, |m| format!(" model={m}"));
 
     let started = Instant::now();
     let response = next.run(req).await;
@@ -684,6 +739,12 @@ const fn level_for_status(status: u16) -> Level {
 /// Separate from the pump so the fiddly parts — a line split across two reads,
 /// a line longer than the ring's per-line budget, `\r\n`, a bare `\r` — are
 /// testable without touching a file descriptor.
+///
+/// Off unix nothing feeds it outside the tests, and it is kept rather than
+/// `cfg`'d away so those tests still run there: the reassembly rules are pure
+/// byte handling, and a platform where they are never exercised is a platform
+/// where a regression in them would land unnoticed.
+#[cfg_attr(not(unix), allow(dead_code))]
 struct Reassembler {
     pending: Vec<u8>,
     /// We already emitted this line's truncated head; swallow the rest of it.
@@ -753,13 +814,22 @@ impl Reassembler {
 pub fn install() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        capture::install();
-        push(
-            Source::Server,
+        // The banner has to say which of the two things actually happened.
+        // Claiming capture unconditionally meant the Windows desktop shell's
+        // log page asserted a capture it does not have, and then sat with an
+        // empty `server` source forever — which reads as "the server printed
+        // nothing", the exact wrong conclusion on the page you open when
+        // nothing works.
+        let text = if capture::install() {
             format!(
                 "[mummu-serve] logs: capturing stdout/stderr into a {MAX_LINES}-line ring — GET /logs"
-            ),
-        );
+            )
+        } else {
+            format!(
+                "[mummu-serve] logs: request entries only — this platform has no stdout/stderr capture, so the `server` source stays empty and the process's own prints go to the console; {MAX_LINES}-line ring — GET /logs"
+            )
+        };
+        push(Source::Server, text);
     });
 }
 
@@ -782,10 +852,14 @@ mod capture {
 
     use super::{Reassembler, Source, push};
 
-    pub(super) fn install() {
+    /// Returns whether capture is in effect — always true here, because even
+    /// if one `tee` fails the other may not, and either way the fds are left
+    /// exactly as they were.
+    pub(super) fn install() -> bool {
         for fd in [libc::STDOUT_FILENO, libc::STDERR_FILENO] {
             tee(fd);
         }
+        true
     }
 
     fn tee(fd: RawFd) {
@@ -821,7 +895,7 @@ mod capture {
         };
         if std::thread::Builder::new()
             .name(name.to_owned())
-            .spawn(move || pump(read_fd, original))
+            .spawn(move || pump(fd, read_fd, original))
             .is_err()
         {
             // Without a reader the pipe fills at 64 KiB and every print in the
@@ -835,13 +909,51 @@ mod capture {
         }
     }
 
-    fn pump(read_fd: RawFd, original: RawFd) {
+    /// Undo the tee when the pump stops, however it stops.
+    ///
+    /// Without this, a pump thread that leaves its loop is a **silent,
+    /// permanent wedge of the whole process**: fd 1/2 is still the pipe's
+    /// write end, nobody is reading it, and the next 64 KiB of output fills
+    /// the pipe buffer and blocks every printing thread in `write` forever.
+    /// No log line, no panic message, no way to tell from outside — the
+    /// server simply goes quiet and then stops answering as threads pile up.
+    ///
+    /// Two ways out of the loop reach here: a read error that is not `EINTR`,
+    /// and a panic inside `push` (an allocation failure, a poisoned lock
+    /// handler). The install path already reverts the `dup2` when the thread
+    /// cannot be spawned, for exactly this reason; this is the same revert on
+    /// the other way out, and `Drop` is what makes it cover the panic too.
+    struct RestoreOnExit {
+        fd: RawFd,
+        original: RawFd,
+        read_fd: RawFd,
+    }
+
+    impl Drop for RestoreOnExit {
+        fn drop(&mut self) {
+            // SAFETY: plain POSIX fd calls on fds this thread owns.
+            // `dup2` closes `fd`'s current description (the pipe) as it
+            // replaces it, which is what releases the writers.
+            unsafe {
+                libc::dup2(self.original, self.fd);
+                libc::close(self.original);
+                libc::close(self.read_fd);
+            }
+        }
+    }
+
+    fn pump(fd: RawFd, read_fd: RawFd, original: RawFd) {
+        let restore = RestoreOnExit {
+            fd,
+            original,
+            read_fd,
+        };
         let mut buf = [0u8; 8192];
         let mut lines = Reassembler::new();
         let mut emit = |text: String| push(Source::Server, text);
         loop {
             // SAFETY: `buf` is a live, correctly sized local; `read_fd` is
-            // owned by this thread.
+            // owned by this thread (through `restore`) until it returns.
             let read = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len()) };
             if read < 0 {
                 if std::io::Error::last_os_error().kind() == ErrorKind::Interrupted {
@@ -860,6 +972,7 @@ mod capture {
             lines.feed(chunk, &mut emit);
         }
         lines.finish(&mut emit);
+        drop(restore);
     }
 
     fn write_all(fd: RawFd, mut buf: &[u8]) {
@@ -891,7 +1004,12 @@ mod capture {
     //! entries are explicit [`super::push`] calls and appear exactly as they
     //! do on unix; only the `server` source stays empty, and the process's
     //! prints go to the console as they always did.
-    pub(super) fn install() {}
+    //!
+    //! `install` returns `false` so [`super::install`]'s banner says that
+    //! rather than announcing a capture this target does not have.
+    pub(super) fn install() -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -983,18 +1101,55 @@ mod tests {
     }
 
     /// A `since` beyond anything this process produced means the client kept a
-    /// cursor across a server restart. Re-sync it to the newest line instead of
-    /// leaving it waiting for seqs that will never be reached.
+    /// cursor across a server restart. Re-sync it to everything the NEW
+    /// process still holds — which is the startup banner it just printed, the
+    /// thing the reader restarted the server to watch. Re-syncing to `newest`
+    /// instead left the page blank until something else happened to print.
     #[test]
-    fn a_since_in_the_future_resyncs_instead_of_hanging() {
-        let ring = ring_of(&[(Source::Server, "after the restart")]);
+    fn a_since_in_the_future_replays_what_the_new_process_printed() {
+        let ring = ring_of(&[
+            (
+                Source::Server,
+                "[mummu-serve] logs: capturing stdout/stderr",
+            ),
+            (Source::Server, "[mummu-serve] adapter: RTX 4070 Ti SUPER"),
+            (
+                Source::Server,
+                "[mummu-serve] listening on http://0.0.0.0:8095",
+            ),
+        ]);
         let stale = page(&ring, u64::MAX, 10, None);
-        assert!(stale.lines.is_empty());
+        assert_eq!(
+            texts(&stale),
+            [
+                "[mummu-serve] logs: capturing stdout/stderr",
+                "[mummu-serve] adapter: RTX 4070 Ti SUPER",
+                "[mummu-serve] listening on http://0.0.0.0:8095",
+            ],
+            "the new process's whole startup lands, not nothing"
+        );
         assert_eq!(
             stale.cursor, stale.newest,
             "a cursor that comes back lower is the re-sync signal"
         );
         assert_eq!(stale.dropped, 0, "nothing was missed — nothing existed");
+        // And the re-synced cursor is then a normal cursor: no replay.
+        assert!(page(&ring, stale.cursor, 10, None).lines.is_empty());
+    }
+
+    /// The same re-sync against a ring that has already overrun: the client
+    /// gets what is left, and is told how much it missed rather than being
+    /// handed a silent splice.
+    #[test]
+    fn a_future_since_against_an_overrun_ring_reports_the_gap() {
+        let mut ring = Ring::new();
+        for i in 0..MAX_LINES + 10 {
+            ring.record(line(Source::Server, None, false, format!("restarted {i}")));
+        }
+        let stale = page(&ring, u64::MAX, MAX_LIMIT, None);
+        assert_eq!(stale.lines.len(), MAX_LINES);
+        assert_eq!(stale.lines[0].text, "restarted 10");
+        assert_eq!(stale.dropped, 10, "the gap is confessed, not hidden");
     }
 
     /// A `since` older than anything the ring still holds must report the size

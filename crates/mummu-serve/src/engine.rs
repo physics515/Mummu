@@ -17,6 +17,12 @@ use mummu::models::{lfm2, olmoe, qwen2, qwen3, qwen35};
 use mummu::registry::{Architecture, ModelSpec, WeightFormat};
 use tokenizers::Tokenizer;
 
+// Linux `MemAvailable` in bytes (None elsewhere). The parse lives in
+// `crate::status`, which needs `MemTotal` out of the same file for the RAM
+// gauge: one read, one parser, one definition of "available" shared by the fit
+// planner below, the host-pressure watcher, and the gauge the operator watches.
+use crate::status::mem_available_bytes;
+
 /// One chat-servable model: the architecture-erased LM plus its tokenizer.
 pub struct Loaded {
     pub lm: AnyLm,
@@ -1248,6 +1254,10 @@ fn build_layered_qwen35(
     );
     certify_residency(main, placed, vram_before);
     RESIDENT_VRAM.store(placed, std::sync::atomic::Ordering::Relaxed);
+    // The bytes are down; what follows is CPU work on weights already in RAM,
+    // and it has no count of its own — so the bar goes indeterminate rather
+    // than freezing at 851/851 for the tens of seconds this takes.
+    mummu::progress::phase(mummu::progress::Phase::Packing);
     warm_host_twins(&model, on_device);
     Ok(model)
 }
@@ -1476,6 +1486,11 @@ fn build_partitioned_qwen35(
     // loaded the whole group at it, so 107 clusters were silently materialized
     // at a precision the planner never chose, while the byte total added up
     // costs for rungs that were never loaded.
+    // The trunk and the local clusters are down; the remote clusters are a
+    // second pass over the pack, layer by layer. Counted in LAYERS, because
+    // that is the loop's own unit — a cluster count would be a number that
+    // moves in jumps of 30 whenever one group covers a whole layer.
+    mummu::progress::begin(mummu::progress::Phase::Loading, layers as u64);
     let mut rows: Vec<Vec<std::sync::Arc<dyn mummu::nn::ExpertExec>>> = Vec::with_capacity(layers);
     for l in 0..layers {
         let mut by_slot: std::collections::BTreeMap<
@@ -1543,6 +1558,7 @@ fn build_partitioned_qwen35(
             }
         }
         rows.push(row);
+        mummu::progress::advance(rows.len() as u64, pack.bytes_read());
     }
     let pool = std::sync::Arc::new(mummu::nn::ExpertPool::new(rows));
     // The cubecl device-server threads exist now (the load used every
@@ -1656,6 +1672,11 @@ fn build_tiered_experts(
         );
     }
     let started = Instant::now();
+    // 64 experts x 16 layers is over a thousand separate reads off the pack;
+    // counting them is the only thing that makes this phase determinate.
+    // Bytes come from the pack's own read counter, same as the trunk loader's.
+    mummu::progress::begin(mummu::progress::Phase::Loading, (layers * epl) as u64);
+    let mut loaded = 0u64;
     let mut slots = Vec::with_capacity(layers);
     for layer in 0..layers {
         let mut row = Vec::with_capacity(epl);
@@ -1668,6 +1689,8 @@ fn build_tiered_experts(
                 index,
                 tier,
             )?);
+            loaded += 1;
+            mummu::progress::advance(loaded, pack.bytes_read());
         }
         slots.push(row);
     }
@@ -2590,23 +2613,6 @@ fn estimate_resident_bytes(f: &GgufFile, policy: mummu::quant::QuantPolicy) -> u
     (bytes as f64 * 1.35) as u64 + largest_f32
 }
 
-/// The memory budget of one backend. GPU budgets come from the wgpu
-/// inventory where it exists (native Windows/Linux); the CUDA container has
-/// no wgpu adapters, so a conservative default applies, overridable with
-/// `MUMMU_GPU_BUDGET_GB`. CPU gets 3/4 of physical RAM.
-/// Linux `MemAvailable` in bytes (None elsewhere).
-fn mem_available_bytes() -> Option<u64> {
-    std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|m| {
-            m.lines()
-                .find(|l| l.starts_with("MemAvailable:"))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|kb| kb.parse::<u64>().ok())
-        })
-        .map(|kb| kb * 1024)
-}
-
 /// Make sure `need` bytes of host RAM are free before a load that lands on
 /// the host: when `MemAvailable` is short and the CPU slot holds some other
 /// model, evict it (the alternative is the VM's OOM killer taking the whole
@@ -3068,13 +3074,26 @@ async fn drive(
     // planner's decision cosmetic.
     let device = device_of(backend);
     let key = spec.dir(models_root);
-    if slot.loaded_key_async().await.as_deref() != Some(key.as_path())
-        && tiers_pack_in(&key).is_none()
-    {
+    // Exactly one question, asked once: is this request going to pay for a
+    // load? `loaded_key_async` waits for the slot rather than reporting busy,
+    // so the answer is the truth and not "busy, can't tell" — which matters,
+    // because claiming a load that is not happening would put a creeping bar
+    // under a warm request that is about to answer in milliseconds.
+    let cold = slot.loaded_key_async().await.as_deref() != Some(key.as_path());
+    if cold && tiers_pack_in(&key).is_none() {
         // This slot is about to evict its occupant; if that was the tiered
         // model, its experts on the *other* devices go with it.
         clear_tiers_if_slot(backend);
     }
+    // The progress guard covers the load AND the first forward, because to the
+    // person watching an empty bubble those are one wait. It is created here
+    // rather than around `plan_fit` in `run_chat` for the reason above: this
+    // is the first point at which "a load is happening" is a fact.
+    //
+    // Every way out of this function from here on drops it — an early `?`, a
+    // panic in a kernel, a cancelled task when the browser tab closes — and
+    // the Drop returns the phase to Idle. Only `ready()` below disarms that.
+    let progress = cold.then(|| mummu::progress::Load::begin(&spec.name));
     // The load closure and the async body both want `device`; give the loader
     // its own handle so the future can capture the original by reference.
     let load_device = device.clone();
@@ -3088,6 +3107,12 @@ async fn drive(
             load_any(spec, models_root, &load_device, policy, backend)
         })
         .await?;
+    // The weights are resident. What is left before the first token is kernel
+    // compilation and autotune — one pass whose duration is the unknown, so
+    // it renders indeterminate rather than as a fake percentage.
+    if let Some(p) = &progress {
+        p.phase(mummu::progress::Phase::Warming);
+    }
     {
         // ChatML renderers leave specials to the tokenizer; the Tulu
         // render already embeds its own BOS (the real_olmoe.rs pattern).
@@ -3118,6 +3143,15 @@ async fn drive(
         });
         let out =
             m.lm.generate(&prompt_ids, max_tokens, opts, &device, |id| {
+                // The first token is where warming ends and the wait the bar
+                // exists for is over. Said here rather than after `generate`
+                // returns, because the rest of a 512-token decode is not a
+                // load and must not keep a progress bar on screen.
+                if ids.is_empty()
+                    && let Some(p) = &progress
+                {
+                    p.ready();
+                }
                 ids.push(id);
                 // Incremental decode: re-decode the whole tail and emit the
                 // suffix beyond what was already streamed. A trailing U+FFFD

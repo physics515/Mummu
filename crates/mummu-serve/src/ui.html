@@ -45,13 +45,37 @@
   .msg.user .body { background: var(--user); border-radius: 10px; padding: 8px 12px; }
   .msg.assistant .body { padding: 2px 0; }
   .msg .meta { font-size: 11px; color: var(--dim); margin-top: 4px; }
-  /* Live server output while a generation is in flight — a cold load spends
+  /* Live load progress while a generation is in flight — a cold load spends
      minutes before the first token, and an empty bubble reads as "broken". */
-  .msg .status {
-    font: 11.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    color: var(--dim); margin-top: 4px; white-space: pre-wrap; word-break: break-word;
-  }
+  .msg .status { margin-top: 6px; }
   .msg .status:empty { display: none; }
+
+  /* The bar and the two gauges. Shared, character for character, with
+     logs.html: both pages are include_str!'d into the binary with no build
+     step, so the duplication is deliberate — see the comment at the top of
+     logs.html. Keep them in step by hand. */
+  .prog { max-width: 520px; font: 11.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .prog .plabel { color: var(--dim); white-space: pre-wrap; word-break: break-word; }
+  .track {
+    height: 6px; background: var(--panel2); border-radius: 3px;
+    overflow: hidden; margin-top: 4px;
+  }
+  .track > i {
+    display: block; height: 100%; width: 0; background: var(--accent);
+    border-radius: 3px; transition: width .35s linear;
+  }
+  /* A phase with no count (packing, warming) sweeps instead of lying about a
+     percentage. `transform`, not `width`, so it costs no layout. */
+  .track.indet > i { width: 32%; transition: none; animation: sweep 1.5s ease-in-out infinite; }
+  @keyframes sweep { from { transform: translateX(-110%); } to { transform: translateX(350%); } }
+  .gauges { display: flex; gap: 16px; margin-top: 6px; flex-wrap: wrap; }
+  .gauge { display: flex; align-items: center; gap: 6px; color: var(--dim); }
+  .gauge .gname { letter-spacing: .04em; }
+  .gauge .gtrack { width: 84px; height: 5px; background: var(--panel2); border-radius: 3px; overflow: hidden; }
+  .gauge .gtrack > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .35s linear; }
+  /* No reading at all: the track is visibly inert, never a full-looking 0%. */
+  .gauge .gtrack.na { opacity: .3; }
+  .gauge .gmine { opacity: .75; }
   a.nav {
     color: var(--dim); text-decoration: none; font-size: 13px;
     border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px;
@@ -87,6 +111,9 @@
   <button id="unload" title="Drop the resident model from GPU/CPU memory">Unload</button>
   <button id="clear" title="Clear the conversation">Clear</button>
   <span id="device" class="badge">…</span>
+  <!-- Which build is actually running. "Is the new release deployed?" was
+       asked and could not be answered from the server at all. -->
+  <span id="build" class="badge" title="running version (git commit)"></span>
 </header>
 
 <div id="log"><div id="empty"><div class="big">𒀯</div>Pick a model, pull it if needed, and say something.</div></div>
@@ -126,6 +153,8 @@ async function refresh() {
   dev.textContent = h.device;
   dev.classList.toggle("gpu", h.device.includes("GPU"));
   dev.title = (h.gpus || []).map(g => `${g.name} (${g.api})`).join("\n") || "no GPU adapters";
+  // textContent, not innerHTML: these come off the wire like everything else.
+  $("build").textContent = h.version ? `v${h.version} (${h.build || "unknown"})` : "";
   models = m.models;
   const prev = modelSel.value;
   modelSel.innerHTML = "";
@@ -204,41 +233,135 @@ async function readSse(resp, onEvent) {
   }
 }
 
-// While a generation is in flight, show what the SERVER says it is doing.
+// ---------------------------------------------------------------------------
+// The load bar and the two memory gauges.
 //
 // The failure this fixes: a cold 27B load spends over two minutes reading its
 // pack off a spinning array before the first token, and this UI showed an
 // empty assistant bubble the whole time — indistinguishable from a hung
-// server. The server was printing exactly the right thing to stderr
-// ("[mummu] load: 673/851 tensors — 14.46 GiB off the pack in 91s (162 MB/s)")
-// and only `docker logs` could see it. /api/logs makes it readable from here.
+// server. What the operator asked for, in their words, was "a loading progress
+// bar" and "showing loading to memory and vram".
 //
-// Deliberately one line under the bubble, not a panel: /logs is where the
-// whole merged feed lives. It clears the moment real text arrives.
+// The numbers come from the `status` object on /api/logs, NOT from parsing the
+// log lines. The loader prints its progress once every 15 seconds — right for
+// `docker logs`, hopeless for a bar, which would sit still for a quarter of a
+// minute and then jump. The status object is fed by atomics the loader updates
+// once per tensor (see crates/mummu/src/progress.rs).
+//
+// It rides the poll this page was already making, so it costs nothing new.
+// ---------------------------------------------------------------------------
 
-// Lines worth promoting over "whatever came last" — a cold start's time goes
-// into reading the pack and placing it, and those are the lines that say so.
-const PROGRESS = /load:|tensors|resident|fit plan|vnni twins|pack import|MB\/s|experts/i;
+const GIB = 1024 ** 3;
+const MIB = 1024 ** 2;
 
-function watchServerStatus(el) {
-  let cursor = null, stopped = false, misses = 0;
-  const show = text => { el.textContent = text; log.scrollTop = log.scrollHeight; };
+// GiB with a sensible number of digits: "14.5 GiB", "124 GiB".
+function gib(bytes) {
+  const g = bytes / GIB;
+  return (g >= 100 ? g.toFixed(0) : g.toFixed(1)) + " GiB";
+}
+
+// Seconds as something a person reads off a bar.
+function secs(s) {
+  if (s < 60) return Math.round(s) + " s";
+  const m = Math.floor(s / 60);
+  return m + " min " + String(Math.round(s - m * 60)).padStart(2, "0") + " s";
+}
+
+// Build the bar + gauges. Returns { root, render }. Everything is written with
+// textContent and style widths — never innerHTML — because a model name the
+// client chose reaches the label.
+function makeProgress() {
+  const el = (tag, cls) => { const e = document.createElement(tag); if (cls) e.className = cls; return e; };
+  const root = el("div", "prog");
+  const label = el("div", "plabel");
+  const track = el("div", "track");
+  const fill = el("i");
+  track.appendChild(fill);
+  const gauges = el("div", "gauges");
+  const gauge = name => {
+    const g = el("div", "gauge");
+    const n = el("span", "gname"); n.textContent = name;
+    const t = el("span", "gtrack");
+    const f = el("i");
+    t.appendChild(f);
+    const v = el("span", "gval");
+    g.append(n, t, v);
+    gauges.appendChild(g);
+    return { track: t, fill: f, value: v };
+  };
+  const ram = gauge("RAM"), vram = gauge("VRAM");
+  root.append(label, track, gauges);
+
+  // One gauge: `used` of `total`, plus an optional "mine" note naming this
+  // process's share. A null reading renders "n/a" with an inert track, never
+  // an empty one that reads as 0%.
+  const setGauge = (g, used, total, mine) => {
+    if (total == null || total <= 0) {
+      g.track.classList.add("na");
+      g.fill.style.width = "0%";
+      g.value.textContent = "n/a";
+      return;
+    }
+    g.track.classList.remove("na");
+    g.fill.style.width = Math.max(0, Math.min(100, (used / total) * 100)).toFixed(1) + "%";
+    g.value.textContent = `${(used / GIB).toFixed(1)} / ${gib(total)}`;
+    if (mine != null) g.value.textContent += ` · mummu ${(mine / GIB).toFixed(1)}`;
+  };
+
+  // Returns true while a load is actually in flight, so the caller can decide
+  // whether the bar belongs under the bubble at all. (On /logs the same render
+  // keeps it up and reads "ready"; here it comes and goes with the wait.)
+  const render = st => {
+    if (!st) return false;
+    setGauge(ram, st.host ? st.host.total - st.host.available : null,
+             st.host ? st.host.total : null, st.host ? st.host.rss : null);
+    setGauge(vram, st.vram ? st.vram.used : null, st.vram ? st.vram.total : null, null);
+
+    const working = st.phase === "loading" || st.phase === "packing" || st.phase === "warming";
+    if (!working) return false;
+    const parts = [st.model ? `${st.phase} ${st.model}` : st.phase];
+    const determinate = st.total > 0;
+    if (determinate) parts.push(`${st.done}/${st.total} tensors`);
+    if (st.bytes > 0) {
+      // MiB/s labelled "MB/s", matching the server's own load line exactly —
+      // the two sit next to each other on /logs and must not disagree.
+      const rate = st.rate_bps == null ? "" : ` at ${(st.rate_bps / MIB).toFixed(0)} MB/s`;
+      parts.push(gib(st.bytes) + rate);
+    }
+    // No eta is rendered as no eta. The server sends null when it cannot know
+    // one (no total, nothing done yet, no measurable time) and the page does
+    // not get to invent a number the server refused to guess.
+    if (st.eta_s != null) parts.push(`about ${secs(st.eta_s)} left`);
+    else if (st.elapsed_s != null) parts.push(`${secs(st.elapsed_s)} so far`);
+    label.textContent = parts.join(" — ");
+    track.className = determinate ? "track" : "track indet";
+    fill.style.width = determinate ? ((st.done / st.total) * 100).toFixed(1) + "%" : "";
+    return true;
+  };
+  return { root, render };
+}
+
+// Poll the load status while a generation is in flight, into `el`.
+function watchLoadProgress(el) {
+  let stopped = false, misses = 0;
+  const bar = makeProgress();
   const tick = async () => {
     if (stopped) return;
     try {
-      // The first poll only establishes where "now" is: what matters is what
-      // THIS request causes, not what the previous one left in the ring.
-      const url = cursor === null
-        ? "/api/logs?source=server&limit=1"
-        : `/api/logs?source=server&limit=200&since=${cursor}`;
-      const page = await fetch(url, { cache: "no-store" }).then(r => r.json());
-      if (cursor === null) {
-        cursor = page.newest;
-      } else {
-        cursor = page.cursor;
-        const lines = page.lines.map(l => l.text);
-        const pick = lines.filter(t => PROGRESS.test(t)).pop() || lines.pop();
-        if (pick) show(pick.replace(/^\[mummu[^\]]*\]\s*/, ""));
+      // limit=1: this wants the `status` object, not the lines — /logs is
+      // where the whole merged feed lives.
+      const page = await fetch("/api/logs?limit=1&source=server", { cache: "no-store" })
+        .then(r => r.json());
+      // Re-check AFTER the await. A poll still in flight when the generation
+      // ends would otherwise draw a stale bar under a finished answer, with
+      // nothing left running to ever clear it. (Found in review of the line
+      // this replaces; the same window exists here.)
+      if (stopped) return;
+      if (bar.render(page.status)) {
+        if (!bar.root.isConnected) el.appendChild(bar.root);
+        log.scrollTop = log.scrollHeight;
+      } else if (bar.root.isConnected) {
+        bar.root.remove();
       }
       misses = 0;
     } catch (e) {
@@ -249,7 +372,7 @@ function watchServerStatus(el) {
     if (!stopped) setTimeout(tick, misses ? Math.min(1000 * 2 ** misses, 10000) : 1000);
   };
   tick();
-  return () => { stopped = true; show(""); };
+  return () => { stopped = true; el.textContent = ""; };
 }
 
 pullBtn.addEventListener("click", async () => {
@@ -304,7 +427,7 @@ async function send() {
 
   const div = addMsg("assistant", "");
   const body = div.querySelector(".body");
-  const stopStatus = watchServerStatus(div.querySelector(".status"));
+  const stopStatus = watchLoadProgress(div.querySelector(".status"));
   let acc = "";
   const request = {
     model: c.name,
