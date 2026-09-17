@@ -25,6 +25,7 @@ pub const MIN_SET_OVERLAP: usize = 4;
 
 /// Next free port for a reference server; each leg gets its own so a binary's
 /// tests can run concurrently.
+#[allow(dead_code)] // fixture-replay binaries use only the verdict half
 pub fn next_port(base: u16) -> u16 {
     static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
     base + NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -36,6 +37,7 @@ pub fn next_port(base: u16) -> u16 {
 /// dense tiers compare on the GPU, OLMoE's ~28 GB f32 build only fits the host,
 /// and the f16 leg configures an f16 GPU device from its own binary (device
 /// dtype settings lock once per process). Panics (test style) on any divergence.
+#[allow(dead_code)] // fixture-replay binaries use only the verdict half
 pub async fn compare_against_llama_cpp<M, C>(
     tag: &str,
     gguf: &std::path::Path,
@@ -88,34 +90,65 @@ pub async fn compare_against_llama_cpp<M, C>(
         .expect("logits readback");
     drop(cache);
 
-    let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
-    indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
-    let our_ids: Vec<u32> = indexed[..TOP_K].iter().map(|&(id, _)| id as u32).collect();
-    let ref_ids: Vec<u32> = ref_top.iter().map(|&(id, _)| id).collect();
-    let ours_lp = logprobs_at(&logits, &our_ids);
-    let max_abs_diff = ours_lp
-        .iter()
-        .zip(ref_top.iter())
-        .map(|(a, &(_, b))| (a - b).abs())
-        .fold(0.0_f64, f64::max);
-
     let out_ids = loaded
         .greedy_generate(&ids, MAX_TOKENS, device)
         .await
         .expect("greedy decode");
     let ours = tok.decode(&out_ids, true).expect("decode");
 
+    assert_matches_reference(
+        tag,
+        &logits,
+        out_ids.len(),
+        &ours,
+        &ref_top,
+        &reference.content,
+        tolerance,
+    );
+}
+
+/// The gate's verdict on one prompt, given our first-forward `logits`, our
+/// decoded greedy text `ours` (`out_len` tokens), the reference's best-first
+/// top-[`TOP_K`] `(id, logprob)` and its greedy `ref_content`. Split out of
+/// [`compare_against_llama_cpp`] so a RECORDED reference (the Flash-Next
+/// fixture, whose 111 GB reference cannot share the box with our load) is
+/// judged by literally the same code as a live one — two copies of a policy
+/// drift.
+///
+/// Note the logprob bound is RANK-aligned: ours at our i-th id against the
+/// reference's at its i-th id, not the same id on both sides. Where ranks
+/// 4-5 swap that compares two different tokens' logprobs — measured tail
+/// drift, which is why the bound is loose and the greedy byte match primary.
+pub fn assert_matches_reference(
+    tag: &str,
+    logits: &[f32],
+    out_len: usize,
+    ours: &str,
+    ref_top: &[(u32, f64)],
+    ref_content: &str,
+    tolerance: f64,
+) {
+    assert_eq!(
+        ref_top.len(),
+        TOP_K,
+        "reference returned fewer than top-{TOP_K}"
+    );
+    let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+    indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let our_ids: Vec<u32> = indexed[..TOP_K].iter().map(|&(id, _)| id as u32).collect();
+    let ref_ids: Vec<u32> = ref_top.iter().map(|&(id, _)| id).collect();
+    let ours_lp = logprobs_at(logits, &our_ids);
+    let max_abs_diff = ours_lp
+        .iter()
+        .zip(ref_top.iter())
+        .map(|(a, &(_, b))| (a - b).abs())
+        .fold(0.0_f64, f64::max);
+
     eprintln!("[parity/gguf/{tag}] top-{TOP_K} ids ours: {our_ids:?}");
     eprintln!("[parity/gguf/{tag}] top-{TOP_K} ids ref : {ref_ids:?}");
     eprintln!("[parity/gguf/{tag}] max |Δlogprob| vs llama.cpp: {max_abs_diff:e}");
-    eprintln!(
-        "[parity/gguf/{tag}] ours      ({} tokens): {ours:?}",
-        out_ids.len()
-    );
-    eprintln!(
-        "[parity/gguf/{tag}] llama.cpp           : {:?}",
-        reference.content
-    );
+    eprintln!("[parity/gguf/{tag}] ours      ({out_len} tokens): {ours:?}");
+    eprintln!("[parity/gguf/{tag}] llama.cpp           : {ref_content:?}");
 
     assert_eq!(
         &our_ids[..STRICT_ORDER_K],
@@ -132,7 +165,7 @@ pub async fn compare_against_llama_cpp<M, C>(
         max_abs_diff <= tolerance,
         "logprobs diverge: max |Δ| = {max_abs_diff} > {tolerance}"
     );
-    let (a, b) = (ours.trim(), reference.content.trim());
+    let (a, b) = (ours.trim(), ref_content.trim());
     let n = a.len().min(b.len());
     assert!(n >= 8, "outputs too short to compare: {n} chars");
     assert_eq!(&a[..n], &b[..n], "greedy sequences diverge");

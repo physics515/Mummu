@@ -16,12 +16,16 @@
 //! - **Gated DeltaNet** (the rest): one projection mixes q/k/v, a second
 //!   emits the gate `z`; the mix runs through a depthwise causal conv
 //!   (kernel `conv_kernel`, rolling state) + SiLU; q/k are L2-normalized
-//!   per head (`x / max(‖x‖, ε)`) and tiled from `n_k_heads` to
+//!   per head (`x / max(‖x‖, ε)` here, `x / sqrt(‖x‖² + ε)` for qwen4exp:
+//!   [`Qwen35Config::gdn_l2`]) and tiled from `n_k_heads` to
 //!   `n_v_heads`; the recurrence per head with state `S ∈ R^{d_k×d_v}`:
 //!   `S ← S·exp(g);  v̂ = Sᵀk;  S += k(β(v − v̂))ᵀ;  o = Sᵀ(q/√d_k)` with
 //!   `β = σ(x·Wβ)` and `g = softplus(x·Wα + dt_bias)·a` (`a` holds
 //!   `-exp(A_log)`, negative); the output is gated-RMS-normed
-//!   (`RMS(o)·silu(z)` per head) and projected back.
+//!   (`RMS(o)·silu(z)` per head) and projected back. The gate activation is
+//!   [`Qwen35Config::gdn_gate`]: qwen35 is `silu`; qwen4exp reuses these
+//!   blocks through a config adapter with `sigmoid`, its one numerical
+//!   difference in the DeltaNet.
 //!
 //! The NextN/MTP block some checkpoints append (`nextn_predict_layers = 1`)
 //! is a draft head for speculative decoding, unused by the main forward —
@@ -42,6 +46,10 @@ use crate::models::CausalLm;
 use crate::models::qwen2::EosIds;
 use crate::nn::{LayerKv, SwiGluMlp, SwiGluMlpConfig, causal_mask, repeat_kv, rope_tables};
 use crate::quant::QuantPolicy;
+
+/// Re-exported so config literals outside `flex` (qwen4exp's adapter,
+/// mummu-serve's test configs) can name the gate next to the config.
+pub use crate::flex::gdn::{GdnGate, GdnL2};
 
 /// Architecture hyperparameters, read from a GGUF header's `qwen35.*`
 /// metadata (the family currently ships as GGUF; a safetensors `config.json`
@@ -74,6 +82,14 @@ pub struct Qwen35Config {
     pub n_k_heads: usize,
     /// DeltaNet value heads (`ssm.time_step_rank` — llama.cpp's reuse).
     pub n_v_heads: usize,
+    /// Activation on `z` in the DeltaNet's gated output RMSNorm. Not in
+    /// the GGUF header — fixed by the architecture: [`GdnGate::Silu`] for
+    /// qwen35, [`GdnGate::Sigmoid`] when qwen4exp drives these blocks.
+    pub gdn_gate: GdnGate,
+    /// Where `rms_norm_eps` enters the DeltaNet's q/k L2 norms. Not in the
+    /// header either: [`GdnL2::ClampNorm`] for qwen35 (the form its parity
+    /// fixtures were recorded against), [`GdnL2::AddEps`] for qwen4exp.
+    pub gdn_l2: GdnL2,
     pub eos_token_id: EosIds,
 }
 
@@ -162,13 +178,22 @@ impl Qwen35Config {
             d_state: meta_usize("qwen35.ssm.state_size")?,
             n_k_heads: meta_usize("qwen35.ssm.group_count")?,
             n_v_heads: meta_usize("qwen35.ssm.time_step_rank")?,
+            // llama.cpp qwen35.cpp build_norm_gated: ggml_silu(z).
+            gdn_gate: GdnGate::Silu,
+            // Unchanged from the parity-checked port. transformers and
+            // llama.cpp master both use GdnL2::AddEps for this family too;
+            // switching needs the qwen35 parity legs rerun, which the
+            // qwen4exp change (found by its teacher-forced dump) did not do.
+            gdn_l2: GdnL2::ClampNorm,
             eos_token_id: EosIds::One(u32::try_from(eos).map_err(|_| "EOS out of u32")?),
         };
         cfg.validate()?;
         Ok(cfg)
     }
 
-    fn validate(&self) -> Result<(), String> {
+    /// Layout invariants both blocks rely on. `pub(crate)` so qwen4exp's
+    /// adapter config is held to the same checks.
+    pub(crate) fn validate(&self) -> Result<(), String> {
         if self.d_inner != self.n_v_heads * self.d_state {
             return Err(format!(
                 "ssm.inner_size ({}) != n_v_heads ({}) · d_state ({}) — layout not implemented",
@@ -200,12 +225,12 @@ impl Qwen35Config {
 /// from the logical one — measured with Q4 on flex AND wgpu, 2026-08-21).
 /// Flatten the FLOAT input instead; the weight goes into the matmul as-is.
 /// All qwen35 projections are bias-free.
-fn qlinear(l: &Linear, x: Tensor<3>) -> Tensor<3> {
+pub(crate) fn qlinear(l: &Linear, x: Tensor<3>) -> Tensor<3> {
     debug_assert!(l.bias.is_none(), "qwen35 projections are bias-free");
     let [b, t, d_in] = x.dims();
     let w = l.weight.val(); // [in, out]
     let d_out = w.dims()[1];
-    let x2 = x.reshape([b * t, d_in]);
+    let x2 = crate::nn::refarith::linear_input2(x.reshape([b * t, d_in]), d_in, d_out);
     // Decode-shape quantized weights take the packed GEMV (reads the
     // stored bytes directly; on flex that is the i8 slab at 1.125 B/elem
     // against the 4 B/elem an f32 slab moves). Anything else — prefill,
@@ -218,13 +243,28 @@ fn qlinear(l: &Linear, x: Tensor<3>) -> Tensor<3> {
 }
 
 /// The 2-D twin of [`qlinear`] (the lm-head path).
-fn qlinear2(l: &Linear, x: Tensor<2>) -> Tensor<2> {
+pub(crate) fn qlinear2(l: &Linear, x: Tensor<2>) -> Tensor<2> {
     debug_assert!(l.bias.is_none(), "qwen35 projections are bias-free");
     let w = l.weight.val();
+    let [w_in, w_out] = w.dims();
+    let x = crate::nn::refarith::linear_input2(x, w_in, w_out);
     match crate::nn::try_q4s_gemv(&x, &w) {
         Some(y) => y,
         None => x.matmul(w),
     }
+}
+
+/// A bias-free `Linear` — every qwen35 projection is one ([`qlinear`]
+/// asserts it).
+fn bias_free_linear(inp: usize, out: usize, device: &Device) -> Linear {
+    LinearConfig::new(inp, out).with_bias(false).init(device)
+}
+
+/// An RMSNorm over `dim` at the model's epsilon.
+fn rms_norm(cfg: &Qwen35Config, dim: usize, device: &Device) -> RmsNorm {
+    RmsNormConfig::new(dim)
+        .with_epsilon(cfg.rms_norm_eps)
+        .init(device)
 }
 
 /// Gated full attention (see the module docs). Field names are this port's
@@ -242,8 +282,41 @@ pub struct GatedAttention {
 }
 
 impl GatedAttention {
+    /// A block shaped by `cfg`, with placeholder weights until a loader
+    /// assigns the real ones. Shared by `build` and sibling ports that
+    /// drive this block with their own loader, so the shapes cannot drift.
+    pub(crate) fn init(cfg: &Qwen35Config, device: &Device) -> Self {
+        Self {
+            q_proj: bias_free_linear(
+                cfg.hidden_size,
+                2 * cfg.num_attention_heads * cfg.head_dim,
+                device,
+            ),
+            k_proj: bias_free_linear(
+                cfg.hidden_size,
+                cfg.num_key_value_heads * cfg.head_dim,
+                device,
+            ),
+            v_proj: bias_free_linear(
+                cfg.hidden_size,
+                cfg.num_key_value_heads * cfg.head_dim,
+                device,
+            ),
+            o_proj: bias_free_linear(
+                cfg.num_attention_heads * cfg.head_dim,
+                cfg.hidden_size,
+                device,
+            ),
+            q_norm: rms_norm(cfg, cfg.head_dim, device),
+            k_norm: rms_norm(cfg, cfg.head_dim, device),
+        }
+    }
+
+    /// One gated-attention block over `x` `[b, t, hidden]`. `cos`/`sin` are
+    /// [`rope_tables`] over `rope_dim` for positions `past..past+t`; `mask`
+    /// is the causal mask when `t > 1`; `kv` grows by `t`.
     #[allow(clippy::too_many_arguments)] // mirrors the reference data flow
-    fn forward(
+    pub(crate) fn forward(
         &self,
         x: Tensor<3>,
         cfg: &Qwen35Config,
@@ -294,23 +367,31 @@ impl GatedAttention {
         let (k_all, v_all) = crate::nn::kv_append(kv, k_new, v_new);
 
         let group = nh / nkv;
-        let k = repeat_kv(k_all, group);
-        let v = repeat_kv(v_all, group).cast(ambient);
-        drop(_s_kv);
-        let _s_scores = crate::prof::scope("fa.scores");
-
-        // f32 island for the scores — the same overflow guard as GqaAttention.
         let scale = 1.0 / (hd as f32).sqrt();
-        let mut scores = q
-            .cast(DType::F32)
-            .matmul(k.cast(DType::F32).swap_dims(2, 3))
-            .mul_scalar(scale);
-        if let Some(m) = mask {
-            scores = scores.add(m.clone().cast(DType::F32));
-        }
-        let probs = activation::softmax(scores, 3).cast(ambient);
-        let ctx = probs.matmul(v); // [b, nh, t, hd]
-        drop(_s_scores);
+        // Diagnostic only (`nn::refarith`, off by default): ggml's CPU flash
+        // attention arithmetic over an f16 cache, host-side.
+        let ctx = if crate::nn::refarith::enabled() {
+            drop(_s_kv);
+            crate::nn::refarith::flash_attn_f16(q, k_all, v_all, scale)
+        } else {
+            let k = repeat_kv(k_all, group);
+            let v = repeat_kv(v_all, group).cast(ambient);
+            drop(_s_kv);
+            let _s_scores = crate::prof::scope("fa.scores");
+
+            // f32 island for the scores — the same overflow guard as GqaAttention.
+            let mut scores = q
+                .cast(DType::F32)
+                .matmul(k.cast(DType::F32).swap_dims(2, 3))
+                .mul_scalar(scale);
+            if let Some(m) = mask {
+                scores = scores.add(m.clone().cast(DType::F32));
+            }
+            let probs = activation::softmax(scores, 3).cast(ambient);
+            let ctx = probs.matmul(v); // [b, nh, t, hd]
+            drop(_s_scores);
+            ctx
+        };
         let _s = crate::prof::scope("fa.out");
 
         // Per-head output gate: out ⊙ sigmoid(gate).
@@ -381,7 +462,41 @@ impl DeltaState {
 }
 
 impl GatedDeltaNet {
-    fn forward(&self, x: Tensor<3>, cfg: &Qwen35Config, cache: &mut DeltaState) -> Tensor<3> {
+    /// A block shaped by `cfg`, with placeholder weights until a loader
+    /// assigns the real ones. Build DeltaNets through here rather than a
+    /// struct literal: the conv carries `conv_kernel - 1` explicit padding
+    /// on both sides, and [`Self::forward`]'s fresh-prefill branch reads
+    /// outputs `0..t` of exactly that padded conv as the causal alignment —
+    /// any other padding computes a shifted conv with no error.
+    pub(crate) fn init(cfg: &Qwen35Config, device: &Device) -> Self {
+        Self {
+            qkv_proj: bias_free_linear(cfg.hidden_size, cfg.conv_dim(), device),
+            z_proj: bias_free_linear(cfg.hidden_size, cfg.d_inner, device),
+            beta_proj: bias_free_linear(cfg.hidden_size, cfg.n_v_heads, device),
+            alpha_proj: bias_free_linear(cfg.hidden_size, cfg.n_v_heads, device),
+            dt_bias: Param::from_tensor(Tensor::zeros([cfg.n_v_heads], device)),
+            a: Param::from_tensor(Tensor::zeros([cfg.n_v_heads], device)),
+            conv1d: Conv1dConfig::new(cfg.conv_dim(), cfg.conv_dim(), cfg.conv_kernel)
+                .with_groups(cfg.conv_dim())
+                .with_padding(PaddingConfig1d::Explicit(
+                    cfg.conv_kernel - 1,
+                    cfg.conv_kernel - 1,
+                ))
+                .with_bias(false)
+                .init(device),
+            norm: rms_norm(cfg, cfg.d_state, device),
+            out_proj: bias_free_linear(cfg.d_inner, cfg.hidden_size, device),
+        }
+    }
+
+    /// One Gated DeltaNet block over `x` `[b, t, hidden]`, advancing
+    /// `cache` (conv window + recurrent state) by `t` tokens.
+    pub(crate) fn forward(
+        &self,
+        x: Tensor<3>,
+        cfg: &Qwen35Config,
+        cache: &mut DeltaState,
+    ) -> Tensor<3> {
         let [b, t, _] = x.dims();
         let (hk, hv, ds) = (cfg.n_k_heads, cfg.n_v_heads, cfg.d_state);
         let key_dim = cfg.key_dim();
@@ -474,10 +589,16 @@ impl GatedDeltaNet {
         drop(_s_conv);
         let _s_split = crate::prof::scope("delta.split");
 
-        // Split into q/k/v and L2-normalize q/k per head: x / max(‖x‖, ε).
+        // Split into q/k/v and L2-normalize q/k per head, in the family's
+        // form: x / max(‖x‖, ε) or x / sqrt(‖x‖² + ε).
         let eps = cfg.rms_norm_eps as f32;
+        let l2_form = cfg.gdn_l2;
         let l2 = |x: Tensor<4>| -> Tensor<4> {
-            let norm = x.clone().powi_scalar(2).sum_dim(3).sqrt().clamp_min(eps);
+            let sum_sq = x.clone().powi_scalar(2).sum_dim(3);
+            let norm = match l2_form {
+                GdnL2::ClampNorm => sum_sq.sqrt().clamp_min(eps),
+                GdnL2::AddEps => sum_sq.add_scalar(eps).sqrt(),
+            };
             x.div(norm)
         };
         let q = l2(conv_out
@@ -536,10 +657,16 @@ impl GatedDeltaNet {
         drop(_s_recur);
         let _s = crate::prof::scope("delta.out");
 
-        // Gated RMSNorm per value head, then flatten and project out.
+        // Gated RMSNorm per value head, then flatten and project out. The
+        // gate activation is the family's (silu for qwen35, sigmoid for
+        // qwen4exp); the fused host step applies the same choice.
         let o = self.norm.forward(o.swap_dims(1, 2)); // [b, t, hv, ds]
         let z = z.reshape([b, t, hv, ds]);
-        let gated = o.mul(activation::silu(z)).reshape([b, t, cfg.d_inner]);
+        let gate = match cfg.gdn_gate {
+            GdnGate::Silu => activation::silu(z),
+            GdnGate::Sigmoid => activation::sigmoid(z),
+        };
+        let gated = o.mul(gate).reshape([b, t, cfg.d_inner]);
         qlinear(&self.out_proj, gated)
     }
 
@@ -636,12 +763,14 @@ impl GatedDeltaNet {
             key_dim: cfg.key_dim(),
             d_inner: cfg.d_inner,
             l2_eps: cfg.rms_norm_eps as f32,
+            l2: cfg.gdn_l2,
             norm_eps: cfg.rms_norm_eps as f32,
             scale: 1.0 / (cfg.d_state as f32).sqrt(),
             conv_w: host(conv_w),
             dt_bias: host(self.dt_bias.val()),
             a: host(self.a.val()),
             gamma: host(self.norm.gamma.val()),
+            gate: cfg.gdn_gate,
         }
     }
 }
@@ -996,14 +1125,8 @@ pub struct LoadedQwen35 {
 }
 
 fn build(cfg: &Qwen35Config, device: &Device, untied_head: bool) -> Qwen35 {
-    let norm = |dim: usize, dev: &Device| {
-        RmsNormConfig::new(dim)
-            .with_epsilon(cfg.rms_norm_eps)
-            .init(dev)
-    };
-    let linear = |inp: usize, out: usize, dev: &Device| {
-        LinearConfig::new(inp, out).with_bias(false).init(dev)
-    };
+    let norm = |dim: usize, dev: &Device| rms_norm(cfg, dim, dev);
+    let linear = bias_free_linear;
     let mlp_cfg = SwiGluMlpConfig {
         hidden_size: cfg.hidden_size,
         intermediate_size: cfg.intermediate_size,
@@ -1014,48 +1137,8 @@ fn build(cfg: &Qwen35Config, device: &Device, untied_head: bool) -> Qwen35 {
             Qwen35Layer {
                 input_norm: norm(cfg.hidden_size, device),
                 post_attn_norm: norm(cfg.hidden_size, device),
-                self_attn: attn.then(|| GatedAttention {
-                    q_proj: linear(
-                        cfg.hidden_size,
-                        2 * cfg.num_attention_heads * cfg.head_dim,
-                        device,
-                    ),
-                    k_proj: linear(
-                        cfg.hidden_size,
-                        cfg.num_key_value_heads * cfg.head_dim,
-                        device,
-                    ),
-                    v_proj: linear(
-                        cfg.hidden_size,
-                        cfg.num_key_value_heads * cfg.head_dim,
-                        device,
-                    ),
-                    o_proj: linear(
-                        cfg.num_attention_heads * cfg.head_dim,
-                        cfg.hidden_size,
-                        device,
-                    ),
-                    q_norm: norm(cfg.head_dim, device),
-                    k_norm: norm(cfg.head_dim, device),
-                }),
-                linear_attn: (!attn).then(|| GatedDeltaNet {
-                    qkv_proj: linear(cfg.hidden_size, cfg.conv_dim(), device),
-                    z_proj: linear(cfg.hidden_size, cfg.d_inner, device),
-                    beta_proj: linear(cfg.hidden_size, cfg.n_v_heads, device),
-                    alpha_proj: linear(cfg.hidden_size, cfg.n_v_heads, device),
-                    dt_bias: Param::from_tensor(Tensor::zeros([cfg.n_v_heads], device)),
-                    a: Param::from_tensor(Tensor::zeros([cfg.n_v_heads], device)),
-                    conv1d: Conv1dConfig::new(cfg.conv_dim(), cfg.conv_dim(), cfg.conv_kernel)
-                        .with_groups(cfg.conv_dim())
-                        .with_padding(PaddingConfig1d::Explicit(
-                            cfg.conv_kernel - 1,
-                            cfg.conv_kernel - 1,
-                        ))
-                        .with_bias(false)
-                        .init(device),
-                    norm: norm(cfg.d_state, device),
-                    out_proj: linear(cfg.d_inner, cfg.hidden_size, device),
-                }),
+                self_attn: attn.then(|| GatedAttention::init(cfg, device)),
+                linear_attn: (!attn).then(|| GatedDeltaNet::init(cfg, device)),
                 mlp: mlp_cfg.init(device),
             }
         })
@@ -1100,8 +1183,9 @@ fn gguf_tensor_map(info: &GgufTensorInfo, trunk_layers: usize) -> Option<GgufMap
 }
 
 /// GGUF per-layer field → this port's parameter path (minus the layer
-/// prefix). Shared by the GGUF map and the pack loader.
-fn qwen35_field(field: &str) -> Option<&'static str> {
+/// prefix). Shared by the GGUF map and the pack loader (and qwen4exp, whose
+/// GDN and attention tensors carry the same names and shapes).
+pub(crate) fn qwen35_field(field: &str) -> Option<&'static str> {
     Some(match field {
         "attn_norm.weight" => "input_norm.weight",
         "post_attention_norm.weight" => "post_attn_norm.weight",
@@ -1220,7 +1304,7 @@ fn expected_tensor_count(cfg: &Qwen35Config, untied: bool) -> usize {
 
 /// Build a device tensor from row-major f32 `values` of `shape`, cast to the
 /// backend float dtype.
-fn device_tensor<const D: usize>(
+pub(crate) fn device_tensor<const D: usize>(
     values: Vec<f32>,
     shape: [usize; D],
     device: &Device,
@@ -1232,7 +1316,7 @@ fn device_tensor<const D: usize>(
 /// A 2-D **linear weight**: GGUF row-major is `[out, in]`, burn's `Linear`
 /// wants `[in, out]` — transpose on device, then quantize when the policy
 /// takes it.
-fn linear_weight(
+pub(crate) fn linear_weight(
     values: Vec<f32>,
     shape: &[usize],
     policy: QuantPolicy,
@@ -2385,6 +2469,8 @@ mod tests {
             d_state: 4,
             n_k_heads: 1,
             n_v_heads: 3,
+            gdn_gate: GdnGate::Silu,
+            gdn_l2: GdnL2::ClampNorm,
             eos_token_id: EosIds::One(0),
         }
     }
@@ -2698,35 +2784,187 @@ mod tests {
     fn fused_gdn_decode_matches_tensor_decode() {
         let _serial = FUSED_TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let m = toy_model();
-        let device = crate::backend::cpu_device();
-        let prefix: Vec<u32> = vec![3, 17, 42];
-        let decode: Vec<u32> = vec![9, 60, 11, 5];
+        let tensor = oracle_decode_steps(&m, false);
+        let fused = oracle_decode_steps(&m, true);
+        assert_steps_close(&tensor, &fused);
+    }
 
-        let run = |fused: bool| -> Vec<Vec<f32>> {
-            crate::flex::gdn::force_disable(!fused);
-            let _restore = RestoreFused;
-            let mut cache = m.new_cache();
-            let _ = m.forward(&prefix, 0, &mut cache, &device);
-            decode
-                .iter()
-                .enumerate()
-                .map(|(i, &id)| {
-                    m.forward(&[id], prefix.len() + i, &mut cache, &device)
-                        .into_data()
-                        .try_to_vec::<f32>()
-                        .unwrap()
-                })
-                .collect()
-        };
-        let tensor = run(false);
-        let fused = run(true);
-        for (step, (a, b)) in tensor.iter().zip(&fused).enumerate() {
+    /// The oracle's token script: a 3-token tensor-path prefill, then four
+    /// single-token decode steps carrying the conv ring and the recurrent
+    /// state from one step to the next.
+    const ORACLE_PREFIX: [u32; 3] = [3, 17, 42];
+    const ORACLE_DECODE: [u32; 4] = [9, 60, 11, 5];
+
+    /// Every decode step's logits for the oracle script, with the fused
+    /// host step on (`fused`) or forced off. Callers hold
+    /// `FUSED_TOGGLE_LOCK`.
+    fn oracle_decode_steps(m: &LoadedQwen35, fused: bool) -> Vec<Vec<f32>> {
+        let device = crate::backend::cpu_device();
+        crate::flex::gdn::force_disable(!fused);
+        let _restore = RestoreFused;
+        let mut cache = m.new_cache();
+        let _ = m.forward(&ORACLE_PREFIX, 0, &mut cache, &device);
+        ORACLE_DECODE
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| {
+                m.forward(&[id], ORACLE_PREFIX.len() + i, &mut cache, &device)
+                    .into_data()
+                    .try_to_vec::<f32>()
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    fn assert_steps_close(tensor: &[Vec<f32>], fused: &[Vec<f32>]) {
+        assert_eq!(tensor.len(), fused.len());
+        for (step, (a, b)) in tensor.iter().zip(fused).enumerate() {
+            assert_eq!(a.len(), b.len());
             for (i, (x, y)) in a.iter().zip(b).enumerate() {
                 assert!(
                     (x - y).abs() < 1e-4,
                     "decode step {step} logit {i}: tensor {x} vs fused {y}"
                 );
             }
+        }
+    }
+
+    /// The same oracle under qwen4exp's gate, `sigmoid(z)` in the gated
+    /// RMSNorm: the fused host step and the tensor path must agree at every
+    /// carried-state decode step. Agreement alone would also hold if both
+    /// paths ignored `gdn_gate`, so the gate must visibly reach them — the
+    /// sigmoid model's logits differ from the silu logits of the SAME
+    /// weights — and a one-shot prefill of the whole script (tensor path;
+    /// the chunked recurrence under the default env, t = 7 being above the
+    /// sequential ceiling of 4) must land on the fused path's last decode
+    /// step.
+    #[test]
+    fn fused_gdn_decode_matches_tensor_decode_with_sigmoid_gate() {
+        let _serial = FUSED_TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let silu = toy_model();
+        let sigmoid = LoadedQwen35 {
+            model: silu.model.clone(),
+            config: Qwen35Config {
+                gdn_gate: GdnGate::Sigmoid,
+                ..silu.config.clone()
+            },
+            tokenizer_config: None,
+            ffn_pool: None,
+            ffn_skip_tau: 0.0,
+            ffn_plan: None,
+        };
+
+        let tensor = oracle_decode_steps(&sigmoid, false);
+        let fused = oracle_decode_steps(&sigmoid, true);
+        assert_steps_close(&tensor, &fused);
+
+        let silu_tensor = oracle_decode_steps(&silu, false);
+        let gate_effect = tensor
+            .iter()
+            .flatten()
+            .zip(silu_tensor.iter().flatten())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            gate_effect > 1e-3,
+            "sigmoid and silu gates gave the same logits (max diff {gate_effect}): \
+             gdn_gate is not reaching the DeltaNet"
+        );
+
+        let device = crate::backend::cpu_device();
+        let script: Vec<u32> = ORACLE_PREFIX
+            .iter()
+            .chain(&ORACLE_DECODE)
+            .copied()
+            .collect();
+        let mut cache = sigmoid.new_cache();
+        let one_shot = sigmoid
+            .forward(&script, 0, &mut cache, &device)
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap();
+        let last = fused.last().expect("decode steps ran");
+        assert_eq!(one_shot.len(), last.len());
+        for (i, (x, y)) in one_shot.iter().zip(last).enumerate() {
+            assert!(
+                (x - y).abs() < 1e-4,
+                "logit {i}: one-shot prefill {x} vs fused decode {y}"
+            );
+        }
+    }
+
+    /// The oracle under qwen4exp's q/k L2 form, `x / sqrt(‖x‖² + ε)`: the
+    /// fused host step and the tensor path must agree at every carried-state
+    /// decode step, and a one-shot prefill (chunked recurrence) must land on
+    /// the last fused step. The toy's ε is raised to 0.25 so the form is
+    /// visible at the toy's O(1) key norms — on real weights it shows at
+    /// ‖k‖ ≈ 1e-3 with ε = 1e-6 — and the two forms must give different
+    /// logits on the same weights, so a `gdn_l2` that is ignored cannot pass.
+    #[test]
+    fn fused_gdn_decode_matches_tensor_decode_with_add_eps_l2() {
+        let _serial = FUSED_TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cfg = Qwen35Config {
+            rms_norm_eps: 0.25,
+            gdn_gate: GdnGate::Sigmoid,
+            gdn_l2: GdnL2::AddEps,
+            ..toy_config()
+        };
+        cfg.validate().expect("toy config validates");
+        let device = crate::backend::cpu_device();
+        let add = LoadedQwen35 {
+            model: build(&cfg, &device, false),
+            config: cfg.clone(),
+            tokenizer_config: None,
+            ffn_pool: None,
+            ffn_skip_tau: 0.0,
+            ffn_plan: None,
+        };
+        let clamp = LoadedQwen35 {
+            model: add.model.clone(),
+            config: Qwen35Config {
+                gdn_l2: GdnL2::ClampNorm,
+                ..cfg
+            },
+            tokenizer_config: None,
+            ffn_pool: None,
+            ffn_skip_tau: 0.0,
+            ffn_plan: None,
+        };
+
+        let tensor = oracle_decode_steps(&add, false);
+        let fused = oracle_decode_steps(&add, true);
+        assert_steps_close(&tensor, &fused);
+
+        let clamp_tensor = oracle_decode_steps(&clamp, false);
+        let form_effect = tensor
+            .iter()
+            .flatten()
+            .zip(clamp_tensor.iter().flatten())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            form_effect > 1e-3,
+            "AddEps and ClampNorm gave the same logits (max diff {form_effect}): \
+             gdn_l2 is not reaching the DeltaNet"
+        );
+
+        let script: Vec<u32> = ORACLE_PREFIX
+            .iter()
+            .chain(&ORACLE_DECODE)
+            .copied()
+            .collect();
+        let mut cache = add.new_cache();
+        let one_shot = add
+            .forward(&script, 0, &mut cache, &device)
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap();
+        let last = fused.last().expect("decode steps ran");
+        for (i, (x, y)) in one_shot.iter().zip(last).enumerate() {
+            assert!(
+                (x - y).abs() < 1e-4,
+                "logit {i}: one-shot prefill {x} vs fused decode {y}"
+            );
         }
     }
 
