@@ -87,13 +87,18 @@ pub enum GdnL2 {
 }
 
 impl GdnL2 {
-    /// `1 / norm` for a head whose squared entries sum to `sum_sq`.
+    /// The L2 denominator for a head whose squared entries sum to `sum_sq`.
+    ///
+    /// Returned as the norm rather than its inverse so callers divide by it:
+    /// `scale / n` and `scale * (1 / n)` differ by one ulp on about a quarter
+    /// of f32 inputs, and the [`GdnL2::ClampNorm`] arm must stay bit-identical
+    /// to the qwen35 fused step its parity fixtures were recorded against.
     #[inline]
     #[must_use]
-    pub fn inv_norm(self, sum_sq: f32, eps: f32) -> f32 {
+    pub fn norm(self, sum_sq: f32, eps: f32) -> f32 {
         match self {
-            Self::ClampNorm => 1.0 / sum_sq.sqrt().max(eps),
-            Self::AddEps => 1.0 / (sum_sq + eps).sqrt(),
+            Self::ClampNorm => sum_sq.sqrt().max(eps),
+            Self::AddEps => (sum_sq + eps).sqrt(),
         }
     }
 }
@@ -278,8 +283,9 @@ pub fn gdn_step(
     for h in 0..hk {
         let seg = h * ds..(h + 1) * ds;
         let sum_sq = |x: &[f32]| x.iter().map(|x| x * x).sum::<f32>();
-        let sq = p.scale * p.l2.inv_norm(sum_sq(&q_raw[seg.clone()]), p.l2_eps);
-        let sk = p.l2.inv_norm(sum_sq(&k_raw[seg.clone()]), p.l2_eps);
+        let nq = p.l2.norm(sum_sq(&q_raw[seg.clone()]), p.l2_eps);
+        let nk = p.l2.norm(sum_sq(&k_raw[seg.clone()]), p.l2_eps);
+        let (sq, sk) = (p.scale / nq, 1.0 / nk);
         for i in seg {
             qn[i] = q_raw[i] * sq;
             kn[i] = k_raw[i] * sk;

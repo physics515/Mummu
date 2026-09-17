@@ -70,7 +70,7 @@ pub const DEFAULT_CACHE_GB: f64 = 0.0;
 /// Floor on the selected-probability sum before renormalizing: llama.cpp's
 /// `ggml_clamp(weights_sum, 6.103515625e-5, INF)` — the smallest positive
 /// F16 value, so the division can never blow up.
-pub const WEIGHT_SUM_FLOOR: f32 = 6.103_515_625e-5;
+pub const WEIGHT_SUM_FLOOR: f32 = 1.0 / 16384.0;
 
 /// f32 elements per dequantized row chunk (~256 KiB): L2-sized, so a chunk's
 /// rows are dotted while still hot, and big enough that a rayon task
@@ -454,15 +454,15 @@ fn matvec_rows(
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     let mut acc = [0f32; 8];
-    let mut ca = a.chunks_exact(8);
-    let mut cb = b.chunks_exact(8);
-    for (x, y) in (&mut ca).zip(&mut cb) {
-        for l in 0..8 {
-            acc[l] += x[l] * y[l];
+    let (ca, ra) = a.as_chunks::<8>();
+    let (cb, rb) = b.as_chunks::<8>();
+    for (x, y) in ca.iter().zip(cb) {
+        for ((lane, xl), yl) in acc.iter_mut().zip(x).zip(y) {
+            *lane += xl * yl;
         }
     }
     let mut s = ((acc[0] + acc[4]) + (acc[1] + acc[5])) + ((acc[2] + acc[6]) + (acc[3] + acc[7]));
-    for (x, y) in ca.remainder().iter().zip(cb.remainder()) {
+    for (x, y) in ra.iter().zip(rb) {
         s += x * y;
     }
     s
@@ -1462,6 +1462,8 @@ mod tests {
                     mask[e] = p / top_sum;
                 }
                 let x = &xs[t * TOY_HIDDEN..(t + 1) * TOY_HIDDEN];
+                #[allow(clippy::needless_range_loop)]
+                // `e` is the expert id the bank reads, not just an index
                 for e in 0..TOY_EXPERTS {
                     let deq = |b: &ExpertBank| b.dequantize_expert(e).unwrap();
                     let (g, _) = ref_matvec(&deq(&banks.gate), TOY_HIDDEN, x);
@@ -1816,7 +1818,7 @@ mod tests {
         let mut rng = Rng(0xF1A5);
         let unit_rms = |rng: &mut Rng, n: usize| {
             let mut xs: Vec<f32> = rng.uniform_vec(n * 2560);
-            for x in xs.chunks_exact_mut(2560) {
+            for x in xs.as_chunks_mut::<2560>().0 {
                 let rms = (x.iter().map(|v| v * v).sum::<f32>() / 2560.0).sqrt();
                 x.iter_mut().for_each(|v| *v /= rms);
             }
@@ -1866,10 +1868,14 @@ mod tests {
             .expect("router weight");
         assert_eq!(router.len(), 512 * 2560);
         let logits_for = |xs: &[f32]| -> Vec<f32> {
-            xs.chunks_exact(2560)
+            xs.as_chunks::<2560>()
+                .0
+                .iter()
                 .flat_map(|x| {
                     router
-                        .chunks_exact(2560)
+                        .as_chunks::<2560>()
+                        .0
+                        .iter()
                         .map(|w| dot(w, x))
                         .collect::<Vec<_>>()
                 })

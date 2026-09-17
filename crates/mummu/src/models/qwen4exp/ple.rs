@@ -110,14 +110,15 @@ pub fn ple_row_ids(
     let mut ctx = [0u64; MAX_NGRAM];
     ctx[0] = u64::from(token);
     let mut cut = false;
-    for s in 1..n_gram {
+    for (back, slot) in ctx.iter_mut().enumerate().take(n_gram).skip(1) {
+        // `back` positions before the current token (prev[0] is one back).
         let t = if cut {
             None
         } else {
-            prev.get(s - 1).copied().flatten()
+            prev.get(back - 1).copied().flatten()
         };
         cut = cut || t.is_none() || t == Some(eos);
-        ctx[s] = u64::from(match t {
+        *slot = u64::from(match t {
             Some(v) if !cut => v,
             _ => eos,
         });
@@ -1606,6 +1607,9 @@ mod tests {
             ],
             "token 0 rows"
         );
+        // Printed by the independent numpy decode at full f32 precision, and
+        // compared with assert_eq!, so the digits past f32's are deliberate.
+        #[allow(clippy::excessive_precision)]
         let want: [([f32; 4], f32); 3] = [
             (
                 [

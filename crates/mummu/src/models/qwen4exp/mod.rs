@@ -340,6 +340,33 @@ impl Qwen4expConfig {
             ));
         }
 
+        // The attention layers run plain partial RoPE over `rope_dim` dims.
+        // That is exact for llama.cpp's IMROPE only while every rotated
+        // frequency is assigned to the t/h/w sections, which all equal the
+        // token position for text; a non-zero 4th (e) section would give
+        // those dims angle 0 in llama.cpp and a real rotation here. The
+        // shipped header is [11, 11, 10, 0], so refuse anything else loudly
+        // rather than rotate the wrong dims silently.
+        let rope_dim = usize_at("qwen4exp.rope.dimension_count")?;
+        let sections = f
+            .get("qwen4exp.rope.dimension_sections")
+            .and_then(GgufValue::as_array)
+            .ok_or("GGUF metadata missing array qwen4exp.rope.dimension_sections")?
+            .iter()
+            .map(|v| {
+                v.as_i64()
+                    .and_then(|n| usize::try_from(n).ok())
+                    .ok_or_else(|| "rope.dimension_sections holds a non-integer entry".to_string())
+            })
+            .collect::<Result<Vec<usize>, String>>()?;
+        let rotated: usize = sections.iter().take(3).sum();
+        if sections.len() != 4 || sections[3] != 0 || 2 * rotated != rope_dim {
+            return Err(format!(
+                "rope.dimension_sections {sections:?} is not text-degenerate for rope.dimension_count \
+                 {rope_dim}: only [t, h, w, 0] with 2*(t+h+w) == rope_dim is implemented"
+            ));
+        }
+
         let cfg = Self {
             vocab_size,
             hidden_size: usize_at("qwen4exp.embedding_length")?,
@@ -349,7 +376,7 @@ impl Qwen4expConfig {
             head_dim: usize_at("qwen4exp.attention.key_length")?,
             rms_norm_eps: f64::from(f32_at("qwen4exp.attention.layer_norm_rms_epsilon")?),
             rope_theta: f32_at("qwen4exp.rope.freq_base")?,
-            rope_dim: usize_at("qwen4exp.rope.dimension_count")?,
+            rope_dim,
             full_attention_interval,
             conv_kernel: usize_at("qwen4exp.ssm.conv_kernel")?,
             d_inner: usize_at("qwen4exp.ssm.inner_size")?,

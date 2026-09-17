@@ -76,6 +76,14 @@ pub fn set_perturbation(seed: Option<u64>, eps: f64) {
     EPS.store(eps.to_bits(), Ordering::Relaxed);
 }
 
+/// Whether an embedding perturbation is currently configured. A parity gate
+/// asserts this is false: a verdict measured on a perturbed forward is not a
+/// verdict about the port.
+#[must_use]
+pub fn perturbation_active() -> bool {
+    SEED.load(Ordering::Relaxed) != 0
+}
+
 /// Apply the configured embedding perturbation (identity when none is set).
 pub fn perturb_embedding(x: Tensor<3>) -> Tensor<3> {
     let s = SEED.load(Ordering::Relaxed);

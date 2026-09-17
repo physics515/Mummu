@@ -13,7 +13,13 @@
 //!
 //! ```text
 //! MUMMU_QWEN4EXP_DIR=/home/physics515/.cache/mummu-models/qwen3.8-flash-next \
-//!   cargo test -p mummu --release --test parity_qwen4exp -- --ignored --nocapture
+//!   cargo test -p mummu --release --test parity_qwen4exp -- --ignored --nocapture \
+//!   --exact qwen4exp_cpu_matches_the_recorded_llama_cpp_reference
+//!
+//! Name the gate test: this binary also holds diagnostics (the noise sweep
+//! flips process-global `nn::refarith` state), and a gate verdict must never
+//! share a process with them. The gate itself also asserts that state is
+//! clean before it measures anything.
 //! ```
 //!
 //! Point the directory at an NVMe copy: the routed experts and PLE rows are
@@ -92,6 +98,14 @@ fn qwen4exp_cpu_matches_the_recorded_llama_cpp_reference() {
         eprintln!("skipped: set MUMMU_QWEN4EXP_DIR to the shard directory");
         return;
     };
+    // The verdict is only meaningful on the exact path: a diagnostic that
+    // ran earlier in this process (the noise sweep) may have left the
+    // reference-arithmetic emulation or an embedding perturbation switched on.
+    assert!(
+        !mummu::nn::refarith::enabled() && !mummu::nn::refarith::perturbation_active(),
+        "the parity gate must run on the exact path: nn::refarith emulation or \
+         perturbation is active in this process (unset MUMMU_REF_ARITH, run the gate by name)"
+    );
     let fx = Fixture::load();
     let (model, tok) = load(&first);
     let device = mummu::backend::cpu_device();
@@ -278,6 +292,17 @@ fn noise_realizations_of_the_first_forward() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1e-5);
+    // Restore the process-global emulation state however this test exits,
+    // so nothing that runs after it in the same process measures a
+    // perturbed or emulated forward by accident.
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            mummu::nn::refarith::set_enabled(self.0);
+            mummu::nn::refarith::set_perturbation(None, 0.0);
+        }
+    }
+    let _restore = Restore(mummu::nn::refarith::enabled());
     for (mode, on, n) in [("exact", false, 3usize), ("emulated", true, seeds)] {
         mummu::nn::refarith::set_enabled(on);
         for s in 0..=n {
