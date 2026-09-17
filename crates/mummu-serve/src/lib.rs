@@ -15,7 +15,9 @@
 //! parked on minutes of CPU/GPU work. Endpoints:
 //!
 //! - `GET  /`            the embedded chat UI
+//! - `GET  /logs`        the embedded merged-log page (see [`logs`])
 //! - `GET  /api/health`  device policy + adapter inventory
+//! - `GET  /api/logs`    the merged server/api/shim log ring, since a cursor
 //! - `GET  /api/models`  the catalog with installed flags
 //! - `POST /api/pull`    download a catalog model (SSE progress)
 //! - `POST /api/chat`    stream a chat completion (SSE deltas)
@@ -32,6 +34,7 @@
 //! they were, read at the point of use.
 
 mod engine;
+pub mod logs;
 mod shim;
 
 use std::convert::Infallible;
@@ -60,6 +63,10 @@ pub use engine::device_label;
 /// that wants to embed the same bytes (the Tauri app's offline fallback) has
 /// one source of truth instead of a copy that drifts.
 pub const UI_HTML: &str = include_str!("ui.html");
+
+/// The logs page, exactly as `GET /logs` serves it — same reason as
+/// [`UI_HTML`].
+pub const LOGS_HTML: &str = logs::LOGS_HTML;
 
 /// Default listen address of the native API + UI.
 pub const DEFAULT_ADDR: &str = "0.0.0.0:8095";
@@ -173,6 +180,11 @@ pub async fn serve_on<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    // Before anything else prints: everything written before the tee is
+    // installed reaches only `docker logs`, and the lines worth seeing start
+    // at the first model load. Idempotent, so the binary having already
+    // installed it (earlier, in `main`) costs nothing.
+    logs::install();
     // Start watching host memory as soon as we are serving: the pressure it
     // guards against arrives from OTHER processes, so it must not depend on
     // this one receiving traffic. See `engine::spawn_host_pressure_watch`.
@@ -240,7 +252,12 @@ pub fn router() -> Router {
     Router::new()
         .route("/", get(ui))
         .route("/index.html", get(ui))
+        // The merged log feed and the page that reads it. Beside /api/health
+        // because they answer the same question — is this thing alive? — and
+        // the log is the half that says what it is *doing*.
+        .route("/logs", get(logs::page))
         .route("/api/health", get(health))
+        .route("/api/logs", get(logs::endpoint))
         .route("/api/models", get(models))
         .route("/api/pull", post(pull))
         .route("/api/chat", post(chat))
@@ -259,6 +276,10 @@ pub fn router() -> Router {
         // `+ 1` so a body just over the ceiling still reaches the handler
         // and gets the JSON "body too large" the sync reader produced.
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES + 1))
+        // Outermost, so it also records the requests the layers below reject
+        // (a body over the ceiling, a route that does not exist) — those are
+        // exactly the ones an operator is hunting when nothing works.
+        .layer(axum::middleware::from_fn(logs::record_api))
 }
 
 /// The ollama-compatibility router, for a caller that wants to mount or

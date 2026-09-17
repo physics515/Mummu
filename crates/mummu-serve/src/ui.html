@@ -45,6 +45,18 @@
   .msg.user .body { background: var(--user); border-radius: 10px; padding: 8px 12px; }
   .msg.assistant .body { padding: 2px 0; }
   .msg .meta { font-size: 11px; color: var(--dim); margin-top: 4px; }
+  /* Live server output while a generation is in flight — a cold load spends
+     minutes before the first token, and an empty bubble reads as "broken". */
+  .msg .status {
+    font: 11.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color: var(--dim); margin-top: 4px; white-space: pre-wrap; word-break: break-word;
+  }
+  .msg .status:empty { display: none; }
+  a.nav {
+    color: var(--dim); text-decoration: none; font-size: 13px;
+    border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px;
+  }
+  a.nav:hover { color: var(--accent); border-color: var(--accent); }
   .msg .body details {
     color: var(--dim); font-size: 13px; border-left: 2px solid var(--border);
     padding-left: 10px; margin: 4px 0; white-space: pre-wrap;
@@ -71,6 +83,7 @@
     <span id="pullpct" class="badge" style="display:none"></span>
   </span>
   <span style="flex:1"></span>
+  <a class="nav" href="/logs" title="Everything this server printed, plus every API and shim request, merged">Logs</a>
   <button id="unload" title="Drop the resident model from GPU/CPU memory">Unload</button>
   <button id="clear" title="Clear the conversation">Clear</button>
   <span id="device" class="badge">…</span>
@@ -138,7 +151,7 @@ function addMsg(who, text) {
   $("empty") && $("empty").remove();
   const div = document.createElement("div");
   div.className = "msg " + who;
-  div.innerHTML = `<div class="who">${who}</div><div class="body"></div><div class="meta"></div>`;
+  div.innerHTML = `<div class="who">${who}</div><div class="body"></div><div class="status"></div><div class="meta"></div>`;
   renderBody(div.querySelector(".body"), text);
   log.appendChild(div);
   log.scrollTop = log.scrollHeight;
@@ -189,6 +202,54 @@ async function readSse(resp, onEvent) {
       }
     }
   }
+}
+
+// While a generation is in flight, show what the SERVER says it is doing.
+//
+// The failure this fixes: a cold 27B load spends over two minutes reading its
+// pack off a spinning array before the first token, and this UI showed an
+// empty assistant bubble the whole time — indistinguishable from a hung
+// server. The server was printing exactly the right thing to stderr
+// ("[mummu] load: 673/851 tensors — 14.46 GiB off the pack in 91s (162 MB/s)")
+// and only `docker logs` could see it. /api/logs makes it readable from here.
+//
+// Deliberately one line under the bubble, not a panel: /logs is where the
+// whole merged feed lives. It clears the moment real text arrives.
+
+// Lines worth promoting over "whatever came last" — a cold start's time goes
+// into reading the pack and placing it, and those are the lines that say so.
+const PROGRESS = /load:|tensors|resident|fit plan|vnni twins|pack import|MB\/s|experts/i;
+
+function watchServerStatus(el) {
+  let cursor = null, stopped = false, misses = 0;
+  const show = text => { el.textContent = text; log.scrollTop = log.scrollHeight; };
+  const tick = async () => {
+    if (stopped) return;
+    try {
+      // The first poll only establishes where "now" is: what matters is what
+      // THIS request causes, not what the previous one left in the ring.
+      const url = cursor === null
+        ? "/api/logs?source=server&limit=1"
+        : `/api/logs?source=server&limit=200&since=${cursor}`;
+      const page = await fetch(url, { cache: "no-store" }).then(r => r.json());
+      if (cursor === null) {
+        cursor = page.newest;
+      } else {
+        cursor = page.cursor;
+        const lines = page.lines.map(l => l.text);
+        const pick = lines.filter(t => PROGRESS.test(t)).pop() || lines.pop();
+        if (pick) show(pick.replace(/^\[mummu[^\]]*\]\s*/, ""));
+      }
+      misses = 0;
+    } catch (e) {
+      misses++;   // a poll that fails is not worth reporting; the chat stream is
+    }
+    // Never faster than once a second, and back off if the server stops
+    // answering — this runs alongside a generation and must cost nothing.
+    if (!stopped) setTimeout(tick, misses ? Math.min(1000 * 2 ** misses, 10000) : 1000);
+  };
+  tick();
+  return () => { stopped = true; show(""); };
 }
 
 pullBtn.addEventListener("click", async () => {
@@ -243,6 +304,7 @@ async function send() {
 
   const div = addMsg("assistant", "");
   const body = div.querySelector(".body");
+  const stopStatus = watchServerStatus(div.querySelector(".status"));
   let acc = "";
   const request = {
     model: c.name,
@@ -256,6 +318,7 @@ async function send() {
   // Same frames either way; only the transport differs.
   const onEvent = ev => {
     if (ev.type === "delta") {
+      stopStatus();   // the answer is arriving; the load status has done its job
       acc += ev.text;
       renderBody(body, acc);
       log.scrollTop = log.scrollHeight;
@@ -275,6 +338,7 @@ async function send() {
     // keep history consistent: a failed turn contributes no assistant message
     if (history[history.length - 1]?.role !== "assistant") { /* nothing to pop */ }
   } finally {
+    stopStatus();
     generating = false; $("send").disabled = false;
     log.scrollTop = log.scrollHeight;
   }

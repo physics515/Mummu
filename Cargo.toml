@@ -144,6 +144,14 @@ tokio-stream = "0.1"
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
 once_cell = "1"
+# `dup`/`dup2`/`pipe` for mummu-serve's stdout/stderr tee (crates/mummu-serve/
+# src/logs.rs). Already in the graph transitively (tokio, wgpu, half, …), so
+# naming it here pins nothing new — there is simply no std API for dup2.
+libc = "0.2"
+# The `Body` trait, for reading a finished response's exact length in the
+# request-logging middleware. The same http-body 1.x axum and hyper already
+# resolve; a direct handle on it only brings the trait into scope.
+http-body = "1"
 
 criterion = "0.8"
 

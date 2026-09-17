@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mummu logs</title>
+<!--
+  The merged log feed for GET /api/logs.
+
+  Standalone on purpose: same CSS variables and the same dark look as ui.html,
+  but its own file with no shared build step and no external asset, because
+  both pages are `include_str!`d into the binary and served by a box that may
+  have no internet at all. A framework or a CDN font would be one more thing
+  that can fail on the day you are trying to find out why nothing works.
+-->
+<style>
+  :root {
+    --bg: #101014; --panel: #17171d; --panel2: #1e1e26; --border: #2a2a35;
+    --text: #e7e7ee; --dim: #8a8a99; --accent: #7aa2f7; --user: #24283b;
+    --err: #f7768e; --ok: #9ece6a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.55 system-ui, "Segoe UI", sans-serif;
+    display: flex; flex-direction: column; height: 100dvh;
+  }
+  header {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 10px 14px; background: var(--panel); border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 16px; margin: 0 6px 0 0; font-weight: 600; letter-spacing: .04em; }
+  header h1 span { color: var(--accent); }
+  select, input, button {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 6px 10px; font: inherit;
+  }
+  button { cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button.on { border-color: var(--accent); color: var(--accent); }
+  a.nav {
+    color: var(--dim); text-decoration: none; font-size: 13px;
+    border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px;
+  }
+  a.nav:hover { color: var(--accent); border-color: var(--accent); }
+  .badge {
+    font-size: 12px; color: var(--dim); border: 1px solid var(--border);
+    border-radius: 999px; padding: 2px 10px; white-space: nowrap;
+  }
+  .badge.live { color: var(--ok); }
+  .badge.down { color: var(--err); }
+  label.check { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--dim); }
+  label.check input { width: auto; padding: 0; }
+
+  #feed {
+    flex: 1; overflow-y: auto; padding: 8px 0 14px;
+    font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  .row {
+    display: flex; gap: 10px; padding: 1px 14px; white-space: pre-wrap; word-break: break-word;
+  }
+  .row:hover { background: var(--panel); }
+  .row[hidden] { display: none; }
+  .ts { color: var(--dim); flex: none; }
+  .chip {
+    flex: none; width: 52px; text-align: center; border-radius: 4px;
+    background: var(--panel2); font-size: 11px; letter-spacing: .04em;
+  }
+  .chip.server { color: var(--dim); }
+  .chip.api { color: var(--ok); }
+  .chip.shim { color: var(--accent); }
+  .txt { flex: 1; min-width: 0; }
+  /* Level colouring, from the same four variables the chat UI uses. */
+  .lvl-error .txt { color: var(--err); }
+  .lvl-warn .txt { color: var(--accent); }
+  .quiet .txt, .quiet .chip { opacity: .5; }
+
+  .gap {
+    color: var(--err); padding: 4px 14px; text-align: center;
+    border-top: 1px dashed var(--border); border-bottom: 1px dashed var(--border);
+    margin: 4px 0;
+  }
+  #empty { text-align: center; color: var(--dim); margin-top: 12vh; font-family: system-ui, sans-serif; }
+  #empty .big { font-size: 40px; }
+  footer {
+    padding: 6px 14px; background: var(--panel); border-top: 1px solid var(--border);
+    font-size: 12px; color: var(--dim); display: flex; gap: 14px; align-items: center; flex-wrap: wrap;
+  }
+  #tail { display: none; }
+  #tail.show { display: inline-block; }
+</style>
+</head>
+<body>
+<header>
+  <h1><span>mummu</span> logs</h1>
+  <a class="nav" href="/">&larr; Chat</a>
+  <select id="source" title="which source to show">
+    <option value="all">all sources</option>
+    <option value="server">server (stdout/stderr)</option>
+    <option value="api">api (8095)</option>
+    <option value="shim">shim (11435)</option>
+  </select>
+  <input id="search" type="search" placeholder="filter (plain text)" style="width:220px">
+  <label class="check"><input id="quiet" type="checkbox"> show health/poll traffic</label>
+  <span style="flex:1"></span>
+  <button id="pause" title="Stop polling. The server keeps logging; a gap marker appears if the ring overran while you were paused.">Pause</button>
+  <button id="clear" title="Clear what is on screen (the server's ring is untouched)">Clear</button>
+  <span id="status" class="badge">…</span>
+</header>
+
+<div id="feed"><div id="empty"><div class="big">𒀯</div>Waiting for the first line…</div></div>
+
+<footer>
+  <span id="counts">0 lines</span>
+  <span id="dropped"></span>
+  <span style="flex:1"></span>
+  <button id="tail">Jump to newest &darr;</button>
+  <span id="cursorinfo"></span>
+</footer>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const feed = $("feed");
+
+// Keep the DOM at the size of the server's ring: past that the page is showing
+// lines the server has already forgotten, and a browser tab left open for a
+// week would grow without bound.
+const MAX_ROWS = 2000;
+// Never faster than this, whatever happens — a log reader must not be able to
+// cost the server more than the thing it is watching.
+const MIN_POLL_MS = 1000;
+const HIDDEN_POLL_MS = 5000;
+const MAX_BACKOFF_MS = 15000;
+
+let cursor = 0;          // 0 = "everything you still have"
+let paused = false;
+let failures = 0;
+let stick = true;        // auto-scroll: true while the reader is at the bottom
+let droppedTotal = 0;
+
+function shortTime(ms) {
+  const d = new Date(ms);
+  const p = n => String(n).padStart(2, "0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+// --- filtering -------------------------------------------------------------
+//
+// Every line the server hands over is kept in the DOM and merely hidden, so
+// changing the filter or the search is instant and never loses history the
+// server may already have dropped. The source filter is applied here rather
+// than through the endpoint's `source=` parameter for the same reason:
+// switching from "api" to "all" would otherwise show nothing before the switch.
+
+function matches(row) {
+  if (row.classList.contains("gap")) return true;
+  const want = $("source").value;
+  if (want !== "all" && row.dataset.source !== want) return false;
+  if (!$("quiet").checked && row.dataset.quiet === "1") return false;
+  const needle = $("search").value.trim().toLowerCase();
+  if (needle && !row.dataset.text.includes(needle)) return false;
+  return true;
+}
+
+function applyFilter(row) { row.hidden = !matches(row); }
+function reapplyAll() {
+  for (const row of feed.children) if (row.dataset) applyFilter(row);
+  if (stick) toBottom();
+}
+for (const el of ["source", "search", "quiet"]) $(el).addEventListener("input", reapplyAll);
+
+// --- the feed --------------------------------------------------------------
+
+function toBottom() { feed.scrollTop = feed.scrollHeight; }
+
+// Cap the LINES, not every child.
+//
+// A gap marker only ever appears in front of a full ring's worth of lines —
+// that is what "the ring overran" means — so a cap that counted markers too
+// would trim away the confession along with the lines it was confessing
+// about, every single time. Counting rows keeps the newest marker pinned at
+// the top where it belongs; older ones reach the front as the rows ahead of
+// them go, and are dropped there, annotating nothing.
+function trim() {
+  let lines = feed.querySelectorAll(".row").length;
+  while (lines > MAX_ROWS && feed.firstElementChild) {
+    if (feed.firstElementChild.classList.contains("row")) lines--;
+    feed.removeChild(feed.firstElementChild);
+  }
+}
+
+function addRow(line) {
+  const empty = $("empty");
+  if (empty) empty.remove();
+  const row = document.createElement("div");
+  row.className = "row lvl-" + line.level + (line.quiet ? " quiet" : "");
+  row.dataset.source = line.source;
+  row.dataset.quiet = line.quiet ? "1" : "0";
+  row.dataset.text = String(line.text).toLowerCase();
+  const ts = document.createElement("span");
+  ts.className = "ts";
+  ts.textContent = shortTime(line.ts);
+  ts.title = new Date(line.ts).toISOString() + `  (seq ${line.seq})`;
+  const chip = document.createElement("span");
+  chip.className = "chip " + line.source;
+  chip.textContent = line.source;
+  const txt = document.createElement("span");
+  txt.className = "txt";
+  txt.textContent = line.text;   // textContent, never innerHTML: log lines carry
+  row.append(ts, chip, txt);     // model names and paths a client chose
+  feed.appendChild(row);
+  applyFilter(row);
+}
+
+// A break, not a silent splice: the feed says where it is missing something
+// rather than joining two stretches of time as if nothing happened between.
+function addNote(text) {
+  const empty = $("empty");
+  if (empty) empty.remove();
+  const note = document.createElement("div");
+  note.className = "gap";
+  note.textContent = text;
+  feed.appendChild(note);
+}
+
+feed.addEventListener("scroll", () => {
+  // Within a couple of lines of the bottom counts as "at the bottom", so a
+  // smooth-scroll or a fractional device pixel does not silently unstick it.
+  stick = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 24;
+  $("tail").classList.toggle("show", !stick);
+});
+$("tail").addEventListener("click", () => { stick = true; toBottom(); $("tail").classList.remove("show"); });
+
+$("clear").addEventListener("click", () => {
+  feed.textContent = "";
+  updateCounts();
+  // The cursor is deliberately NOT reset: Clear means "stop showing me this",
+  // not "replay the ring".
+});
+
+$("pause").addEventListener("click", () => {
+  paused = !paused;
+  $("pause").textContent = paused ? "Resume" : "Pause";
+  $("pause").classList.toggle("on", paused);
+  setStatus();
+});
+
+// Counted off the DOM rather than kept in a variable, so Clear, the row cap
+// and the gap markers cannot drift it out of agreement with what is on screen.
+function updateCounts() {
+  const rows = feed.querySelectorAll(".row").length;
+  $("counts").textContent = `${rows} line${rows === 1 ? "" : "s"} held`;
+  $("dropped").textContent = droppedTotal ? `· ${droppedTotal} dropped since start` : "";
+}
+
+function setStatus(extra) {
+  const badge = $("status");
+  badge.classList.toggle("live", !paused && failures === 0);
+  badge.classList.toggle("down", failures > 0);
+  badge.textContent = paused ? "paused" : failures > 0 ? `unreachable (retry ${failures})` : (extra || "live");
+}
+
+// --- polling ---------------------------------------------------------------
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function nextDelay() {
+  if (failures > 0) return Math.min(MIN_POLL_MS * 2 ** failures, MAX_BACKOFF_MS);
+  return document.hidden ? HIDDEN_POLL_MS : MIN_POLL_MS;
+}
+
+async function pollOnce() {
+  // limit = the whole ring: a since-cursor makes the normal answer a handful
+  // of lines, and asking for the maximum means a burst can never leave the
+  // page a poll behind.
+  const resp = await fetch(`/api/logs?since=${cursor}&limit=2000&source=all`, { cache: "no-store" });
+  if (!resp.ok) throw new Error("HTTP " + resp.status);
+  const page = await resp.json();
+  // A cursor that comes back LOWER than the one we sent means the server
+  // restarted under us and re-synced us to its newest line — say so, because
+  // the seq numbers either side of that point are unrelated.
+  if (page.cursor < cursor) addNote("⋯ server restarted — the log resumes from its newest line ⋯");
+  if (page.dropped > 0) {
+    const n = page.dropped;
+    addNote(`⋯ ${n} line${n === 1 ? "" : "s"} dropped — the server's ring overran ⋯`);
+  }
+  for (const line of page.lines) addRow(line);
+  cursor = page.cursor;
+  droppedTotal = page.dropped_total;
+  trim();
+  updateCounts();
+  if (stick) toBottom();
+  $("cursorinfo").textContent = `seq ${page.newest} / ring ${page.capacity}`;
+}
+
+async function loop() {
+  for (;;) {
+    await sleep(nextDelay());
+    if (paused) continue;
+    try {
+      await pollOnce();
+      if (failures) { failures = 0; }
+      setStatus();
+    } catch (e) {
+      failures++;
+      setStatus();
+    }
+  }
+}
+
+// A tab that comes back to the foreground should not wait out a 5 s sleep.
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && !paused) pollOnce().then(() => setStatus(), () => {});
+});
+
+updateCounts();
+setStatus("connecting…");
+pollOnce().then(() => setStatus(), () => { failures = 1; setStatus(); }).finally(loop);
+</script>
+</body>
+</html>
