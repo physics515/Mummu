@@ -16,7 +16,8 @@
 //! - **Gated DeltaNet** (the rest): one projection mixes q/k/v, a second
 //!   emits the gate `z`; the mix runs through a depthwise causal conv
 //!   (kernel `conv_kernel`, rolling state) + SiLU; q/k are L2-normalized
-//!   per head (`x / max(‖x‖, ε)`) and tiled from `n_k_heads` to
+//!   per head (`x / max(‖x‖, ε)` here, `x / sqrt(‖x‖² + ε)` for qwen4exp:
+//!   [`Qwen35Config::gdn_l2`]) and tiled from `n_k_heads` to
 //!   `n_v_heads`; the recurrence per head with state `S ∈ R^{d_k×d_v}`:
 //!   `S ← S·exp(g);  v̂ = Sᵀk;  S += k(β(v − v̂))ᵀ;  o = Sᵀ(q/√d_k)` with
 //!   `β = σ(x·Wβ)` and `g = softplus(x·Wα + dt_bias)·a` (`a` holds
@@ -48,7 +49,7 @@ use crate::quant::QuantPolicy;
 
 /// Re-exported so config literals outside `flex` (qwen4exp's adapter,
 /// mummu-serve's test configs) can name the gate next to the config.
-pub use crate::flex::gdn::GdnGate;
+pub use crate::flex::gdn::{GdnGate, GdnL2};
 
 /// Architecture hyperparameters, read from a GGUF header's `qwen35.*`
 /// metadata (the family currently ships as GGUF; a safetensors `config.json`
@@ -85,6 +86,10 @@ pub struct Qwen35Config {
     /// the GGUF header — fixed by the architecture: [`GdnGate::Silu`] for
     /// qwen35, [`GdnGate::Sigmoid`] when qwen4exp drives these blocks.
     pub gdn_gate: GdnGate,
+    /// Where `rms_norm_eps` enters the DeltaNet's q/k L2 norms. Not in the
+    /// header either: [`GdnL2::ClampNorm`] for qwen35 (the form its parity
+    /// fixtures were recorded against), [`GdnL2::AddEps`] for qwen4exp.
+    pub gdn_l2: GdnL2,
     pub eos_token_id: EosIds,
 }
 
@@ -175,6 +180,11 @@ impl Qwen35Config {
             n_v_heads: meta_usize("qwen35.ssm.time_step_rank")?,
             // llama.cpp qwen35.cpp build_norm_gated: ggml_silu(z).
             gdn_gate: GdnGate::Silu,
+            // Unchanged from the parity-checked port. transformers and
+            // llama.cpp master both use GdnL2::AddEps for this family too;
+            // switching needs the qwen35 parity legs rerun, which the
+            // qwen4exp change (found by its teacher-forced dump) did not do.
+            gdn_l2: GdnL2::ClampNorm,
             eos_token_id: EosIds::One(u32::try_from(eos).map_err(|_| "EOS out of u32")?),
         };
         cfg.validate()?;
@@ -579,10 +589,16 @@ impl GatedDeltaNet {
         drop(_s_conv);
         let _s_split = crate::prof::scope("delta.split");
 
-        // Split into q/k/v and L2-normalize q/k per head: x / max(‖x‖, ε).
+        // Split into q/k/v and L2-normalize q/k per head, in the family's
+        // form: x / max(‖x‖, ε) or x / sqrt(‖x‖² + ε).
         let eps = cfg.rms_norm_eps as f32;
+        let l2_form = cfg.gdn_l2;
         let l2 = |x: Tensor<4>| -> Tensor<4> {
-            let norm = x.clone().powi_scalar(2).sum_dim(3).sqrt().clamp_min(eps);
+            let sum_sq = x.clone().powi_scalar(2).sum_dim(3);
+            let norm = match l2_form {
+                GdnL2::ClampNorm => sum_sq.sqrt().clamp_min(eps),
+                GdnL2::AddEps => sum_sq.add_scalar(eps).sqrt(),
+            };
             x.div(norm)
         };
         let q = l2(conv_out
@@ -747,6 +763,7 @@ impl GatedDeltaNet {
             key_dim: cfg.key_dim(),
             d_inner: cfg.d_inner,
             l2_eps: cfg.rms_norm_eps as f32,
+            l2: cfg.gdn_l2,
             norm_eps: cfg.rms_norm_eps as f32,
             scale: 1.0 / (cfg.d_state as f32).sqrt(),
             conv_w: host(conv_w),
@@ -2453,6 +2470,7 @@ mod tests {
             n_k_heads: 1,
             n_v_heads: 3,
             gdn_gate: GdnGate::Silu,
+            gdn_l2: GdnL2::ClampNorm,
             eos_token_id: EosIds::One(0),
         }
     }
@@ -2867,6 +2885,81 @@ mod tests {
             .unwrap();
         let last = fused.last().expect("decode steps ran");
         assert_eq!(one_shot.len(), last.len());
+        for (i, (x, y)) in one_shot.iter().zip(last).enumerate() {
+            assert!(
+                (x - y).abs() < 1e-4,
+                "logit {i}: one-shot prefill {x} vs fused decode {y}"
+            );
+        }
+    }
+
+    /// The oracle under qwen4exp's q/k L2 form, `x / sqrt(‖x‖² + ε)`: the
+    /// fused host step and the tensor path must agree at every carried-state
+    /// decode step, and a one-shot prefill (chunked recurrence) must land on
+    /// the last fused step. The toy's ε is raised to 0.25 so the form is
+    /// visible at the toy's O(1) key norms — on real weights it shows at
+    /// ‖k‖ ≈ 1e-3 with ε = 1e-6 — and the two forms must give different
+    /// logits on the same weights, so a `gdn_l2` that is ignored cannot pass.
+    #[test]
+    fn fused_gdn_decode_matches_tensor_decode_with_add_eps_l2() {
+        let _serial = FUSED_TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cfg = Qwen35Config {
+            rms_norm_eps: 0.25,
+            gdn_gate: GdnGate::Sigmoid,
+            gdn_l2: GdnL2::AddEps,
+            ..toy_config()
+        };
+        cfg.validate().expect("toy config validates");
+        let device = crate::backend::cpu_device();
+        let add = LoadedQwen35 {
+            model: build(&cfg, &device, false),
+            config: cfg.clone(),
+            tokenizer_config: None,
+            ffn_pool: None,
+            ffn_skip_tau: 0.0,
+            ffn_plan: None,
+        };
+        let clamp = LoadedQwen35 {
+            model: add.model.clone(),
+            config: Qwen35Config {
+                gdn_l2: GdnL2::ClampNorm,
+                ..cfg
+            },
+            tokenizer_config: None,
+            ffn_pool: None,
+            ffn_skip_tau: 0.0,
+            ffn_plan: None,
+        };
+
+        let tensor = oracle_decode_steps(&add, false);
+        let fused = oracle_decode_steps(&add, true);
+        assert_steps_close(&tensor, &fused);
+
+        let clamp_tensor = oracle_decode_steps(&clamp, false);
+        let form_effect = tensor
+            .iter()
+            .flatten()
+            .zip(clamp_tensor.iter().flatten())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            form_effect > 1e-3,
+            "AddEps and ClampNorm gave the same logits (max diff {form_effect}): \
+             gdn_l2 is not reaching the DeltaNet"
+        );
+
+        let script: Vec<u32> = ORACLE_PREFIX
+            .iter()
+            .chain(&ORACLE_DECODE)
+            .copied()
+            .collect();
+        let mut cache = add.new_cache();
+        let one_shot = add
+            .forward(&script, 0, &mut cache, &device)
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap();
+        let last = fused.last().expect("decode steps ran");
         for (i, (x, y)) in one_shot.iter().zip(last).enumerate() {
             assert!(
                 (x - y).abs() < 1e-4,

@@ -15,7 +15,7 @@
 //!
 //! Quiet-box rules apply; read ratios, not absolutes.
 
-use mummu::flex::gdn::{GdnGate, GdnMiddle, gdn_step};
+use mummu::flex::gdn::{GdnGate, GdnL2, GdnMiddle, gdn_step};
 use mummu::flex::kernels::{PackedQ4, gemm_q4n_auto, gemv_q4n_auto};
 
 fn wave(len: usize, f: f32) -> Vec<f32> {
@@ -51,6 +51,7 @@ fn main() {
         key_dim,
         d_inner,
         l2_eps: 1e-6,
+        l2: GdnL2::ClampNorm,
         norm_eps: 1e-6,
         scale: 1.0 / (ds as f32).sqrt(),
         conv_w: wave(conv_dim * kk, 0.13),

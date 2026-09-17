@@ -64,6 +64,40 @@ pub enum GdnGate {
     Sigmoid,
 }
 
+/// How the DeltaNet L2-normalizes each q and k head before the recurrence.
+///
+/// The two forms agree to ~ε/(2‖x‖²) relative, which is invisible at unit
+/// norm but not on real checkpoints: Flash-Next's keys reach ‖k‖ ≈ 1e-3
+/// after conv + SiLU (layers 16, 28, 34, 38 of the parity prompt), where
+/// `max(‖x‖, 1e-6)` and `sqrt(‖x‖² + 1e-6)` differ by up to 40% per head
+/// and the block output by 1.5e-2 relative. Measured against a
+/// full-precision llama.cpp b10991 dump (teacher-forced, same inputs):
+/// [`GdnL2::AddEps`] reproduces its `k_conv_predelta` to 5e-8,
+/// [`GdnL2::ClampNorm`] misses by 2.8e-2. Deliberately no `Default`, as
+/// for [`GdnGate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GdnL2 {
+    /// `x / max(‖x‖, ε)` — `ggml_l2_norm`, the form mummu's qwen35 port was
+    /// parity-checked with.
+    ClampNorm,
+    /// `x / sqrt(‖x‖² + ε)` — transformers' (FLA) `l2norm` and llama.cpp
+    /// master's `build_gdn_l2_norm` (`rms_norm(x, ε/n) / sqrt(n)`), which
+    /// its qwen4exp graph uses.
+    AddEps,
+}
+
+impl GdnL2 {
+    /// `1 / norm` for a head whose squared entries sum to `sum_sq`.
+    #[inline]
+    #[must_use]
+    pub fn inv_norm(self, sum_sq: f32, eps: f32) -> f32 {
+        match self {
+            Self::ClampNorm => 1.0 / sum_sq.sqrt().max(eps),
+            Self::AddEps => 1.0 / (sum_sq + eps).sqrt(),
+        }
+    }
+}
+
 impl GdnGate {
     /// The gate activation at one scalar.
     #[inline]
@@ -95,8 +129,10 @@ pub struct GdnMiddle {
     pub key_dim: usize,
     /// `hv * ds`.
     pub d_inner: usize,
-    /// Clamp floor for the q/k L2 norms (the model's `rms_norm_eps`).
+    /// Epsilon of the q/k L2 norms (the model's `rms_norm_eps`).
     pub l2_eps: f32,
+    /// Where that epsilon enters the q/k L2 norms.
+    pub l2: GdnL2,
     /// Epsilon inside the gated RMSNorm.
     pub norm_eps: f32,
     /// `1 / sqrt(ds)`, folded into the normalized q.
@@ -241,19 +277,9 @@ pub fn gdn_step(
     let mut kn = vec![0f32; p.key_dim];
     for h in 0..hk {
         let seg = h * ds..(h + 1) * ds;
-        let nq = q_raw[seg.clone()]
-            .iter()
-            .map(|x| x * x)
-            .sum::<f32>()
-            .sqrt()
-            .max(p.l2_eps);
-        let nk = k_raw[seg.clone()]
-            .iter()
-            .map(|x| x * x)
-            .sum::<f32>()
-            .sqrt()
-            .max(p.l2_eps);
-        let (sq, sk) = (p.scale / nq, 1.0 / nk);
+        let sum_sq = |x: &[f32]| x.iter().map(|x| x * x).sum::<f32>();
+        let sq = p.scale * p.l2.inv_norm(sum_sq(&q_raw[seg.clone()]), p.l2_eps);
+        let sk = p.l2.inv_norm(sum_sq(&k_raw[seg.clone()]), p.l2_eps);
         for i in seg {
             qn[i] = q_raw[i] * sq;
             kn[i] = k_raw[i] * sk;
@@ -347,6 +373,7 @@ mod tests {
             key_dim: 1,
             d_inner: 1,
             l2_eps: 1e-6,
+            l2: GdnL2::ClampNorm,
             norm_eps: 1e-6,
             scale: 1.0,
             // Per channel: taps [oldest, middle, newest].
@@ -470,6 +497,7 @@ mod tests {
             key_dim: 2,
             d_inner: 2,
             l2_eps: 1e-6,
+            l2: GdnL2::ClampNorm,
             norm_eps: 1e-6,
             scale: 1.0,
             // Every channel passes its newest mix value straight through.
@@ -531,6 +559,90 @@ mod tests {
             );
         }
         assert_eq!(state_sig, state_silu, "the gate must not touch the state");
+    }
+
+    /// The q/k L2 norms use the configured epsilon form. With the state
+    /// empty, no decay and `beta = 1/2`, the step writes
+    /// `S[i][j] = k̂_i · ½·silu(v_j)`, so the state exposes the normalized
+    /// key directly. Keys of norm ~1e-3 — the regime real Flash-Next keys
+    /// reach — make `x/sqrt(‖x‖²+ε)` and `x/max(‖x‖,ε)` disagree by ~25%;
+    /// both are checked against textbook formulas written out here, and
+    /// against each other so an ignored field cannot pass.
+    #[test]
+    fn the_state_carries_keys_normalized_in_the_configured_l2_form() {
+        let middle = |l2: GdnL2| GdnMiddle {
+            hk: 1,
+            hv: 1,
+            ds: 2,
+            kk: 2,
+            conv_dim: 6,
+            key_dim: 2,
+            d_inner: 2,
+            l2_eps: 1e-6,
+            l2,
+            norm_eps: 1e-6,
+            scale: 1.0,
+            conv_w: [0.0, 1.0].repeat(6), // newest mix value passes through
+            dt_bias: vec![0.0],
+            a: vec![0.0],
+            gamma: vec![1.0, 1.0],
+            gate: GdnGate::Sigmoid,
+        };
+        let key = [2e-3f32, -1e-3];
+        let v_mix = [1.2f32, -0.7];
+        let mixed = [key[0], key[1], key[0], key[1], v_mix[0], v_mix[1]];
+        let run = |l2: GdnL2| {
+            let p = middle(l2);
+            let mut ring = vec![0.0f32; p.ring_len()];
+            let mut state = vec![0.0f32; p.state_len()];
+            let mut out = vec![0.0f32; p.d_inner];
+            gdn_step(
+                &p,
+                &mixed,
+                &[0.0, 0.0],
+                &[0.0],
+                &[0.0],
+                &mut ring,
+                &mut state,
+                &mut out,
+            );
+            state
+        };
+        let silu64 = |x: f32| {
+            let x = f64::from(x);
+            x / (1.0 + (-x).exp())
+        };
+        let k: Vec<f64> = key.iter().map(|&x| silu64(x)).collect();
+        let sum_sq: f64 = k.iter().map(|x| x * x).sum();
+        let want = |inv: f64| -> Vec<f64> {
+            (0..2)
+                .flat_map(|i| (0..2).map(move |j| (i, j)))
+                .map(|(i, j)| k[i] * inv * 0.5 * silu64(v_mix[j]))
+                .collect()
+        };
+        let add = want(1.0 / (sum_sq + 1e-6).sqrt());
+        let clamp = want(1.0 / sum_sq.sqrt().max(1e-6));
+        let (got_add, got_clamp) = (run(GdnL2::AddEps), run(GdnL2::ClampNorm));
+        for n in 0..4 {
+            assert!(
+                (f64::from(got_add[n]) - add[n]).abs() < 1e-4,
+                "AddEps state[{n}]: got {} want {}",
+                got_add[n],
+                add[n]
+            );
+            assert!(
+                (f64::from(got_clamp[n]) - clamp[n]).abs() < 1e-4,
+                "ClampNorm state[{n}]: got {} want {}",
+                got_clamp[n],
+                clamp[n]
+            );
+            assert!(
+                (got_add[n] - got_clamp[n]).abs() > 0.1 * got_clamp[n].abs(),
+                "the two L2 forms must disagree on a 1e-3-norm key at {n}: {} vs {}",
+                got_add[n],
+                got_clamp[n]
+            );
+        }
     }
 
     /// Stable transcendentals at the extremes.

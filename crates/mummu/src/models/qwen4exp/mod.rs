@@ -46,7 +46,7 @@ pub use model::{LoadedQwen4exp, Qwen4exp, Qwen4expCache, Qwen4expLayer, load_fro
 
 use crate::gguf::{GgufFile, GgufValue};
 use crate::models::qwen2::EosIds;
-use crate::models::qwen35::{GdnGate, Qwen35Config};
+use crate::models::qwen35::{GdnGate, GdnL2, Qwen35Config};
 
 /// Upper bound on PLE hash tables and per-layer arrays carried in the
 /// header. The shipped model has 16 head vocabularies, 3 multipliers and 48
@@ -204,6 +204,10 @@ impl Qwen4expConfig {
             n_k_heads: self.n_k_heads,
             n_v_heads: self.n_v_heads,
             gdn_gate: GdnGate::Sigmoid,
+            // llama.cpp qwen4exp.cpp build_gdn_l2_norm and transformers'
+            // l2norm: x / sqrt(‖x‖² + ε). The clamp form missed llama.cpp's
+            // keys by up to 2.8e-2 on real prompts (see GdnL2).
+            gdn_l2: GdnL2::AddEps,
             eos_token_id: EosIds::One(self.eos_token_id),
         }
     }
@@ -550,10 +554,13 @@ mod tests {
 
     #[test]
     fn the_blocks_adapter_gates_the_deltanet_with_sigmoid() {
-        // The one numerical difference from qwen35 inside the reused blocks;
-        // a silu here computes a plausible, wrong model.
+        // The numerical differences from mummu's qwen35 inside the reused
+        // blocks; a silu gate or the clamp L2 form computes a plausible,
+        // wrong model (the clamp form moved Flash-Next's layer-28 DeltaNet
+        // output by 1.5e-2 against llama.cpp).
         let b = shipped().blocks_config();
         assert_eq!(b.gdn_gate, GdnGate::Sigmoid);
+        assert_eq!(b.gdn_l2, GdnL2::AddEps);
         assert_eq!(b.conv_dim(), 10_240);
         assert_eq!((b.hidden_size, b.head_dim, b.rope_dim), (2560, 256, 64));
     }

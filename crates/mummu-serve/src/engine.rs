@@ -3242,6 +3242,7 @@ mod reserve_tests {
             n_k_heads: 16,
             n_v_heads: 32,
             gdn_gate: qwen35::GdnGate::Silu,
+            gdn_l2: qwen35::GdnL2::ClampNorm,
             eos_token_id: mummu::models::qwen2::EosIds::One(0),
         }
     }
