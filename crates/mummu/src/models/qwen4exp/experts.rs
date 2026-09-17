@@ -800,8 +800,40 @@ impl ExpertWeights<'_> {
         for (hi, &ui) in h.iter_mut().zip(&u) {
             *hi = silu(*hi) * ui;
         }
+        // Q5_1 banks dot against Q8_1, whose block sum `s` ggml rounds to
+        // f16; the fake-quantized activations cannot carry that, so the
+        // emulation adds `min · (rounded s − s)` per weight block afterwards.
+        let min_rounding = match self {
+            Self::Quant(layer, _)
+                if crate::nn::refarith::enabled() && layer.down.dtype() == GgmlType::Q5_1 =>
+            {
+                Some(crate::nn::refarith::q8_1_min_term_rounding(
+                    &h,
+                    layer.down.in_dim(),
+                ))
+            }
+            _ => None,
+        };
         let h = fq(BankKind::Down, &h).unwrap_or(h);
-        self.matvec(BankKind::Down, &h, n)
+        let mut y = self.matvec(BankKind::Down, &h, n)?;
+        if let (Some(delta), Self::Quant(layer, e)) = (min_rounding, self) {
+            let bank = &layer.down;
+            let (blocks, out) = (bank.in_dim() / 32, bank.out_dim());
+            let bytes = bank.expert_bytes(*e)?;
+            // block_q5_1 = f16 d | f16 m | u32 qh | 16 B qs (24 bytes).
+            let (blocks24, _) = bytes.as_chunks::<24>();
+            let mins: Vec<f32> = blocks24
+                .iter()
+                .map(|blk| half::f16::from_le_bytes([blk[2], blk[3]]).to_f32())
+                .collect();
+            for (yt, dt) in y.chunks_mut(out).zip(delta.chunks(blocks)) {
+                for (r, yr) in yt.iter_mut().enumerate() {
+                    let m = &mins[r * blocks..(r + 1) * blocks];
+                    *yr += m.iter().zip(dt).map(|(a, b)| a * b).sum::<f32>();
+                }
+            }
+        }
+        Ok(y)
     }
 }
 

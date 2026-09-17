@@ -193,6 +193,19 @@ fn trace_the_primes_prefill() {
 /// directory name; add `MUMMU_REF_ARITH=1` to use llama.cpp's activation
 /// grids (then a structurally identical op agrees to ~1e-4 or better), and
 /// `MUMMU_QWEN4EXP_TEACHER_FORCE=0` to compare without forcing.
+///
+/// Measured 2026-09-16 on the primes leg, emulated and forced (median /
+/// max relative error over layers): HC mix 1.1e-7 / 1.7e-4, router 1.8e-7,
+/// shared expert 3.4e-7, routed experts 3.5e-5 / 2.4e-4, DeltaNet
+/// 3.9e-5 / 2.9e-4, attention 1.1e-3 / 4.4e-3 (f16 flash attention, not
+/// exactly emulated), head 2.3e-7. This check found the DeltaNet L2 form
+/// (1.5e-2 on layer 28 before `GdnL2::AddEps`) and the missing Q8_1 `s`
+/// rounding (5e-4 on Q5_1-down experts). On the exact path the same ops
+/// sit at 0.7-2.2e-2, which is llama.cpp's activation-quantization noise.
+/// Free-running with the emulation on, `l_last` still drifts from 2.8e-3
+/// at layer 0 to 4e-2 at layer 44, because float ops that are not
+/// bit-identical flip rounding decisions: no emulation short of bit
+/// exactness reproduces the reference's realization.
 #[test]
 #[ignore = "diagnostic: needs MUMMU_QWEN4EXP_DIR, MUMMU_QWEN4EXP_TEACHER and ~25 GB RAM"]
 fn teacher_forced_ops_against_a_llama_cpp_dump() {
@@ -231,14 +244,22 @@ fn teacher_forced_ops_against_a_llama_cpp_dump() {
 /// exact f32 path under the same perturbations as the control (which must not
 /// move). Compare the printed spread with
 /// `the_gate_is_tighter_than_llama_cpps_own_spread_on_this_model`'s
-/// realizations. Measured 2026-09-16, 11 emulated realizations per run:
-/// primes `<|im_end|>` mean -14.94, sd 0.61 (llama.cpp's 4 distinct
-/// realizations: -15.06, sd 0.33); moon -12.39, sd 0.21 (llama.cpp: -12.22,
-/// sd 0.30); the unchanged verdict passed both legs in 2 of 11. The same run
-/// before the chunked-GDN solve changed (a 6e-6 move on the exact path) drew
-/// entirely different realizations (means -14.99 / -12.33, both legs in 5 of
-/// 11): the emulated forward is as chaotic as the reference. `NOISE_SEEDS`
-/// (default 8) and `NOISE_EPS` (default 1e-5) tune the sampling.
+/// realizations. Measured 2026-09-16 with 11 emulated realizations per run
+/// (seeds None and 1..=10), llama.cpp's 4 distinct realizations for
+/// comparison:
+/// - primes `<|im_end|>`: -14.91 (sd 0.53) after the DeltaNet L2 fix, then
+///   -15.52 (sd 0.56) once the Q8_1 `s` rounding was emulated. llama.cpp:
+///   -15.06 (sd 0.33).
+/// - moon: -12.35 (sd 0.28), then -12.32 (sd 0.20). llama.cpp: -12.22
+///   (sd 0.30).
+/// - The unchanged first-forward verdict passed both legs in 2 of 11, then
+///   in 3 of 11.
+///
+/// Earlier runs on older code gave different realizations again: 2 of 11
+/// before the L2 fix, and 5 of 11 before the chunked-GDN solve changed, a
+/// 6e-6 move on the exact path. The emulated forward is as chaotic as the
+/// reference. `NOISE_SEEDS` (default 8) and `NOISE_EPS` (default 1e-5) tune
+/// the sampling.
 #[test]
 #[ignore = "diagnostic: needs MUMMU_QWEN4EXP_DIR and ~25 GB RAM"]
 fn noise_realizations_of_the_first_forward() {

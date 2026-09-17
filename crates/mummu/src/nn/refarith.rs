@@ -18,8 +18,11 @@
 //!   `q = round_nearest(x·127/amax)`; the dot uses the f16 `d`.
 //! - Q8_K activations (`quantize_row_q8_K_ref`, also the repacked 4x8 grid):
 //!   signed-max scale `-127/max`, `q = min(127, nearest(iscale·x))`.
-//! - Q8_1 (Q5_1 weights) as Q8_0; ggml additionally rounds `s = d·Σq` to f16,
-//!   a 1e-4-relative term on the min offset that is left out.
+//! - Q8_1 (Q5_1 weights) as Q8_0, plus [`q8_1_min_term_rounding`]: ggml
+//!   stores `s = d·Σq` (with the f32 `d`) as f16 and dots the weight block's
+//!   min against that rounded `s`. Left out, it moved Flash-Next's
+//!   Q5_1-down expert outputs by ~5e-4 relative against a teacher-forced
+//!   llama.cpp dump (the Q8_0-down layers matched to 2e-6).
 //! - Flash attention: `ggml_compute_forward_flash_attn_ext_f16_one_chunk`
 //!   (the path for fewer than 64 query rows and fewer than 512 cached cells).
 //!
@@ -188,6 +191,25 @@ fn fq_q8_k(x: &mut [f32]) {
     }
 }
 
+/// The part of ggml's `vec_dot_q5_1_q8_1` that fake-quantized activations
+/// miss: per row of `xs` (rows of `width`, a multiple of 32) and per 32-block,
+/// `f16(d·Σq) − f16(d)·Σq`, where `d = amax/127` and `q` is the block's Q8_1
+/// quantization. A Q5_1 weight block with min `m` adds `m` times this to
+/// its dot product; the caller owns the mins. Row-major `[rows · width/32]`.
+#[must_use]
+pub fn q8_1_min_term_rounding(xs: &[f32], width: usize) -> Vec<f32> {
+    xs.chunks(width)
+        .flat_map(|row| row.chunks(32))
+        .map(|b| {
+            let amax = b.iter().fold(0f32, |a, v| a.max(v.abs()));
+            let d = amax / 127.0;
+            let id = if amax != 0.0 { 127.0 / amax } else { 0.0 };
+            let sum_q: f32 = b.iter().map(|v| (*v * id).round_ties_even()).sum();
+            f16r(d * sum_q) - f16r(d) * sum_q
+        })
+        .collect()
+}
+
 /// Fake-quantize host activations `xs` (rows of `width`) the way llama.cpp
 /// quantizes them before a matmul with a weight stored as `dtype`; other
 /// dtypes (F32/F16/BF16 weights) leave `xs` untouched. Rows are independent.
@@ -331,6 +353,36 @@ mod tests {
             (x[5] + 127.0 * f16r(4.0 / 127.0)).abs() < 1e-6,
             "amax maps to -127·d"
         );
+    }
+
+    /// ggml's Q8_1 `s` is `f16(d·Σq)` with the f32 `d`, while fake-quantized
+    /// activations sum to `f16(d)·Σq`; the returned term is exactly that
+    /// difference, per 32-block, recomputed here from the textbook grid.
+    #[test]
+    fn the_q8_1_min_term_is_the_f16_rounding_of_the_block_sum() {
+        let x: Vec<f32> = (0..64)
+            .map(|i| ((i as f32) * 0.61).cos() * 0.0137 + 0.004)
+            .collect();
+        let got = q8_1_min_term_rounding(&x, 64);
+        assert_eq!(got.len(), 2);
+        for (b, block) in x.chunks(32).enumerate() {
+            let amax = block.iter().fold(0f32, |a, v| a.max(v.abs()));
+            let sum_q: f32 = block.iter().map(|v| (v * 127.0 / amax).round()).sum();
+            let d = amax / 127.0;
+            let want =
+                half::f16::from_f32(d * sum_q).to_f32() - half::f16::from_f32(d).to_f32() * sum_q;
+            assert!(sum_q != 0.0, "the block must have a nonzero quant sum");
+            assert!(
+                (got[b] - want).abs() <= 1e-9,
+                "block {b}: {} vs {want}",
+                got[b]
+            );
+        }
+        assert!(
+            got.iter().any(|g| g.abs() > 0.0),
+            "these blocks' sums are not f16-exact, so the term must not vanish"
+        );
+        assert_eq!(q8_1_min_term_rounding(&[0.0; 32], 32), vec![0.0]);
     }
 
     #[test]
