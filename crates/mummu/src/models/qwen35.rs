@@ -726,6 +726,81 @@ fn gdn_recurrence_sequential(
     (Tensor::cat(outs, 2), s) // [b, hv, t, ds]
 }
 
+/// `(I + A)⁻¹` for the chunk system `A[t, j] = β_t·exp(L_t − L_j)·(k_t·k_j)`
+/// (`j < t`, else 0), from `k [b, h, c, ds]`, `l [b, h, c, 1]` (cumulative
+/// log-decay) and `beta [b, h, c, 1]`, by block recursion: with
+/// `I + A = [[L₁₁, 0], [A₂₁, L₂₂]]`,
+///
+/// ```text
+/// (I + A)⁻¹ = [[L₁₁⁻¹, 0], [−L₂₂⁻¹·A₂₁·L₁₁⁻¹, L₂₂⁻¹]]
+/// ```
+///
+/// evaluated bottom-up for every diagonal block of size 1, 2, 4, … at once.
+/// Why not a power series: every intermediate here is itself the inverse
+/// of a contiguous sub-span's system, whose entries are delta-rule
+/// sensitivities bounded by `β ≤ 1` (products of `γ(I − βkkᵀ)`
+/// contractions), so f32 never cancels large terms.
+///
+/// Each level builds its `A₂₁` blocks straight from the factors (the rows of
+/// the second half of a pair against the columns of the first), so there is
+/// no gather and no index upload on a GPU: reshapes, narrows, three matmuls
+/// and three concats per level, `⌈log₂c⌉` levels. `c` is padded to a power
+/// of two with `β = 0` rows (zero `A` rows, identity inverse rows) and the
+/// last `L` repeated (so padded exponents stay `≤ 0`); the leading `c × c`
+/// block of the padded inverse is the answer.
+fn unit_lower_inverse(k: Tensor<4>, l: Tensor<4>, beta: Tensor<4>, device: &Device) -> Tensor<4> {
+    let [b, h, c, ds] = k.dims();
+    let p = c.next_power_of_two();
+    let bh = b * h;
+    let dtype = k.dtype();
+    let (mut k, mut l, mut beta) = (k, l, beta);
+    if p > c {
+        let pad = p - c;
+        let zeros = |w: usize| Tensor::<4>::zeros([b, h, pad, w], device).cast(dtype);
+        k = Tensor::cat(vec![k, zeros(ds)], 2);
+        beta = Tensor::cat(vec![beta, zeros(1)], 2);
+        let last = l.clone().narrow(2, c - 1, 1).repeat_dim(2, pad);
+        l = Tensor::cat(vec![l, last], 2);
+    }
+    let (k, l, beta) = (
+        k.reshape([bh, p, ds]),
+        l.reshape([bh, p, 1]),
+        beta.reshape([bh, p, 1]),
+    );
+    // Diagonal-block inverses of size s, one row per (batch·head, block).
+    let mut inv = Tensor::<3>::ones([bh * p, 1, 1], device).cast(dtype);
+    let mut s = 1usize;
+    while s < p {
+        let n = bh * (p / (2 * s)); // (batch·head, pair) rows
+        let halves = |x: &Tensor<3>, w: usize| {
+            let x = x.clone().reshape([n, 2 * s, w]);
+            (x.clone().narrow(1, 0, s), x.narrow(1, s, s))
+        };
+        let (k1, k2) = halves(&k, ds);
+        let (l1, l2) = halves(&l, 1);
+        let (_, b2) = halves(&beta, 1);
+        // Every row of the second half comes after every column of the
+        // first, so these exponents are ≤ 0 and need no causal mask.
+        let a21 = k2
+            .matmul(k1.swap_dims(1, 2))
+            .mul(l2.sub(l1.swap_dims(1, 2)).exp())
+            .mul(b2); // [n, s, s]
+        let pair = inv.reshape([n, 2, s, s]);
+        let inv11 = pair.clone().narrow(1, 0, 1).reshape([n, s, s]);
+        let inv22 = pair.narrow(1, 1, 1).reshape([n, s, s]);
+        let m21 = inv22.clone().matmul(a21).matmul(inv11.clone()).neg();
+        let zeros = Tensor::<3>::zeros([n, s, s], device).cast(dtype);
+        let top = Tensor::cat(vec![inv11, zeros], 2);
+        let bottom = Tensor::cat(vec![m21, inv22], 2);
+        inv = Tensor::cat(vec![top, bottom], 1); // [n, 2s, 2s]
+        s *= 2;
+    }
+    inv.reshape([bh, p, p])
+        .narrow(1, 0, c)
+        .narrow(2, 0, c)
+        .reshape([b, h, c, c])
+}
+
 /// Chunkwise-parallel evaluation of the same recurrence — the Gated
 /// DeltaNet / DeltaNet WY form (Yang et al.), specialised to this
 /// parameterization's **scalar** per-head decay. Same signature as
@@ -762,12 +837,15 @@ fn gdn_recurrence_sequential(
 /// steps of the sequential recurrence at `C = 2` (both `d₂ = b₂ − A[2,1]d₁`
 /// and the `o`/`S` reads land on the same expressions).
 ///
-/// Exactness of the solve: `A` is strictly lower triangular, so `N = −A`
-/// is nilpotent (`N^C = 0`) and `(I + A)⁻¹ = Σ_{k<C} N^k` — a FINITE
-/// Neumann sum, evaluated in `⌈log₂C⌉` doubling stages
-/// (`R ← R + X·R`, `X ← X·X`, with `R = Σ_{k<span} N^k`, `X = N^span`).
-/// Nothing is truncated, so the chunked path is algebraically exact — an
-/// evaluation-order change, not an approximation.
+/// Exactness of the solve: `(I + A)⁻¹` is formed by [`unit_lower_inverse`]
+/// (block recursion over halves, nothing truncated), so the chunked path is
+/// an evaluation-order change, not an approximation. It used to be the
+/// finite Neumann sum `Σ_{k<C} N^k` of `N = −A` in doubling stages, which is
+/// algebraically exact too but numerically unusable when keys repeat: with
+/// `k_t·k_j ≈ 1`, `β ≈ 1` and little decay, `N^k` holds binomials up to
+/// C(62, 31) ≈ 5e17 whose sum cancels to O(1), and f32 turned that into
+/// garbage and then NaN (Flash-Next layer 45 on a repetitive 285-token
+/// prompt; `chunked_recurrence_survives_repeated_keys`).
 ///
 /// Numerical safety: every decay ratio `P_t/P_j` is `exp(L_t − L_j)` — a
 /// difference of cumulative logs, never a ratio of products (γ^64 reaches
@@ -779,10 +857,9 @@ fn gdn_recurrence_sequential(
 /// ambient dtype on the way out.
 ///
 /// Launch economics: the sequential loop issues ~9 small ops per token;
-/// a chunk issues ~20 chunk-level ops plus 2–3 matmuls per doubling stage
-/// (6 stages at C = 64) — ~40 launches per 64 tokens, every one of them a
-/// batched matmul over all heads, against ~576 for the same span
-/// sequentially.
+/// a chunk issues ~20 chunk-level ops plus ~6 per level of the inverse
+/// (6 levels at C = 64) — ~56 launches per 64 tokens, the heavy ones
+/// batched over all heads, against ~576 for the same span sequentially.
 #[allow(clippy::too_many_arguments)] // the recurrence's natural arity
 fn gdn_recurrence_chunked(
     q: &Tensor<4>,
@@ -838,38 +915,15 @@ fn gdn_recurrence_chunked(
             .mask_fill(noncausal, f32::NEG_INFINITY)
             .exp(); // [b, hv, c, c], causal-inclusive
 
-        // A[t, j] = β_t·(P_t/P_j)·(k_t·k_j), strictly lower. Every entry
-        // of `decay` is finite in [0, 1], so a plain tril is safe here.
-        let a = decay
-            .clone()
-            .mul(kc.clone().matmul(kc.clone().swap_dims(2, 3)))
-            .mul(bc.clone())
-            .tril(-1);
+        // D = (I + A)⁻¹·B with A[t, j] = β_t·(P_t/P_j)·(k_t·k_j) strictly
+        // lower; the inverse is built by stable block recursion.
+        let r = unit_lower_inverse(kc.clone(), l.clone(), bc.clone(), &device);
 
         // RHS rows: B[t] = β_t·v_t − β_t·P_t·(S₀ᵀ k_t).
         let u0 = bc
             .clone()
             .mul(vc)
             .sub(bc.mul(p.clone()).mul(kc.clone()).matmul(s.clone()));
-
-        // D = (I + A)⁻¹·B through the finite Neumann sum of N = −A.
-        let n = a.neg();
-        let eye = Tensor::<2>::eye(c, &device)
-            .cast(DType::F32)
-            .unsqueeze::<4>();
-        let mut r = n.clone().add(eye); // Σ_{k<2} N^k
-        if c > 2 {
-            let mut x = n.clone().matmul(n); // N²
-            let mut span = 2usize; // r = Σ_{k<span} N^k, x = N^span
-            loop {
-                r = r.clone().add(x.clone().matmul(r));
-                span *= 2;
-                if span >= c {
-                    break; // N^span = 0 from here on
-                }
-                x = x.clone().matmul(x);
-            }
-        }
         let u = r.matmul(u0); // the solved pseudo-values, [b, hv, c, ds]
 
         // o_t = P_t·S₀ᵀq_t + Σ_{j≤t} (P_t/P_j)·(q_t·k_j)·u_j — inclusive
@@ -2506,6 +2560,44 @@ mod tests {
         let sd = max_abs_diff(s_seq, s_chk);
         assert!(od < 1e-4, "outputs diverge under strong decay: {od}");
         assert!(sd < 1e-4, "final state diverges under strong decay: {sd}");
+    }
+
+    /// Repeated-key stress, the failure the real Flash-Next weights hit on a
+    /// repetitive 285-token prompt (layer 45 went NaN at token 192, the
+    /// first token of a later full chunk): with (nearly) parallel keys,
+    /// β near 1 and almost no decay, `A[t, j] ≈ 1` below the diagonal. The
+    /// true `(I + A)⁻¹` stays bounded (its entries are delta-rule
+    /// sensitivities, at most 1), but its power-series terms `N^k` are
+    /// binomials up to C(62, 31) ≈ 5e17 at C = 64, so any evaluation that
+    /// forms them cancels catastrophically in f32. The chunked path must
+    /// still track the sequential reference.
+    #[test]
+    fn chunked_recurrence_survives_repeated_keys() {
+        let device = crate::backend::cpu_device();
+        let (b, hv, ds, t) = (1, 3, 4, 192);
+        let scale = 1.0 / (ds as f32).sqrt();
+        let (q, _, v, _, _) = random_recurrence_inputs(t, (-1.0, 0.0), &device);
+        // One unit key per head, repeated at every position, with a tiny
+        // per-token wobble so the keys are parallel but not bit-identical.
+        let base = Tensor::<4>::random([b, hv, 1, ds], Distribution::Uniform(-1.0, 1.0), &device)
+            .repeat_dim(2, t)
+            .add(Tensor::<4>::random(
+                [b, hv, t, ds],
+                Distribution::Uniform(-1e-3, 1e-3),
+                &device,
+            ));
+        let k = base
+            .clone()
+            .div(base.powi_scalar(2).sum_dim(3).sqrt().clamp_min(1e-6));
+        let g = Tensor::<3>::random([b, t, hv], Distribution::Uniform(-1e-3, 0.0), &device);
+        let beta = Tensor::<3>::random([b, t, hv], Distribution::Uniform(0.9, 0.99), &device);
+        let s0 = Tensor::<4>::zeros([b, hv, ds, ds], &device);
+        let (o_seq, s_seq) = gdn_recurrence_sequential(&q, &k, &v, &g, &beta, s0.clone(), scale);
+        let (o_chk, s_chk) = gdn_recurrence_chunked(&q, &k, &v, &g, &beta, s0, scale, 64);
+        let od = max_abs_diff(o_seq, o_chk);
+        let sd = max_abs_diff(s_seq, s_chk);
+        assert!(od < 1e-3, "outputs diverge under repeated keys: {od}");
+        assert!(sd < 1e-3, "final state diverges under repeated keys: {sd}");
     }
 
     /// The cache invariant again, with the prefill long enough (100 > the
