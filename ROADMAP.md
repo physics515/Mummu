@@ -1019,6 +1019,28 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       kept verbatim for decode and as the test reference; equivalence pinned at t ∈ {5, 64, 100,
       129} with random initial state, plus an underflow stress test and a chunked-prefill→decode
       handoff gate. A 2048-token prefill drops from ~18k launches to ~1.3k per GDN layer.
+      *(2026-09-16) **CORRECTION: "exact, no truncation" was true algebraically and false in f32 —
+      the Neumann doubling returned NaN on ordinary prompts, on every backend, for three weeks.** With
+      repeated keys inside a chunk (`k_t·k_j ≈ 1`, `β ≈ 1`, weak decay) the powers of `N = -A` hold
+      binomials up to C(62, 31) ≈ 5e17 whose sum cancels to O(1), so f32 returns garbage, then NaN.
+      Found while porting Qwen3.8-Flash-Next (a repetitive 285-token prompt turned a GDN layer NaN at
+      the first token of a later full chunk), then measured on the qwen35 family itself with the
+      Qwen3.5-2B BF16 fixture against llama.cpp b10991, main vs fixed, same session:
+      **main returns all-NaN logits (every decode step NaN, greedy emits token 0) on a realistic
+      324-token code-review chat prompt and on 256-, 360- and 1024-token prompts, on wgpu AND on flex**;
+      it is finite but far off at 64 prose tokens (max |Δlogprob| 0.78 at the reference top-5), 200
+      repeated tokens (3.09) and a 239-token chat prompt (1.74, greedy diverges at token 9). The
+      15-token parity prompt never fills a chunk, which is why no gate saw it. Every production qwen35
+      prompt longer than 4 tokens takes this path (default `MUMMU_GDN_CHUNK` 64).
+      Fix: `unit_lower_inverse` builds the inverse by block recursion `[[L11⁻¹, 0], [-L22⁻¹A21L11⁻¹,
+      L22⁻¹]]` bottom-up over power-of-two blocks; every intermediate is the inverse of a contiguous
+      sub-span, bounded by β ≤ 1. Unit repro `chunked_recurrence_survives_repeated_keys` (the old code
+      diverged by 4e29). With the fix, all 9 probe prompts are finite, match llama.cpp's top-5 order
+      and 17-token greedy output, and sit at 1.3e-2–7.6e-2 max |Δlogprob|; the 15-token parity legs
+      move by < 1e-4 and stay green against the ollama-bundled llama.cpp (5.0238e-2, unchanged).
+      Cost on wgpu (2B, warm, alternating processes, 15 timings each): prefill +3.5% at 64 tokens,
+      +5.9% at 256, +4-6% on 239-324-token chat prompts, **+20.8% at 1024** — worth a profile, not a
+      reason to keep a NaN. Follow-up: the qwen35 gate needs a leg longer than one chunk.*
 - [x] **VRAM guard is now a tracked quantile, not a constant: chance-constrained placement.**
       *(2026-08-27)* `mummu-schedule` gains P² online quantile estimation (Jain–Chlamtac),
       a `Watermark` guard (envelope semantics: rises immediately on any spike, shrinks only after a
