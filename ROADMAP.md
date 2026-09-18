@@ -688,11 +688,30 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       copy, and the next process replayed 95 lines from its local copy and answered two more failures
       with `cooldown`, not a restart; an exit armed to hang was ended by the watchdog at 20.0 s, code
       75.
-- [ ] **Measure `MUMMU_VRAM_LIVE_BUDGET` on the 27B and decide whether it becomes the default.** The
-      live reading should let the planner use VRAM another tenant has freed, and stop it overcommitting
-      a card another tenant has filled — but on a box where plex and deepseek-ocr move VRAM underneath,
-      it can also demote layers over a transient dip. Wants: a cold 27B timed both ways with the
-      placement line from each, and a run with a co-tenant deliberately allocating during the load.
+- [x] **Measure `MUMMU_VRAM_LIVE_BUDGET` on the 27B — measured, and ON in production.** *(2026-09-18,
+      v0.3.2, DeepStack `mummu`)* The co-tenant was a throwaway container from the deepseek-ocr image
+      holding a fixed amount of VRAM with torch, so the pressure was controlled rather than waited for.
+      Every cold load read ~17 GiB off the array (126-171 MB/s; the page cache did not serve repeats).
+
+      | flag | card | placement | resident | warm decode | outcome |
+      |---|---|---|---|---|---|
+      | off | free | 33/64 layers, 7.35 GiB | 113-141 s | 1.90-2.10 tok/s | ok |
+      | off | 13 GiB held | planned 7.35 GiB anyway | — | — | **OOM; backend poisoned** (v0.3.2 recovers: error frame, 503, in-process reload once the card freed) |
+      | on | free | 33/64 layers, 7.35 GiB | 113 s | 2.00-2.10 tok/s | ok — identical to off |
+      | on | 10 GiB held | `budget 9.0 -> 3.1 GiB`, **8/64 layers, 1.78 GiB** | 58 s | 1.10 tok/s | ok — no OOM, residency certified |
+
+      So the flag costs nothing when the card is free, and turns the day's crash into a model that runs
+      at about half speed. That is the trade the owner wanted, so it is set in the live compose
+      (`compose-linux/ai.yaml`, with the reasoning beside it; backup `ai.yaml.bak.20260918-vram-live-budget`).
+      The code default stays OFF: this box's co-tenant pattern is what was measured, and a different
+      host should get its own measurement before the default moves.
+- [ ] **A placement made under pressure never recovers when the pressure goes.** The live budget acts
+      only at LOAD time: after the 10 GiB co-tenant released its memory, the resident 27B stayed at 8/64
+      layers and 1.10 tok/s — half its speed on a free card — until something reloaded it (here, a
+      manual restart; 33/64 and full speed came back). Wants: the host-pressure watcher (it already
+      samples every 5 s) noticing that a resident model sits below the plan the card would now allow, and
+      scheduling a reload at an idle moment — never mid-generation, and with hysteresis so a co-tenant
+      that allocates in bursts does not cause a reload storm.
 - [ ] **What v0.3.1's review left open on `/logs`** *(2026-09-18)* — none blocked the deploy; each is
       a way the page can still lose or misstate history. (1) **A LOUD flood still evicts the load**: 404s
       stay loud by design, so one scanner sweep of more than 2000 paths on the public shim pushes the
