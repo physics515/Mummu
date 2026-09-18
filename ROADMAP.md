@@ -628,6 +628,46 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       locally: after 13,440 quiet requests the startup lines, both chats and the scanner 404s were all
       still held, `dropped` was 0, and `/logs` had polled through all of it without drawing a single gap
       marker; a deliberate overrun of the main ring then drew exactly one, for exactly the 100 lost.
+      **v0.3.2 (2026-09-18): a crashed GPU backend recovers by itself, and every surface says so.** The
+      first cold load after the v0.3.1 deploy ran while deepseek-ocr held most of the shared 16 GiB card;
+      with the live VRAM reading still off the planner placed `33/64 on GPU (cuda) (7.35 of 14.26 GiB)`
+      anyway, and cubecl's device thread `DSD-0-0` panicked 30 times in six seconds with `failed to
+      reserve 22020096 bytes of device memory: out of device memory allocating 261319680 bytes`. cubecl
+      catches those panics on its own thread, so the loader returned `Ok` (`RESIDENCY SUSPECT: … card
+      grew 0.00 GiB`) and every later chat panicked on its first read — `bytes: host access failed:
+      Read("The server is in an invalid state … couldn't find resource for that handle: Memory locat…`
+      — which reached the client as an HTTP 200 with an empty stream in 0.3 s, while the status object
+      said `ready` and `/api/health` said `ok`, until a manual `docker restart mummu`. **Read from the
+      cubecl source, that state is not sticky**: `ServerUnhealthy` is a per-stream error queue that the
+      read reporting it drains (`mem::take`); what kept failing was the resident model, whose weights
+      carried handles the device never bound. So the recovery is **unload and reload in-process** first
+      (`mummu-serve/src/recovery.rs` has the evidence, line by line): a device failure — any panic on a
+      `DSD-*`/`DSU-*` thread, seen by a panic hook because cubecl swallows it there, or cubecl's failure
+      text in a request's panic or error — drops the model and its residency note; a load counts only
+      once the device has synced its uploads with no device panic under it, so an OOM fails as a load
+      and never leaves a half-placed model in the slot; and a model loaded before the latest device
+      failure is never served again. **A process restart only when the reload did not hold** — a second
+      device failure with no token in between — because a sticky CUDA error cannot be cleared in-process:
+      exit 75 into Docker's `restart: unless-stopped`, at most once per 30 minutes, the history carried
+      across the restart, so a co-tenant that still holds the card costs one restart, not a loop. Every
+      client hears the truth: an `error` frame with a `recovery` field on SSE and WebSocket (and one
+      even if a worker ends without a final frame), ollama's `{"error": …}` line when streaming and a
+      503 body when not, an `error` phase in red on both pages, and a 503 from `/api/health` saying why —
+      which marks the container unhealthy and restarts nothing (no `autoheal` label). The chat page shows
+      the error in the bubble, and a stream that ends with neither `done` nor `error` as a dropped
+      connection. Before a self-restart the process leaves its last 300 log lines in
+      `/models/.mummu-serve/` (or its own temp dir, if the array refuses the write — the cooldown rides
+      in that file) and the next one replays them into `/logs`, marked `[previous process]`.
+      `--features fault-injection` (never in the image; a test pins the Dockerfile) replays the
+      incident on a CPU box, and did, under a shell loop standing in for Docker's restart policy: an
+      injected load OOM answered the SSE chat with one `error` frame (`"recovery":"reload"`) in 2.1 s,
+      `/api/health` went 503 and the phase `error`; the next WebSocket chat reloaded and answered,
+      clearing both; two injected invalid-state reads in a row — a shim stream, then a WebSocket chat
+      right after a clean reload — ended on ollama's `{"error": …}` line and a `"recovery":"restart"`
+      frame, a chat during the exit got a 503, and the process exited 75 and was serving again 1 s later
+      with the previous failure in its status and 62 replayed lines on `/logs`; two more failed loads
+      inside the cooldown drew "will not restart again before 18:06:07Z" and no exit. Every guard
+      added was shown to fail against a one-line mutation of the fix it pins.
 - [ ] **Measure `MUMMU_VRAM_LIVE_BUDGET` on the 27B and decide whether it becomes the default.** The
       live reading should let the planner use VRAM another tenant has freed, and stop it overcommitting
       a card another tenant has filled — but on a box where plex and deepseek-ocr move VRAM underneath,
