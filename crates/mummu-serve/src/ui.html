@@ -329,11 +329,19 @@ function makeProgress() {
 
     const working = st.phase === "loading" || st.phase === "packing" || st.phase === "warming";
     if (!working) return false;
-    const parts = [st.model ? `${st.phase} ${st.model}` : st.phase];
     const determinate = st.total > 0;
+    // "step 2" is not decoration. The tiered and partitioned paths load in two
+    // counted passes, and the second one legitimately restarts at 0 with a
+    // different denominator and a fresh eta; without the step a bar that
+    // resets mid-load reads as a hang to the person watching it. Shown only
+    // beside a count, because the count is the thing that restarted.
+    const phase = determinate && st.step > 1 ? `${st.phase} (step ${st.step})` : st.phase;
+    const parts = [st.model ? `${phase} ${st.model}` : phase];
     // Clamped for the same reason the width is: a torn snapshot must read
-    // "851/851 tensors", never "900/851".
-    if (determinate) parts.push(`${Math.min(st.done, st.total)}/${st.total} tensors`);
+    // "851/851 tensors", never "900/851". The UNIT comes from the server: the
+    // three loaders count tensors, layers and experts, and this said "tensors"
+    // for all three.
+    if (determinate) parts.push(`${Math.min(st.done, st.total)}/${st.total} ${st.unit || "tensors"}`);
     if (st.bytes > 0) {
       // MiB/s labelled "MB/s", matching the server's own load line exactly —
       // the two sit next to each other on /logs and must not disagree.

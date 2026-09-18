@@ -82,14 +82,16 @@ fn git(args: &[&str]) -> Option<String> {
 ///
 /// Paths are resolved with `git rev-parse --git-path` rather than hardcoded
 /// as `../../.git/...`, because this crate is routinely built from a
-/// **worktree**, where `.git` is a file pointing elsewhere and HEAD and the
-/// index live under the main repository's `worktrees/` directory while
-/// `packed-refs` and the refs themselves stay in the common one. Asking git
-/// where its own files are is the only way to watch the right ones.
+/// **worktree**, where `.git` is a file pointing elsewhere and HEAD, the
+/// index and `logs/HEAD` live under the main repository's `worktrees/`
+/// directory while `packed-refs`, the refs themselves and their reflogs stay
+/// in the common one. Asking git where its own files are is the only way to
+/// watch the right ones — and it is why the reflog watches work at all here.
 ///
 /// Every path is checked for existence first. Cargo treats a declared path
-/// that is not there as a reason to re-run forever, and `ORIG_HEAD` (and a
-/// packed branch ref) genuinely may not exist.
+/// that is not there as a reason to re-run forever, and `ORIG_HEAD`, a packed
+/// branch ref, and the reflogs of a repository with `core.logAllRefUpdates`
+/// off genuinely may not exist.
 fn watch() {
     let head = git(&["symbolic-ref", "--quiet", "HEAD"]);
     for name in build_sha::git_watches(head.as_deref()) {

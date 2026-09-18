@@ -235,13 +235,30 @@ impl<T: Copy + Send + 'static> Stale<T> {
     /// Returns without waiting, always. `name` is what the refresh thread is
     /// called in a stack dump, which is the whole story when one is wedged.
     fn get(&'static self, ttl: Duration, name: &'static str, sample: fn() -> T) -> Option<T> {
+        self.get_at(ttl, name, sample).map(|(_, v)| v)
+    }
+
+    /// The same reading, with the instant it was taken.
+    ///
+    /// A gauge does not care how old its number is — it is redrawn a second
+    /// later either way. A *measurement* does: `engine::certify_residency`
+    /// subtracts a before from an after, and handing it the same sample twice
+    /// would report zero bytes resident and cry residency failure at a
+    /// perfectly good load. So the timestamp travels with the value and the
+    /// caller decides whether this reading is new enough to mean anything.
+    fn get_at(
+        &'static self,
+        ttl: Duration,
+        name: &'static str,
+        sample: fn() -> T,
+    ) -> Option<(Instant, T)> {
         let mut st = self.lock();
         if let Some((at, v)) = st.sample
             && at.elapsed() < ttl
         {
-            return Some(v);
+            return Some((at, v));
         }
-        let stale = st.sample.map(|(_, v)| v);
+        let stale = st.sample;
         if st.refreshing {
             return stale; // someone is already asking; do not ask again
         }
@@ -262,7 +279,44 @@ impl<T: Copy + Send + 'static> Stale<T> {
         }
         stale
     }
+
+    /// Wait — bounded — for a reading taken after `since`.
+    ///
+    /// The wait is on THIS cache, never on the source: each poll hands back
+    /// whatever has landed and asks for a refresh if the sample is stale, so a
+    /// driver that never answers costs the caller `budget` and not a minute.
+    /// `None` means no fresh reading arrived in time, which is a fact the
+    /// caller must report rather than paper over with the stale one.
+    ///
+    /// It sleeps, so it belongs on a thread of its own — never on an async
+    /// runtime and never under a lock somebody else needs.
+    fn wait_after(
+        &'static self,
+        since: Instant,
+        budget: Duration,
+        ttl: Duration,
+        name: &'static str,
+        sample: fn() -> T,
+    ) -> Option<T> {
+        let deadline = Instant::now() + budget;
+        loop {
+            if let Some((at, v)) = self.get_at(ttl, name, sample)
+                && at > since
+            {
+                return Some(v);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(POLL_INTERVAL.min(budget));
+        }
+    }
 }
+
+/// How often [`Stale::wait_after`] looks again. Short enough that a healthy
+/// driver's refresh (milliseconds) is not made to look slow, long enough that
+/// waiting out a wedged one costs a handful of wakeups.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// The VRAM reading. Stale-served — NVML is the source that can block.
 static VRAM: Stale<Option<mummu::vram::Memory>> = Stale::new();
@@ -302,6 +356,62 @@ pub fn memory() -> Memory {
     }
 }
 
+/// The VRAM reading for the MODEL-LOAD path: whatever has already been
+/// sampled, and a refresh asked for if that is stale. Never a call into the
+/// driver on this thread.
+///
+/// # Why the load path is the worst place of all to block
+///
+/// `nvmlDeviceGetMemoryInfo` takes the driver's lock, and on a wedged card it
+/// does not come back for seconds — sometimes not until the module is
+/// reloaded. Every other caller of NVML here is a gauge, and a gauge that
+/// stops moving is a cosmetic failure. The load path is different in two ways
+/// that compound:
+///
+/// * It runs with the **model slot lock held**, so a parked FFI call does not
+///   stall one load, it stalls every request behind that slot — including the
+///   `/logs` poll the operator opened *because* the GPU looks dead.
+/// * It is the one moment that must not get slower. A cold 27B off the
+///   spinning array is already minutes; the whole of v0.3.0 exists because
+///   two of those minutes looked like a hang.
+///
+/// A gauge may be a second stale. A load may not be a second late, and it may
+/// never be indefinitely late.
+#[must_use]
+pub fn vram_used() -> Option<u64> {
+    VRAM.get_at(SAMPLE_TTL, "mummu-vram", mummu::vram::memory)
+        .and_then(|(_, v)| v)
+        .map(|m| m.used)
+}
+
+/// Wait, bounded and off the driver, for a VRAM reading taken after `since`.
+///
+/// The residency check subtracts a before from an after, so it needs a
+/// reading that actually postdates the load — the cached one may have been
+/// taken while the weights were still landing. `None` means none arrived
+/// inside `budget`, which the caller reports as "unverified" rather than
+/// turning into a number it did not measure.
+///
+/// Sleeps: call it from a thread that exists for this, never from an async
+/// task and never while holding a lock.
+#[must_use]
+pub fn vram_used_after(since: Instant, budget: Duration) -> Option<u64> {
+    VRAM.wait_after(since, budget, SAMPLE_TTL, "mummu-vram", mummu::vram::memory)
+        .flatten()
+        .map(|m| m.used)
+}
+
+/// Take the first readings now, before anything needs one.
+///
+/// [`Stale`] answers from the last sample and refreshes behind it, so the
+/// very first call after boot has nothing to hand back. That is fine for a
+/// gauge (it fills in a second later) and not fine for the first load's VRAM
+/// baseline, which has exactly one chance to be taken. One call at startup,
+/// on the refresh thread, and the cache is warm before a model ever lands.
+pub fn prime() {
+    let _ = memory();
+}
+
 // ---------------------------------------------------------------------------
 // The wire shape
 // ---------------------------------------------------------------------------
@@ -336,7 +446,8 @@ fn finite(v: Option<f64>) -> Value {
 /// "status": {
 ///   "version": "0.3.0", "build": "abc1234",
 ///   "phase": "loading", "generation": 7, "model": "gemma3:27b",
-///   "done": 673, "total": 851, "bytes": 15527000000,
+///   "done": 673, "total": 851, "unit": "tensors", "step": 1,
+///   "bytes": 15527000000,
 ///   "rate_bps": 169000000.0, "elapsed_s": 91.2, "eta_s": 24.0,
 ///   "host": {"rss": 22000000000, "available": 90000000000, "total": 133000000000},
 ///   "vram": {"used": 7900000000, "free": 9300000000, "total": 17170000000}
@@ -362,6 +473,13 @@ pub fn to_json() -> Value {
         "model": if p.model.is_empty() { Value::Null } else { json!(p.model) },
         "done": p.done,
         "total": p.expected,
+        // What the two counts above are counting. Three loaders feed this bar
+        // and they count tensors, layers and experts respectively; the pages
+        // used to print "tensors" under all three.
+        "unit": p.unit.as_str(),
+        // Which counted pass of this load the bar is on. Past 1 it is what
+        // separates "the second pass started" from "the bar went backwards".
+        "step": p.step,
         "bytes": p.bytes,
         "rate_bps": finite(p.rate_bps()),
         "elapsed_s": finite(p.elapsed_s().map(tenths)),
@@ -400,6 +518,8 @@ mod tests {
             "model",
             "done",
             "total",
+            "unit",
+            "step",
             "bytes",
             "rate_bps",
             "elapsed_s",
@@ -526,6 +646,89 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(landed, Some(1), "one refresh between 21 callers, not 21");
+    }
+
+    /// MINOR 4: the count the bar draws has to say what it counts. Three
+    /// loaders feed it — tensors, layers, experts — and the pages printed
+    /// "tensors" under all three until the unit rode along with the count.
+    #[test]
+    fn the_counts_carry_the_unit_and_the_pass_they_belong_to() {
+        let _serial = crate::progress_serial();
+        mummu::progress::begin(
+            mummu::progress::Phase::Loading,
+            64,
+            mummu::progress::Unit::Layers,
+        );
+        mummu::progress::advance(12, 1 << 30);
+        let s = to_json();
+        assert_eq!(s["unit"], json!("layers"), "12/64 layers, not tensors");
+        assert_eq!(s["done"], json!(12));
+        assert_eq!(s["total"], json!(64));
+        assert!(s["step"].is_u64(), "the pass number is a number");
+        mummu::progress::idle();
+        // Idle still answers with a unit rather than a missing field: every
+        // field of this object is always present (see above).
+        assert!(to_json()["unit"].is_string());
+    }
+
+    /// MAJOR 3: the load path reads VRAM through this cache, and the waiting
+    /// it does when it needs a reading NEWER than something must be bounded
+    /// by its own budget — never by whether the driver ever answers. A wedged
+    /// `nvmlDeviceGetMemoryInfo` parks for seconds; a load holding the model
+    /// slot lock cannot park with it.
+    #[test]
+    fn a_wedged_source_never_holds_a_waiter_past_its_budget() {
+        static WEDGED: Stale<u64> = Stale::new();
+        fn never_answers() -> u64 {
+            std::thread::sleep(Duration::from_secs(30));
+            0
+        }
+        let budget = Duration::from_millis(300);
+        let t = Instant::now();
+        let got = WEDGED.wait_after(
+            Instant::now(),
+            budget,
+            Duration::from_millis(10),
+            "test-wedged-wait",
+            never_answers,
+        );
+        assert_eq!(got, None, "no reading arrived, and none may be invented");
+        assert!(
+            t.elapsed() < budget * 4,
+            "waited {:?} on a {budget:?} budget",
+            t.elapsed()
+        );
+    }
+
+    /// And when the source does answer, the wait returns the reading that
+    /// actually postdates the caller's mark — not the stale one it started
+    /// with, which for `certify_residency` would be "before minus before" and
+    /// a residency alarm on a load that worked.
+    #[test]
+    fn a_wait_returns_only_a_reading_newer_than_its_mark() {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        static SOURCE: Stale<u64> = Stale::new();
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        fn counted() -> u64 {
+            NEXT.fetch_add(1, Relaxed)
+        }
+        let ttl = Duration::from_millis(10);
+
+        // Land a first reading, and mark the moment after it.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while SOURCE.get(ttl, "test-mark", counted).is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let first = SOURCE.get(ttl, "test-mark", counted).expect("a reading");
+        let mark = Instant::now();
+
+        let after = SOURCE
+            .wait_after(mark, Duration::from_secs(5), ttl, "test-mark", counted)
+            .expect("the source answers, so a fresh reading must arrive");
+        assert!(
+            after > first,
+            "handed back a reading from before the mark: {after} after {first}"
+        );
     }
 
     /// A stale reading is served while the refresh runs — the gauge keeps

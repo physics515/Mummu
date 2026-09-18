@@ -1246,7 +1246,11 @@ pub fn load_from_gguf_quantized(
     // come from the tensors' own on-disk sizes, so the rate reported is the
     // disk's, not the f32 expansion's.
     let expected = expected_tensor_count(&config, untied);
-    crate::progress::begin(crate::progress::Phase::Loading, expected as u64);
+    crate::progress::begin(
+        crate::progress::Phase::Loading,
+        expected as u64,
+        crate::progress::Unit::Tensors,
+    );
     let mut assigned = 0usize;
     let mut bytes_read = 0u64;
     for info in &f.tensors {
@@ -1737,7 +1741,11 @@ pub fn load_from_pack_layered(
     // The same numbers, structured, for a progress bar: the print above is
     // throttled to one line per 15 s so `docker logs` stays readable, which is
     // far too coarse for a bar. See `crate::progress`.
-    crate::progress::begin(crate::progress::Phase::Loading, expected as u64);
+    crate::progress::begin(
+        crate::progress::Phase::Loading,
+        expected as u64,
+        crate::progress::Unit::Tensors,
+    );
 
     let mut assigned = 0usize;
     for entry in &pack.manifest.tensors {
@@ -1945,6 +1953,7 @@ fn load_from_pack_inner(
     crate::progress::begin(
         crate::progress::Phase::Loading,
         expected_tensor_count(&config, untied) as u64,
+        crate::progress::Unit::Tensors,
     );
     let mut assigned = 0usize;
     for entry in &pack.manifest.tensors {

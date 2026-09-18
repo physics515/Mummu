@@ -208,6 +208,11 @@ where
     // guards against arrives from OTHER processes, so it must not depend on
     // this one receiving traffic. See `engine::spawn_host_pressure_watch`.
     engine::spawn_host_pressure_watch();
+    // And take the first memory readings now. The VRAM cache answers from its
+    // last sample and refreshes behind it, so the first load's baseline would
+    // otherwise be "nothing sampled yet" on a server nobody has polled —
+    // see `status::prime`.
+    status::prime();
     // One trigger, two listeners: `with_graceful_shutdown` consumes a
     // future, and futures aren't cloneable, so the trigger fans out through
     // a watch channel.
