@@ -34,7 +34,10 @@
 //! where you go to find out *why* it is dead. So the VRAM reading goes
 //! through [`Stale`], which answers instantly from the last sample and does
 //! the refresh on a thread of its own. A driver that never answers costs a
-//! stale VRAM gauge and one parked thread; it does not cost the endpoint.
+//! stale VRAM gauge and a parked thread; it does not cost the endpoint, and
+//! it does not cost the gauge permanently — see [`Stale`] on why a refresh
+//! that has clearly parked is retired rather than left holding the flag
+//! forever.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -188,16 +191,66 @@ pub struct Memory {
 /// where there is no tokio runtime to spawn into, and one thread per stale
 /// poll (so at most one per [`SAMPLE_TTL`], and none at all while nobody is
 /// watching) is cheaper than the one request it would otherwise delay.
+///
+/// # Which failure a wedged source buys: a stale gauge, never a dead one
+///
+/// Single-flight on its own turns "one refresh is stuck" into "no refresh is
+/// ever attempted again". The flag was cleared only by the refresh thread, so
+/// a call parked in the driver froze the reading for the life of the
+/// process — after the card recovered, after a driver reset, hours later. The
+/// doc comment above promises a gauge that *stops moving*, which is a
+/// temporary failure; that was a permanent one.
+///
+/// So a refresh still running after [`StaleState::retire_after`] is **retired**
+/// by the next caller, which starts another. The cost is stated plainly: one
+/// parked FFI call per retirement interval, and the interval doubles up to
+/// [`MAX_RETIRE_AFTER`] while the source stays unresponsive — so a driver
+/// that never answers accumulates a handful of parked threads an hour rather
+/// than one a second, and the reading revives the moment any refresh returns.
+/// A retired refresh's own reading is discarded (see [`Stale::get_at`]): it
+/// was measured before the retirement and stamping it `now` is the lie this
+/// whole type exists to avoid.
 struct Stale<T: Copy + Send + 'static> {
     state: Mutex<StaleState<T>>,
 }
 
 struct StaleState<T> {
     sample: Option<(Instant, T)>,
-    /// A refresh is in flight. Single-flight: ten tabs arriving together make
-    /// one call into the driver, not ten.
-    refreshing: bool,
+    /// The refresh in flight — which one, and when it started. `None` means
+    /// none is running. Single-flight: ten tabs arriving together make one
+    /// call into the driver, not ten.
+    ///
+    /// The token is what makes retirement safe. A retired refresh that wakes
+    /// up minutes later must not clear a *newer* refresh's flag, nor publish
+    /// its own stale reading over a fresher one, so both are conditional on
+    /// still being the refresh this state is waiting for.
+    refreshing: Option<(u64, Instant)>,
+    /// Handed to the next refresh. Monotonic, never reused.
+    next_token: u64,
+    /// How long the CURRENT refresh may run before a caller may retire it.
+    /// Doubles per retirement (the source is not answering, so asking again
+    /// immediately is just another parked thread) and resets to
+    /// [`StaleState::retire_base`] the moment a refresh lands.
+    retire_after: Duration,
+    /// What [`StaleState::retire_after`] resets to. A field rather than the
+    /// constant so a test can run this machinery in milliseconds.
+    retire_base: Duration,
 }
+
+/// How long a refresh may run before a later caller retires it and asks
+/// again.
+///
+/// A healthy `nvmlDeviceGetMemoryInfo` is a millisecond or two, and a
+/// `/proc` read is less; five seconds is three orders of magnitude past
+/// either, so nothing that is merely slow gets retired — only something that
+/// has clearly parked.
+const RETIRE_AFTER: Duration = Duration::from_secs(5);
+
+/// The ceiling the retirement interval backs off to. Five minutes: long
+/// enough that a driver wedged for hours costs a dozen parked threads rather
+/// than hundreds, short enough that a card which comes back is noticed while
+/// the operator is still looking at the page.
+const MAX_RETIRE_AFTER: Duration = Duration::from_secs(300);
 
 /// Clears [`StaleState::refreshing`] however the refresh ends.
 ///
@@ -205,20 +258,35 @@ struct StaleState<T> {
 /// that panics would otherwise leave the flag set forever and freeze the
 /// reading for the life of the process — the same shape as the NVML resolve
 /// that cached its own failure.
-struct Refreshing<T: Copy + Send + 'static>(&'static Stale<T>);
+///
+/// Carries its own token: a refresh that was retired for parking too long
+/// must not clear the flag of the refresh that replaced it.
+struct Refreshing<T: Copy + Send + 'static>(&'static Stale<T>, u64);
 
 impl<T: Copy + Send + 'static> Drop for Refreshing<T> {
     fn drop(&mut self) {
-        self.0.lock().refreshing = false;
+        let mut st = self.0.lock();
+        if st.refreshing.is_some_and(|(token, _)| token == self.1) {
+            st.refreshing = None;
+        }
     }
 }
 
 impl<T: Copy + Send + 'static> Stale<T> {
     const fn new() -> Self {
+        Self::with_retirement(RETIRE_AFTER)
+    }
+
+    /// [`Self::new`] with a different starting retirement interval, so the
+    /// tests can prove the timeout without sitting through [`RETIRE_AFTER`].
+    const fn with_retirement(retire_after: Duration) -> Self {
         Self {
             state: Mutex::new(StaleState {
                 sample: None,
-                refreshing: false,
+                refreshing: None,
+                next_token: 1,
+                retire_after,
+                retire_base: retire_after,
             }),
         }
     }
@@ -259,23 +327,45 @@ impl<T: Copy + Send + 'static> Stale<T> {
             return Some((at, v));
         }
         let stale = st.sample;
-        if st.refreshing {
-            return stale; // someone is already asking; do not ask again
+        if let Some((_, started)) = st.refreshing {
+            if started.elapsed() < st.retire_after {
+                return stale; // someone is already asking; do not ask again
+            }
+            // It has clearly parked (see `Stale`'s header). Retire it and ask
+            // again, backing off first so a source that never answers is not
+            // asked once per poll forever.
+            st.retire_after = (st.retire_after * 2).min(MAX_RETIRE_AFTER);
         }
-        st.refreshing = true;
+        let token = st.next_token;
+        st.next_token += 1;
+        st.refreshing = Some((token, Instant::now()));
         drop(st);
         let spawned = std::thread::Builder::new()
             .name(name.to_owned())
             .spawn(move || {
                 // Armed BEFORE the call that can block or panic.
-                let _flag = Refreshing(self);
+                let _flag = Refreshing(self, token);
                 let fresh = sample();
-                self.lock().sample = Some((Instant::now(), fresh));
+                let mut st = self.lock();
+                // Only the refresh this state is still waiting for publishes.
+                // A retired one's reading predates its own retirement by at
+                // least `retire_after`, and stamping it `now` would hand
+                // `wait_after` and the residency baseline a fresh-looking
+                // number that measured a different moment.
+                if st.refreshing.is_some_and(|(t, _)| t == token) {
+                    st.sample = Some((Instant::now(), fresh));
+                    // The source answered, so the backoff has nothing left to
+                    // protect against.
+                    st.retire_after = st.retire_base;
+                }
             });
         if spawned.is_err() {
             // Out of threads. Clear the flag by hand or the reading never
             // refreshes again, which is a worse failure than this one.
-            self.lock().refreshing = false;
+            let mut st = self.lock();
+            if st.refreshing.is_some_and(|(t, _)| t == token) {
+                st.refreshing = None;
+            }
         }
         stale
     }
@@ -356,32 +446,64 @@ pub fn memory() -> Memory {
     }
 }
 
-/// The VRAM reading for the MODEL-LOAD path: whatever has already been
-/// sampled, and a refresh asked for if that is stale. Never a call into the
-/// driver on this thread.
+/// How old a sample may be and still serve as the residency BASELINE.
 ///
-/// # Why the load path is the worst place of all to block
+/// Three times [`SAMPLE_TTL`], not one: the cache refreshes only when
+/// something asks, so the newest sample on an unwatched server is by
+/// definition a little stale, and demanding a sub-second-old reading would
+/// make every load on an idle box report "unverified". Three seconds against
+/// a load measured in minutes still pins the baseline to *before the weights
+/// started landing*, which is the only property the subtraction needs.
+const BASELINE_MAX_AGE: Duration = Duration::from_secs(3);
+
+/// The VRAM baseline for the residency measurement: a reading no older than
+/// [`BASELINE_MAX_AGE`], waiting at most `budget` for one to land.
+///
+/// # Why the baseline needs a freshness bound at all
+///
+/// This is one half of a subtraction. The `after` side is already bounded by
+/// [`vram_used_after`], which refuses a reading that does not postdate the
+/// load; the `before` side used to take whatever the cache happened to hold,
+/// of any age. A baseline sampled *while the weights were already landing*
+/// makes `after - before` small, and `engine::certify_residency` then prints
+/// `RESIDENCY SUSPECT` — red on `/logs`, "decode is running on the host" —
+/// about a load that worked perfectly. A false alarm on the page this
+/// release exists to make trustworthy is worse than no alarm, so a baseline
+/// that cannot be dated is refused and the line reads "placement
+/// unverified" instead.
+///
+/// # Why it may wait, and why the wait cannot be the driver's decision
 ///
 /// `nvmlDeviceGetMemoryInfo` takes the driver's lock, and on a wedged card it
 /// does not come back for seconds — sometimes not until the module is
-/// reloaded. Every other caller of NVML here is a gauge, and a gauge that
-/// stops moving is a cosmetic failure. The load path is different in two ways
-/// that compound:
+/// reloaded. This runs with the **model slot lock held**, so a parked FFI
+/// call here does not stall one load, it stalls every request behind that
+/// slot — including the `/logs` poll the operator opened *because* the GPU
+/// looks dead.
 ///
-/// * It runs with the **model slot lock held**, so a parked FFI call does not
-///   stall one load, it stalls every request behind that slot — including the
-///   `/logs` poll the operator opened *because* the GPU looks dead.
-/// * It is the one moment that must not get slower. A cold 27B off the
-///   spinning array is already minutes; the whole of v0.3.0 exists because
-///   two of those minutes looked like a hang.
-///
-/// A gauge may be a second stale. A load may not be a second late, and it may
-/// never be indefinitely late.
+/// So the wait is on the sample CACHE, exactly as [`vram_used_after`]'s is:
+/// the refresh runs on a thread of its own, this thread polls what has
+/// landed, and `budget` is a ceiling no driver can extend. A quarter second
+/// against a cold 27B's minutes is not a slower load; an unbounded one would
+/// be.
 #[must_use]
-pub fn vram_used() -> Option<u64> {
-    VRAM.get_at(SAMPLE_TTL, "mummu-vram", mummu::vram::memory)
-        .and_then(|(_, v)| v)
-        .map(|m| m.used)
+pub fn vram_baseline(budget: Duration) -> Option<u64> {
+    // `wait_after` returns a reading stamped later than `since`, so a horizon
+    // of "now minus the max age" IS the freshness bound: a sample inside it
+    // comes back immediately, an older one costs a refresh (bounded by
+    // `budget`), and a source that will not answer costs `budget` and `None`.
+    let horizon = Instant::now()
+        .checked_sub(BASELINE_MAX_AGE)
+        .unwrap_or_else(Instant::now);
+    VRAM.wait_after(
+        horizon,
+        budget,
+        SAMPLE_TTL,
+        "mummu-vram",
+        mummu::vram::memory,
+    )
+    .flatten()
+    .map(|m| m.used)
 }
 
 /// Wait, bounded and off the driver, for a VRAM reading taken after `since`.
@@ -445,7 +567,7 @@ fn finite(v: Option<f64>) -> Value {
 /// ```json
 /// "status": {
 ///   "version": "0.3.0", "build": "abc1234",
-///   "phase": "loading", "generation": 7, "model": "gemma3:27b",
+///   "phase": "loading", "working": true, "generation": 7, "model": "gemma3:27b",
 ///   "done": 673, "total": 851, "unit": "tensors", "step": 1,
 ///   "bytes": 15527000000,
 ///   "rate_bps": 169000000.0, "elapsed_s": 91.2, "eta_s": 24.0,
@@ -467,6 +589,14 @@ pub fn to_json() -> Value {
         "version": VERSION,
         "build": BUILD,
         "phase": p.phase.as_str(),
+        // Whether that phase is WORK, decided by `Phase::is_working` rather
+        // than by a list of phase names. Both pages carried their own copy of
+        // that list in JavaScript, so the two phases this release adds —
+        // `importing` and `partitioning`, together the longest part of a
+        // first-ever load — would have drawn no bar at all on either page
+        // while the server counted them perfectly. The verdict travels with
+        // the phase so the copies cannot drift again.
+        "working": p.phase.is_working(),
         // Which load these numbers belong to. A client that sees it change
         // knows the previous load is over, whatever the other fields say.
         "generation": p.generation,
@@ -514,6 +644,7 @@ mod tests {
             "version",
             "build",
             "phase",
+            "working",
             "generation",
             "model",
             "done",
@@ -556,9 +687,41 @@ mod tests {
         mummu::progress::idle();
         let s = to_json();
         assert_eq!(s["phase"], json!("idle"));
+        assert_eq!(s["working"], json!(false), "idle is not work");
         assert_eq!(s["model"], Value::Null, "no model, not an empty string");
         assert_eq!(s["total"], json!(0), "0 total is the indeterminate signal");
         assert_eq!(s["eta_s"], Value::Null, "no eta invented out of nothing");
+    }
+
+    /// MINOR 4/5: the pages decide whether to draw a bar from `working`, not
+    /// from their own list of phase names. Every phase the loader can publish
+    /// has to come back with the verdict `Phase::is_working` gives it — the
+    /// two one-time phases especially, since they are the 173 seconds that
+    /// used to read as nothing happening.
+    #[test]
+    fn the_wire_carries_the_bar_verdict_for_every_phase() {
+        use mummu::progress::Phase;
+        let _serial = crate::progress_serial();
+        for phase in [
+            Phase::Idle,
+            Phase::Loading,
+            Phase::Importing,
+            Phase::Partitioning,
+            Phase::Packing,
+            Phase::Warming,
+            Phase::Ready,
+        ] {
+            mummu::progress::phase(phase);
+            let s = to_json();
+            assert_eq!(s["phase"], json!(phase.as_str()));
+            assert_eq!(
+                s["working"],
+                json!(phase.is_working()),
+                "{} disagreed with is_working()",
+                phase.as_str()
+            );
+        }
+        mummu::progress::idle();
     }
 
     /// The gauges are drawn from these, so an inconsistent reading would draw
@@ -728,6 +891,154 @@ mod tests {
         assert!(
             after > first,
             "handed back a reading from before the mark: {after} after {first}"
+        );
+    }
+
+    /// MAJOR 1: the residency BASELINE is one half of a subtraction, so an
+    /// undated number is not a cheap approximation of it — it is a red
+    /// `RESIDENCY SUSPECT` on a load that worked. A sample older than the age
+    /// bound must be refused outright, which is what makes
+    /// `certify_residency`'s honest "placement unverified" reachable.
+    ///
+    /// The deliberately-old baseline is built the way a real one goes stale:
+    /// a source that answers once and then parks, a sample left to age past
+    /// the bound, and a caller that then asks for a baseline.
+    #[test]
+    fn a_baseline_older_than_its_bound_is_refused_not_subtracted() {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        static SOURCE: Stale<u64> = Stale::new();
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+        /// Answers the first call, parks on every one after — a card that
+        /// worked when the server started and wedged before this load.
+        fn answers_once_then_parks() -> u64 {
+            if CALLS.fetch_add(1, Relaxed) == 0 {
+                return 7;
+            }
+            std::thread::sleep(Duration::from_secs(30));
+            0
+        }
+        let ttl = Duration::from_millis(10);
+        let max_age = Duration::from_millis(120);
+
+        // Land the one good reading, and note that a baseline taken NOW —
+        // inside the age bound — is served from it without waiting.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while SOURCE
+            .get(ttl, "test-baseline", answers_once_then_parks)
+            .is_none()
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let fresh = SOURCE.wait_after(
+            Instant::now() - max_age,
+            Duration::from_millis(200),
+            ttl,
+            "test-baseline",
+            answers_once_then_parks,
+        );
+        assert_eq!(fresh, Some(7), "a sample inside the bound IS the baseline");
+
+        // Now let it age past the bound. The source cannot answer any more,
+        // so the only reading available is the old one — and it must not be
+        // handed out as a baseline.
+        std::thread::sleep(max_age + Duration::from_millis(30));
+        let budget = Duration::from_millis(200);
+        let t = Instant::now();
+        let aged = SOURCE.wait_after(
+            Instant::now() - max_age,
+            budget,
+            ttl,
+            "test-baseline",
+            answers_once_then_parks,
+        );
+        assert_eq!(
+            aged, None,
+            "a baseline that measured a different moment must be refused, \
+             not subtracted from the after reading"
+        );
+        assert!(
+            t.elapsed() < budget * 4,
+            "and the refusal is bounded by the budget, not by the driver: {:?}",
+            t.elapsed()
+        );
+        // The gauge, which does not subtract anything, still has its number.
+        assert_eq!(
+            SOURCE.get(ttl, "test-baseline", answers_once_then_parks),
+            Some(7),
+            "refusing a BASELINE must not blank the gauge"
+        );
+    }
+
+    /// The baseline the load path actually calls must come back inside its
+    /// budget on this machine, whatever NVML does or does not exist here. A
+    /// value is never asserted: there may be no card, and on a shared one the
+    /// number is every tenant's.
+    #[test]
+    fn the_load_paths_baseline_is_bounded_by_its_budget() {
+        let budget = Duration::from_millis(250);
+        let t = Instant::now();
+        let _ = vram_baseline(budget);
+        assert!(
+            t.elapsed() < budget * 4,
+            "the load path waited {:?} for a {budget:?} baseline",
+            t.elapsed()
+        );
+    }
+
+    /// MINOR 2: single-flight must not become never-again. A refresh that has
+    /// parked past its retirement interval is retired by the next caller,
+    /// which asks again — so the chosen failure is a gauge that is stale
+    /// until the card answers, never one that is dead for the life of the
+    /// process.
+    #[test]
+    fn a_parked_refresh_is_retired_so_the_reading_can_recover() {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        // A 60 ms retirement interval, so this test costs milliseconds rather
+        // than the 5 s a real wedged driver is given.
+        static WEDGED: Stale<u64> = Stale::with_retirement(Duration::from_millis(60));
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+        fn never_answers() -> u64 {
+            CALLS.fetch_add(1, Relaxed);
+            std::thread::sleep(Duration::from_secs(2));
+            0
+        }
+        let ttl = Duration::from_millis(5);
+
+        // First poll starts the refresh that will park.
+        assert_eq!(WEDGED.get(ttl, "test-retire", never_answers), None);
+        // Polls inside the interval must NOT pile on: single-flight still
+        // holds while the refresh is merely slow.
+        for _ in 0..5 {
+            std::thread::sleep(Duration::from_millis(5));
+            assert_eq!(WEDGED.get(ttl, "test-retire", never_answers), None);
+        }
+        assert_eq!(
+            CALLS.load(Relaxed),
+            1,
+            "a refresh that is merely slow is asked once, not once per poll"
+        );
+
+        // Past the interval, a later caller retires it and asks again. This
+        // is the line that used to be impossible: the flag was only ever
+        // cleared by the thread that was stuck holding it.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while CALLS.load(Relaxed) < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+            let _ = WEDGED.get(ttl, "test-retire", never_answers);
+        }
+        assert!(
+            CALLS.load(Relaxed) >= 2,
+            "a parked refresh was never retired, so the gauge would stay dead \
+             even after the card recovered"
+        );
+        // And the retries back off rather than spawning one per poll: the
+        // interval doubles each time, so a driver that never answers costs a
+        // handful of parked threads, not one per second.
+        assert!(
+            CALLS.load(Relaxed) < 20,
+            "{} refreshes in two seconds is a thread pile, not a backoff",
+            CALLS.load(Relaxed)
         );
     }
 

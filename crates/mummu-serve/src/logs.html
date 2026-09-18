@@ -387,8 +387,12 @@ const bar = (() => {
              st.host ? st.host.total : null, st.host ? st.host.rss : null);
     setGauge(vram, st.vram ? st.vram.used : null, st.vram ? st.vram.total : null, null);
 
-    const working = st.phase === "loading" || st.phase === "packing" || st.phase === "warming";
-    if (!working) {
+    // The SERVER decides whether a phase is work (`Phase::is_working`). This
+    // used to be a list of phase names held here, and a phase added on the
+    // server then drew no bar at all — which is exactly what would have
+    // happened to `importing` and `partitioning`, the two phases that cover
+    // the longest part of a first-ever load.
+    if (!st.working) {
       // Resting, not working. "ready" once a model is resident, "idle" before
       // the first one — both honest, neither an animation suggesting work.
       label.textContent = st.phase === "ready"
@@ -454,11 +458,24 @@ function nextDelay() {
 // not mistaken by the loop for a successful one.
 let inflight = false;
 
+// How many times one poll may immediately continue itself.
+//
+// The server bounds ONE response's size (see MAX_PAGE_BYTES), so a bootstrap
+// of the whole ring can come back in chunks. Following them here keeps the
+// reader's experience what it was — the page fills in one go — instead of a
+// chunk per second. Sixteen covers the largest ring the server can hold even
+// if every line in it is at the truncation limit, and it is a ceiling rather
+// than a condition, so a server that answered "more" forever could not spin
+// this.
+const MAX_CATCHUP = 16;
+
 async function pollOnce() {
   if (inflight) return false;
   inflight = true;
   try {
-    await poll();
+    for (let i = 0; i < MAX_CATCHUP; i++) {
+      if (!await poll()) break;
+    }
     return true;
   } finally {
     inflight = false;
@@ -490,6 +507,9 @@ async function poll() {
   updateCounts();
   if (stick) toBottom();
   $("cursorinfo").textContent = `seq ${page.newest} / ring ${page.capacity}`;
+  // The server stopped this page early (on `limit` or on its byte budget) and
+  // is holding more. Told, rather than re-derived from the cursor.
+  return page.more === true;
 }
 
 async function loop() {

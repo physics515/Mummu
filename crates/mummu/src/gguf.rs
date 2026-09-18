@@ -716,6 +716,22 @@ impl GgufFile {
     /// count, rename collision) ahead of the first payload byte, so a bad map
     /// fails in milliseconds instead of after N tensors have been
     /// dequantized.
+    ///
+    /// # Why the progress bar is fed from HERE
+    ///
+    /// This loop is the load, for every architecture that goes through
+    /// [`crate::import::gguf_store`] — qwen2, qwen3, lfm2 and olmoe. It reads
+    /// every tensor off the checkpoint, dequantizes it and writes it out;
+    /// what follows is burn's store installing weights that are already on
+    /// the fast path. Only qwen35 had a counted bar, so for those four
+    /// families the whole release rendered as a spinner. The count is
+    /// published here rather than in each of the four ports because here is
+    /// the only place that has it, and four copies of the same three lines is
+    /// how the four drift apart.
+    ///
+    /// The plan is the denominator on purpose: it excludes [`GgufMap::Skip`]
+    /// tensors, so the bar counts the tensors that will actually be read
+    /// rather than the ones the file happens to contain.
     fn dequant_into<W: std::io::Write>(
         &self,
         map: &dyn Fn(&GgufTensorInfo) -> Option<GgufMap>,
@@ -759,9 +775,21 @@ impl GgufFile {
         // 1 MiB, never a second copy of the payload.
         let mut stage: Vec<u8> = Vec::with_capacity(DEQUANT_STAGE_BYTES);
         let mut written = 0u64;
-        for p in &plan {
+        crate::progress::begin(
+            crate::progress::Phase::Loading,
+            plan.len() as u64,
+            crate::progress::Unit::Tensors,
+        );
+        // Bytes as they come OFF THE DISK, not as they land: a Q4 checkpoint
+        // expands eightfold on the way through, and reporting the expansion
+        // would claim a read rate the spinning array never delivered.
+        let mut read_bytes = 0u64;
+        for (done, p) in plan.iter().enumerate() {
             debug_assert_eq!(written, p.start, "tensors are written in output order");
-            let values = self.read_tensor_f32(&self.tensors[p.source].name)?;
+            let source = &self.tensors[p.source];
+            crate::progress::advance(done as u64, read_bytes);
+            read_bytes += source.byte_len();
+            let values = self.read_tensor_f32(&source.name)?;
             debug_assert_eq!(
                 values.len() as u64 * 4,
                 p.len,
@@ -774,6 +802,10 @@ impl GgufFile {
                 written += stage.len() as u64;
             }
         }
+        // The advance above fires BEFORE each tensor, so the last one it
+        // reported was n-1 of n. Close the count instead of leaving the bar
+        // one tensor short of a pass that finished.
+        crate::progress::advance(plan.len() as u64, read_bytes);
         assert_eq!(
             written, total,
             "every planned byte was written exactly once"
@@ -2306,6 +2338,10 @@ mod tests {
 
     #[test]
     fn dequant_to_safetensors_reverses_dims_and_round_trips_bytes() {
+        // The dequant pass publishes its own progress (it is the counted
+        // bar four architectures load behind), so this shares the lock with
+        // every other test that touches that process-wide state.
+        let _serial = crate::progress::test_serial();
         // One F32 tensor with ggml dims [2, 3] and payload 1..=6.
         let payload: Vec<u8> = (1..=6).flat_map(|v| (v as f32).to_le_bytes()).collect();
         let bytes = TestGguf::new()
@@ -2341,6 +2377,10 @@ mod tests {
 
     #[test]
     fn dequant_to_safetensors_rejects_rename_collisions() {
+        // The dequant pass publishes its own progress (it is the counted
+        // bar four architectures load behind), so this shares the lock with
+        // every other test that touches that process-wide state.
+        let _serial = crate::progress::test_serial();
         let payload = [0u8; 64]; // two 8-element F32 tensors, offsets 0 and 32
         let bytes = TestGguf::new()
             .tensor("a.weight", &[8], 0, 0)
@@ -2357,6 +2397,10 @@ mod tests {
 
     #[test]
     fn dequanting_to_a_file_is_byte_identical_to_dequanting_in_memory() {
+        // The dequant pass publishes its own progress (it is the counted
+        // bar four architectures load behind), so this shares the lock with
+        // every other test that touches that process-wide state.
+        let _serial = crate::progress::test_serial();
         // Mixed dtypes and widths, so the pin covers the quantized path and
         // the tensor-to-tensor offset arithmetic, not just one F32 copy.
         // Q8_0 blocks are 34 B for 32 elements: two blocks = 68 B at offset 0,
@@ -2399,6 +2443,10 @@ mod tests {
 
     #[test]
     fn a_bad_map_is_rejected_before_any_payload_is_read() {
+        // The dequant pass publishes its own progress (it is the counted
+        // bar four architectures load behind), so this shares the lock with
+        // every other test that touches that process-wide state.
+        let _serial = crate::progress::test_serial();
         // The tensor table claims a payload far past the end of the file, so
         // ANY read of it is an io error. A map error must still surface as the
         // map error: planning happens first, by construction.

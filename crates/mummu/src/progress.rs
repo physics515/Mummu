@@ -50,6 +50,28 @@ pub enum Phase {
     Idle = 0,
     /// Reading weights off the pack/checkpoint. Counted: tensors and bytes.
     Loading = 1,
+    /// Converting a GGUF into a `.mummu` pack, once, on the first load a
+    /// model ever gets. Counted: tensors of the source GGUF, and the bytes
+    /// read off it.
+    ///
+    /// Its own phase rather than part of [`Self::Loading`] because it is not
+    /// the same work and not the same denominator: the import walks every
+    /// tensor in the file (851 on the 27B) while the load that follows reads
+    /// only the ones the plan places (320 on a layered load), and merging the
+    /// two would make the bar restart with a *smaller* total for no reason a
+    /// reader could see. It is also, measured, the longest phase of a
+    /// first-ever load: 58 s against the counted pass's 6 s on
+    /// qwen3.5-2b-q8.
+    Importing = 5,
+    /// Rewriting a pack's FFNs into neuron clusters, once, in place. Counted:
+    /// trunk layers.
+    ///
+    /// Counted in layers because the loop's body is one layer — read three
+    /// tensors, cluster the neurons, rewrite them — and a cluster count would
+    /// move in jumps of 32 with nothing between them. Measured at 115 s on
+    /// qwen3.5-2b-q8, which is the single longest thing a first load does and
+    /// was reported as `loading 0/0` for its whole duration.
+    Partitioning = 6,
     /// Building the VNNI host twins from resident weights. Uncounted — the
     /// work is per-projection and the count is not known before it starts.
     Packing = 2,
@@ -67,6 +89,8 @@ impl Phase {
         match self {
             Self::Idle => "idle",
             Self::Loading => "loading",
+            Self::Importing => "importing",
+            Self::Partitioning => "partitioning",
             Self::Packing => "packing",
             Self::Warming => "warming",
             Self::Ready => "ready",
@@ -79,6 +103,8 @@ impl Phase {
             2 => Self::Packing,
             3 => Self::Warming,
             4 => Self::Ready,
+            5 => Self::Importing,
+            6 => Self::Partitioning,
             // Anything else cannot happen (only this module stores the byte),
             // and Idle is the safe reading if it somehow did: a bar that is
             // not shown beats a bar stuck on a phase nobody is in.
@@ -87,9 +113,19 @@ impl Phase {
     }
 
     /// Is a load actually in flight? `Ready` is a resting state, not work.
+    ///
+    /// This is the ONE list of working phases. Both pages used to carry their
+    /// own copy of it in JavaScript (`phase === "loading" || ...`), which
+    /// means a phase added here drew no bar at all over there — the exact
+    /// failure the counted import and partition phases exist to fix. The
+    /// status object now ships this verdict as a field so the pages cannot
+    /// hold a stale copy of the list. See `mummu_serve::status::to_json`.
     #[must_use]
     pub const fn is_working(self) -> bool {
-        matches!(self, Self::Loading | Self::Packing | Self::Warming)
+        matches!(
+            self,
+            Self::Loading | Self::Importing | Self::Partitioning | Self::Packing | Self::Warming
+        )
     }
 }
 
@@ -565,6 +601,21 @@ impl Snapshot {
     }
 }
 
+/// The lock every test that TOUCHES this state must hold.
+///
+/// The state is process-wide and `cargo test` runs in parallel threads, so a
+/// test that asserts a phase has to exclude every other test that publishes
+/// one. That is no longer only this module's own tests: the shared GGUF
+/// dequant pass counts itself (see [`crate::gguf::GgufFile`]), so a
+/// `dequant_to_safetensors` test running alongside would move the phase out
+/// from under an assertion here. Hence crate-internal rather than private to
+/// the tests below.
+#[cfg(test)]
+pub(crate) fn test_serial() -> MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Read the current state. Cheap: nine relaxed loads and one short `String`
 /// clone, so a status endpoint may call it whenever it likes.
 #[must_use]
@@ -588,13 +639,11 @@ mod tests {
     use super::*;
 
     /// The state is process-wide and `cargo test` runs in parallel threads, so
-    /// every test that writes to it takes this first. The arithmetic tests
-    /// build `Snapshot` values by hand and need no lock at all.
-    static SERIAL: Mutex<()> = Mutex::new(());
-
-    fn serial() -> MutexGuard<'static, ()> {
-        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
-    }
+    /// every test that writes to it takes this first — including the ones in
+    /// other modules, which is why it lives outside this module now. The
+    /// arithmetic tests build `Snapshot` values by hand and need no lock at
+    /// all.
+    use super::test_serial as serial;
 
     fn snap(done: u64, expected: u64, bytes: u64, elapsed_ms: u64) -> Snapshot {
         let now = now_ms();
@@ -984,11 +1033,61 @@ mod tests {
     fn phase_names_are_the_wire_names() {
         assert_eq!(Phase::Idle.as_str(), "idle");
         assert_eq!(Phase::Loading.as_str(), "loading");
+        assert_eq!(Phase::Importing.as_str(), "importing");
+        assert_eq!(Phase::Partitioning.as_str(), "partitioning");
         assert_eq!(Phase::Packing.as_str(), "packing");
         assert_eq!(Phase::Warming.as_str(), "warming");
         assert_eq!(Phase::Ready.as_str(), "ready");
         assert!(Phase::Loading.is_working());
         assert!(!Phase::Ready.is_working(), "resident is not work");
         assert!(!Phase::Idle.is_working());
+    }
+
+    /// Every phase must survive the round trip through the byte that carries
+    /// it, or a bar would silently read `idle` in the middle of a load. The
+    /// discriminants are not contiguous (the two one-time phases were added
+    /// after `Ready` and took 5 and 6 rather than renumbering the four a
+    /// running process already stores), which is exactly the shape where a
+    /// missing `from_u8` arm hides.
+    #[test]
+    fn every_phase_survives_the_byte_it_travels_in() {
+        for p in [
+            Phase::Idle,
+            Phase::Loading,
+            Phase::Importing,
+            Phase::Partitioning,
+            Phase::Packing,
+            Phase::Warming,
+            Phase::Ready,
+        ] {
+            assert_eq!(Phase::from_u8(p as u8), p, "{} lost its byte", p.as_str());
+        }
+    }
+
+    /// The two one-time phases are WORK, and the whole point of counting them
+    /// is that the bar moves while they run. A phase that is working but
+    /// renders as "idle" is the 173-second silence this release exists to end.
+    #[test]
+    fn the_one_time_phases_are_work_and_are_counted() {
+        let _serial = serial();
+        for (phase, unit) in [
+            (Phase::Importing, Unit::Tensors),
+            (Phase::Partitioning, Unit::Layers),
+        ] {
+            assert!(phase.is_working(), "{} must draw a bar", phase.as_str());
+            begin(phase, 851, unit);
+            // The clock this reads has millisecond resolution, and an ETA
+            // needs measurable elapsed time (see `Snapshot::eta_s`) — so the
+            // work has to take at least one tick, as any real phase does.
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            advance(107, 1 << 30);
+            let s = snapshot();
+            assert_eq!(s.phase, phase);
+            assert_eq!(s.unit, unit, "{} counts the wrong thing", phase.as_str());
+            assert_eq!((s.done, s.expected), (107, 851));
+            assert!(s.fraction().is_some(), "a counted phase is determinate");
+            assert!(s.eta_s().is_some(), "and it can say how much is left");
+        }
+        idle();
     }
 }

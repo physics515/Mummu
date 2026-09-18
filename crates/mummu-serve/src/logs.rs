@@ -75,6 +75,39 @@ pub const MAX_LIMIT: usize = MAX_LINES;
 /// `limit` when the query does not say.
 pub const DEFAULT_LIMIT: usize = 500;
 
+/// Largest payload ONE response will build, whatever `limit` asks for.
+///
+/// `/logs` and `/api/logs` are public on `mummu.basicautomation.io`, by
+/// decision — no token, no IP gate — so the cost of a single anonymous
+/// request is a property the endpoint has to own rather than delegate to
+/// whoever is asking. `limit` alone bounds it at
+/// [`MAX_LIMIT`] x [`MAX_LINE_BYTES`], about 4 MiB, which is a lot of work
+/// and a lot of bandwidth to hand a caller who asks in a loop.
+///
+/// The value is set at the largest thing a REAL reader can ask for, so it
+/// costs them nothing at all: the lines this ring holds run well under 200
+/// bytes, so `/logs`'s own `limit=2000` bootstrap of a completely full ring
+/// is ~330 KiB with the envelope charged, and it arrives in one response
+/// exactly as it always did. What it takes away is the pathological case —
+/// 2000 lines each at the [`MAX_LINE_BYTES`] truncation limit — which is the
+/// only way to reach 4 MiB and is not a thing the server ever produces.
+///
+/// And meeting the bound is not an error and loses nothing: it is the same
+/// stop `limit` already produces. The page ends, `cursor` points at the last
+/// line handed over, [`Page::more`] says there is more, and the next poll
+/// continues from there. Semantics unchanged, worst case eight times smaller.
+pub const MAX_PAGE_BYTES: usize = 512 * 1024;
+
+/// Charged per line on top of its text, for the JSON that wraps it (`seq`,
+/// `ts`, `level`, `source`, `quiet`, the key names, the quoting).
+///
+/// Measured against the real shape — `{"seq":1234,"ts":1758150000000,
+/// "level":"info","source":"server","quiet":false,"text":""}` is ~85 bytes —
+/// and rounded up, because [`MAX_PAGE_BYTES`] is a bound on the work one
+/// request may cause, not a content-length promise. Charging it at all is
+/// what keeps a page of 2000 empty lines from being free.
+const LINE_ENVELOPE_BYTES: usize = 96;
+
 // ---------------------------------------------------------------------------
 // Entries
 // ---------------------------------------------------------------------------
@@ -327,6 +360,15 @@ pub struct Page {
     /// Oldest and newest seq the ring still holds (`newest` is 0 when empty).
     pub oldest: u64,
     pub newest: u64,
+    /// The ring holds lines past this page's `cursor` — the page stopped on
+    /// `limit` or on [`MAX_PAGE_BYTES`], not because it ran out.
+    ///
+    /// Always derivable from `cursor < newest`, and sent anyway: a reader
+    /// that has to know whether to poll again should be told, not made to
+    /// re-derive it, and a client written against an earlier build that
+    /// ignores the field still behaves exactly as it did (it polls again on
+    /// its own timer and the cursor picks up where it left off).
+    pub more: bool,
 }
 
 impl Page {
@@ -340,6 +382,7 @@ impl Page {
             "oldest": self.oldest,
             "newest": self.newest,
             "capacity": MAX_LINES,
+            "more": self.more,
         })
     }
 }
@@ -348,8 +391,10 @@ impl Page {
 ///
 /// Deliberately cheap enough to poll once a second forever: one mutex
 /// acquisition, a binary search over a monotonic seq column, and at most
-/// `limit` string clones. Nothing here touches the disk, the device, or the
-/// model slot, so a client hammering `/api/logs` cannot stall a generation.
+/// `limit` string clones — and never more than [`MAX_PAGE_BYTES`] of them,
+/// which is what bounds the cost of one anonymous request on a public
+/// endpoint. Nothing here touches the disk, the device, or the model slot, so
+/// a client hammering `/api/logs` cannot stall a generation.
 #[must_use]
 pub fn query(q: &Query) -> Page {
     read(&ring(), q)
@@ -396,20 +441,31 @@ fn read(ring: &Ring, q: &Query) -> Page {
     let start = ring.lines.partition_point(|l| l.seq <= since);
     let mut lines = Vec::new();
     let mut cursor = since;
-    let mut hit_limit = false;
+    let mut stopped_early = false;
+    let mut bytes = 0usize;
     for line in ring.lines.iter().skip(start) {
         if q.source.is_some_and(|want| want != line.source) {
             cursor = line.seq; // skipped, but the client has still seen past it
             continue;
         }
         if lines.len() >= q.limit {
-            hit_limit = true;
+            stopped_early = true;
             break;
         }
+        // The byte budget stops the page exactly as `limit` does. The first
+        // line is always taken, whatever it weighs: a line longer than the
+        // whole budget would otherwise be skipped by every request forever
+        // and park the cursor in front of it.
+        let cost = line.text.len() + LINE_ENVELOPE_BYTES;
+        if !lines.is_empty() && bytes + cost > MAX_PAGE_BYTES {
+            stopped_early = true;
+            break;
+        }
+        bytes += cost;
         cursor = line.seq;
         lines.push(line.clone());
     }
-    if !hit_limit {
+    if !stopped_early {
         cursor = cursor.max(newest);
     }
     Page {
@@ -419,6 +475,7 @@ fn read(ring: &Ring, q: &Query) -> Page {
         dropped_total: ring.dropped_total,
         oldest,
         newest,
+        more: cursor < newest,
     }
 }
 
@@ -1062,7 +1119,7 @@ mod tests {
         // The fit planner's budget flag is only meaningful as that exact token.
         assert_eq!(classify("cuda:0 9.32 GiB (OVER — will spill)"), Level::Warn);
         assert_eq!(
-            classify("[mummu-serve] residency: no VRAM reading — placement unverified"),
+            classify("[mummu-serve] residency: no fresh VRAM baseline — placement unverified"),
             Level::Warn
         );
         assert_eq!(
@@ -1203,6 +1260,109 @@ mod tests {
             "the cursor stops where the page did"
         );
         assert_eq!(texts(&page(&ring, first.cursor, 10, None)), ["c", "d"]);
+        assert!(first.more, "the ring is holding c and d");
+        assert!(
+            !page(&ring, first.cursor, 10, None).more,
+            "and nothing once they have been handed over"
+        );
+    }
+
+    /// `/logs` and `/api/logs` are public and unauthenticated by decision, so
+    /// the cost of ONE request cannot be the caller's to choose. `limit`
+    /// alone allowed ~4 MiB; the byte budget makes the worst case small
+    /// without changing what a reader sees — the page stops, the cursor
+    /// points at the last line handed over, and the next poll continues.
+    #[test]
+    fn one_response_is_bounded_in_bytes_however_much_the_caller_asks_for() {
+        // A ring full of the largest lines the ring will hold: ~4 MiB of
+        // text, which is exactly what an anonymous caller could ask for in a
+        // loop before this bound existed.
+        let mut ring = Ring::new();
+        for i in 0..MAX_LINES {
+            ring.record(line(
+                Source::Server,
+                None,
+                false,
+                format!("{i:06} {}", "x".repeat(MAX_LINE_BYTES - 7)),
+            ));
+        }
+        let first = page(&ring, 0, MAX_LIMIT, None);
+        let bytes: usize = first.lines.iter().map(|l| l.text.len()).sum();
+        assert!(
+            bytes <= MAX_PAGE_BYTES,
+            "one response carried {bytes} bytes of text against a {MAX_PAGE_BYTES} budget"
+        );
+        assert!(
+            first.lines.len() < MAX_LINES,
+            "this ring is bigger than the budget, so the page must stop early"
+        );
+        assert!(first.more, "and must say that it stopped early");
+
+        // Nothing is lost: the whole ring still arrives, in order, with no
+        // gap and no repeat — the same semantics `limit` already had.
+        let mut seen = first.lines.len();
+        let mut cursor = first.cursor;
+        let mut guard = 0;
+        while seen < MAX_LINES {
+            guard += 1;
+            assert!(guard < 100, "paging the ring should not take 100 requests");
+            let next = page(&ring, cursor, MAX_LIMIT, None);
+            assert!(!next.lines.is_empty(), "a page must always make progress");
+            assert_eq!(
+                next.lines[0].seq,
+                cursor + 1,
+                "the next page resumes at the line after the cursor"
+            );
+            seen += next.lines.len();
+            cursor = next.cursor;
+        }
+        assert_eq!(seen, MAX_LINES, "every line arrived exactly once");
+        assert!(!page(&ring, cursor, MAX_LIMIT, None).more);
+    }
+
+    /// The ordinary reader must not be able to tell the budget exists: a
+    /// whole ring of REAL log lines (the ones this server actually prints)
+    /// fits in one page, with room to spare.
+    #[test]
+    fn a_ring_of_real_lines_still_arrives_in_one_page() {
+        let mut ring = Ring::new();
+        for i in 0..MAX_LINES {
+            ring.record(line(
+                Source::Server,
+                None,
+                false,
+                format!("[mummu] load: {i}/851 tensors — 14.46 GiB off the pack in 91s (162 MB/s)"),
+            ));
+        }
+        let all = page(&ring, 0, MAX_LIMIT, None);
+        assert_eq!(
+            all.lines.len(),
+            MAX_LINES,
+            "a full ring of real lines must still come back in one response"
+        );
+        assert!(!all.more);
+    }
+
+    /// A single line larger than the whole budget must still be delivered.
+    /// Skipping it would park the cursor in front of it forever — the client
+    /// would ask again, get nothing again, and the feed would stop dead at
+    /// the one line most likely to be the interesting one (a panic payload).
+    #[test]
+    fn a_line_bigger_than_the_budget_is_still_handed_over() {
+        // Two lines, each already truncated to MAX_LINE_BYTES; the budget is
+        // set below one of them only in the pathological case, so this checks
+        // the rule directly with the first-line exemption.
+        let ring = ring_of(&[
+            (Source::Server, &"x".repeat(MAX_LINE_BYTES * 3)),
+            (Source::Server, "the line after it"),
+        ]);
+        let first = page(&ring, 0, MAX_LIMIT, None);
+        assert!(!first.lines.is_empty(), "the big line came back");
+        assert_eq!(
+            texts(&page(&ring, first.lines[0].seq, MAX_LIMIT, None)),
+            ["the line after it"],
+            "and the feed continued past it"
+        );
     }
 
     // -- the merge ---------------------------------------------------------

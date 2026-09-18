@@ -327,8 +327,12 @@ function makeProgress() {
              st.host ? st.host.total : null, st.host ? st.host.rss : null);
     setGauge(vram, st.vram ? st.vram.used : null, st.vram ? st.vram.total : null, null);
 
-    const working = st.phase === "loading" || st.phase === "packing" || st.phase === "warming";
-    if (!working) return false;
+    // The SERVER decides whether a phase is work (`Phase::is_working`). This
+    // used to be a list of phase names held here, and a phase added on the
+    // server then drew no bar at all — which is exactly what would have
+    // happened to `importing` and `partitioning`, the two phases that cover
+    // the longest part of a first-ever load.
+    if (!st.working) return false;
     const determinate = st.total > 0;
     // "step 2" is not decoration. The tiered and partitioned paths load in two
     // counted passes, and the second one legitimately restarts at 0 with a
