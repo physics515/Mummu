@@ -3959,11 +3959,17 @@ mod observability_tests {
     /// silently. It is why the guard is moved into a second binding at all.
     #[test]
     fn the_progress_guard_is_declared_last_so_it_drops_first() {
+        // Only the CODE, never the test modules: this test quotes both
+        // needles, so searching the whole file would match its own literals
+        // and pass against a tree where the binding had been moved back.
         let src = include_str!("engine.rs");
-        let slot = src
+        let code = &src[..src
+            .find("\n#[cfg(test)]")
+            .expect("engine.rs ends in test modules")];
+        let slot = code
             .find("let m = slot")
             .expect("drive takes the model slot");
-        let moved = src
+        let moved = code
             .find("let progress = armed;")
             .expect("the progress guard is re-declared after the slot guard");
         assert!(

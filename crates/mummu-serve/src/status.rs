@@ -492,15 +492,9 @@ const BASELINE_MAX_AGE: Duration = Duration::from_secs(3);
 /// be.
 #[must_use]
 pub fn vram_baseline(budget: Duration) -> Option<u64> {
-    // `wait_after` returns a reading stamped later than `since`, so a horizon
-    // of "now minus the max age" IS the freshness bound: a sample inside it
-    // comes back immediately, an older one costs a refresh (bounded by
-    // `budget`), and a source that will not answer costs `budget` and `None`.
-    let horizon = Instant::now()
-        .checked_sub(BASELINE_MAX_AGE)
-        .unwrap_or_else(Instant::now);
-    VRAM.wait_after(
-        horizon,
+    baseline_of(
+        &VRAM,
+        BASELINE_MAX_AGE,
         budget,
         SAMPLE_TTL,
         "mummu-vram",
@@ -508,6 +502,32 @@ pub fn vram_baseline(budget: Duration) -> Option<u64> {
     )
     .flatten()
     .map(|m| m.used)
+}
+
+/// The baseline rule itself, over any source.
+///
+/// `wait_after` returns a reading stamped later than `since`, so a horizon of
+/// "now minus `max_age`" IS the freshness bound: a sample inside it comes back
+/// immediately, an older one costs a refresh (bounded by `budget`), and a
+/// source that will not answer costs `budget` and `None`.
+///
+/// Split out from [`vram_baseline`] so the rule can be tested against a source
+/// that parks on demand — a test cannot wedge a working card. The first
+/// version of this bound shipped with a test that drove `wait_after` on its
+/// own static instead, which passed just as happily against the code that had
+/// no bound at all.
+fn baseline_of<T: Copy + Send + 'static>(
+    stale: &'static Stale<T>,
+    max_age: Duration,
+    budget: Duration,
+    ttl: Duration,
+    name: &'static str,
+    sample: fn() -> T,
+) -> Option<T> {
+    let horizon = Instant::now()
+        .checked_sub(max_age)
+        .unwrap_or_else(Instant::now);
+    stale.wait_after(horizon, budget, ttl, name, sample)
 }
 
 /// Wait, bounded and off the driver, for a VRAM reading taken after `since`.
@@ -934,8 +954,9 @@ mod tests {
         {
             std::thread::sleep(Duration::from_millis(5));
         }
-        let fresh = SOURCE.wait_after(
-            Instant::now() - max_age,
+        let fresh = baseline_of(
+            &SOURCE,
+            max_age,
             Duration::from_millis(200),
             ttl,
             "test-baseline",
@@ -949,8 +970,9 @@ mod tests {
         std::thread::sleep(max_age + Duration::from_millis(30));
         let budget = Duration::from_millis(200);
         let t = Instant::now();
-        let aged = SOURCE.wait_after(
-            Instant::now() - max_age,
+        let aged = baseline_of(
+            &SOURCE,
+            max_age,
             budget,
             ttl,
             "test-baseline",
