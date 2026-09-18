@@ -117,6 +117,13 @@
   .gauge .gtrack > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .35s linear; }
   /* No reading at all: the track is visibly inert, never a full-looking 0%. */
   .gauge .gtrack.na { opacity: .3; }
+  /* An unresolved GPU failure, from the status object's `error`: red, under
+     the bar, whatever the phase says. Empty when there is none. Shared with
+     ui.html. */
+  .perr { color: var(--err); margin-top: 4px; white-space: pre-wrap; word-break: break-word; }
+  .perr:empty { display: none; }
+  /* The `error` phase: the label itself goes red, where v0.3.1 said "ready". */
+  .prog .plabel.bad { color: var(--err); }
   footer {
     padding: 6px 14px; background: var(--panel); border-top: 1px solid var(--border);
     font-size: 12px; color: var(--dim); display: flex; gap: 14px; align-items: center; flex-wrap: wrap;
@@ -355,6 +362,31 @@ function secs(s) {
 // exactly that, and the label beside it printed the raw counts.
 const widthPct = (used, total) => Math.max(0, Math.min(100, (used / total) * 100)).toFixed(1) + "%";
 
+// The status object's `error`, as one line: what failed, what happens next,
+// and when. Shared, character for character, with the other page.
+function failureText(e) {
+  const when = new Date(e.at_ms).toLocaleTimeString();
+  // A replayed failure names the previous process in its own message.
+  return `${e.message} (${when})`;
+}
+
+// What recovery is doing, as the status object reports it — never a fixed
+// promise. A label that said "the next request loads the model again" while
+// the process was exiting, or while a spent restart budget kept it from
+// restarting, would be the lie the error phase exists to end. Shared,
+// character for character, with the other page; a server test pins that
+// every value `recovery::Recovery` can send has its own words here.
+function recoveryText(e) {
+  switch (e && e.recovery) {
+    case "reload": return "the next request loads the model again";
+    case "restart": return "mummu is restarting for a clean GPU context — back in a minute";
+    case "restarted": return "the previous process restarted the GPU backend; the next request loads the model";
+    case "cooldown": return "a reload did not hold and the restart budget is spent — each request tries a fresh load";
+    case "unsupervised": return "a reload did not hold and nothing will restart mummu — each request tries a fresh load";
+    default: return "see the message below";
+  }
+}
+
 // Build the bar + gauges into #bar. Everything is written with textContent and
 // style widths — never innerHTML — because a model name the client chose
 // reaches the label.
@@ -378,7 +410,8 @@ const bar = (() => {
     return { track: t, fill: f, value: v };
   };
   const ram = gauge("RAM"), vram = gauge("VRAM");
-  root.append(label, track, gauges);
+  const note = el("div", "perr");
+  root.append(label, track, gauges, note);
   $("bar").appendChild(root);
 
   // One gauge: `used` of `total`, plus an optional "mine" note naming this
@@ -409,12 +442,20 @@ const bar = (() => {
     // server then drew no bar at all — which is exactly what would have
     // happened to `importing` and `partitioning`, the two phases that cover
     // the longest part of a first-ever load.
+    // A GPU failure nothing has recovered from yet, in red, under whatever
+    // the bar says — during the reload that is the recovery, too.
+    note.textContent = st.error ? failureText(st.error) : "";
+    label.classList.toggle("bad", st.phase === "error");
     if (!st.working) {
       // Resting, not working. "ready" once a model is resident, "idle" before
       // the first one — both honest, neither an animation suggesting work.
-      label.textContent = st.phase === "ready"
-        ? (st.model ? `ready — ${st.model}` : "ready")
-        : "idle";
+      // And "error" — in red — when the GPU backend failed and nothing has
+      // loaded cleanly since: the phase v0.3.1 reported as "ready".
+      label.textContent = st.phase === "error"
+        ? `error — the GPU backend failed; ${recoveryText(st.error)}`
+        : st.phase === "ready"
+          ? (st.model ? `ready — ${st.model}` : "ready")
+          : "idle";
       track.className = "track rest";
       fill.style.width = "0%";
       return;

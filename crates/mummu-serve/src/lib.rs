@@ -41,7 +41,13 @@
 #[cfg(test)]
 mod build_sha;
 mod engine;
+/// Makes the generation path fail the way the 2026-09-18 incident did, on a
+/// machine with no GPU. Compiled only with the `fault-injection` feature —
+/// see the module for why it cannot reach production.
+#[cfg(feature = "fault-injection")]
+mod fault;
 pub mod logs;
+pub mod recovery;
 mod shim;
 pub mod status;
 
@@ -102,7 +108,80 @@ pub(crate) const MAX_MAX_TOKENS: usize = 4096;
 pub(crate) const DEFAULT_MAX_TOKENS: usize = 512;
 
 pub(crate) fn models_root() -> PathBuf {
+    #[cfg(test)]
+    if let Some(root) = test_seams::models_root() {
+        return root;
+    }
     std::env::var_os("MUMMU_MODELS_DIR").map_or_else(|| PathBuf::from("models"), PathBuf::from)
+}
+
+/// What the environment would say, said by a test instead: the models root
+/// and the backend. `std::env::set_var` is `unsafe` in a process whose other
+/// threads read the environment — which is every test binary — so the tests
+/// that drive the real engine set these, under `progress_serial`, and put
+/// them back when they are done. Nothing else about the path changes.
+#[cfg(test)]
+pub(crate) mod test_seams {
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    static MODELS_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
+    static BACKEND: Mutex<Option<crate::engine::BackendChoice>> = Mutex::new(None);
+
+    pub(crate) fn models_root() -> Option<PathBuf> {
+        MODELS_ROOT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    #[cfg(feature = "fault-injection")]
+    pub(crate) fn set_models_root(root: Option<PathBuf>) {
+        *MODELS_ROOT.lock().unwrap_or_else(|e| e.into_inner()) = root;
+    }
+
+    pub(crate) fn backend() -> Option<crate::engine::BackendChoice> {
+        *BACKEND.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[cfg(feature = "fault-injection")]
+    pub(crate) fn set_backend(backend: Option<crate::engine::BackendChoice>) {
+        *BACKEND.lock().unwrap_or_else(|e| e.into_inner()) = backend;
+    }
+
+    /// A scratch directory that removes itself when dropped — on a failed
+    /// assertion too, which unwinds through it. An earlier run of these tests
+    /// cleaned up only on success and left seventeen directories in `/tmp`.
+    pub(crate) struct Scratch(PathBuf);
+
+    impl Scratch {
+        pub(crate) fn new(name: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "mummu-serve-test-{name}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, SeqCst)
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+            Self(dir)
+        }
+
+        pub(crate) fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            // An exit a test started writes its evidence here; let it finish,
+            // or it recreates the directory after this removes it (which is
+            // how a failing test used to leak dirs into /tmp).
+            crate::recovery::wait_for_exit_threads();
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -205,6 +284,10 @@ where
     // at the first model load. Idempotent, so the binary having already
     // installed it (earlier, in `main`) costs nothing.
     logs::install();
+    // Next, before anything can touch a GPU: a device failure is noticed by
+    // this hook (cubecl swallows it on its own thread — see `recovery`), so a
+    // load that runs before it is installed could fail unseen. Idempotent.
+    recovery::install_panic_hook();
     // Start watching host memory as soon as we are serving: the pressure it
     // guards against arrives from OTHER processes, so it must not depend on
     // this one receiving traffic. See `engine::spawn_host_pressure_watch`.
@@ -274,7 +357,7 @@ async fn triggered(mut rx: watch::Receiver<bool>, which: &'static str) {
 
 /// The native API + UI router.
 pub fn router() -> Router {
-    Router::new()
+    let routes = Router::new()
         .route("/", get(ui))
         .route("/index.html", get(ui))
         // The merged log feed and the page that reads it. Beside /api/health
@@ -293,7 +376,13 @@ pub fn router() -> Router {
         .route("/api/unload", post(unload))
         // Flame graphs from a profiled generation — see `profile_svg`.
         .route("/api/profile", get(profile_svg))
-        .route("/api/profile/folded", get(profile_folded))
+        .route("/api/profile/folded", get(profile_folded));
+    // Arms the incident's failures on a build that asked for them, and does
+    // not exist on any other: without the feature this route is not compiled,
+    // and the request falls through to the 404 below like any unknown path.
+    #[cfg(feature = "fault-injection")]
+    let routes = routes.route("/api/fault", post(fault::endpoint).get(fault::state));
+    routes
         // The sync server matched on (method, path) and answered anything
         // else with the same 404 JSON — keep that, rather than axum's bare
         // 405, so a client sees one error shape.
@@ -402,8 +491,31 @@ async fn favicon() -> Response {
         .into_response()
 }
 
+/// `GET /api/health` — 200 while the backend is healthy, **503 while it is
+/// poisoned**: from a GPU failure in this process until the next load comes
+/// up clean (see [`recovery::poisoned`], which also puts the status object in
+/// its `error` phase, so the two cannot disagree). The body says why.
+///
+/// # What a 503 does in production
+///
+/// The container's healthcheck is `curl -sf …/api/health` every 30 s with 5
+/// retries, so about two and a half minutes of 503s mark it `unhealthy` in
+/// `docker ps` and on every dashboard that reads Docker's health — which is
+/// the point: v0.3.1 answered `ok` through the whole incident. It restarts
+/// NOTHING. Docker's `restart: unless-stopped` acts only on an exit, never on
+/// health, and the autoheal container acts only on containers labelled
+/// `autoheal`, which mummu is not. The recovery is mummu's own: the next
+/// request reloads the model in-process, and if that fails too the process
+/// exits and Docker restarts it (`recovery::supervised`). With no traffic a
+/// poisoned server stays `unhealthy` until a request proves the card works —
+/// the honest answer, since nothing has.
 async fn health() -> Response {
-    blocking(|| json_response(200, health_json())).await
+    blocking(|| {
+        let poisoned = recovery::poisoned();
+        let body = health_json(recovery::current().as_ref(), poisoned);
+        json_response(if poisoned { 503 } else { 200 }, body)
+    })
+    .await
 }
 
 /// The health body, as a value.
@@ -411,8 +523,10 @@ async fn health() -> Response {
 /// Split out from the handler so a test can pin the shape without standing up
 /// a runtime — and the shape is worth pinning, because clients read these
 /// fields and a probe silently losing `status` would look like a healthy
-/// server right up until something depended on it.
-fn health_json() -> serde_json::Value {
+/// server right up until something depended on it. The failure is passed in
+/// rather than read, for the same reason, and so a test of one cannot see
+/// another test's GPU failure.
+fn health_json(error: Option<&recovery::BackendError>, poisoned: bool) -> serde_json::Value {
     let inv = mummu::backend::inventory();
     let gpus: Vec<_> = inv
         .gpus
@@ -428,7 +542,13 @@ fn health_json() -> serde_json::Value {
         .collect();
     let (version, build) = status::build_json();
     json!({
-        "status": "ok",
+        // "error" exactly when the handler answers 503: the backend failed in
+        // this process and no load has come up clean since.
+        "status": if poisoned { "error" } else { "ok" },
+        // Why, when there is anything to say — including the previous
+        // process's failure after a self-restart, which is shown here without
+        // making THIS process unhealthy.
+        "error": error.map(recovery::BackendError::to_json),
         "device": engine::device_label(),
         "gpus": gpus,
         "cpu_cores": inv.cpu.logical_cores,
@@ -499,15 +619,82 @@ async fn unload() -> Response {
 // by `MAX_MAX_TOKENS` short strings.
 // ---------------------------------------------------------------------------
 
-fn sse_response(mut rx: mpsc::UnboundedReceiver<serde_json::Value>) -> Response {
+fn sse_response(
+    mut rx: mpsc::UnboundedReceiver<serde_json::Value>,
+    inflight: Option<recovery::InFlight>,
+) -> Response {
     let stream = async_stream::stream! {
+        // Held until the last frame has been handed to the connection, so a
+        // process exiting to restart the GPU backend waits for it.
+        let _inflight = inflight;
+        let mut ended = false;
         while let Some(frame) = rx.recv().await {
+            ended |= is_final_frame(&frame);
             yield Ok::<Event, Infallible>(Event::default().data(frame.to_string()));
+        }
+        // The worker is gone without saying how it ended. Say so: a stream
+        // that simply stops is the incident's empty bubble.
+        if !ended {
+            yield Ok(Event::default().data(ended_without_result().to_string()));
         }
     };
     // axum's `Sse` sets `text/event-stream` + `no-cache`; the third header
     // is the one that keeps nginx from buffering the stream into silence.
     ([("x-accel-buffering", "no")], Sse::new(stream)).into_response()
+}
+
+/// Is this the frame a stream ends on? Every native stream — chat and pull —
+/// ends on exactly one `done` or one `error`.
+fn is_final_frame(frame: &serde_json::Value) -> bool {
+    matches!(
+        frame.get("type").and_then(serde_json::Value::as_str),
+        Some("done" | "error")
+    )
+}
+
+/// The frame a stream ends on when its worker vanished without choosing one.
+/// Should be unreachable — every worker ends in `done` or `error` — and it is
+/// the reason "unreachable" can never again mean "an empty 200".
+fn ended_without_result() -> serde_json::Value {
+    json!({
+        "type": "error",
+        "error": "the server's worker for this request ended without a result — this is a \
+                  mummu-serve bug, not your request; try again",
+    })
+}
+
+/// Sends a stream's final frame exactly once: the one the worker chose, or,
+/// if the worker never got to choose — it panicked outside the part
+/// [`recovery::contain`] guards, or the runtime dropped it — `fallback`.
+pub(crate) struct FinalFrame {
+    tx: Option<mpsc::UnboundedSender<serde_json::Value>>,
+    fallback: serde_json::Value,
+}
+
+impl FinalFrame {
+    pub(crate) fn new(
+        tx: mpsc::UnboundedSender<serde_json::Value>,
+        fallback: serde_json::Value,
+    ) -> Self {
+        Self {
+            tx: Some(tx),
+            fallback,
+        }
+    }
+
+    pub(crate) fn send(mut self, frame: serde_json::Value) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(frame);
+        }
+    }
+}
+
+impl Drop for FinalFrame {
+    fn drop(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(std::mem::take(&mut self.fallback));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -565,7 +752,7 @@ async fn pull(body: Bytes) -> Response {
         };
         let _ = tx.send(done);
     });
-    sse_response(rx)
+    sse_response(rx, None)
 }
 
 // ---------------------------------------------------------------------------
@@ -585,13 +772,19 @@ async fn pull(body: Bytes) -> Response {
 /// below the connection dies at the same place, just with a different error.
 async fn chat_ws(upgrade: axum::extract::ws::WebSocketUpgrade) -> Response {
     upgrade.on_upgrade(|socket| async move {
-        if let Err(e) = drive_chat_ws(socket).await {
+        if let Err(e) = drive_chat_ws(socket, start_chat).await {
             eprintln!("[mummu-serve] chat ws: {e}");
         }
     })
 }
 
-async fn drive_chat_ws(mut socket: axum::extract::ws::WebSocket) -> Result<(), String> {
+/// Drive one chat over `socket`. `start` is [`start_chat`] in production; a
+/// test hands in one whose generation fails the way production's did, and
+/// reads the frames off a real socket.
+async fn drive_chat_ws(
+    mut socket: axum::extract::ws::WebSocket,
+    start: fn(ChatRequest) -> Result<ChatStream, Rejection>,
+) -> Result<(), String> {
     use axum::extract::ws::Message;
     // `close` is `SinkExt::close`, not an inherent method on WebSocket.
     use futures::SinkExt;
@@ -612,19 +805,25 @@ async fn drive_chat_ws(mut socket: axum::extract::ws::WebSocket) -> Result<(), S
             Some(Err(e)) => return Err(e.to_string()),
         }
     };
-    let parsed: ChatRequest = serde_json::from_str(&request).map_err(|e| e.to_string())?;
-
-    let mut rx = match start_chat(parsed) {
-        Ok(rx) => rx,
-        Err(response) => {
+    let started = serde_json::from_str::<ChatRequest>(&request)
+        .map_err(|e| Rejection {
+            status: 400,
+            error: format!("bad json: {e}"),
+        })
+        .and_then(start);
+    let mut chat = match started {
+        Ok(chat) => chat,
+        Err(rejection) => {
             // Report the rejection in-band and close cleanly: a WebSocket
-            // client cannot read the HTTP status of a request it never made.
-            let status = response.status().as_u16();
-            let frame = json!({"type": "error", "status": status});
+            // client cannot read the HTTP status of a request it never made,
+            // so the frame carries the status AND the reason.
+            let frame = rejection.frame();
             let _ = socket.send(Message::Text(frame.to_string().into())).await;
+            let _ = socket.close().await;
             return Ok(());
         }
     };
+    let rx = &mut chat.rx;
 
     let mut beat = tokio::time::interval(HEARTBEAT);
     // Missed ticks are worthless: if we were not polled for a minute, sending
@@ -635,8 +834,7 @@ async fn drive_chat_ws(mut socket: axum::extract::ws::WebSocket) -> Result<(), S
         tokio::select! {
             event = rx.recv() => match event {
                 Some(frame) => {
-                    let done = frame.get("type").and_then(|t| t.as_str()) == Some("done")
-                        || frame.get("type").and_then(|t| t.as_str()) == Some("error");
+                    let done = is_final_frame(&frame);
                     if socket.send(Message::Text(frame.to_string().into())).await.is_err() {
                         return Ok(()); // client gone; the generation task sees the closed channel
                     }
@@ -646,6 +844,10 @@ async fn drive_chat_ws(mut socket: axum::extract::ws::WebSocket) -> Result<(), S
                     }
                 }
                 None => {
+                    // The worker is gone without a final frame (see
+                    // `ended_without_result`): never close on silence.
+                    let frame = ended_without_result();
+                    let _ = socket.send(Message::Text(frame.to_string().into())).await;
                     let _ = socket.close().await;
                     return Ok(());
                 }
@@ -843,8 +1045,34 @@ async fn chat(body: Bytes) -> Response {
         Err(response) => return *response,
     };
     match start_chat(parsed) {
-        Ok(rx) => sse_response(rx),
-        Err(response) => *response,
+        Ok(chat) => sse_response(chat.rx, Some(chat.inflight)),
+        Err(rejection) => rejection.response(),
+    }
+}
+
+/// A chat that has started: its frames, and the claim that its response is
+/// still open (see [`recovery::InFlight`]) — carried together so that
+/// whichever transport drains the frames also holds the claim until it is
+/// done writing them.
+struct ChatStream {
+    rx: mpsc::UnboundedReceiver<serde_json::Value>,
+    inflight: recovery::InFlight,
+}
+
+/// A chat refused before it started. A POST client gets the status; a
+/// WebSocket client, which never sees one, gets both in a frame.
+struct Rejection {
+    status: u16,
+    error: String,
+}
+
+impl Rejection {
+    fn response(&self) -> Response {
+        json_response(self.status, json!({"error": self.error}))
+    }
+
+    fn frame(&self) -> serde_json::Value {
+        json!({"type": "error", "status": self.status, "error": self.error})
     }
 }
 
@@ -853,17 +1081,14 @@ async fn chat(body: Bytes) -> Response {
 ///
 /// The generation outlives the caller: it runs as its own task and whoever
 /// holds the receiver drains it.
-fn start_chat(
-    parsed: ChatRequest,
-) -> Result<mpsc::UnboundedReceiver<serde_json::Value>, Box<Response>> {
-    let turns = match to_turns(&parsed.messages) {
-        Ok(t) => t,
-        Err(e) => return Err(Box::new(json_response(400, json!({"error": e})))),
-    };
-    let opts = match sampler_options(&parsed.options) {
-        Ok(o) => o,
-        Err(e) => return Err(Box::new(json_response(400, json!({"error": e})))),
-    };
+fn start_chat(parsed: ChatRequest) -> Result<ChatStream, Rejection> {
+    let reject = |status: u16, error: String| Rejection { status, error };
+    // The process is exiting to restart the GPU backend (see `recovery`).
+    if recovery::restarting() {
+        return Err(reject(503, recovery::restarting_message().to_owned()));
+    }
+    let turns = to_turns(&parsed.messages).map_err(|e| reject(400, e))?;
+    let opts = sampler_options(&parsed.options).map_err(|e| reject(400, e))?;
     let max_tokens = parsed.max_tokens();
 
     let root = models_root();
@@ -874,25 +1099,66 @@ fn start_chat(
         .find(|s| s.name == parsed.model)
         .cloned()
     else {
-        return Err(Box::new(json_response(
-            404,
-            json!({"error": format!("unknown model {:?}", parsed.model)}),
-        )));
+        return Err(reject(404, format!("unknown model {:?}", parsed.model)));
     };
     if !engine::is_installed(&spec, &root) {
-        return Err(Box::new(json_response(
+        return Err(reject(
             409,
-            json!({"error": format!("{} is not installed — pull it first", spec.name)}),
-        )));
+            format!("{} is not installed — pull it first", spec.name),
+        ));
     }
 
     let profile = parsed.profile || std::env::var("MUMMU_PROFILE").is_ok();
+    let name = spec.name.clone();
+    Ok(spawn_chat(name, profile, move |sink| async move {
+        engine::run_chat(&spec, &root, &turns, &opts, max_tokens, |delta| {
+            sink.delta(delta)
+        })
+        .await
+    }))
+}
+
+/// Where a generation's text goes: one `delta` frame per piece.
+struct DeltaSink(mpsc::UnboundedSender<serde_json::Value>);
+
+impl DeltaSink {
+    fn delta(&self, text: &str) -> ControlFlow<()> {
+        if self.0.send(json!({"type": "delta", "text": text})).is_err() {
+            return ControlFlow::Break(()); // client gone: stop decoding
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Run one generation as its own task and hand back its frames — the ONE
+/// place a native chat's outcome becomes a frame, for SSE and WebSocket
+/// alike.
+///
+/// The stream it returns ends in exactly one `done` or `error` frame, by
+/// construction rather than by care:
+///
+/// * the generation runs under [`recovery::contain`], so a panic in it — the
+///   incident's `bytes: host access failed` — comes back as an error, and a
+///   GPU failure is acted on (the model is dropped; see `recovery`);
+/// * a [`FinalFrame`] guard sends an error if the task ends any other way.
+///
+/// So the 200-with-an-empty-stream this line of work began with cannot be
+/// produced here. `run` is the generation; production passes
+/// `engine::run_chat`, and a test passes one that fails the way production
+/// did.
+fn spawn_chat<F, Fut>(model: String, profile: bool, run: F) -> ChatStream
+where
+    F: FnOnce(DeltaSink) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<engine::ChatResult, recovery::ChatError>> + Send,
+{
     let (tx, rx) = mpsc::unbounded_channel::<serde_json::Value>();
+    let inflight = recovery::InFlight::enter();
     // A normal async task: the generation is mostly awaits. The one part
     // that genuinely blocks — the model load — declares itself as blocking
     // where it happens, in `mummu::cache`, rather than this pushing the whole
     // future onto a blocking thread.
     tokio::spawn(async move {
+        let last = FinalFrame::new(tx.clone(), ended_without_result());
         // Panic-safe by construction: the guard disables the profiler on
         // Drop even when the generation unwinds. Without it, a panic
         // anywhere in a profiled run — and generation panics have happened
@@ -908,18 +1174,12 @@ fn start_chat(
             DisableProfilerOnDrop
         });
         let started = std::time::Instant::now();
-        let result = engine::run_chat(&spec, &root, &turns, &opts, max_tokens, |delta| {
-            if tx.send(json!({"type": "delta", "text": delta})).is_err() {
-                return ControlFlow::Break(()); // client gone: stop decoding
-            }
-            ControlFlow::Continue(())
-        })
-        .await;
+        let result = recovery::contain(&model, run(DeltaSink(tx))).await;
         if let Some(session) = profile_session {
             drop(session); // stop collecting before folding the report
             publish_profile();
         }
-        let done = match result {
+        let frame = match result {
             Ok(r) => {
                 let secs = (r.elapsed_ms as f64 / 1000.0).max(1e-3);
                 json!({
@@ -933,16 +1193,15 @@ fn start_chat(
             }
             Err(e) => {
                 eprintln!(
-                    "[mummu-serve] chat {}: {e} (after {} ms)",
-                    spec.name,
+                    "[mummu-serve] chat {model}: {e} (after {} ms)",
                     started.elapsed().as_millis()
                 );
-                json!({"type": "error", "error": e})
+                e.frame()
             }
         };
-        let _ = tx.send(done);
+        last.send(frame);
     });
-    Ok(rx)
+    ChatStream { rx, inflight }
 }
 
 #[cfg(test)]
@@ -989,20 +1248,21 @@ mod tests {
     /// it rather than reshaping it.
     #[test]
     fn health_keeps_its_fields_and_now_names_the_build() {
-        let h = health_json();
+        let h = health_json(None, false);
         let o = h.as_object().expect("health is an object");
         for key in ["status", "device", "gpus", "cpu_cores"] {
             assert!(o.contains_key(key), "health lost its {key} field");
         }
         assert_eq!(h["status"], json!("ok"));
+        assert_eq!(h["error"], json!(null), "no failure, nothing to say");
         assert!(h["gpus"].is_array());
         assert!(h["cpu_cores"].is_u64());
         // The new half: which release, and which commit of it.
         assert_eq!(h["version"], json!(status::VERSION));
         assert_eq!(
             h["version"],
-            json!("0.3.1"),
-            "this branch ships as v0.3.1; the workspace version is what says so"
+            json!("0.3.2"),
+            "this branch ships as v0.3.2; the workspace version is what says so"
         );
         let build = h["build"].as_str().expect("build is a string");
         assert!(
@@ -1018,5 +1278,422 @@ mod tests {
 
         let parsed = chat_request(r#"{"model": "m", "messages": [], "max_tokens": 999999}"#);
         assert_eq!(parsed.max_tokens(), MAX_MAX_TOKENS);
+    }
+
+    // -- v0.3.2: a GPU failure is told to every client, never swallowed ------
+
+    /// The read that failed every chat after the 2026-09-18 load, verbatim
+    /// up to where the log cut it.
+    const INVALID_READ: &str = "bytes: host access failed: Read(\"The server is in an invalid \
+                                state\\nCaused by:\\n  An IO error happened\\nCaused by:\\n  \
+                                couldn't find resource for that handle: Memory location was \
+                                never initialized\")";
+
+    /// The device-thread panic of the incident's load, verbatim.
+    const LOAD_OOM: &str = "failed to reserve 22020096 bytes of device memory: out of device \
+                            memory allocating 261319680 bytes";
+
+    /// A generation that fails the way production's did: a panic on the
+    /// request's own worker, from the first read.
+    async fn fails_like_production() -> Result<engine::ChatResult, recovery::ChatError> {
+        panic!("{INVALID_READ}")
+    }
+
+    /// A generation that panics for a reason that is NOT the GPU's.
+    async fn fails_with_an_ordinary_bug() -> Result<engine::ChatResult, recovery::ChatError> {
+        panic!("index out of bounds: the len is 3 but the index is 7")
+    }
+
+    /// The incident's load-time failure: cubecl's device thread panics and
+    /// catches its own panic, so nothing but the hook ever sees it.
+    fn device_thread_oom() {
+        std::thread::Builder::new()
+            .name("DSD-0-0".to_owned())
+            .spawn(|| {
+                let _ = std::panic::catch_unwind(|| panic!("{LOAD_OOM}"));
+            })
+            .expect("spawn")
+            .join()
+            .expect("the device thread survives its panic");
+    }
+
+    /// An SSE body as the frames a client parses out of it.
+    async fn sse_frames(response: Response) -> Vec<serde_json::Value> {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        String::from_utf8_lossy(&body)
+            .split("\n\n")
+            .filter_map(|f| f.strip_prefix("data: "))
+            .map(|d| serde_json::from_str(d).expect("each frame is JSON"))
+            .collect()
+    }
+
+    /// POST /api/chat, the incident, on the transport it happened on: the
+    /// client got a 200 carrying NOTHING. It must get exactly one final
+    /// frame, an error, saying what failed and what happens next.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serializes tests; nothing else waits on it
+    async fn an_sse_chat_that_hits_the_gpu_failure_ends_in_an_error_frame() {
+        let _serial = progress_serial();
+        recovery::reset_for_tests();
+        recovery::install_panic_hook();
+
+        let chat = spawn_chat("qwen3.8-27b-ud-q4ks".into(), false, |_| {
+            fails_like_production()
+        });
+        let frames = sse_frames(sse_response(chat.rx, Some(chat.inflight))).await;
+        assert!(!frames.is_empty(), "the incident's empty 200");
+        assert_eq!(
+            frames.iter().filter(|f| is_final_frame(f)).count(),
+            1,
+            "exactly one final frame: {frames:?}"
+        );
+        let last = frames.last().expect("a frame");
+        assert_eq!(last["type"], json!("error"), "{last}");
+        assert_eq!(last["recovery"], json!("reload"), "{last}");
+        let message = last["error"].as_str().expect("a message");
+        assert!(
+            message.contains("GPU backend failed") && message.contains("try again"),
+            "{message}"
+        );
+        recovery::reset_for_tests();
+    }
+
+    /// A panic that is not the GPU's still reaches the client — as an error
+    /// that promises no recovery, because none is happening.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serializes tests; nothing else waits on it
+    async fn an_ordinary_panic_is_an_error_frame_that_promises_no_recovery() {
+        let _serial = progress_serial();
+        recovery::reset_for_tests();
+        recovery::install_panic_hook();
+
+        let chat = spawn_chat("m".into(), false, |_| fails_with_an_ordinary_bug());
+        let frames = sse_frames(sse_response(chat.rx, Some(chat.inflight))).await;
+        let last = frames.last().expect("a frame");
+        assert_eq!(last["type"], json!("error"), "{last}");
+        assert!(last.get("recovery").is_none(), "{last}");
+        assert!(!recovery::poisoned(), "a bug is not a poisoned GPU");
+        recovery::reset_for_tests();
+    }
+
+    /// The belt under the braces: whatever becomes of the worker, the stream
+    /// a client reads ends on a final frame, never on silence.
+    #[tokio::test]
+    async fn a_stream_whose_worker_vanished_still_ends_in_an_error() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(json!({"type": "delta", "text": "half an ans"}))
+            .expect("open");
+        drop(tx);
+        let frames = sse_frames(sse_response(rx, None)).await;
+        assert_eq!(frames.len(), 2, "{frames:?}");
+        assert_eq!(frames[1]["type"], json!("error"));
+    }
+
+    /// The worker's own guard: the final frame it chose, or the fallback if
+    /// it never got to choose — and never both.
+    #[test]
+    fn a_worker_sends_exactly_one_final_frame_however_it_ends() {
+        let fallback = json!({"type": "error", "error": "fallback"});
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        drop(FinalFrame::new(tx, fallback.clone()));
+        assert_eq!(rx.try_recv().expect("sent on drop"), fallback);
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        FinalFrame::new(tx, fallback).send(json!({"type": "done"}));
+        assert_eq!(rx.try_recv().expect("sent")["type"], json!("done"));
+        assert!(rx.try_recv().is_err(), "exactly one final frame");
+    }
+
+    fn failing_start(_: ChatRequest) -> Result<ChatStream, Rejection> {
+        Ok(spawn_chat("qwen3.8-27b-ud-q4ks".into(), false, |_| {
+            fails_like_production()
+        }))
+    }
+
+    fn restarting_start(_: ChatRequest) -> Result<ChatStream, Rejection> {
+        Err(Rejection {
+            status: 503,
+            error: recovery::restarting_message().to_owned(),
+        })
+    }
+
+    /// Every text frame a real WebSocket client receives for one chat.
+    async fn ws_frames(
+        start: fn(ChatRequest) -> Result<ChatStream, Rejection>,
+    ) -> Vec<serde_json::Value> {
+        use futures::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let app = Router::new().route(
+            "/ws",
+            get(move |up: axum::extract::ws::WebSocketUpgrade| async move {
+                up.on_upgrade(move |socket| async move {
+                    let _ = drive_chat_ws(socket, start).await;
+                })
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .expect("connect");
+        ws.send(Message::Text(
+            r#"{"model": "m", "messages": [{"role": "user", "content": "hi"}]}"#.into(),
+        ))
+        .await
+        .expect("send");
+        let mut frames = Vec::new();
+        while let Some(Ok(message)) = ws.next().await {
+            if let Message::Text(text) = message {
+                frames.push(serde_json::from_str(text.as_str()).expect("JSON frame"));
+            }
+        }
+        frames
+    }
+
+    /// The UI's transport. A GPU failure arrives as an error frame on the
+    /// socket before it closes — never as a socket that simply closes, which
+    /// is what the chat page drew as an empty bubble.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // serializes tests; nothing else waits on it
+    async fn a_websocket_chat_that_hits_the_gpu_failure_gets_an_error_frame() {
+        let _serial = progress_serial();
+        recovery::reset_for_tests();
+        recovery::install_panic_hook();
+
+        let frames = ws_frames(failing_start).await;
+        let last = frames.last().expect("at least one frame before the close");
+        assert_eq!(last["type"], json!("error"), "{frames:?}");
+        assert_eq!(last["recovery"], json!("reload"), "{last}");
+        assert!(
+            last["error"]
+                .as_str()
+                .is_some_and(|m| m.contains("GPU backend failed")),
+            "{last}"
+        );
+
+        // Refused while restarting: the status AND the reason, in-band.
+        let frames = ws_frames(restarting_start).await;
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        assert_eq!(frames[0]["status"], json!(503));
+        assert_eq!(frames[0]["error"], json!(recovery::restarting_message()));
+        recovery::reset_for_tests();
+    }
+
+    /// `/api/health` said `ok` through the whole incident. While the backend
+    /// is poisoned it must answer non-2xx — Docker's `curl -sf` fails on it —
+    /// and say why; and a clean load must bring it back.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serializes tests; nothing else waits on it
+    async fn health_is_503_and_says_why_while_the_gpu_is_poisoned() {
+        let _serial = progress_serial();
+        recovery::reset_for_tests();
+        recovery::install_panic_hook();
+        assert_eq!(health().await.status(), 200);
+
+        device_thread_oom();
+        let response = health().await;
+        assert_eq!(response.status(), 503, "a poisoned GPU answered healthy");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let h: serde_json::Value = serde_json::from_slice(&body).expect("JSON");
+        assert_eq!(h["status"], json!("error"));
+        assert!(
+            h["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("out of device memory")),
+            "{h}"
+        );
+        for key in ["device", "gpus", "cpu_cores", "version", "build"] {
+            assert!(h.get(key).is_some(), "a 503 still carries {key}");
+        }
+
+        // A clean load on the device that failed (the thread was DSD-0-0).
+        recovery::load_succeeded(
+            "qwen3.8-27b-ud-q4ks",
+            &[recovery::DeviceKey::Cubecl {
+                type_id: 0,
+                index: 0,
+            }],
+        );
+        assert_eq!(health().await.status(), 200, "a clean load clears it");
+        recovery::reset_for_tests();
+    }
+
+    /// Fault injection must never reach the image: the Dockerfile's build
+    /// names its features, and this one is not among them nor a default.
+    #[test]
+    fn the_docker_image_never_builds_fault_injection() {
+        let dockerfile = include_str!("../Dockerfile");
+        let build = dockerfile
+            .lines()
+            .find(|l| l.trim_start().starts_with("RUN cargo build"))
+            .expect("the image builds with cargo");
+        assert!(
+            build.contains("--features cuda")
+                && !build.contains("fault-injection")
+                && !build.contains("--all-features"),
+            "{build}"
+        );
+        assert!(!dockerfile.contains("fault-injection"));
+        let manifest = include_str!("../Cargo.toml");
+        let default = manifest
+            .lines()
+            .find(|l| l.starts_with("default ="))
+            .expect("a default feature list");
+        assert!(!default.contains("fault-injection"), "{default}");
+    }
+
+    /// POST to a router served on a real socket; the status line's code.
+    async fn post_status(app: Router, path: &str, body: &str) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.expect("read");
+        response
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .expect("a status line")
+    }
+
+    /// Without the feature there is no route to arm anything: the request is
+    /// an unknown path like any other.
+    #[cfg(not(feature = "fault-injection"))]
+    #[tokio::test]
+    async fn a_build_without_fault_injection_has_no_fault_route() {
+        assert_eq!(
+            post_status(router(), "/api/fault", r#"{"load_oom": 1}"#).await,
+            404
+        );
+    }
+
+    /// With it, the route arms what it is told to and nothing more.
+    #[cfg(feature = "fault-injection")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serializes tests; nothing else waits on it
+    async fn a_fault_injection_build_arms_faults_through_its_route() {
+        let _serial = progress_serial();
+        assert_eq!(
+            post_status(
+                router(),
+                "/api/fault",
+                r#"{"load_oom": 1, "read_invalid": 2}"#
+            )
+            .await,
+            200
+        );
+        assert_eq!(
+            (fault::armed().load_oom, fault::armed().read_invalid),
+            (1, 2)
+        );
+        fault::arm(fault::Arm::default());
+    }
+
+    /// Both pages render the status object's error: the `error` phase, and
+    /// the message in the error colour. Asserted against the shipped bytes,
+    /// which have no test runner of their own.
+    #[test]
+    fn both_pages_render_a_gpu_failure_in_red() {
+        for (name, html) in [("ui.html", UI_HTML), ("logs.html", LOGS_HTML)] {
+            assert!(
+                html.contains(".perr { color: var(--err);"),
+                "{name} has no red failure line"
+            );
+            assert!(
+                html.contains("note.textContent = st.error ? failureText(st.error) : \"\";"),
+                "{name} ignores the status object's error"
+            );
+            assert!(
+                html.contains("st.phase === \"error\""),
+                "{name} has no error phase"
+            );
+            assert!(
+                html.contains("function failureText(e) {"),
+                "{name} does not share the failure line"
+            );
+        }
+        assert!(
+            LOGS_HTML.contains("label.classList.toggle(\"bad\", st.phase === \"error\");"),
+            "the logs page's label must go red on the error phase"
+        );
+    }
+
+    /// The source of one JavaScript function, from its `function` line to
+    /// the first line that closes it at column zero.
+    fn js_function<'a>(html: &'a str, signature: &str) -> &'a str {
+        let start = html.find(signature).expect("the function is on the page");
+        let end = html[start..].find("\n}\n").expect("the function ends") + start + 2;
+        &html[start..end]
+    }
+
+    /// MINOR 8: the red label says what recovery is ACTUALLY doing — the
+    /// status object's `error.recovery` — never a fixed promise of a reload
+    /// that, while the process is exiting or its restart budget is spent, is
+    /// not what happens. Every value the server can send has its own words,
+    /// and both pages say them identically.
+    #[test]
+    fn both_pages_render_the_recovery_the_status_reports() {
+        let words = js_function(UI_HTML, "function recoveryText(e) {");
+        assert_eq!(
+            words,
+            js_function(LOGS_HTML, "function recoveryText(e) {"),
+            "the two pages describe recovery differently"
+        );
+        for r in recovery::Recovery::ALL {
+            assert!(
+                words.contains(&format!("case \"{}\":", r.as_str())),
+                "the pages have no words for recovery {:?}",
+                r.as_str()
+            );
+        }
+        for (name, html) in [("ui.html", UI_HTML), ("logs.html", LOGS_HTML)] {
+            assert!(
+                html.contains("`error — the GPU backend failed; ${recoveryText(st.error)}`"),
+                "{name}'s error label ignores error.recovery"
+            );
+            for fixed in [
+                "failed; the next request loads the model again\"",
+                "failed; this request loads the model again\"",
+            ] {
+                assert!(!html.contains(fixed), "{name} still promises a reload");
+            }
+        }
+    }
+
+    /// The chat page never leaves an empty bubble: an error frame is shown
+    /// (as text, never as markup off the wire), and a stream that ends with
+    /// neither `done` nor `error` is reported as a dropped connection.
+    #[test]
+    fn the_chat_page_never_leaves_an_empty_bubble() {
+        assert!(
+            UI_HTML.contains("if (!ended) {"),
+            "a stream that ended without done or error is drawn as nothing"
+        );
+        assert!(UI_HTML.contains("the connection closed before the reply finished"));
+        assert!(
+            UI_HTML.contains("err.textContent = `⚠ ${e.message}`;"),
+            "the error is not rendered, or is rendered as markup"
+        );
+        assert!(
+            !UI_HTML.contains("body.innerHTML += `<div class=\"err\">"),
+            "a server message reached innerHTML"
+        );
     }
 }

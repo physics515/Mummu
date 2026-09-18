@@ -85,9 +85,35 @@ impl<T> ModelSlot<T> {
         key: &Path,
         load: impl FnOnce(&Path) -> Result<T, E>,
     ) -> Result<SlotGuard<'_, T>, E> {
+        self.acquire_valid(key, |_| true, load).await
+    }
+
+    /// [`Self::acquire`], where a resident value only counts as a hit if
+    /// `still_valid` says so. One that does not is dropped — before `load`
+    /// runs, exactly like a different key — and loaded again.
+    ///
+    /// # Why the check has to happen here, under the lock
+    ///
+    /// A model can be resident and broken. mummu-serve's case: a GPU
+    /// allocation that failed on cubecl's device thread was swallowed there,
+    /// so the loader returned a model whose weights point at device memory
+    /// that was never initialized, and every later read of it fails. Asking
+    /// "is the resident model still good?" and then acquiring is two lock
+    /// acquisitions, and a request queued behind the one that discovered the
+    /// failure takes the slot in between and runs on the broken model again.
+    /// Deciding inside the same critical section as the key comparison is the
+    /// only way the answer and the model it describes cannot come apart.
+    pub async fn acquire_valid<E>(
+        &self,
+        key: &Path,
+        still_valid: impl FnOnce(&T) -> bool,
+        load: impl FnOnce(&Path) -> Result<T, E>,
+    ) -> Result<SlotGuard<'_, T>, E> {
         assert!(!key.as_os_str().is_empty(), "model cache: empty key");
         let mut guard = self.inner.lock().await;
-        let hit = guard.as_ref().is_some_and(|e| e.key == key);
+        let hit = guard
+            .as_ref()
+            .is_some_and(|e| e.key == key && still_valid(&e.value));
         if !hit {
             *guard = None; // free the old model before loading the new one
             // Loading is the one genuinely blocking thing on this path:
@@ -144,6 +170,20 @@ impl<T> ModelSlot<T> {
         *self.inner.lock().await = None;
     }
 
+    /// [`Self::clear`], reporting what it found — so a caller that has to
+    /// SAY what happened (mummu-serve's recovery log, replayed to the next
+    /// process) can never claim it dropped a model when the slot was empty,
+    /// or that a busy slot held one.
+    pub fn try_clear(&self) -> Cleared {
+        match self.inner.try_lock() {
+            Ok(mut guard) => match guard.take() {
+                Some(entry) => Cleared::Dropped(entry.key),
+                None => Cleared::Empty,
+            },
+            Err(_) => Cleared::Busy,
+        }
+    }
+
     /// The checkpoint dir currently loaded, if any — for settings UIs.
     ///
     /// A **peek**: `None` when the slot is empty *or* busy serving a
@@ -165,10 +205,44 @@ impl<T> ModelSlot<T> {
     }
 }
 
+/// What [`ModelSlot::try_clear`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Cleared {
+    /// A model was resident and has been dropped; this was its key.
+    Dropped(PathBuf),
+    /// Nothing was resident.
+    Empty,
+    /// Something holds the slot (a load or a generation); nothing was done.
+    Busy,
+}
+
 /// A held model slot (see [`ModelSlot::acquire`]). Deref to the model;
 /// dropping it releases the slot for the next generation.
 pub struct SlotGuard<'a, T> {
     guard: tokio::sync::MutexGuard<'a, Option<Entry<T>>>,
+}
+
+impl<T> SlotGuard<'_, T> {
+    /// Drop the model this guard holds and release the slot EMPTY, in that
+    /// order: the value is dropped while the lock is still held.
+    ///
+    /// The point is the order. A holder that has just watched its model fail
+    /// (mummu-serve: the GPU backend failed under it) must not hand that
+    /// model to the next request in line, and dropping the guard first would
+    /// do exactly that — a queued `acquire` takes the lock the instant it is
+    /// released and finds the key it asked for. Evicting through the guard
+    /// leaves no instant in which the broken model is in an unlocked slot.
+    /// Returns the evicted model's key.
+    pub fn evict(mut self) -> PathBuf {
+        let entry = self
+            .guard
+            .take()
+            .expect("a slot guard always holds a loaded model");
+        let key = entry.key.clone();
+        drop(entry); // under the lock
+        key
+        // `self` (and with it the lock) goes here, after the value.
+    }
 }
 
 impl<T> std::ops::Deref for SlotGuard<'_, T> {
@@ -290,6 +364,96 @@ mod tests {
             2,
             "the request the peek called warm paid for a load after all"
         );
+    }
+
+    /// The invariant `acquire_valid` exists for: a resident model that is no
+    /// longer valid is never handed out, not even to a request that finds its
+    /// key already in the slot. It is dropped and loaded again, under the
+    /// same lock that compared the key.
+    ///
+    /// mummu-serve's poisoned-GPU case in miniature: the resident value
+    /// carries the fault count it was loaded under, and a fault since then
+    /// makes it stale.
+    #[tokio::test]
+    async fn a_resident_value_that_is_no_longer_valid_is_reloaded_not_served() {
+        use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+        let slot: ModelSlot<(String, u32)> = ModelSlot::new();
+        let key = Path::new("model-a");
+        let faults = AtomicU32::new(0);
+        let loads = AtomicU32::new(0);
+        let load = |_: &Path| {
+            loads.fetch_add(1, SeqCst);
+            Ok::<_, Infallible>(("model-a".to_owned(), faults.load(SeqCst)))
+        };
+        let valid = |m: &(String, u32)| m.1 == faults.load(SeqCst);
+
+        drop(slot.acquire_valid(key, valid, load).await.unwrap());
+        drop(slot.acquire_valid(key, valid, load).await.unwrap());
+        assert_eq!(loads.load(SeqCst), 1, "a valid resident model is a hit");
+
+        faults.fetch_add(1, SeqCst); // the device failed under the resident model
+        let m = slot.acquire_valid(key, valid, load).await.unwrap();
+        assert_eq!(
+            loads.load(SeqCst),
+            2,
+            "a model loaded before the failure was served instead of reloaded"
+        );
+        assert_eq!(m.1, 1, "and what is handed out is the fresh load");
+    }
+
+    /// `try_clear` says what it found, and only that: an empty slot is not a
+    /// dropped model, and a held slot is not touched.
+    #[tokio::test]
+    async fn try_clear_reports_what_it_actually_found() {
+        let slot: ModelSlot<u32> = ModelSlot::new();
+        assert_eq!(slot.try_clear(), Cleared::Empty, "nothing was resident");
+        drop(
+            slot.acquire::<Infallible>(Path::new("m"), |_| Ok(7))
+                .await
+                .unwrap(),
+        );
+        let held = slot
+            .acquire::<Infallible>(Path::new("m"), |_| Ok(7))
+            .await
+            .unwrap();
+        assert_eq!(slot.try_clear(), Cleared::Busy, "a held slot is not freed");
+        drop(held);
+        assert_eq!(
+            slot.try_clear(),
+            Cleared::Dropped(PathBuf::from("m")),
+            "and a resident model is named when it is dropped"
+        );
+        assert_eq!(slot.loaded_key(), None);
+    }
+
+    /// The invariant `SlotGuard::evict` exists for: the holder's model is
+    /// gone BEFORE the lock is released, so the request queued behind it
+    /// finds an empty slot and loads — it is never handed the evicted model.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_evicted_model_is_never_handed_to_the_request_queued_behind_it() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+        static SLOT: ModelSlot<u32> = ModelSlot::new();
+        let loads = Arc::new(AtomicU32::new(0));
+        let load = {
+            let loads = loads.clone();
+            move |_: &Path| Ok::<_, Infallible>(loads.fetch_add(1, SeqCst) + 1)
+        };
+        let held = SLOT.acquire(Path::new("m"), load.clone()).await.unwrap();
+        assert_eq!(*held, 1);
+        let queued = tokio::spawn({
+            let load = load.clone();
+            async move { *SLOT.acquire(Path::new("m"), load).await.unwrap() }
+        });
+        // Let the second request reach the lock and wait on it.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(held.evict(), PathBuf::from("m"));
+        assert_eq!(
+            queued.await.unwrap(),
+            2,
+            "the queued request was handed the evicted model instead of a fresh load"
+        );
+        assert_eq!(loads.load(SeqCst), 2);
     }
 
     #[test]

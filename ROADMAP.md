@@ -628,6 +628,66 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       locally: after 13,440 quiet requests the startup lines, both chats and the scanner 404s were all
       still held, `dropped` was 0, and `/logs` had polled through all of it without drawing a single gap
       marker; a deliberate overrun of the main ring then drew exactly one, for exactly the 100 lost.
+      **v0.3.2 (2026-09-18): a crashed GPU backend recovers by itself, and every surface says so.** The
+      first cold load after the v0.3.1 deploy ran while deepseek-ocr held most of the shared 16 GiB card;
+      with the live VRAM reading still off the planner placed `33/64 on GPU (cuda) (7.35 of 14.26 GiB)`
+      anyway, and cubecl's device thread `DSD-0-0` panicked 30 times in six seconds with `failed to
+      reserve 22020096 bytes of device memory: out of device memory allocating 261319680 bytes`. cubecl
+      catches those panics on its own thread, so the loader returned `Ok` (`RESIDENCY SUSPECT: … card
+      grew 0.00 GiB`) and every later chat panicked on its first read — `bytes: host access failed:
+      Read("The server is in an invalid state … couldn't find resource for that handle: Memory locat…`
+      — which reached the client as an HTTP 200 with an empty stream in 0.3 s, while the status object
+      said `ready` and `/api/health` said `ok`, until a manual `docker restart mummu`. **Read from the
+      cubecl source, that state is not sticky**: `ServerUnhealthy` is a per-stream error queue that the
+      read reporting it drains (`mem::take`); what kept failing was the resident model, whose weights
+      carried handles the device never bound. So the recovery is **unload and reload in-process** first
+      (`mummu-serve/src/recovery.rs` has the evidence, line by line): a device failure — cubecl's failure
+      text in a panic anywhere (a panic hook sees the ones cubecl swallows on its `DSD-*`/`DSU-*`
+      threads, whose name says which device) or in a request's error; a kernel-gap panic mummu itself
+      catches and retries (`nn/moe.rs`) is not one — drops the model and its residency note; a load
+      counts only once the device has synced its uploads with no device failure under it, so an OOM
+      fails as a load and never leaves a half-placed model in the slot; and a model loaded before the
+      latest device failure is never served again, whether the failure arrived as a panic or as an
+      `Err`: each is decided, and the model evicted, while the failing request still holds the model
+      slot, so a queued request finds an empty slot or a refusal. **A process restart only when the
+      reload did not hold** — a second failure on the same device with no token there in between (the
+      poison, what clears it and that count are kept per device: a CPU load or token vouches for
+      nothing on the card) — because a sticky CUDA error cannot be cleared in-process: exit 75 into
+      Docker's `restart: unless-stopped`, at most once per 30 minutes, under a 20 s watchdog that
+      `_exit`s a stuck exit, the history carried across the restart, so a co-tenant that still holds
+      the card costs one restart, not a loop. Every
+      client hears the truth: an `error` frame with a `recovery` field on SSE and WebSocket (and one
+      even if a worker ends without a final frame), ollama's `{"error": …}` line when streaming and a
+      503 body when not, an `error` phase in red on both pages — whose label renders what recovery is
+      actually doing (`reload`, `restart`, `cooldown`, ...), never a fixed promise — and a 503 from
+      `/api/health` saying why, which marks the container unhealthy and restarts nothing (no `autoheal`
+      label). The chat page shows the error in the bubble, and a stream that ends with neither `done`
+      nor `error` as a dropped connection. Before a self-restart the process leaves the restart history
+      and its last log lines (header first, capped at 512 KiB) in a private dir in its own temp dir —
+      the container layer, which a restart of the same container keeps — and only then, best effort
+      with a 2 s bound, in `/models/.mummu-serve/` (the failing array must not be able to stall the
+      exit); the next one replays the newer into `/logs`, marked `[previous process]`.
+      `--features fault-injection` (never in the image; a test pins the Dockerfile) replays the
+      incident on a CPU box, and did, under a shell loop standing in for Docker's restart policy: an
+      injected load OOM answered the SSE chat with one `error` frame (`"recovery":"reload"`) in 2.1 s,
+      `/api/health` went 503 and the phase `error`; the next WebSocket chat reloaded and answered,
+      clearing both; two injected invalid-state reads in a row — a shim stream, then a WebSocket chat
+      right after a clean reload — ended on ollama's `{"error": …}` line and a `"recovery":"restart"`
+      frame, a chat during the exit got a 503, and the process exited 75 and was serving again 1 s later
+      with the previous failure in its status and 62 replayed lines on `/logs`; two more failed loads
+      inside the cooldown drew "will not restart again before 18:06:07Z" and no exit. After review, the
+      production wiring is guarded by tests that drive the real engine (handler → `plan_fit` → `drive`
+      → loader → generation) on a two-layer Qwen2 written per test: 30 one-line mutations of it — the
+      stale-model predicate, the load check's mark, the per-device resets, the evictions, the
+      refusals, the latch, the in-flight hold, the drain, the watchdog, the evidence cap — each fail
+      at least one test. Live again on 127.0.0.1:18130 (release, 0.5B on the CPU, the same shell
+      loop): an `Err`-path readback failure moved the epoch 0 → 1 and the next chat reloaded; a handled
+      kernel-gap panic on `DSD-0-0` left the epoch, the model and a 200 alone; an idle OOM on `DSD-0-0`
+      made the resident model stale and the CPU reload that answered did NOT clear the card's 503; two
+      card load failures exited 75 2.4 s after the restart frame with a FIFO blocking the models-root
+      copy, and the next process replayed 95 lines from its local copy and answered two more failures
+      with `cooldown`, not a restart; an exit armed to hang was ended by the watchdog at 20.0 s, code
+      75.
 - [ ] **Measure `MUMMU_VRAM_LIVE_BUDGET` on the 27B and decide whether it becomes the default.** The
       live reading should let the planner use VRAM another tenant has freed, and stop it overcommitting
       a card another tenant has filled — but on a box where plex and deepseek-ocr move VRAM underneath,
@@ -647,6 +707,26 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       nothing checks that the middleware hands `quiet_request` the real response status. Also worth
       knowing: the quiet rule ignores latency, so a successful `/api/models` that takes 30 s under a cold
       load's seek storm is hidden by default.
+- [ ] **What v0.3.2's review left open on self-recovery** *(2026-09-18)* — two reviewers said ship;
+      none of these blocked it. (1) **Guards still missing** at five production sites: deleting drive's
+      `Ok(Err(e)) if e.needs_decision()` arm (an Err-path failure is then decided only AFTER the slot is
+      released); the in-flight hold on the WebSocket and both ollama-shim paths (only native SSE is
+      tested); the `recovery::supervised(&root)` call in `main.rs` and `serve_on`'s
+      `install_panic_hook()` (delete either and the suite stays green while production loses the
+      self-restart); which device drive charges a request-path failure to; and the rule that ANY epoch
+      movement fails a load. (2) **A stale reload of a tiered model keeps the old tier runtime** —
+      `likely_cold` is false for the same key, so `clear_tiers_if_slot` is skipped and the old
+      `ExpertPool` keeps its GPU experts while the loader builds a new one (the production 27B is
+      layered, not tiered, so it is unaffected; OLMoE-style models are not). (3) The evidence header
+      stamps `exited_at_ms` when it is rendered, and the watchdog's own line is never persisted, so a
+      hung exit looks ~20 s earlier and clean on `/logs`. (4) The pages' red label still says "GPU"
+      for a failure charged to the host, and a `[previous process]` note can outlive a load on another
+      device. (5) Any device panic evicts the resident model even when its weights are intact (a
+      transient activation OOM after a verified load) — a conscious trade-off that costs one ~2-minute
+      reload; worth revisiting once `MUMMU_VRAM_LIVE_BUDGET` makes such OOMs rare. Closed before the
+      tag: the exit no longer writes to the models root when the local copy is on disk (the array's
+      failing sda could hold `_exit` in uninterruptible I/O), and the client sentence no longer says
+      "unloaded the model" after a load that never finished.
 - [ ] **The gap to a fused runtime is a KERNEL problem, not a placement one — measured, and the reason
       scheduler tuning stops here.** *(2026-08-24)* Five measured iterations took the 27B from 4.88 to
       **3.91 s/token** and moved the discrete GPU from 996 to **1784 of 2048 clusters**. Then the

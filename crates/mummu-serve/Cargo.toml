@@ -18,6 +18,12 @@ vulkan-spirv = ["mummu/vulkan-spirv"]
 # builds with this: it is the only correct GPU path inside WSL2 containers
 # (libcuda is injected by the nvidia runtime; dzn/Vulkan computes garbage).
 cuda = ["mummu/cuda"]
+# Makes the generation path fail the way the 2026-09-18 incident did — a
+# device-thread OOM during the load, an "invalid state" panic on the next
+# read — so the recovery can be driven without a GPU (see src/fault.rs).
+# NEVER in the Dockerfile's feature list: a test pins that. Off by default,
+# and a build without it has neither the injection points nor the route.
+fault-injection = []
 
 [dependencies]
 rayon = { workspace = true }
@@ -39,6 +45,12 @@ tokio-stream = { workspace = true }
 # `Body::size_hint`, so the request log can say how many bytes a buffered
 # response actually carried (axum sets no content-length header of its own).
 http-body = { workspace = true }
+
+[dev-dependencies]
+# A real WebSocket client for the chat-over-WebSocket tests: the error frame a
+# GPU failure owes the client has to be proven on the wire. Already in the
+# lock through axum's `ws` feature, at the same version.
+tokio-tungstenite = "0.29"
 
 # The stdout/stderr tee behind `GET /api/logs` re-points fds 1 and 2 at a pipe,
 # which needs dup/dup2/pipe — no std equivalent exists. Unix only: the module
