@@ -16,8 +16,9 @@
 //!
 //! - `GET  /`            the embedded chat UI
 //! - `GET  /logs`        the embedded merged-log page (see [`logs`])
+//! - `GET  /favicon.ico` 204 — there is no icon, and a 404 would read as a scan
 //! - `GET  /api/health`  device policy + adapter inventory
-//! - `GET  /api/logs`    the merged server/api/shim log ring, since a cursor
+//! - `GET  /api/logs`    the merged server/api/shim log, since a cursor
 //! - `GET  /api/models`  the catalog with installed flags
 //! - `POST /api/pull`    download a catalog model (SSE progress)
 //! - `POST /api/chat`    stream a chat completion (SSE deltas)
@@ -280,6 +281,7 @@ pub fn router() -> Router {
         // because they answer the same question — is this thing alive? — and
         // the log is the half that says what it is *doing*.
         .route("/logs", get(logs::page))
+        .route("/favicon.ico", get(favicon))
         .route("/api/health", get(health))
         .route("/api/logs", get(logs::endpoint))
         .route("/api/models", get(models))
@@ -380,6 +382,22 @@ async fn ui() -> Response {
     (
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
         include_str!("ui.html"),
+    )
+        .into_response()
+}
+
+/// `GET /favicon.ico` — a deliberate `204 No Content`: "there is no icon".
+///
+/// Every browser that opens `/` or `/logs` asks for this, and so does a
+/// dashboard that shows a monitored site's icon. With no route each of those
+/// was a `404` — and a 404 is LOUD on the log page, by design, because on a
+/// public listener it is usually a scanner (see `logs::quiet_request`). A
+/// tab opening is not a scanner, so it gets a success the log can fold away,
+/// cached for a day so the browser stops asking on every load.
+async fn favicon() -> Response {
+    (
+        axum::http::StatusCode::NO_CONTENT,
+        [(header::CACHE_CONTROL, "public, max-age=86400")],
     )
         .into_response()
 }
@@ -983,8 +1001,8 @@ mod tests {
         assert_eq!(h["version"], json!(status::VERSION));
         assert_eq!(
             h["version"],
-            json!("0.3.0"),
-            "this branch ships as v0.3.0; the workspace version is what says so"
+            json!("0.3.1"),
+            "this branch ships as v0.3.1; the workspace version is what says so"
         );
         let build = h["build"].as_str().expect("build is a string");
         assert!(

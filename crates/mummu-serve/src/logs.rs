@@ -9,7 +9,7 @@
 //! time. Worse, a CUDA failure has shown up *only* as a panic on stderr while
 //! the request hung and `/api/health` still answered `ok`.
 //!
-//! So this module keeps a bounded ring of lines that the server can serve back
+//! So this module keeps a bounded log of lines that the server can serve back
 //! over HTTP, fed from two places:
 //!
 //! - **Captured output** ([`Source::Server`]): on unix, fds 1 and 2 are
@@ -21,10 +21,20 @@
 //!   middleware on both routers records one line when a request arrives (if it
 //!   can start real work) and one when its response head goes out.
 //!
-//! Both feed **one ring with one sequence space**, so `GET /api/logs` hands
-//! back a single chronological stream that a page can filter — a request entry
-//! and the load-progress line it triggered sit next to each other in the order
-//! they actually happened, which is the whole point.
+//! Both feed **one sequence space**, so `GET /api/logs` hands back a single
+//! chronological stream that a page can filter — a request entry and the
+//! load-progress line it triggered sit next to each other in the order they
+//! actually happened, which is the whole point.
+//!
+//! That one sequence is stored in **two bounded rings**: [`MAX_LINES`] for
+//! captured output and every request that did something, and a much smaller
+//! [`QUIET_LINES`] for the [quiet](LogLine::quiet) ones — the health probes
+//! and monitor polls that arrive on a timer whether or not anything is
+//! happening. v0.3.0 kept them in one ring and merely flagged the polls, and
+//! the flag hid them without stopping them from taking slots: six hours after
+//! that deploy the live ring held four hours, 97% of it polling, and the cold
+//! load the page exists to show had been evicted. A read merges the two rings
+//! back into seq order, so a client sees one stream exactly as before.
 //!
 //! What this is *not*: a logging framework. Captured output carries no level,
 //! because the call sites are free-text `eprintln!`s that predate this module
@@ -46,17 +56,58 @@ use serde_json::json;
 
 use crate::json_response;
 
-/// Lines held in the ring.
+/// Lines the MAIN ring holds: captured server output, and every request that
+/// is not [quiet](LogLine::quiet).
 ///
 /// Sized against the thing this exists to show: a cold 27B load prints a few
 /// hundred lines (per-tier fit plans, the per-tensor load ticker, VNNI packing,
 /// residency), so 2000 holds a whole cold start *plus* the conversation that
-/// followed it with room to spare. Against the other end — an idle production
-/// server whose only traffic is Docker's 30 s health check — 2000 lines is
-/// ~16 hours before the oldest content rolls off, and a client that misses
-/// lines is told exactly how many (see [`Page::dropped`]) rather than being
-/// left to wonder.
+/// followed it with room to spare, and a client that misses lines is told
+/// exactly how many (see [`Page::dropped`]) rather than being left to wonder.
+///
+/// What it does NOT hold is polling, and that is what makes the size mean
+/// anything. v0.3.0's single ring was measured on the live server six hours
+/// after its deploy: it held exactly four hours, and 97% of it was automated
+/// polls (720 health probes, ~240 each of three monitors) — the cold load
+/// had already been evicted by traffic the page was hiding. Quiet requests
+/// now live in their own [`QUIET_LINES`] ring, so nothing that arrives on a
+/// timer can take a slot from this one, however often it arrives.
 pub const MAX_LINES: usize = 2000;
+
+/// Lines the QUIET ring holds: the successful page and listing reads that
+/// `quiet_request` names — Docker's health probe, dashboard monitors,
+/// scheduled flows and ollama clients, all polling on a timer.
+///
+/// The question this ring answers is "are the probes still arriving, and when
+/// did each last run?", which needs a recent window rather than history. In
+/// production the four pollers measured in v0.3.0's ring (Docker's probe, an
+/// ollama client on the shim, a Glance monitor and a Kestra flow) put 1,450
+/// lines there in four hours, about six a minute, so 500 lines is over an
+/// hour: each of them shows up dozens of times, and anything on a timer of up
+/// to an hour shows up at least once. It is small on purpose, too. Every
+/// quiet line is a request line for a path on a fixed list — method, path,
+/// status, duration, size, well under 100 bytes — so the whole ring is a few
+/// tens of KiB, and a flood of probes cycles it in seconds without touching
+/// the main ring at all.
+pub const QUIET_LINES: usize = 500;
+
+/// How many main-ring evictions the ring remembers the seq of, so that
+/// [`Page::dropped`] counts main-ring losses and nothing else.
+///
+/// With two rings evicting independently the seq column is no longer
+/// contiguous, so "the gap since your cursor" stopped being `oldest - 1 -
+/// since`: that span now also holds quiet lines that aged out of their own
+/// smaller ring, and counting them would have the page draw a gap marker in
+/// front of lines nobody could have seen (quiet lines are hidden by default).
+/// Which seqs in the span were main-ring lines is information that left with
+/// the lines themselves, so the ring keeps just their seqs — 8 bytes each.
+///
+/// One ring's worth covers every reader that exists: a polling page is a
+/// second behind, a fresh one asks from 0 (exact whatever this holds), and a
+/// paused one stays exact until it has fallen two whole rings of server
+/// output behind. Past that, `dropped` is a floor, and [`Page::dropped_exact`]
+/// says so rather than letting the page print it as a count.
+const EVICTION_MEMORY: usize = MAX_LINES;
 
 /// Longest single line kept, in bytes. A runaway print (a panic payload
 /// carrying a whole tensor manifest, a client-supplied name, a binary blob
@@ -69,8 +120,14 @@ pub const MAX_LINE_BYTES: usize = 2048;
 /// Marker appended to a line cut at [`MAX_LINE_BYTES`].
 const TRUNCATED: &str = " …[truncated]";
 
-/// Largest page `GET /api/logs` will return, whatever `limit` asks for. Equal
-/// to the ring so one request can always bootstrap a fresh client.
+/// Largest page `GET /api/logs` will return, whatever `limit` asks for.
+///
+/// Equal to the MAIN ring, so one request can always hand a fresh client
+/// every line that ring holds. A full read of both rings can be up to
+/// [`QUIET_LINES`] longer than that and then takes one more request, which
+/// [`Page::more`] announces and `/logs` follows immediately — the same stop
+/// the byte budget already produces, and unchanged for a client that ignores
+/// `more` and simply polls again on its timer.
 pub const MAX_LIMIT: usize = MAX_LINES;
 /// `limit` when the query does not say.
 pub const DEFAULT_LIMIT: usize = 500;
@@ -207,9 +264,10 @@ pub struct LogLine {
     pub unix_ms: u64,
     pub level: Level,
     pub source: Source,
-    /// Routine chatter (health checks, client polling) that a reader normally
-    /// wants hidden. Kept in the ring rather than dropped, because "is Docker's
-    /// health check still passing?" is a real question.
+    /// Routine chatter (health checks, monitor and client polling) that a
+    /// reader normally wants hidden. Kept rather than dropped, because "is
+    /// Docker's health check still passing?" is a real question — but kept in
+    /// the smaller quiet ring ([`QUIET_LINES`]), never in the main one.
     pub quiet: bool,
     pub text: String,
 }
@@ -231,31 +289,124 @@ impl LogLine {
 // The ring
 // ---------------------------------------------------------------------------
 
+/// Both rings and the one sequence they share, behind one lock.
+///
+/// Each ring is ordered by seq on its own (a line takes the next seq and is
+/// pushed in the same critical section), and every seq ever assigned lives
+/// in exactly one of them until it is evicted — which is what lets a read
+/// merge them back into the single stream a client has always been handed.
 struct Ring {
+    /// The MAIN ring: server output and loud requests, [`MAX_LINES`].
     lines: VecDeque<LogLine>,
+    /// The QUIET ring: routine polling, [`QUIET_LINES`].
+    quiet: VecDeque<LogLine>,
     /// The seq the next recorded line will take. Never reused, never reset.
     next_seq: u64,
-    /// Lines evicted since the process started, for the whole lifetime.
+    /// Main-ring evictions over the life of the process.
     dropped_total: u64,
+    /// Quiet-ring evictions over the life of the process.
+    dropped_quiet_total: u64,
+    /// The seqs of the most recent main-ring evictions, oldest first, at most
+    /// [`EVICTION_MEMORY`] of them — see there for why they are worth 8 bytes
+    /// each.
+    evicted: VecDeque<u64>,
 }
 
 impl Ring {
     const fn new() -> Self {
         Self {
             lines: VecDeque::new(),
+            quiet: VecDeque::new(),
             next_seq: 1,
             dropped_total: 0,
+            dropped_quiet_total: 0,
+            evicted: VecDeque::new(),
         }
     }
 
     fn record(&mut self, mut line: LogLine) {
         line.seq = self.next_seq;
         self.next_seq += 1;
+        if line.quiet {
+            self.quiet.push_back(line);
+            while self.quiet.len() > QUIET_LINES {
+                self.quiet.pop_front();
+                self.dropped_quiet_total += 1;
+            }
+            return;
+        }
         self.lines.push_back(line);
         while self.lines.len() > MAX_LINES {
-            self.lines.pop_front();
+            let Some(gone) = self.lines.pop_front() else {
+                break;
+            };
             self.dropped_total += 1;
+            self.evicted.push_back(gone.seq);
+            if self.evicted.len() > EVICTION_MEMORY {
+                self.evicted.pop_front();
+            }
         }
+    }
+
+    /// The oldest seq either ring still holds, or `next_seq` when both are
+    /// empty — so `oldest - 1` is still "just before everything I have".
+    fn oldest(&self) -> u64 {
+        let main = self.lines.front().map(|l| l.seq);
+        let quiet = self.quiet.front().map(|l| l.seq);
+        main.into_iter().chain(quiet).min().unwrap_or(self.next_seq)
+    }
+
+    /// Every held line with `seq > since`, from both rings, in seq order.
+    ///
+    /// A merge of two already-sorted runs, each entered by binary search: no
+    /// sort, no allocation, and nothing cloned — the caller clones the lines
+    /// it actually keeps.
+    fn after(&self, since: u64) -> impl Iterator<Item = &LogLine> {
+        let main_start = self.lines.partition_point(|l| l.seq <= since);
+        let quiet_start = self.quiet.partition_point(|l| l.seq <= since);
+        let mut main = self.lines.range(main_start..).peekable();
+        let mut quiet = self.quiet.range(quiet_start..).peekable();
+        std::iter::from_fn(move || match (main.peek(), quiet.peek()) {
+            (Some(m), Some(q)) if q.seq < m.seq => quiet.next(),
+            (Some(_), _) => main.next(),
+            (None, _) => quiet.next(),
+        })
+    }
+
+    /// How many MAIN-ring lines with `seq > since` have been evicted, and
+    /// whether that number is exact.
+    ///
+    /// Quiet lines are not counted, whatever became of them: they age out of
+    /// their own ring by design, they are hidden unless asked for, and a gap
+    /// marker for them would be a marker for nothing the reader was shown.
+    ///
+    /// Exact whenever [`EVICTION_MEMORY`] reaches back to `since`, or the
+    /// ring has never forgotten an eviction, or `since` is so early that the
+    /// forgotten ones must all lie after it (a fresh client's `since = 0`).
+    /// Otherwise the forgotten evictions are bounded rather than counted, and
+    /// the floor is what comes back — never more than was really lost, and
+    /// never zero when anything was.
+    fn dropped_after(&self, since: u64) -> (u64, bool) {
+        let (Some(&first), Some(&last)) = (self.evicted.front(), self.evicted.back()) else {
+            return (0, true); // nothing has ever left the main ring
+        };
+        if since >= last {
+            return (0, true); // everything that left, left before the cursor
+        }
+        let remembered = self.evicted.len() as u64;
+        let after = remembered - self.evicted.partition_point(|&s| s <= since) as u64;
+        let forgotten = self.dropped_total - remembered;
+        if after < remembered || forgotten == 0 {
+            // The memory reaches back past `since` (so every eviction after it
+            // is in there), or it holds every eviction there has ever been.
+            return (after, true);
+        }
+        // All `remembered` are after `since`; of the `forgotten` ones — all
+        // older than `first` — at most `since` can sit at or before it (one
+        // line per seq), and at most `first - 1 - since` after it.
+        let floor = forgotten.saturating_sub(since);
+        let ceiling = forgotten.min(first - 1 - since);
+        (remembered + floor, floor == ceiling)
     }
 }
 
@@ -340,7 +491,28 @@ pub struct Query {
 }
 
 /// One answer to a [`Query`].
+///
+/// The contract against v0.3.0, which had one ring, field by field:
+///
+/// - `lines`, `cursor`, `newest`, `more` — unchanged. The lines come from
+///   both rings merged into seq order, the cursor is still a seq in the one
+///   seq space, and a client polling `since=<cursor>` sees every line once.
+/// - `dropped`, `dropped_total`, `capacity` — describe the MAIN ring, which
+///   is what v0.3.0 called "the ring" minus the polling that no longer lives
+///   in it. A v0.3.0 client draws a marker for the same losses it always
+///   did, and no longer draws one for a poll ageing out of its own ring.
+/// - `oldest` — still the oldest seq held anywhere, so `oldest - 1` still
+///   means "everything"; it is no longer `dropped + 1` for a fresh client.
+/// - ADDED: `dropped_exact`, `dropped_quiet_total`, `quiet_capacity`.
+///
+/// What a v0.3.0 client must not do is infer a gap from a seq jump: a merged
+/// read is no longer contiguous. Nothing shipped ever did — both embedded
+/// pages trust `dropped`, and `ui.html` reads only the `status` object.
 pub struct Page {
+    /// Held lines with `seq` after the query's `since`, from BOTH rings,
+    /// merged into seq order — quiet ones carry `quiet: true`, as before.
+    /// Consecutive lines need not have consecutive seqs: a quiet line that
+    /// aged out of its ring leaves a hole that is not a gap.
     pub lines: Vec<LogLine>,
     /// What the client should send as `since` next time.
     ///
@@ -351,16 +523,35 @@ pub struct Page {
     /// that kept its cursor), and the client has been re-synced — see [`read`]
     /// for where to.
     pub cursor: u64,
-    /// Lines after the client's `since` that the ring had already evicted —
-    /// i.e. the size of the gap this page starts with. A client shows a marker
-    /// instead of silently missing them.
+    /// MAIN-ring lines after the client's `since` that had already been
+    /// evicted — the size of the gap this page starts with. A client shows a
+    /// marker instead of silently missing them.
+    ///
+    /// Quiet lines that aged out of their own ring are never counted here
+    /// (see [`Page::dropped_quiet_total`]): they are hidden by default, so a
+    /// marker for them would sit in front of nothing the reader was missing.
     pub dropped: u64,
-    /// Lines evicted over the whole life of the process.
+    /// Whether `dropped` is a count or a floor. It is a count for every
+    /// realistic reader; it becomes a floor only for a cursor that has fallen
+    /// more than two whole main rings behind (see [`EVICTION_MEMORY`]), and
+    /// then the true number is at least `dropped`, never less.
+    pub dropped_exact: bool,
+    /// Main-ring lines evicted over the whole life of the process.
     pub dropped_total: u64,
-    /// Oldest and newest seq the ring still holds (`newest` is 0 when empty).
+    /// Quiet-ring lines aged out over the whole life of the process — the
+    /// polling that was recorded and has since been let go, by design.
+    pub dropped_quiet_total: u64,
+    /// The oldest seq held in EITHER ring (the next seq to be assigned when
+    /// both are empty), so `since = oldest - 1` still means "everything you
+    /// have". Unlike v0.3.0 it is no longer `dropped + 1` for a fresh client:
+    /// the seqs below it include quiet lines, which `dropped` does not count.
     pub oldest: u64,
+    /// The highest seq ever assigned, in either ring (0 before the first
+    /// line). This is the one-seq-space high-water mark a cursor is compared
+    /// against, so it has to cover both: a cursor that rests on a quiet line
+    /// must not look like a cursor from the future.
     pub newest: u64,
-    /// The ring holds lines past this page's `cursor` — the page stopped on
+    /// The rings hold lines past this page's `cursor` — the page stopped on
     /// `limit` or on [`MAX_PAGE_BYTES`], not because it ran out.
     ///
     /// Always derivable from `cursor < newest`, and sent anyway: a reader
@@ -378,23 +569,28 @@ impl Page {
             "lines": self.lines.iter().map(LogLine::to_json).collect::<Vec<_>>(),
             "cursor": self.cursor,
             "dropped": self.dropped,
+            "dropped_exact": self.dropped_exact,
             "dropped_total": self.dropped_total,
+            "dropped_quiet_total": self.dropped_quiet_total,
             "oldest": self.oldest,
             "newest": self.newest,
+            // The MAIN ring's, as in v0.3.0 — the ring `dropped` is about.
             "capacity": MAX_LINES,
+            "quiet_capacity": QUIET_LINES,
             "more": self.more,
         })
     }
 }
 
-/// Read a page out of the ring.
+/// Read a page out of the rings.
 ///
 /// Deliberately cheap enough to poll once a second forever: one mutex
-/// acquisition, a binary search over a monotonic seq column, and at most
-/// `limit` string clones — and never more than [`MAX_PAGE_BYTES`] of them,
-/// which is what bounds the cost of one anonymous request on a public
-/// endpoint. Nothing here touches the disk, the device, or the model slot, so
-/// a client hammering `/api/logs` cannot stall a generation.
+/// acquisition, a binary search into each of the two seq-ordered rings, and
+/// one merge walk over them that clones at most `limit` lines — and never
+/// more than [`MAX_PAGE_BYTES`] of them, which is what bounds the cost of one
+/// anonymous request on a public endpoint. Nothing here touches the disk,
+/// the device, or the model slot, so a client hammering `/api/logs` cannot
+/// stall a generation.
 #[must_use]
 pub fn query(q: &Query) -> Page {
     read(&ring(), q)
@@ -405,7 +601,7 @@ pub fn query(q: &Query) -> Page {
 /// are testable without a process-wide singleton the tests would race on.
 fn read(ring: &Ring, q: &Query) -> Page {
     let newest = ring.next_seq.saturating_sub(1);
-    let oldest = ring.lines.front().map_or(ring.next_seq, |l| l.seq);
+    let oldest = ring.oldest();
     // A cursor from a previous process (or a client that invented one) would
     // otherwise park forever waiting for seqs this process will never reach.
     //
@@ -429,21 +625,18 @@ fn read(ring: &Ring, q: &Query) -> Page {
     // answer. The gap that IS real is measured from the start of this process:
     // the lines it printed and evicted before this client ever asked, which it
     // will never see. Reporting them lets the page draw a break instead of
-    // splicing a restart onto an overrun.
-    let dropped = if resynced {
-        oldest.saturating_sub(1)
+    // splicing a restart onto an overrun. Main-ring lines only, as everywhere.
+    let (dropped, dropped_exact) = if resynced {
+        (ring.dropped_total, true)
     } else {
-        oldest.saturating_sub(1).saturating_sub(since)
+        ring.dropped_after(since)
     };
 
-    // `lines` is ordered by seq, so the first line to return is a partition
-    // point rather than a scan.
-    let start = ring.lines.partition_point(|l| l.seq <= since);
     let mut lines = Vec::new();
     let mut cursor = since;
     let mut stopped_early = false;
     let mut bytes = 0usize;
-    for line in ring.lines.iter().skip(start) {
+    for line in ring.after(since) {
         if q.source.is_some_and(|want| want != line.source) {
             cursor = line.seq; // skipped, but the client has still seen past it
             continue;
@@ -472,7 +665,9 @@ fn read(ring: &Ring, q: &Query) -> Page {
         lines,
         cursor,
         dropped,
+        dropped_exact,
         dropped_total: ring.dropped_total,
+        dropped_quiet_total: ring.dropped_quiet_total,
         oldest,
         newest,
         more: cursor < newest,
@@ -590,17 +785,55 @@ pub async fn record_shim(req: Request, next: Next) -> Response {
 /// The feed's own poll. Recording it would make the ring mostly a record of
 /// the page reading the ring — one line a second, evicting in half an hour the
 /// cold-load progress the page exists to show.
+///
+/// Not recorded even as [quiet](LogLine::quiet), now that quiet lines have a
+/// ring of their own: one open tab would cycle that ring in about eight
+/// minutes, and push out the probe history it is there to keep.
 fn ignored(source: Source, path: &str) -> bool {
     source == Source::Api && path == "/api/logs"
 }
 
-/// Traffic that is *someone else's* heartbeat: Docker's 30 s health probe, and
-/// the endpoints ollama clients poll to populate a model picker. Kept in the
-/// ring (whether the health check still passes is a real question) but marked
-/// quiet so the page can fold it away.
-fn quiet_path(source: Source, path: &str) -> bool {
+/// Is this request *someone else's* heartbeat — [quiet](LogLine::quiet)?
+///
+/// **The rule: a SUCCESSFUL, idempotent read of a page or a listing is
+/// quiet. Everything else is loud.** Concretely, all three must hold:
+///
+/// - the method is `GET` or `HEAD` — any `POST` does work, and is loud;
+/// - the path is one of the pages and listings things poll on a timer
+///   ([`polled_path`]) — which leaves out the WebSocket upgrade, the one GET
+///   here that starts a generation;
+/// - the status is 2xx or 3xx.
+///
+/// The status clause is what keeps the public listeners legible. Scanners
+/// probe the shim for `/.env`, `/v1/.env`, `/.git/config` and friends and
+/// get a 404, and the owner should see that on the page without ticking a
+/// box; so should a monitor whose listing starts answering 500. A poll is
+/// only routine while it keeps succeeding.
+///
+/// Why the path list is what it is: measured on the live server, the traffic
+/// that filled v0.3.0's ring was Docker's 30 s health probe and an ollama
+/// client polling the shim's `/` (both already quiet), plus a Glance
+/// dashboard monitor on `GET /` and a Kestra flow on `GET /api/models`, once
+/// a minute each — reads of the same page and listing a person opens, which
+/// is why the whole set is quiet rather than just those two.
+fn quiet_request(source: Source, method: &Method, path: &str, status: u16) -> bool {
+    let read = method == Method::GET || method == Method::HEAD;
+    let succeeded = (200..400).contains(&status);
+    read && succeeded && polled_path(source, path)
+}
+
+/// The pages and listings — the only paths [`quiet_request`] can call quiet.
+///
+/// On the API listener: the chat page (`/` and its `/index.html` alias),
+/// the logs page, the model listing, the health probe and the favicon a
+/// browser or a dashboard asks for beside a page. On the shim: the four
+/// reads an ollama client polls to fill a model picker.
+fn polled_path(source: Source, path: &str) -> bool {
     match source {
-        Source::Api => path == "/api/health",
+        Source::Api => matches!(
+            path,
+            "/" | "/index.html" | "/logs" | "/api/models" | "/api/health" | "/favicon.ico"
+        ),
         Source::Shim => matches!(path, "/" | "/api/version" | "/api/tags" | "/api/ps"),
         Source::Server => false,
     }
@@ -724,7 +957,6 @@ async fn observe(source: Source, req: Request, next: Next) -> Response {
         return next.run(req).await;
     }
     let method = req.method().clone();
-    let quiet = quiet_path(source, &raw_path);
     // Route decisions read the real path; only the *printed* copy is folded.
     let starts = announces_start(&method, &raw_path);
     let path = sanitize(&raw_path);
@@ -744,10 +976,14 @@ async fn observe(source: Source, req: Request, next: Next) -> Response {
         // needs to see, so the line goes out when the head arrives. The model
         // name is not known yet; it is attached to the completion line, which
         // is the one that can carry it.
+        //
+        // Never quiet: a request that announces itself is one that does work
+        // (a POST, the WebSocket upgrade), and no such request is a poll —
+        // `quiet_request` could not say otherwise even with the status in hand.
         record(
             source,
             Some(Level::Info),
-            quiet,
+            false,
             format!("{method} {path} → started"),
         );
     }
@@ -759,6 +995,10 @@ async fn observe(source: Source, req: Request, next: Next) -> Response {
     let response = next.run(req).await;
     let ms = started.elapsed().as_millis();
     let status = response.status().as_u16();
+    // Decided here, with the status in hand, not on arrival: the same poll is
+    // routine while it succeeds and exactly what the owner needs to see the
+    // moment it does not.
+    let quiet = quiet_request(source, &method, &raw_path, status);
     let streaming = is_streaming(&response);
     let bytes = response_bytes(&response).map_or_else(String::new, |n| format!(" {n} B"));
     // For a streamed response this is time-to-first-byte, not the whole
@@ -879,11 +1119,11 @@ pub fn install() {
         // nothing works.
         let text = if capture::install() {
             format!(
-                "[mummu-serve] logs: capturing stdout/stderr into a {MAX_LINES}-line ring — GET /logs"
+                "[mummu-serve] logs: capturing stdout/stderr into a {MAX_LINES}-line ring (+{QUIET_LINES} for health/poll traffic) — GET /logs"
             )
         } else {
             format!(
-                "[mummu-serve] logs: request entries only — this platform has no stdout/stderr capture, so the `server` source stays empty and the process's own prints go to the console; {MAX_LINES}-line ring — GET /logs"
+                "[mummu-serve] logs: request entries only — this platform has no stdout/stderr capture, so the `server` source stays empty and the process's own prints go to the console; {MAX_LINES}-line ring (+{QUIET_LINES} for health/poll traffic) — GET /logs"
             )
         };
         push(Source::Server, text);
@@ -1098,6 +1338,34 @@ mod tests {
 
     fn texts(page: &Page) -> Vec<&str> {
         page.lines.iter().map(|l| l.text.as_str()).collect()
+    }
+
+    fn seqs(page: &Page) -> Vec<u64> {
+        page.lines.iter().map(|l| l.seq).collect()
+    }
+
+    /// A main-ring line: server output, or a request that did something.
+    fn loud(ring: &mut Ring, source: Source, text: &str) {
+        ring.record(line(source, None, false, text.to_owned()));
+    }
+
+    /// A quiet-ring line: a poll, exactly as the middleware records one.
+    fn poll(ring: &mut Ring, text: &str) {
+        ring.record(line(Source::Api, Some(Level::Info), true, text.to_owned()));
+    }
+
+    /// A deterministic, irregular traffic mix (xorshift64), so the merge and
+    /// the gap count are exercised on interleavings no hand-written pattern
+    /// would think of — and the same ones on every run.
+    struct Mix(u64);
+
+    impl Mix {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
     }
 
     // -- level classification ---------------------------------------------
@@ -1420,6 +1688,366 @@ mod tests {
         );
     }
 
+    // -- the two rings -------------------------------------------------------
+    //
+    // The first two tests are the regression guards for the defect v0.3.1
+    // exists for, and they read only what v0.3.0's `Page` already had
+    // (`lines`, `dropped`, `cursor`, `dropped_total`) — no `dropped_exact`,
+    // no quiet totals. That is deliberate: pasted into v0.3.0's module (with
+    // `QUIET_LINES` defined as the number it is) they compile, and they FAIL.
+    // A guard that cannot fail against the code it guards against is not
+    // guarding anything.
+
+    /// The defect, as a test. v0.3.0 flagged polls quiet but kept them in the
+    /// one ring, and on the live server they evicted a cold load within six
+    /// hours. Forty quiet rings' worth of probes later — ten of v0.3.0's whole
+    /// ring — the load line and the request that caused it must still be
+    /// readable, and nothing may be reported missing in front of them.
+    #[test]
+    fn server_lines_survive_any_amount_of_quiet_traffic() {
+        let mut ring = Ring::new();
+        let load = "[mummu] load: 851/851 tensors — 14.46 GiB off the pack in 121s (122 MB/s)";
+        let chat = "POST /api/chat 200 121034 ms streaming model=qwen3.6-27b";
+        loud(&mut ring, Source::Server, load);
+        loud(&mut ring, Source::Api, chat);
+        for i in 0..QUIET_LINES * 40 {
+            poll(&mut ring, &format!("GET /api/health 200 {i} ms"));
+        }
+
+        let all = page(&ring, 0, MAX_LIMIT, None);
+        let kept: Vec<&str> = all
+            .lines
+            .iter()
+            .filter(|l| !l.quiet)
+            .map(|l| l.text.as_str())
+            .collect();
+        assert_eq!(kept, [load, chat], "both main-ring lines are still held");
+        assert_eq!(all.dropped, 0, "nothing the reader could see was lost");
+        // And the reader who asks for the server's own output gets the load.
+        let server = page(&ring, 0, MAX_LIMIT, Some(Source::Server));
+        assert_eq!(texts(&server), [load]);
+    }
+
+    /// `dropped` counts MAIN-ring losses and nothing else. The page draws a
+    /// gap marker for it, and quiet lines are hidden by default — so a quiet
+    /// line ageing out of its own ring must never register as a gap.
+    #[test]
+    fn dropped_does_not_count_quiet_evictions() {
+        // Only quiet lines have ever been evicted: no gap, from any cursor.
+        let mut ring = Ring::new();
+        loud(&mut ring, Source::Server, "startup");
+        for i in 0..QUIET_LINES * 4 {
+            poll(&mut ring, &format!("GET /api/health 200 {i} ms"));
+        }
+        for since in [0, 1, 2, 700, ring.next_seq - 2] {
+            assert_eq!(page(&ring, since, 10, None).dropped, 0, "since={since}");
+        }
+
+        // The case a seq-span count gets wrong. The client last saw a server
+        // line; then only polls arrived for a while (and aged out); then
+        // server output overran the main ring — evicting only lines the
+        // client HAD seen. Between its cursor and the main ring's front lie a
+        // thousand seqs, every one a quiet line: nothing it could have missed.
+        let mut ring = Ring::new();
+        for i in 0..10 {
+            loud(&mut ring, Source::Server, &format!("seen {i}"));
+        }
+        let cursor = page(&ring, 0, MAX_LIMIT, None).cursor;
+        for i in 0..QUIET_LINES * 2 {
+            poll(&mut ring, &format!("GET / 200 {i} ms"));
+        }
+        for i in 0..MAX_LINES {
+            loud(&mut ring, Source::Server, &format!("later {i}"));
+        }
+        let front = ring.lines.front().expect("held").seq;
+        assert_eq!(
+            front - 1 - cursor,
+            (QUIET_LINES * 2) as u64,
+            "the naive span"
+        );
+        let p = page(&ring, cursor, MAX_LIMIT, None);
+        assert_eq!(p.dropped, 0, "no marker for a span of aged-out polls");
+        assert_eq!(p.dropped_total, 10, "the ten it evicted were all seen");
+
+        // And when main-ring lines ARE lost, exactly those are counted, not
+        // the polls interleaved with them.
+        let mut ring = Ring::new();
+        loud(&mut ring, Source::Server, "seen");
+        for i in 0..MAX_LINES + 25 {
+            loud(&mut ring, Source::Server, &format!("missed {i}"));
+            poll(&mut ring, "GET /api/health 200 1 ms");
+            poll(&mut ring, "GET /api/models 200 3 ms");
+        }
+        assert_eq!(page(&ring, 1, MAX_LIMIT, None).dropped, 25);
+        assert_eq!(page(&ring, 0, MAX_LIMIT, None).dropped, 26);
+    }
+
+    /// The quiet ring is bounded, keeps the most recent probes, and counts
+    /// what it let go on a total of its own — the part of the first guard's
+    /// story that only v0.3.1's fields can tell.
+    #[test]
+    fn the_quiet_ring_keeps_the_newest_probes_and_counts_the_rest() {
+        let mut ring = Ring::new();
+        loud(&mut ring, Source::Server, "[mummu-serve] listening");
+        let flood = QUIET_LINES * 20 + 7;
+        for i in 0..flood {
+            poll(&mut ring, &format!("GET /api/health 200 {i} ms"));
+        }
+        assert_eq!(ring.quiet.len(), QUIET_LINES, "bounded");
+
+        let all = page(&ring, 0, MAX_LIMIT, None);
+        let quiet: Vec<_> = all.lines.iter().filter(|l| l.quiet).collect();
+        assert_eq!(quiet.len(), QUIET_LINES);
+        assert_eq!(
+            quiet.last().expect("probes held").text,
+            format!("GET /api/health 200 {} ms", flood - 1),
+            "the most recent probe is the one kept — \"when did it last run?\""
+        );
+        assert_eq!(all.dropped_quiet_total, (flood - QUIET_LINES) as u64);
+        assert_eq!(all.dropped_total, 0, "the main ring lost nothing");
+        assert!(all.dropped_exact);
+        assert_eq!(all.newest, (flood + 1) as u64, "one seq space for both");
+    }
+
+    /// Paged through in small pieces, the merged read is every held line of
+    /// both rings, each exactly once, in strictly increasing seq — on an
+    /// irregular mix where both rings have evicted at their own rates. And it
+    /// is NOT contiguous, which is exactly why nothing may treat a seq jump
+    /// as a gap.
+    #[test]
+    fn the_merged_read_is_in_seq_order_across_both_rings() {
+        let mut ring = Ring::new();
+        let mut mix = Mix(0x5eed_1234_abcd_0001);
+        for i in 0..(MAX_LINES + QUIET_LINES) * 4 {
+            if mix.next().is_multiple_of(3) {
+                loud(&mut ring, Source::Server, &format!("server {i}"));
+            } else {
+                poll(&mut ring, &format!("GET /api/health 200 {i} ms"));
+            }
+        }
+        assert!(ring.dropped_total > 0 && ring.dropped_quiet_total > 0);
+
+        let mut held: Vec<u64> = ring
+            .lines
+            .iter()
+            .chain(&ring.quiet)
+            .map(|l| l.seq)
+            .collect();
+        held.sort_unstable();
+        let (mut cursor, mut seen, mut guard) = (0, Vec::new(), 0);
+        loop {
+            guard += 1;
+            assert!(guard < 1000, "paging must terminate");
+            let next = page(&ring, cursor, 97, None);
+            seen.extend(seqs(&next));
+            cursor = next.cursor;
+            if !next.more {
+                break;
+            }
+        }
+        assert!(
+            seen.windows(2).all(|w| w[0] < w[1]),
+            "strictly increasing seq"
+        );
+        assert_eq!(seen, held, "every held line of both rings, once");
+        assert!(
+            seen.windows(2).any(|w| w[1] > w[0] + 1),
+            "a merged read has holes where quiet lines aged out — holes, not gaps"
+        );
+
+        // A source filter over the merge keeps the order, and keeps the quiet
+        // lines of its own source.
+        let api = page(&ring, 0, MAX_LIMIT, Some(Source::Api));
+        assert!(api.lines.iter().all(|l| l.source == Source::Api && l.quiet));
+        assert!(seqs(&api).windows(2).all(|w| w[0] < w[1]));
+    }
+
+    /// A client that polls with `since=<cursor>` — both embedded pages, and
+    /// anything written against v0.3.0 — sees what it always saw: every new
+    /// line exactly once, loud or quiet, in order, with the cursor landing on
+    /// `newest` and no gap reported. Run long enough that BOTH rings evict
+    /// many times over underneath it, because that is production: a poller
+    /// that keeps up must never be told it missed anything.
+    #[test]
+    fn a_polling_cursor_sees_every_line_once_across_both_rings() {
+        let mut ring = Ring::new();
+        let (mut cursor, mut seen, mut round) = (0, Vec::new(), 0u64);
+        while ring.next_seq < ((MAX_LINES + QUIET_LINES) * 3) as u64 {
+            round += 1;
+            for i in 0..=round % 7 {
+                if (round + i) % 3 == 0 {
+                    loud(&mut ring, Source::Server, &format!("server {round}.{i}"));
+                } else {
+                    poll(&mut ring, &format!("GET / 200 {round}.{i} ms"));
+                }
+            }
+            let next = page(&ring, cursor, MAX_LIMIT, None);
+            assert!(next.lines.iter().all(|l| l.seq > cursor));
+            assert_eq!(next.cursor, next.newest);
+            assert!(!next.more);
+            assert_eq!(next.dropped, 0, "round {round}");
+            seen.extend(seqs(&next));
+            cursor = next.cursor;
+        }
+        assert!(
+            ring.dropped_total > 0 && ring.dropped_quiet_total > 0,
+            "both rings evicted under the poller"
+        );
+        let every: Vec<u64> = (1..ring.next_seq).collect();
+        assert_eq!(seen, every, "every line, once, in order");
+
+        // A cursor resting on a quiet line that has since aged out of its
+        // ring is still a cursor in THIS process — not a restart, not a gap.
+        poll(&mut ring, "GET /api/health 200 1 ms");
+        let rest = page(&ring, cursor, MAX_LIMIT, None).cursor;
+        for i in 0..QUIET_LINES * 2 {
+            poll(&mut ring, &format!("GET /api/models 200 {i} ms"));
+        }
+        let back = page(&ring, rest, MAX_LIMIT, None);
+        assert!(back.cursor > rest, "carried forward, not re-synced");
+        assert_eq!(back.dropped, 0, "only quiet lines went, so no gap");
+        assert_eq!(back.lines.len(), QUIET_LINES);
+    }
+
+    /// A restart under a page that kept its cursor: the new process's whole
+    /// startup — server lines AND the probes that arrived during it — is
+    /// replayed from both rings, in order, and the gap reported is main-ring
+    /// losses only.
+    #[test]
+    fn a_since_in_the_future_replays_both_rings() {
+        let mut ring = Ring::new();
+        loud(&mut ring, Source::Server, "[mummu-serve] logs: capturing");
+        poll(&mut ring, "GET /api/health 200 2 ms");
+        loud(&mut ring, Source::Server, "[mummu-serve] listening");
+        poll(&mut ring, "GET /api/health 200 1 ms");
+        let stale = page(&ring, 12_345, MAX_LIMIT, None);
+        assert_eq!(
+            texts(&stale),
+            [
+                "[mummu-serve] logs: capturing",
+                "GET /api/health 200 2 ms",
+                "[mummu-serve] listening",
+                "GET /api/health 200 1 ms",
+            ]
+        );
+        assert_eq!(
+            stale.cursor, stale.newest,
+            "lower than sent: the re-sync signal"
+        );
+        assert_eq!(stale.dropped, 0);
+
+        // The same restart against a process that has overrun both rings.
+        let mut ring = Ring::new();
+        for i in 0..MAX_LINES + 10 {
+            loud(&mut ring, Source::Server, &format!("restarted {i}"));
+        }
+        for i in 0..QUIET_LINES + 99 {
+            poll(&mut ring, &format!("GET /api/health 200 {i} ms"));
+        }
+        let stale = page(&ring, u64::MAX, MAX_LIMIT, None);
+        assert_eq!(stale.dropped, 10, "main-ring losses only");
+        assert!(stale.dropped_exact);
+        assert_eq!(stale.dropped_quiet_total, 99);
+        assert_eq!(
+            stale.lines[0].seq, stale.oldest,
+            "replayed from the oldest held"
+        );
+        assert_eq!(stale.lines[0].text, "restarted 10");
+        assert!(
+            stale.more,
+            "2000 + 500 held lines is two pages at limit 2000"
+        );
+    }
+
+    /// `dropped` against a brute-force count, from every cursor position, on
+    /// an irregular mix long enough to overrun the eviction memory — so both
+    /// the exact path and the floor path run. Exact means equal; a floor
+    /// must never exceed the truth and never hide a real gap.
+    #[test]
+    fn dropped_matches_a_brute_force_count_or_says_it_is_a_floor() {
+        let mut ring = Ring::new();
+        let mut main_seqs = Vec::new();
+        let mut mix = Mix(0x0bad_cafe_f00d_0042);
+        for i in 0..(MAX_LINES + EVICTION_MEMORY) * 4 {
+            if mix.next().is_multiple_of(3) {
+                loud(&mut ring, Source::Server, &format!("server {i}"));
+                main_seqs.push(ring.next_seq - 1);
+            } else {
+                poll(&mut ring, "GET /api/health 200 1 ms");
+            }
+        }
+        assert!(
+            ring.dropped_total > EVICTION_MEMORY as u64,
+            "the mix must overrun the eviction memory for the floor path to run"
+        );
+        let front = ring.lines.front().expect("held").seq;
+        let (mut exact, mut floors) = (0, 0);
+        for since in (0..ring.next_seq + 5)
+            .step_by(7)
+            .chain([0, 1, front - 1, front])
+        {
+            if since >= ring.next_seq {
+                continue; // a re-sync, covered by its own test
+            }
+            let truth = main_seqs
+                .iter()
+                .filter(|&&s| s > since && s < front)
+                .count() as u64;
+            let p = page(&ring, since, 1, None);
+            if p.dropped_exact {
+                assert_eq!(p.dropped, truth, "since={since}");
+                exact += 1;
+            } else {
+                assert!(
+                    p.dropped <= truth,
+                    "a floor above the truth at since={since}"
+                );
+                assert!(
+                    p.dropped > 0,
+                    "a real gap reported as none at since={since}"
+                );
+                floors += 1;
+            }
+        }
+        assert!(exact > 0 && floors > 0, "exact {exact}, floors {floors}");
+    }
+
+    /// Everything a client written against v0.3.0 reads is still there, with
+    /// the same type and — for `capacity` — the same meaning: the ring that
+    /// `dropped` is about. What v0.3.1 has to add, it adds beside them.
+    #[test]
+    fn the_response_keeps_every_field_a_v030_client_reads() {
+        let mut ring = Ring::new();
+        loud(&mut ring, Source::Server, "startup");
+        poll(&mut ring, "GET /api/health 200 1 ms");
+        let body = page(&ring, 0, MAX_LIMIT, None).to_json();
+        for key in [
+            "cursor",
+            "dropped",
+            "dropped_total",
+            "oldest",
+            "newest",
+            "capacity",
+        ] {
+            assert!(body[key].is_u64(), "{key} is still a number: {body}");
+        }
+        assert!(body["more"].is_boolean());
+        assert_eq!(body["capacity"], json!(MAX_LINES), "the main ring's");
+        let lines = body["lines"].as_array().expect("lines is still an array");
+        assert_eq!(lines.len(), 2, "quiet lines are still in the same list");
+        for key in ["seq", "ts"] {
+            assert!(lines[1][key].is_u64(), "line.{key}");
+        }
+        for key in ["level", "source", "text"] {
+            assert!(lines[1][key].is_string(), "line.{key}");
+        }
+        assert_eq!(lines[1]["quiet"], json!(true));
+        // Added, never substituted.
+        assert_eq!(body["quiet_capacity"], json!(QUIET_LINES));
+        assert_eq!(body["dropped_quiet_total"], json!(0));
+        assert_eq!(body["dropped_exact"], json!(true));
+    }
+
     #[test]
     fn an_over_long_push_is_truncated_not_dropped() {
         let ring = ring_of(&[(Source::Server, &"x".repeat(MAX_LINE_BYTES * 3))]);
@@ -1625,19 +2253,92 @@ mod tests {
     // -- request-line helpers ---------------------------------------------
 
     #[test]
-    fn the_pages_own_polling_is_not_recorded_but_health_is_merely_quiet() {
+    fn the_pages_own_polling_is_not_recorded_at_all() {
         assert!(
             ignored(Source::Api, "/api/logs"),
             "recording the feed's own poll would evict the feed"
         );
-        assert!(!ignored(Source::Api, "/api/health"));
+        assert!(
+            !ignored(Source::Api, "/api/health"),
+            "health is recorded — quiet, not ignored"
+        );
         assert!(
             !ignored(Source::Shim, "/api/logs"),
             "the shim has no such route; nothing to suppress"
         );
-        assert!(quiet_path(Source::Api, "/api/health"));
-        assert!(quiet_path(Source::Shim, "/api/tags"));
-        assert!(!quiet_path(Source::Api, "/api/chat"));
+    }
+
+    /// The rule, as a table: a SUCCESSFUL, idempotent read of a page or a
+    /// listing is quiet; any POST, the WebSocket upgrade and every non-2xx/3xx
+    /// answer is loud. The first rows are the traffic measured on the live
+    /// server six hours after v0.3.0 shipped; the 404 rows are the scanners
+    /// that were probing the public shim in the same window.
+    #[test]
+    fn a_successful_read_of_a_page_or_listing_is_quiet_and_nothing_else_is() {
+        use Source::{Api, Server, Shim};
+        let (get, head, post) = (Method::GET, Method::HEAD, Method::POST);
+        let delete = Method::DELETE;
+        #[rustfmt::skip]
+        let table: &[(Source, &Method, &str, u16, bool, &str)] = &[
+            // What filled v0.3.0's ring, one row per poller.
+            (Api,  &get,  "/api/health",   200, true,  "Docker's 30 s health probe"),
+            (Shim, &get,  "/",             200, true,  "an ollama client polling the shim"),
+            (Api,  &get,  "/",             200, true,  "a Glance monitor, once a minute — was loud"),
+            (Api,  &get,  "/api/models",   200, true,  "a Kestra flow, once a minute — was loud"),
+            // The rest of the pages and listings, and HEAD for any of them.
+            (Api,  &head, "/",             200, true,  "HEAD is the same read"),
+            (Api,  &get,  "/index.html",   200, true,  "the same page as /"),
+            (Api,  &get,  "/logs",         200, true,  "the logs page"),
+            (Api,  &head, "/logs",         200, true,  "HEAD of the logs page"),
+            (Api,  &head, "/api/models",   200, true,  "HEAD of the listing"),
+            (Api,  &get,  "/favicon.ico",  204, true,  "the icon a tab or a dashboard asks for"),
+            (Api,  &get,  "/",             304, true,  "a 3xx is still a success"),
+            (Shim, &get,  "/api/version",  200, true,  "ollama client"),
+            (Shim, &get,  "/api/tags",     200, true,  "ollama model picker"),
+            (Shim, &get,  "/api/ps",       200, true,  "ollama model picker"),
+            (Shim, &head, "/",             200, true,  "HEAD of the shim's root"),
+            // Anything that does work is loud, however routine.
+            (Api,  &post, "/api/chat",     200, false, "a generation"),
+            (Api,  &get,  "/api/chat/ws",  101, false, "the upgrade that starts a generation"),
+            (Api,  &post, "/api/pull",     200, false, "a download"),
+            (Api,  &post, "/api/unload",   200, false, "frees the model"),
+            (Shim, &post, "/",             200, false, "the POST / seen on the public shim"),
+            (Shim, &post, "/api/chat",     200, false, "a generation"),
+            (Shim, &post, "/api/generate", 200, false, "a generation"),
+            (Shim, &post, "/api/show",     200, false, "a POST, even one that only reads"),
+            (Shim, &delete, "/api/delete", 200, false, "deletes a model"),
+            (Api,  &post, "/api/models",   404, false, "the path alone does not make a poll"),
+            // Every failure is loud, whatever the path.
+            (Shim, &get,  "/.env",         404, false, "a scanner"),
+            (Shim, &get,  "/v1/.env",      404, false, "a scanner"),
+            (Shim, &get,  "/.git/config",  404, false, "a scanner"),
+            (Shim, &get,  "/.env.backup",  404, false, "a scanner"),
+            (Api,  &get,  "/favicon.ico",  404, false, "what v0.3.0 answered — a 404 is a 404"),
+            (Api,  &get,  "/api/models",   500, false, "a listing that starts failing"),
+            (Api,  &get,  "/api/health",   503, false, "the rule binds the probe too"),
+            (Shim, &get,  "/api/tags",     400, false, "a 4xx on a polled path"),
+            // A read that is not a polled page or listing stays loud.
+            (Api,  &get,  "/api/profile",  200, false, "a flame graph someone asked for"),
+            (Api,  &get,  "/api/tags",     404, false, "a shim path on the API listener"),
+            (Shim, &get,  "/logs",         404, false, "the shim has no logs page"),
+            (Server, &get, "/",            200, false, "captured output is never a request"),
+        ];
+        for (source, method, path, status, want, why) in table {
+            assert_eq!(
+                quiet_request(*source, method, path, *status),
+                *want,
+                "{} {method} {path} {status} ({why})",
+                source.as_str()
+            );
+            // The arrival line is recorded loud unconditionally; that is only
+            // right while no request that announces itself can ever be quiet.
+            if announces_start(method, path) {
+                assert!(
+                    !quiet_request(*source, method, path, 200),
+                    "{method} {path} announces itself, so it must be loud"
+                );
+            }
+        }
     }
 
     /// The status code is not a guess, and `classify` would miss every one of
