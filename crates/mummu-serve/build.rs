@@ -13,39 +13,55 @@
 //!
 //! It runs in contexts where there is no git and no `.git` at all: a Docker
 //! build that `COPY`s the sources in, a `cargo package` tarball, a vendored
-//! source tree. In every one of those the right answer is the string
-//! `unknown`, printed into the binary, and an exit status of zero. So nothing
-//! here returns an error, unwraps, or looks at git's exit code as anything but
-//! a hint — a build that fell over because it could not name itself would be
-//! a strictly worse outcome than a build that does not know its own sha.
+//! source tree. In every one of those the right answer is a sha handed in
+//! through `MUMMU_BUILD_SHA` — or, failing that, the string `unknown` — and an
+//! exit status of zero. So nothing here returns an error, unwraps, or looks at
+//! git's exit code as anything but a hint: a build that fell over because it
+//! could not name itself would be a strictly worse outcome than a build that
+//! does not know its own sha.
+//!
+//! The rules themselves live in `src/build_sha.rs`, which the crate also
+//! compiles under `cfg(test)`. Nothing `cargo test` runs executes a build
+//! script, so anything decided here and only here is decided untested.
 
+use std::path::Path;
 use std::process::Command;
 
+#[path = "src/build_sha.rs"]
+mod build_sha;
+
 fn main() {
-    // Without this, cargo re-runs the script on every change to the crate,
-    // which is harmless but noisy; with the HEAD watches below it re-runs
-    // exactly when the sha could have changed.
+    // Without these, cargo re-runs the script on every change to the crate,
+    // which is harmless but noisy; with the watches below it re-runs exactly
+    // when the sha could have changed.
     println!("cargo:rerun-if-changed=build.rs");
-    watch_head();
-    println!("cargo:rustc-env=MUMMU_BUILD_SHA={}", short_sha());
+    // The escape hatch is itself an input: a deploy that passes a new sha must
+    // re-stamp the binary even though not one source byte moved.
+    println!("cargo:rerun-if-env-changed=MUMMU_BUILD_SHA");
+    watch();
+    println!("cargo:rustc-env=MUMMU_BUILD_SHA={}", resolve());
 }
 
-/// The short sha, or `unknown`. Also marks a dirty tree, because a build made
-/// from uncommitted changes is not the commit it claims to be — and "the sha
-/// matches but the behaviour does not" is the single most confusing way for
-/// this field to mislead someone.
-fn short_sha() -> String {
-    let Some(sha) = git(&["rev-parse", "--short=7", "HEAD"]) else {
-        return "unknown".to_owned();
-    };
+/// Gather [`build_sha::stamp`]'s three inputs from the environment and git.
+fn resolve() -> String {
+    let env = std::env::var("MUMMU_BUILD_SHA").ok();
+    // Asked first so a preset costs no git at all. That is not a micro
+    // optimization: the dirty check below stats every file in the working
+    // tree, and the environment this exists for — the Docker build — has no
+    // working tree and no git binary to run against it.
+    if build_sha::preset(env.as_deref()).is_some() {
+        return build_sha::stamp(env.as_deref(), None, false);
+    }
+    let sha = git(&["rev-parse", "--short=7", "HEAD"]);
     // `--quiet` makes this exit non-zero when there is anything staged or
     // modified; an empty diff exits zero. A repository too broken to answer
     // is treated as clean rather than smeared with a misleading marker.
-    let dirty = Command::new("git")
-        .args(["diff", "--quiet", "HEAD"])
-        .status()
-        .is_ok_and(|s| !s.success());
-    if dirty { format!("{sha}-dirty") } else { sha }
+    let dirty = sha.is_some()
+        && Command::new("git")
+            .args(["diff", "--quiet", "HEAD"])
+            .status()
+            .is_ok_and(|s| !s.success());
+    build_sha::stamp(None, sha.as_deref(), dirty)
 }
 
 /// Run git, returning trimmed stdout only when it actually succeeded.
@@ -62,27 +78,35 @@ fn git(args: &[&str]) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-/// Re-run when HEAD moves.
+/// Declare everything whose change can change the stamp.
 ///
-/// `git rev-parse --git-path HEAD` rather than a hardcoded `../../.git/HEAD`,
-/// because this crate is routinely built from a **worktree**, where `.git` is
-/// a file pointing elsewhere and the real HEAD lives under the main
-/// repository's `worktrees/` directory. Asking git where its own files are is
-/// the only way to watch the right ones.
-fn watch_head() {
-    for path in ["HEAD", "ORIG_HEAD"] {
-        if let Some(p) = git(&["rev-parse", "--git-path", path])
-            && std::path::Path::new(&p).exists()
+/// Paths are resolved with `git rev-parse --git-path` rather than hardcoded
+/// as `../../.git/...`, because this crate is routinely built from a
+/// **worktree**, where `.git` is a file pointing elsewhere and HEAD and the
+/// index live under the main repository's `worktrees/` directory while
+/// `packed-refs` and the refs themselves stay in the common one. Asking git
+/// where its own files are is the only way to watch the right ones.
+///
+/// Every path is checked for existence first. Cargo treats a declared path
+/// that is not there as a reason to re-run forever, and `ORIG_HEAD` (and a
+/// packed branch ref) genuinely may not exist.
+fn watch() {
+    let head = git(&["symbolic-ref", "--quiet", "HEAD"]);
+    for name in build_sha::git_watches(head.as_deref()) {
+        if let Some(p) = git(&["rev-parse", "--git-path", &name])
+            && Path::new(&p).exists()
         {
             println!("cargo:rerun-if-changed={p}");
         }
     }
-    // A detached HEAD names a sha directly; an attached one names a ref whose
-    // file is what actually changes on a commit.
-    if let Some(r) = git(&["symbolic-ref", "--quiet", "HEAD"])
-        && let Some(p) = git(&["rev-parse", "--git-path", &r])
-        && std::path::Path::new(&p).exists()
-    {
-        println!("cargo:rerun-if-changed={p}");
+    // And the working tree, which is where dirtiness lives and which nothing
+    // under `.git` reflects — see `build_sha::tree_watches`.
+    if let Some(top) = git(&["rev-parse", "--show-toplevel"]) {
+        for rel in build_sha::tree_watches() {
+            let p = Path::new(&top).join(rel);
+            if p.exists() {
+                println!("cargo:rerun-if-changed={}", p.display());
+            }
+        }
     }
 }

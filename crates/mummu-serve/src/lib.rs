@@ -33,10 +33,28 @@
 //! `MUMMU_BACKEND` / `MUMMU_FORCE_CPU` / fit-planner variables stay where
 //! they were, read at the point of use.
 
+/// How a build names itself. Compiled here only for the tests: `build.rs`
+/// includes the same file with `#[path]` and is the thing that calls it, and
+/// a build script is not a test target — so without this the stamp rules
+/// would be the one part of the release nothing checks.
+#[cfg(test)]
+mod build_sha;
 mod engine;
 pub mod logs;
 mod shim;
 pub mod status;
+
+/// `mummu::progress` is process-wide state and `cargo test` runs this crate's
+/// tests in parallel threads of one process, so every test that WRITES it —
+/// in any module of this crate — takes this first. Reading it under the lock
+/// is what makes an assertion about the phase mean anything.
+#[cfg(test)]
+pub(crate) static PROGRESS_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn progress_serial() -> std::sync::MutexGuard<'static, ()> {
+    PROGRESS_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 use std::convert::Infallible;
 use std::future::Future;

@@ -18,6 +18,23 @@
 //! and hands every caller in that second the same numbers. Ten tabs at 1 Hz
 //! cost one `/proc` read and one NVML call per second between them, not
 //! twenty.
+//!
+//! # The two sources are cached differently, because they fail differently
+//!
+//! `/proc` is a kernel interface that answers or does not; a read of
+//! `meminfo` cannot park for seconds. So [`host_sample`] is an ordinary
+//! time-to-live cache and holds its lock across the read.
+//!
+//! NVML is a call into the **NVIDIA driver**, and it takes a driver-wide lock
+//! to make it. On a wedged card `nvmlDeviceGetMemoryInfo` blocks — for
+//! seconds, for as long as the reset takes, sometimes until the module is
+//! reloaded. Sampling that under a shared mutex put every `/api/logs` poll
+//! from every tab in a queue behind one hung FFI call, which breaks the one
+//! page that has to keep answering precisely when the GPU is dead: `/logs` is
+//! where you go to find out *why* it is dead. So the VRAM reading goes
+//! through [`Stale`], which answers instantly from the last sample and does
+//! the refresh on a thread of its own. A driver that never answers costs a
+//! stale VRAM gauge and one parked thread; it does not cost the endpoint.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -29,8 +46,14 @@ use serde_json::{Value, json};
 /// and v0.2.0 tags, which is exactly why nobody could tell what was deployed.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// The git short sha this binary was built from, or `unknown` where there was
-/// no git to ask (see `build.rs` — that case must not fail a build).
+/// The git short sha this binary was built from, `<sha>-dirty` when it was
+/// built from uncommitted changes, or `unknown` where nothing named it.
+///
+/// Set by `build.rs` from the repository, or — in the Docker build, which has
+/// the sources but deliberately not the repository — from the
+/// `MUMMU_BUILD_SHA` build argument the compose service passes. See
+/// `src/build_sha.rs` for why a passed-in stamp outranks git, and why
+/// `unknown` must remain reachable rather than becoming a build failure.
 pub const BUILD: &str = env!("MUMMU_BUILD_SHA");
 
 /// How long one memory reading stands in for the next.
@@ -144,29 +167,139 @@ pub struct Memory {
     pub vram: Option<mummu::vram::Memory>,
 }
 
-static SAMPLE: Mutex<Option<(Instant, Memory)>> = Mutex::new(None);
-
-/// The current memory reading, resampled at most once per [`SAMPLE_TTL`].
+/// A reading that is always answered from the last sample, and refreshed on a
+/// thread of its own — so no caller ever waits on the source.
 ///
-/// The lock is held across the sampling, deliberately: two clients arriving
-/// together should produce ONE reading, not two racing ones, and the work
-/// under it is two small file reads and two FFI calls — microseconds. The
-/// alternative (sample outside, then store) is the shape that lets ten tabs
-/// each take their own sample and then argue about which one wins.
-#[must_use]
-pub fn memory() -> Memory {
-    let mut slot = SAMPLE.lock().unwrap_or_else(|e| e.into_inner());
+/// # Why a source gets this instead of a plain TTL cache
+///
+/// A TTL cache holds its lock across the sample, which is right when the
+/// source is a file read and wrong when the source can *block*. NVML takes
+/// the driver's lock; on a wedged GPU the call does not return for seconds.
+/// Under a shared mutex that one call becomes the whole endpoint's latency,
+/// for every tab, and `/logs` stops answering at the exact moment it is the
+/// only thing worth looking at.
+///
+/// So: whoever finds the sample stale starts ONE refresh and is handed the
+/// previous reading immediately, as is everyone who arrives while it runs.
+/// The cost of a source that never answers is a gauge that stops moving and
+/// one parked thread — never a stalled request.
+///
+/// A thread rather than a `spawn_blocking`: this is called from the tests too,
+/// where there is no tokio runtime to spawn into, and one thread per stale
+/// poll (so at most one per [`SAMPLE_TTL`], and none at all while nobody is
+/// watching) is cheaper than the one request it would otherwise delay.
+struct Stale<T: Copy + Send + 'static> {
+    state: Mutex<StaleState<T>>,
+}
+
+struct StaleState<T> {
+    sample: Option<(Instant, T)>,
+    /// A refresh is in flight. Single-flight: ten tabs arriving together make
+    /// one call into the driver, not ten.
+    refreshing: bool,
+}
+
+/// Clears [`StaleState::refreshing`] however the refresh ends.
+///
+/// A `Drop` and not a line at the end of the thread body, because a sampler
+/// that panics would otherwise leave the flag set forever and freeze the
+/// reading for the life of the process — the same shape as the NVML resolve
+/// that cached its own failure.
+struct Refreshing<T: Copy + Send + 'static>(&'static Stale<T>);
+
+impl<T: Copy + Send + 'static> Drop for Refreshing<T> {
+    fn drop(&mut self) {
+        self.0.lock().refreshing = false;
+    }
+}
+
+impl<T: Copy + Send + 'static> Stale<T> {
+    const fn new() -> Self {
+        Self {
+            state: Mutex::new(StaleState {
+                sample: None,
+                refreshing: false,
+            }),
+        }
+    }
+
+    /// A poisoned cache still holds a perfectly good reading, and refusing to
+    /// draw a gauge because a *sample* lock was poisoned would be absurd.
+    fn lock(&self) -> std::sync::MutexGuard<'_, StaleState<T>> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The last reading — `None` only until the first refresh lands — kicking
+    /// off a refresh when the one we have is older than `ttl`.
+    ///
+    /// Returns without waiting, always. `name` is what the refresh thread is
+    /// called in a stack dump, which is the whole story when one is wedged.
+    fn get(&'static self, ttl: Duration, name: &'static str, sample: fn() -> T) -> Option<T> {
+        let mut st = self.lock();
+        if let Some((at, v)) = st.sample
+            && at.elapsed() < ttl
+        {
+            return Some(v);
+        }
+        let stale = st.sample.map(|(_, v)| v);
+        if st.refreshing {
+            return stale; // someone is already asking; do not ask again
+        }
+        st.refreshing = true;
+        drop(st);
+        let spawned = std::thread::Builder::new()
+            .name(name.to_owned())
+            .spawn(move || {
+                // Armed BEFORE the call that can block or panic.
+                let _flag = Refreshing(self);
+                let fresh = sample();
+                self.lock().sample = Some((Instant::now(), fresh));
+            });
+        if spawned.is_err() {
+            // Out of threads. Clear the flag by hand or the reading never
+            // refreshes again, which is a worse failure than this one.
+            self.lock().refreshing = false;
+        }
+        stale
+    }
+}
+
+/// The VRAM reading. Stale-served — NVML is the source that can block.
+static VRAM: Stale<Option<mummu::vram::Memory>> = Stale::new();
+
+/// The host reading. An ordinary TTL cache: `/proc` cannot park on a driver.
+static HOST: Mutex<Option<(Instant, Option<HostMemory>)>> = Mutex::new(None);
+
+/// Host memory, resampled at most once per [`SAMPLE_TTL`].
+///
+/// The lock IS held across the two `/proc` reads, deliberately: two clients
+/// arriving together should produce one reading rather than two racing ones,
+/// and the work under it is two small text files — microseconds, with no
+/// driver anywhere near it.
+fn host_sample() -> Option<HostMemory> {
+    let mut slot = HOST.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((at, sample)) = *slot
         && at.elapsed() < SAMPLE_TTL
     {
         return sample;
     }
-    let fresh = Memory {
-        host: host_memory(),
-        vram: mummu::vram::memory(),
-    };
+    let fresh = host_memory();
     *slot = Some((Instant::now(), fresh));
     fresh
+}
+
+/// The current memory reading. Never waits on the GPU driver.
+#[must_use]
+pub fn memory() -> Memory {
+    Memory {
+        host: host_sample(),
+        // `flatten`: the outer `None` is "no sample has landed yet", the
+        // inner one is "nothing on this machine will say". Both render as
+        // "n/a", and neither is a card with no memory in it.
+        vram: VRAM
+            .get(SAMPLE_TTL, "mummu-vram", mummu::vram::memory)
+            .flatten(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -299,6 +432,7 @@ mod tests {
     /// 0% with an ETA of zero.
     #[test]
     fn an_idle_server_reports_no_counts_and_no_eta() {
+        let _serial = crate::progress_serial();
         mummu::progress::idle();
         let s = to_json();
         assert_eq!(s["phase"], json!("idle"));
@@ -338,13 +472,92 @@ mod tests {
     }
 
     /// The cache is the only thing standing between this endpoint and ten
-    /// browser tabs hammering `/proc` and NVML. Two calls inside one TTL must
-    /// be the same reading, byte for byte.
+    /// browser tabs hammering `/proc`. Two calls inside one TTL must be the
+    /// same reading, byte for byte.
     #[test]
-    fn readings_inside_the_ttl_are_the_same_sample() {
-        let a = memory();
-        let b = memory();
+    fn host_readings_inside_the_ttl_are_the_same_sample() {
+        let a = host_sample();
+        let b = host_sample();
         assert_eq!(a, b, "a second poll must not resample");
+    }
+
+    /// The failure `/logs` exists for is a dead GPU, and a dead GPU is
+    /// exactly when NVML stops returning. A caller must be handed the last
+    /// reading and let go — never queued behind the driver.
+    ///
+    /// The sampler here blocks for 400 ms, which is what a wedged
+    /// `nvmlDeviceGetMemoryInfo` does (only for longer). Twenty-one callers
+    /// arrive during it; all twenty-one must return at once, and between them
+    /// they must make ONE call, not twenty-one.
+    #[test]
+    fn a_blocked_source_is_never_waited_on_and_never_asked_twice() {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        static SLOW: Stale<u64> = Stale::new();
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+        fn wedged_driver() -> u64 {
+            std::thread::sleep(Duration::from_millis(400));
+            CALLS.fetch_add(1, Relaxed) + 1
+        }
+        let ttl = Duration::from_millis(50);
+
+        let t = Instant::now();
+        assert_eq!(
+            SLOW.get(ttl, "test-wedged", wedged_driver),
+            None,
+            "nothing sampled yet, and the honest answer is not to wait for one"
+        );
+        for _ in 0..20 {
+            assert_eq!(SLOW.get(ttl, "test-wedged", wedged_driver), None);
+        }
+        assert!(
+            t.elapsed() < Duration::from_millis(200),
+            "21 polls waited {:?} on a source that blocks for 400 ms",
+            t.elapsed()
+        );
+
+        // And the reading does land, once the source finally answers.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut landed = None;
+        while Instant::now() < deadline {
+            if let Some(v) = SLOW.get(ttl, "test-wedged", wedged_driver) {
+                landed = Some(v);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(landed, Some(1), "one refresh between 21 callers, not 21");
+    }
+
+    /// A stale reading is served while the refresh runs — the gauge keeps
+    /// showing the last thing the card said rather than blanking to "n/a"
+    /// every time the TTL expires.
+    #[test]
+    fn a_refresh_serves_the_previous_reading_rather_than_nothing() {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        static SOURCE: Stale<u64> = Stale::new();
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        fn slowish() -> u64 {
+            std::thread::sleep(Duration::from_millis(150));
+            NEXT.fetch_add(1, Relaxed)
+        }
+        let ttl = Duration::from_millis(30);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while SOURCE.get(ttl, "test-slowish", slowish).is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            SOURCE.get(ttl, "test-slowish", slowish),
+            Some(1),
+            "the first reading landed"
+        );
+        // Past the TTL: a refresh starts, and the caller still gets a number.
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(
+            SOURCE.get(ttl, "test-slowish", slowish),
+            Some(1),
+            "stale, but a reading — never a hole in the gauge"
+        );
     }
 
     /// `MemAvailable` is what the fit planner and the host-pressure watcher

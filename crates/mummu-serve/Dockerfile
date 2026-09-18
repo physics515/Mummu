@@ -34,6 +34,21 @@
 FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY . .
+# Which commit is this? The image cannot work it out for itself: `.dockerignore`
+# excludes `.git/` (deliberately — the repository is history the image has no
+# use for), so the tree `COPY . .` lands has no repository in it, `build.rs`
+# finds no git to ask, and the binary stamps itself `unknown`. That is what the
+# released v0.2.0 image answers on /api/health today: the one answer that
+# identifies nothing, in the field whose entire job is to confirm a deploy.
+#
+# So the sha is passed IN. Build with:
+#   docker build --build-arg MUMMU_BUILD_SHA=$(git rev-parse --short=7 HEAD) \
+#                -f crates/mummu-serve/Dockerfile -t mummu-serve:local .
+# The compose service passes it for you (`build.args` in ai.yaml), so a deploy
+# through compose cannot forget. Left unset it degrades to exactly the old
+# behaviour — a build that says it does not know, never a build that fails.
+ARG MUMMU_BUILD_SHA=unknown
+ENV MUMMU_BUILD_SHA=${MUMMU_BUILD_SHA}
 RUN cargo build --release -p mummu-serve --features cuda
 
 # Runtime: CUDA base (sets up the NVIDIA apt repo + LD_LIBRARY_PATH) plus
