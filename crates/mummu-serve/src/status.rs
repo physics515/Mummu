@@ -343,7 +343,11 @@ impl<T: Copy + Send + 'static> Stale<T> {
         let spawned = std::thread::Builder::new()
             .name(name.to_owned())
             .spawn(move || {
-                // Armed BEFORE the call that can block or panic.
+                // Armed BEFORE the call that can block or panic — and
+                // declared before the guard below, so it is dropped AFTER it
+                // (reverse declaration order). `Refreshing::drop` takes this
+                // same lock; the other order would deadlock the refresh
+                // thread against itself.
                 let _flag = Refreshing(self, token);
                 let fresh = sample();
                 let mut st = self.lock();
