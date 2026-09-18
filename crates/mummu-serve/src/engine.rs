@@ -17,6 +17,8 @@ use mummu::models::{lfm2, olmoe, qwen2, qwen3, qwen35};
 use mummu::registry::{Architecture, ModelSpec, WeightFormat};
 use tokenizers::Tokenizer;
 
+use crate::recovery::ChatError;
+
 // Linux `MemAvailable` in bytes (None elsewhere). The parse lives in
 // `crate::status`, which needs `MemTotal` out of the same file for the RAM
 // gauge: one read, one parser, one definition of "available" shared by the fit
@@ -27,6 +29,12 @@ use crate::status::mem_available_bytes;
 pub struct Loaded {
     pub lm: AnyLm,
     pub tokenizer: Tokenizer,
+    /// [`crate::recovery::fault_epoch`] when this model's load began. Any
+    /// device failure since then may have left its weights pointing at
+    /// device memory that was never initialized, so a model whose stamp is
+    /// behind the epoch is never served again: the slot drops and reloads it
+    /// (see `drive`). This is what "unload and reload the model" means.
+    fault_epoch: u64,
 }
 
 /// Architecture-erased causal LM. `CausalLm` itself can't be a trait object
@@ -300,6 +308,63 @@ pub fn unload_all() -> bool {
     freed
 }
 
+/// Drop everything the device holds for us, because the device failed under
+/// it. `recovery` calls this on every device failure that cost a request.
+///
+/// Everything, not just the slot: the tier runtime holds experts and FFN
+/// clusters on the same devices, and the residency notes would otherwise
+/// route the next request to a model that is no longer there (`plan_fit`'s
+/// "already resident" shortcut plans it at `Off` and the reload then lands
+/// at the wrong precision).
+///
+/// The slot may be busy — a request queued behind the failure takes it the
+/// instant the failing one lets go. That is fine and it is why the model
+/// carries a fault stamp: whoever holds the slot finds the stamp behind
+/// [`crate::recovery::fault_epoch`] and reloads rather than serving it (see
+/// `drive`), so the poisoned model is never used again either way.
+pub(crate) fn evict_after_device_failure() {
+    clear_tiers();
+    RESIDENT.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    if SLOT.clear() {
+        mummu::progress::evicted();
+        eprintln!(
+            "[mummu-serve] recovery: dropped the resident model — nothing it put on the device \
+             is used again; the next request loads it fresh"
+        );
+    } else {
+        eprintln!(
+            "[mummu-serve] recovery: the model slot is busy; the model in it predates the GPU \
+             failure, so whoever holds it reloads instead of using it"
+        );
+    }
+}
+
+/// Forget a residency note for `(backend, dir)` unless disarmed — dropped on
+/// every way out of a load that did not put the model in the slot: an `Err`,
+/// a panic, a cancelled request.
+///
+/// `plan_fit` notes a model as resident when it PLANS it, before the load
+/// runs. A load that then fails left the note standing, and the next request
+/// took `plan_fit`'s "already resident" shortcut — `QuantPolicy::Off`, "the
+/// slot skips the load" — into a slot that was empty, and loaded the model at
+/// the wrong precision. A half-placed model must never be marked resident.
+struct ForgetResidentUnlessLoaded {
+    backend: BackendChoice,
+    dir: std::path::PathBuf,
+    loaded: bool,
+}
+
+impl Drop for ForgetResidentUnlessLoaded {
+    fn drop(&mut self) {
+        if !self.loaded {
+            RESIDENT
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|(b, d, _)| !(*b == self.backend && *d == self.dir));
+        }
+    }
+}
+
 /// The model dirs currently resident in any backend slot (the ollama shim's
 /// `/api/ps` answer). At most one per backend.
 pub fn resident_dirs() -> Vec<std::path::PathBuf> {
@@ -312,7 +377,7 @@ fn load_any(
     device: &Device,
     policy: mummu::quant::QuantPolicy,
     backend: BackendChoice,
-) -> Result<Loaded, String> {
+) -> Result<(AnyLm, Tokenizer), String> {
     // Serve opts into the bounded-exact host lm_head (SPEC P4.3/P4.4):
     // greedy reads the argmax and the sampler consults only its top-k
     // candidates, both of which the bounded head reproduces exactly — the
@@ -344,7 +409,7 @@ fn load_any(
                     return Err("qwen35 loads from GGUF only (no safetensors import yet)".into());
                 }
             };
-            Ok(Loaded { lm, tokenizer })
+            Ok((lm, tokenizer))
         }
         WeightFormat::Gguf { file } => {
             let path = dir.join(file);
@@ -458,7 +523,7 @@ fn load_any(
                     return Err("all-MiniLM is an embedding model — not chat-servable".into());
                 }
             };
-            Ok(Loaded { lm, tokenizer })
+            Ok((lm, tokenizer))
         }
     }
 }
@@ -508,6 +573,10 @@ pub struct ChatResult {
 /// Run one chat completion, streaming decoded-text deltas through `on_delta`
 /// (return `Break` to cancel cooperatively). Loads the model into the
 /// backend's slot on first use; generations are serialized by the slot mutex.
+///
+/// Callers run this under [`crate::recovery::contain`], which is what turns a
+/// panic in here — a GPU failure surfacing as a failed read, say — into an
+/// error the client is actually sent.
 pub async fn run_chat(
     spec: &ModelSpec,
     models_root: &Path,
@@ -515,7 +584,12 @@ pub async fn run_chat(
     opts: &SamplerOptions,
     max_tokens: usize,
     on_delta: impl FnMut(&str) -> ControlFlow<()>,
-) -> Result<ChatResult, String> {
+) -> Result<ChatResult, ChatError> {
+    // The process is on its way out to restart the GPU backend: starting a
+    // load on a device that is about to disappear helps nobody.
+    if crate::recovery::restarting() {
+        return Err(ChatError::restarting());
+    }
     let prompt = render_prompt(spec.architecture, turns)?;
     // Land a line in the log the moment a request enters the engine: the fit
     // planning below can legitimately take minutes on a busy disk, and a
@@ -3408,7 +3482,7 @@ async fn drive(
     backend: BackendChoice,
     label: &'static str,
     mut on_delta: impl FnMut(&str) -> ControlFlow<()>,
-) -> Result<ChatResult, String> {
+) -> Result<ChatResult, ChatError> {
     // The device the fit plan chose — NOT `Device::default()`, which would
     // silently run wherever the process first touched a backend and make the
     // planner's decision cosmetic.
@@ -3460,16 +3534,64 @@ async fn drive(
     // its own handle so the future can capture the original by reference.
     let load_device = device.clone();
     let flag_key = key.clone();
+    // `plan_fit` may have noted this model resident already; every way out
+    // of here that does not end with it in the slot takes the note back.
+    let mut resident_note = ForgetResidentUnlessLoaded {
+        backend,
+        dir: key.clone(),
+        loaded: false,
+    };
+    // A resident model is a hit only if no device failure has happened since
+    // its load began. Decided under the slot lock, in the same breath as the
+    // key comparison: a request queued behind the one that found the GPU
+    // failing takes the slot the moment that one lets go, and must not run on
+    // the poisoned model in the instant before recovery evicts it.
     let m = slot
-        .acquire(&key, move |_| {
-            arming.begin(&spec.name);
-            // One bar for the whole load: a profiled COLD request would
-            // otherwise smear minutes of import across the decode graph.
-            let _s = mummu::prof::scope("model_load");
-            let _loading = LoadInFlight::set(flag_key, backend, policy);
-            load_any(spec, models_root, &load_device, policy, backend)
-        })
+        .acquire_valid(
+            &key,
+            |resident| resident.fault_epoch == crate::recovery::fault_epoch(),
+            move |_| {
+                if crate::recovery::restarting() {
+                    return Err(ChatError::restarting());
+                }
+                arming.begin(&spec.name);
+                // One bar for the whole load: a profiled COLD request would
+                // otherwise smear minutes of import across the decode graph.
+                let _s = mummu::prof::scope("model_load");
+                let _loading = LoadInFlight::set(flag_key, backend, policy);
+                let mark = crate::recovery::fault_epoch();
+                let loaded = load_any(spec, models_root, &load_device, policy, backend);
+                #[cfg(feature = "fault-injection")]
+                crate::fault::during_load();
+                // A GPU allocation that fails does not fail the loader: cubecl
+                // panics on its own device thread, catches that panic there,
+                // and the loader returns Ok with weights pointing at memory
+                // that was never initialized (see `recovery`'s header). So a
+                // load is only a load once the device has finished what it was
+                // given — and did not fail doing it. Whatever was built is
+                // dropped right here, and the slot stays empty.
+                if let Some(cause) = crate::recovery::load_fault(mark, || {
+                    load_device.sync().map_err(|e| e.to_string())
+                }) {
+                    drop(loaded);
+                    clear_tiers_if_slot(backend);
+                    return Err(ChatError::device(format!(
+                        "loading {} failed on {}: {cause}",
+                        spec.name,
+                        label_of(backend)
+                    )));
+                }
+                let (lm, tokenizer) = loaded?;
+                crate::recovery::load_succeeded(&spec.name);
+                Ok(Loaded {
+                    lm,
+                    tokenizer,
+                    fault_epoch: mark,
+                })
+            },
+        )
         .await?;
+    resident_note.loaded = true;
     // DECLARATION ORDER IS DROP ORDER HERE, reversed: the last binding
     // declared is the first one dropped. The progress guard must be declared
     // AFTER the slot guard `m`, so it settles the phase while the slot is
@@ -3517,6 +3639,10 @@ async fn drive(
         if prompt_ids.is_empty() {
             return Err("prompt encoded to zero tokens".into());
         }
+        // Where the incident's read failed: the first forward over a model
+        // whose weights the device never initialized.
+        #[cfg(feature = "fault-injection")]
+        crate::fault::before_first_read();
 
         let start = Instant::now();
         let mut ids: Vec<u32> = Vec::new();
@@ -3540,6 +3666,9 @@ async fn drive(
                 // load and must not keep a progress bar on screen.
                 if ids.is_empty() {
                     progress.ready();
+                    // The device computed and read back: whatever failed
+                    // before this is behind us (see `recovery::decide`).
+                    crate::recovery::generation_succeeded();
                 }
                 ids.push(id);
                 // Incremental decode: re-decode the whole tail and emit the
@@ -3638,6 +3767,46 @@ mod plan_fit_tests {
             ..spec
         };
         assert!(plan_fit(&other, root).is_err());
+    }
+
+    /// A load that failed — the incident's OOM, detected by
+    /// `recovery::load_fault` — must not leave `plan_fit`'s "already
+    /// resident" note behind for a slot that stayed empty: the next request
+    /// would take the shortcut (`QuantPolicy::Off`, no fit check) into a
+    /// fresh load at the wrong precision. A load that did land keeps it.
+    #[test]
+    fn a_load_that_did_not_land_takes_its_resident_note_back() {
+        // A backend and dir no other test notes, so a parallel test cannot
+        // move this one's note.
+        let backend = BackendChoice::IntegratedGpu;
+        let dir = std::path::PathBuf::from("resident-note-test-dir");
+        let noted = || {
+            RESIDENT
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|(b, d, _)| *b == backend && *d == dir)
+        };
+
+        note_resident(backend, dir.clone(), 1 << 30);
+        drop(ForgetResidentUnlessLoaded {
+            backend,
+            dir: dir.clone(),
+            loaded: false,
+        });
+        assert!(!noted(), "a failed load left the model noted as resident");
+
+        note_resident(backend, dir.clone(), 1 << 30);
+        drop(ForgetResidentUnlessLoaded {
+            backend,
+            dir: dir.clone(),
+            loaded: true,
+        });
+        assert!(noted(), "a load that landed must stay noted");
+        RESIDENT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(b, d, _)| !(*b == backend && *d == dir));
     }
 }
 

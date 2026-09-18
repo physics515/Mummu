@@ -76,6 +76,12 @@
   /* No reading at all: the track is visibly inert, never a full-looking 0%. */
   .gauge .gtrack.na { opacity: .3; }
   .gauge .gmine { opacity: .75; }
+  /* An unresolved GPU failure, from the status object's `error`: red, under
+     the bar, whatever the phase says. Empty when there is none. */
+  .perr { color: var(--err); margin-top: 4px; white-space: pre-wrap; word-break: break-word; }
+  .perr:empty { display: none; }
+  .track.rest > i { width: 0; animation: none; }
+  .badge.bad { color: var(--err); border-color: var(--err); }
   a.nav {
     color: var(--dim); text-decoration: none; font-size: 13px;
     border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px;
@@ -153,6 +159,14 @@ async function refresh() {
   dev.textContent = h.device;
   dev.classList.toggle("gpu", h.device.includes("GPU"));
   dev.title = (h.gpus || []).map(g => `${g.name} (${g.api})`).join("\n") || "no GPU adapters";
+  // /api/health answers 503 while the GPU backend is poisoned, and its body
+  // says why. v0.3.1's badge read the device name through a whole incident.
+  const failed = h.status === "error";
+  dev.classList.toggle("bad", failed);
+  if (failed) {
+    dev.textContent = `${h.device} — GPU failed`;
+    if (h.error) dev.title = h.error.message;
+  }
   // textContent, not innerHTML: these come off the wire like everything else.
   $("build").textContent = h.version ? `v${h.version} (${h.build || "unknown"})` : "";
   models = m.models;
@@ -277,6 +291,14 @@ function secs(s) {
 // exactly that, and the label beside it printed the raw counts.
 const widthPct = (used, total) => Math.max(0, Math.min(100, (used / total) * 100)).toFixed(1) + "%";
 
+// The status object's `error`, as one line: what failed, what happens next,
+// and when. Shared, character for character, with logs.html.
+function failureText(e) {
+  const when = new Date(e.at_ms).toLocaleTimeString();
+  // A replayed failure names the previous process in its own message.
+  return `${e.message} (${when})`;
+}
+
 // Build the bar + gauges. Returns { root, render }. Everything is written with
 // textContent and style widths — never innerHTML — because a model name the
 // client chose reaches the label.
@@ -300,7 +322,8 @@ function makeProgress() {
     return { track: t, fill: f, value: v };
   };
   const ram = gauge("RAM"), vram = gauge("VRAM");
-  root.append(label, track, gauges);
+  const note = el("div", "perr");
+  root.append(label, track, gauges, note);
 
   // One gauge: `used` of `total`, plus an optional "mine" note naming this
   // process's share. A null reading renders "n/a" with an inert track, never
@@ -332,7 +355,20 @@ function makeProgress() {
     // server then drew no bar at all — which is exactly what would have
     // happened to `importing` and `partitioning`, the two phases that cover
     // the longest part of a first-ever load.
-    if (!st.working) return false;
+    // A GPU failure nothing has recovered from yet, in red, under whatever
+    // the bar says — during the reload that is the recovery, too.
+    note.textContent = st.error ? failureText(st.error) : "";
+    if (!st.working) {
+      // Not loading. Nothing to show — unless the backend has failed, which
+      // is exactly when an empty bubble would be the worst answer.
+      if (st.phase !== "error" && !st.error) return false;
+      label.textContent = st.phase === "error"
+        ? "error — the GPU backend failed; this request loads the model again"
+        : "";
+      track.className = "track rest";
+      fill.style.width = "0%";
+      return true;
+    }
     const determinate = st.total > 0;
     // "step 2" is not decoration. The tiered and partitioned paths load in two
     // counted passes, and the second one legitimately restarts at 0 with a
@@ -462,7 +498,10 @@ async function send() {
       max_tokens: parseInt($("maxtok").value, 10),
     },
   };
-  // Same frames either way; only the transport differs.
+  // Same frames either way; only the transport differs. Every stream ends on
+  // exactly one `done` or `error` frame, and `ended` records whether this one
+  // did — a stream that simply stops is NOT a finished reply.
+  let ended = false;
   const onEvent = ev => {
     if (ev.type === "delta") {
       stopStatus();   // the answer is arriving; the load status has done its job
@@ -470,18 +509,33 @@ async function send() {
       renderBody(body, acc);
       log.scrollTop = log.scrollHeight;
     } else if (ev.type === "done") {
+      ended = true;
       renderBody(body, ev.text || acc);
       div.querySelector(".meta").textContent =
         `${ev.tokens} tokens · ${ev.tokens_per_second} tok/s · ${ev.device}`;
       history.push({ role: "assistant", content: ev.text || acc });
     } else if (ev.type === "error") {
+      ended = true;
+      // The server's own words — "the GPU backend failed (…); try again in a
+      // moment" — not a generic failure.
       throw new Error(ev.error || `request rejected (${ev.status})`);
     }
   };
   try {
     await chatOverSocket(request, onEvent);
+    // The connection closed with neither a reply nor an error: a dropped
+    // connection, a proxy, a server that died mid-answer. v0.3.1 showed an
+    // empty bubble here, which reads as "the model had nothing to say".
+    if (!ended) {
+      throw new Error("the connection closed before the reply finished — the server may be " +
+        "restarting; try again in a moment");
+    }
   } catch (e) {
-    body.innerHTML += `<div class="err">⚠ ${e.message}</div>`;
+    // textContent, never innerHTML: the message comes off the wire.
+    const err = document.createElement("div");
+    err.className = "err";
+    err.textContent = `⚠ ${e.message}`;
+    body.appendChild(err);
     // keep history consistent: a failed turn contributes no assistant message
     if (history[history.length - 1]?.role !== "assistant") { /* nothing to pop */ }
   } finally {

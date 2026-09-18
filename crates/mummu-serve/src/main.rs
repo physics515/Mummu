@@ -94,6 +94,14 @@ async fn main() -> ExitCode {
         .unwrap_or_else(|_| mummu_serve::DEFAULT_OLLAMA_ADDR.into());
 
     let root = mummu_serve::prepare_models_root().expect("models dir must be creatable");
+    // This binary runs under a supervisor — in production, Docker's `restart:
+    // unless-stopped` — so a GPU backend that a reload cannot cure may be
+    // cured by exiting and letting it start a clean process. The library
+    // never decides that on its own: the desktop shell runs the same routers
+    // in-process, where an exit would close the window. Also replays the log
+    // lines a previous process left behind when it did exactly that. See
+    // `recovery`.
+    mummu_serve::recovery::supervised(&root);
     mummu_serve::log_device_policy(&root);
 
     match mummu_serve::serve(&addr, Some(&shim_addr)).await {

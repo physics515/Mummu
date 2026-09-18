@@ -85,9 +85,35 @@ impl<T> ModelSlot<T> {
         key: &Path,
         load: impl FnOnce(&Path) -> Result<T, E>,
     ) -> Result<SlotGuard<'_, T>, E> {
+        self.acquire_valid(key, |_| true, load).await
+    }
+
+    /// [`Self::acquire`], where a resident value only counts as a hit if
+    /// `still_valid` says so. One that does not is dropped — before `load`
+    /// runs, exactly like a different key — and loaded again.
+    ///
+    /// # Why the check has to happen here, under the lock
+    ///
+    /// A model can be resident and broken. mummu-serve's case: a GPU
+    /// allocation that failed on cubecl's device thread was swallowed there,
+    /// so the loader returned a model whose weights point at device memory
+    /// that was never initialized, and every later read of it fails. Asking
+    /// "is the resident model still good?" and then acquiring is two lock
+    /// acquisitions, and a request queued behind the one that discovered the
+    /// failure takes the slot in between and runs on the broken model again.
+    /// Deciding inside the same critical section as the key comparison is the
+    /// only way the answer and the model it describes cannot come apart.
+    pub async fn acquire_valid<E>(
+        &self,
+        key: &Path,
+        still_valid: impl FnOnce(&T) -> bool,
+        load: impl FnOnce(&Path) -> Result<T, E>,
+    ) -> Result<SlotGuard<'_, T>, E> {
         assert!(!key.as_os_str().is_empty(), "model cache: empty key");
         let mut guard = self.inner.lock().await;
-        let hit = guard.as_ref().is_some_and(|e| e.key == key);
+        let hit = guard
+            .as_ref()
+            .is_some_and(|e| e.key == key && still_valid(&e.value));
         if !hit {
             *guard = None; // free the old model before loading the new one
             // Loading is the one genuinely blocking thing on this path:
@@ -290,6 +316,41 @@ mod tests {
             2,
             "the request the peek called warm paid for a load after all"
         );
+    }
+
+    /// The invariant `acquire_valid` exists for: a resident model that is no
+    /// longer valid is never handed out, not even to a request that finds its
+    /// key already in the slot. It is dropped and loaded again, under the
+    /// same lock that compared the key.
+    ///
+    /// mummu-serve's poisoned-GPU case in miniature: the resident value
+    /// carries the fault count it was loaded under, and a fault since then
+    /// makes it stale.
+    #[tokio::test]
+    async fn a_resident_value_that_is_no_longer_valid_is_reloaded_not_served() {
+        use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+        let slot: ModelSlot<(String, u32)> = ModelSlot::new();
+        let key = Path::new("model-a");
+        let faults = AtomicU32::new(0);
+        let loads = AtomicU32::new(0);
+        let load = |_: &Path| {
+            loads.fetch_add(1, SeqCst);
+            Ok::<_, Infallible>(("model-a".to_owned(), faults.load(SeqCst)))
+        };
+        let valid = |m: &(String, u32)| m.1 == faults.load(SeqCst);
+
+        drop(slot.acquire_valid(key, valid, load).await.unwrap());
+        drop(slot.acquire_valid(key, valid, load).await.unwrap());
+        assert_eq!(loads.load(SeqCst), 1, "a valid resident model is a hit");
+
+        faults.fetch_add(1, SeqCst); // the device failed under the resident model
+        let m = slot.acquire_valid(key, valid, load).await.unwrap();
+        assert_eq!(
+            loads.load(SeqCst),
+            2,
+            "a model loaded before the failure was served instead of reloaded"
+        );
+        assert_eq!(m.1, 1, "and what is handed out is the fresh load");
     }
 
     #[test]

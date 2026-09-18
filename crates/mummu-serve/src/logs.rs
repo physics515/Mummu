@@ -227,6 +227,18 @@ impl Level {
             Self::Error => "error",
         }
     }
+
+    /// The inverse of [`Self::as_str`], for lines read back from a previous
+    /// process's evidence file (see `recovery`). `None` for anything else.
+    #[must_use]
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "info" => Some(Self::Info),
+            "warn" => Some(Self::Warn),
+            "error" => Some(Self::Error),
+            _ => None,
+        }
+    }
 }
 
 /// Guess a level from free text.
@@ -458,6 +470,31 @@ fn line(source: Source, level: Option<Level>, quiet: bool, text: String) -> LogL
 fn record(source: Source, level: Option<Level>, quiet: bool, text: String) {
     let entry = line(source, level, quiet, text);
     ring().record(entry);
+}
+
+/// Record a line that an EARLIER process printed, keeping its own time and
+/// level. It takes a seq in this process's sequence like any other line —
+/// which is what puts it in front of everything this process prints, where a
+/// reader expects the story of the restart to start.
+///
+/// Only `recovery` calls this, replaying the tail the previous process wrote
+/// before it exited to restart the GPU backend.
+pub fn push_replayed(source: Source, unix_ms: u64, level: Level, text: impl Into<String>) {
+    let mut entry = line(source, Some(level), false, text.into());
+    entry.unix_ms = unix_ms;
+    ring().record(entry);
+}
+
+/// The newest `n` lines of the MAIN ring, oldest first.
+///
+/// What a process about to exit leaves for the next one (see `recovery`): the
+/// lines that explain the exit are by definition the last ones printed, and
+/// the quiet ring holds nothing but health probes, so it is not consulted.
+#[must_use]
+pub fn tail(n: usize) -> Vec<LogLine> {
+    let ring = ring();
+    let skip = ring.lines.len().saturating_sub(n);
+    ring.lines.iter().skip(skip).cloned().collect()
 }
 
 /// Cut an over-long line at a char boundary and mark it. Kept separate from

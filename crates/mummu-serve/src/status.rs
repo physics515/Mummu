@@ -590,8 +590,9 @@ fn finite(v: Option<f64>) -> Value {
 ///
 /// ```json
 /// "status": {
-///   "version": "0.3.1", "build": "abc1234",
-///   "phase": "loading", "working": true, "generation": 7, "model": "gemma3:27b",
+///   "version": "0.3.2", "build": "abc1234",
+///   "phase": "loading", "working": true, "error": null,
+///   "generation": 7, "model": "gemma3:27b",
 ///   "done": 673, "total": 851, "unit": "tensors", "step": 1,
 ///   "bytes": 15527000000,
 ///   "rate_bps": 169000000.0, "elapsed_s": 91.2, "eta_s": 24.0,
@@ -607,12 +608,44 @@ fn finite(v: Option<f64>) -> Value {
 /// at all, which is the signal to render an indeterminate bar.
 #[must_use]
 pub fn to_json() -> Value {
+    with_error(
+        crate::recovery::current().as_ref(),
+        crate::recovery::poisoned(),
+    )
+}
+
+/// [`to_json`], with the GPU failure passed in rather than read — so a test
+/// can pin what each state renders as without racing another test's failure.
+///
+/// # The `error` phase
+///
+/// v0.3.1 said `ready` through the whole 2026-09-18 incident, on the panel
+/// built to tell the truth, while every chat failed. So a backend that is
+/// POISONED — it failed in this process and no load has come up clean since
+/// (`recovery::poisoned`, the same predicate that turns `/api/health` 503) —
+/// reports the phase `error` instead of whatever the progress state last
+/// said. A load that is actually running still reports its own phase, with
+/// its bar: that is the recovery happening, and hiding it behind "error"
+/// would be the opposite lie.
+///
+/// The `error` object — message, time, what recovery is doing — rides along
+/// whenever there is an unresolved failure, including the previous process's
+/// after a self-restart, which is shown for the record without calling this
+/// process poisoned. The next clean load clears both.
+#[must_use]
+pub fn with_error(error: Option<&crate::recovery::BackendError>, poisoned: bool) -> Value {
     let p = mummu::progress::snapshot();
     let mem = memory();
+    let working = p.phase.is_working();
+    let phase = if poisoned && !working {
+        "error"
+    } else {
+        p.phase.as_str()
+    };
     json!({
         "version": VERSION,
         "build": BUILD,
-        "phase": p.phase.as_str(),
+        "phase": phase,
         // Whether that phase is WORK, decided by `Phase::is_working` rather
         // than by a list of phase names. Both pages carried their own copy of
         // that list in JavaScript, so the two phases this release adds —
@@ -620,7 +653,10 @@ pub fn to_json() -> Value {
         // first-ever load — would have drawn no bar at all on either page
         // while the server counted them perfectly. The verdict travels with
         // the phase so the copies cannot drift again.
-        "working": p.phase.is_working(),
+        "working": working,
+        // `null`, or `{message, at_ms, at, recovery, previous_process,
+        // faults}` — see `recovery::BackendError`.
+        "error": error.map_or(Value::Null, crate::recovery::BackendError::to_json),
         // Which load these numbers belong to. A client that sees it change
         // knows the previous load is over, whatever the other fields say.
         "generation": p.generation,
@@ -681,6 +717,7 @@ mod tests {
             "eta_s",
             "host",
             "vram",
+            "error",
         ] {
             assert!(o.contains_key(key), "status is missing {key}");
         }
@@ -746,6 +783,67 @@ mod tests {
             );
         }
         mummu::progress::idle();
+    }
+
+    /// The 2026-09-18 lie, pinned: with the GPU poisoned, a server whose
+    /// progress state still says `ready` must report `error`, carry the
+    /// message and the time, and stop saying so once a load comes up clean.
+    #[test]
+    fn a_poisoned_backend_reports_the_error_phase_not_ready() {
+        use crate::recovery::{BackendError, Recovery};
+        let _serial = crate::progress_serial();
+        // What the incident's panel saw: a model resident and "ready".
+        {
+            let load = mummu::progress::Load::begin("qwen3.8-27b-ud-q4ks");
+            load.ready();
+        }
+        assert_eq!(with_error(None, false)["phase"], json!("ready"));
+
+        let failure = BackendError {
+            message: "the GPU backend failed (out of device memory)".into(),
+            at_ms: 1_789_746_952_053,
+            recovery: Recovery::Reload,
+            previous_process: false,
+            faults: 30,
+        };
+        let s = with_error(Some(&failure), true);
+        assert_eq!(
+            s["phase"],
+            json!("error"),
+            "the panel said ready; it must not"
+        );
+        assert_eq!(s["working"], json!(false));
+        assert_eq!(s["error"]["message"], json!(failure.message));
+        assert_eq!(s["error"]["at_ms"], json!(failure.at_ms));
+        assert_eq!(s["error"]["at"], json!("2026-09-18T15:55:52Z"));
+        assert_eq!(s["error"]["recovery"], json!("reload"));
+
+        // The reload that is the recovery shows its own bar, error alongside.
+        mummu::progress::phase(mummu::progress::Phase::Loading);
+        let s = with_error(Some(&failure), true);
+        assert_eq!(
+            s["phase"],
+            json!("loading"),
+            "hiding the recovery is a lie too"
+        );
+        assert!(s["error"].is_object());
+
+        // A restarted process shows the previous one's failure, but its own
+        // backend has not failed: the error rides along, the phase does not.
+        mummu::progress::idle();
+        let inherited = BackendError {
+            previous_process: true,
+            recovery: Recovery::Restarted,
+            ..failure
+        };
+        let s = with_error(Some(&inherited), false);
+        assert_eq!(s["phase"], json!("idle"));
+        assert_eq!(s["error"]["previous_process"], json!(true));
+
+        // Cleared: nothing to report.
+        let s = with_error(None, false);
+        assert_eq!(s["error"], Value::Null);
+        assert_ne!(s["phase"], json!("error"));
     }
 
     /// The gauges are drawn from these, so an inconsistent reading would draw
