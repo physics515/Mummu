@@ -108,7 +108,80 @@ pub(crate) const MAX_MAX_TOKENS: usize = 4096;
 pub(crate) const DEFAULT_MAX_TOKENS: usize = 512;
 
 pub(crate) fn models_root() -> PathBuf {
+    #[cfg(test)]
+    if let Some(root) = test_seams::models_root() {
+        return root;
+    }
     std::env::var_os("MUMMU_MODELS_DIR").map_or_else(|| PathBuf::from("models"), PathBuf::from)
+}
+
+/// What the environment would say, said by a test instead: the models root
+/// and the backend. `std::env::set_var` is `unsafe` in a process whose other
+/// threads read the environment — which is every test binary — so the tests
+/// that drive the real engine set these, under `progress_serial`, and put
+/// them back when they are done. Nothing else about the path changes.
+#[cfg(test)]
+pub(crate) mod test_seams {
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    static MODELS_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
+    static BACKEND: Mutex<Option<crate::engine::BackendChoice>> = Mutex::new(None);
+
+    pub(crate) fn models_root() -> Option<PathBuf> {
+        MODELS_ROOT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    #[cfg(feature = "fault-injection")]
+    pub(crate) fn set_models_root(root: Option<PathBuf>) {
+        *MODELS_ROOT.lock().unwrap_or_else(|e| e.into_inner()) = root;
+    }
+
+    pub(crate) fn backend() -> Option<crate::engine::BackendChoice> {
+        *BACKEND.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[cfg(feature = "fault-injection")]
+    pub(crate) fn set_backend(backend: Option<crate::engine::BackendChoice>) {
+        *BACKEND.lock().unwrap_or_else(|e| e.into_inner()) = backend;
+    }
+
+    /// A scratch directory that removes itself when dropped — on a failed
+    /// assertion too, which unwinds through it. An earlier run of these tests
+    /// cleaned up only on success and left seventeen directories in `/tmp`.
+    pub(crate) struct Scratch(PathBuf);
+
+    impl Scratch {
+        pub(crate) fn new(name: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "mummu-serve-test-{name}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, SeqCst)
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+            Self(dir)
+        }
+
+        pub(crate) fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            // An exit a test started writes its evidence here; let it finish,
+            // or it recreates the directory after this removes it (which is
+            // how a failing test used to leak dirs into /tmp).
+            crate::recovery::wait_for_exit_threads();
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -308,7 +381,7 @@ pub fn router() -> Router {
     // not exist on any other: without the feature this route is not compiled,
     // and the request falls through to the 404 below like any unknown path.
     #[cfg(feature = "fault-injection")]
-    let routes = routes.route("/api/fault", post(fault::endpoint));
+    let routes = routes.route("/api/fault", post(fault::endpoint).get(fault::state));
     routes
         // The sync server matched on (method, path) and answered anything
         // else with the same 404 JSON — keep that, rather than axum's bare
@@ -1440,7 +1513,14 @@ mod tests {
             assert!(h.get(key).is_some(), "a 503 still carries {key}");
         }
 
-        recovery::load_succeeded("qwen3.8-27b-ud-q4ks");
+        // A clean load on the device that failed (the thread was DSD-0-0).
+        recovery::load_succeeded(
+            "qwen3.8-27b-ud-q4ks",
+            &[recovery::DeviceKey::Cubecl {
+                type_id: 0,
+                index: 0,
+            }],
+        );
         assert_eq!(health().await.status(), 200, "a clean load clears it");
         recovery::reset_for_tests();
     }
@@ -1519,8 +1599,11 @@ mod tests {
             .await,
             200
         );
-        assert_eq!(fault::armed(), (1, 2));
-        fault::arm(0, 0);
+        assert_eq!(
+            (fault::armed().load_oom, fault::armed().read_invalid),
+            (1, 2)
+        );
+        fault::arm(fault::Arm::default());
     }
 
     /// Both pages render the status object's error: the `error` phase, and
@@ -1550,6 +1633,48 @@ mod tests {
             LOGS_HTML.contains("label.classList.toggle(\"bad\", st.phase === \"error\");"),
             "the logs page's label must go red on the error phase"
         );
+    }
+
+    /// The source of one JavaScript function, from its `function` line to
+    /// the first line that closes it at column zero.
+    fn js_function<'a>(html: &'a str, signature: &str) -> &'a str {
+        let start = html.find(signature).expect("the function is on the page");
+        let end = html[start..].find("\n}\n").expect("the function ends") + start + 2;
+        &html[start..end]
+    }
+
+    /// MINOR 8: the red label says what recovery is ACTUALLY doing — the
+    /// status object's `error.recovery` — never a fixed promise of a reload
+    /// that, while the process is exiting or its restart budget is spent, is
+    /// not what happens. Every value the server can send has its own words,
+    /// and both pages say them identically.
+    #[test]
+    fn both_pages_render_the_recovery_the_status_reports() {
+        let words = js_function(UI_HTML, "function recoveryText(e) {");
+        assert_eq!(
+            words,
+            js_function(LOGS_HTML, "function recoveryText(e) {"),
+            "the two pages describe recovery differently"
+        );
+        for r in recovery::Recovery::ALL {
+            assert!(
+                words.contains(&format!("case \"{}\":", r.as_str())),
+                "the pages have no words for recovery {:?}",
+                r.as_str()
+            );
+        }
+        for (name, html) in [("ui.html", UI_HTML), ("logs.html", LOGS_HTML)] {
+            assert!(
+                html.contains("`error — the GPU backend failed; ${recoveryText(st.error)}`"),
+                "{name}'s error label ignores error.recovery"
+            );
+            for fixed in [
+                "failed; the next request loads the model again\"",
+                "failed; this request loads the model again\"",
+            ] {
+                assert!(!html.contains(fixed), "{name} still promises a reload");
+            }
+        }
     }
 
     /// The chat page never leaves an empty bubble: an error frame is shown

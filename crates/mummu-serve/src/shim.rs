@@ -645,7 +645,7 @@ where
     }
 }
 
-async fn chat(body: Bytes) -> Response {
+pub(crate) async fn chat(body: Bytes) -> Response {
     let parsed: OllamaChatRequest = match parse_json(&body) {
         Ok(p) => p,
         Err(response) => return *response,
@@ -893,7 +893,10 @@ mod tests {
     /// A pull ends on its own `status` line: only a chat stream is held to
     /// ending on a final line.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serializes tests; nothing else waits on it
     async fn only_a_chat_stream_is_given_a_final_line() {
+        // Holds an `InFlight`, which an exit test elsewhere would wait on.
+        let _serial = crate::progress_serial();
         let (tx, rx) = mpsc::unbounded_channel();
         tx.send(json!({"status": "success"})).expect("open");
         drop(tx);

@@ -170,6 +170,20 @@ impl<T> ModelSlot<T> {
         *self.inner.lock().await = None;
     }
 
+    /// [`Self::clear`], reporting what it found — so a caller that has to
+    /// SAY what happened (mummu-serve's recovery log, replayed to the next
+    /// process) can never claim it dropped a model when the slot was empty,
+    /// or that a busy slot held one.
+    pub fn try_clear(&self) -> Cleared {
+        match self.inner.try_lock() {
+            Ok(mut guard) => match guard.take() {
+                Some(entry) => Cleared::Dropped(entry.key),
+                None => Cleared::Empty,
+            },
+            Err(_) => Cleared::Busy,
+        }
+    }
+
     /// The checkpoint dir currently loaded, if any — for settings UIs.
     ///
     /// A **peek**: `None` when the slot is empty *or* busy serving a
@@ -191,10 +205,44 @@ impl<T> ModelSlot<T> {
     }
 }
 
+/// What [`ModelSlot::try_clear`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Cleared {
+    /// A model was resident and has been dropped; this was its key.
+    Dropped(PathBuf),
+    /// Nothing was resident.
+    Empty,
+    /// Something holds the slot (a load or a generation); nothing was done.
+    Busy,
+}
+
 /// A held model slot (see [`ModelSlot::acquire`]). Deref to the model;
 /// dropping it releases the slot for the next generation.
 pub struct SlotGuard<'a, T> {
     guard: tokio::sync::MutexGuard<'a, Option<Entry<T>>>,
+}
+
+impl<T> SlotGuard<'_, T> {
+    /// Drop the model this guard holds and release the slot EMPTY, in that
+    /// order: the value is dropped while the lock is still held.
+    ///
+    /// The point is the order. A holder that has just watched its model fail
+    /// (mummu-serve: the GPU backend failed under it) must not hand that
+    /// model to the next request in line, and dropping the guard first would
+    /// do exactly that — a queued `acquire` takes the lock the instant it is
+    /// released and finds the key it asked for. Evicting through the guard
+    /// leaves no instant in which the broken model is in an unlocked slot.
+    /// Returns the evicted model's key.
+    pub fn evict(mut self) -> PathBuf {
+        let entry = self
+            .guard
+            .take()
+            .expect("a slot guard always holds a loaded model");
+        let key = entry.key.clone();
+        drop(entry); // under the lock
+        key
+        // `self` (and with it the lock) goes here, after the value.
+    }
 }
 
 impl<T> std::ops::Deref for SlotGuard<'_, T> {
@@ -351,6 +399,61 @@ mod tests {
             "a model loaded before the failure was served instead of reloaded"
         );
         assert_eq!(m.1, 1, "and what is handed out is the fresh load");
+    }
+
+    /// `try_clear` says what it found, and only that: an empty slot is not a
+    /// dropped model, and a held slot is not touched.
+    #[tokio::test]
+    async fn try_clear_reports_what_it_actually_found() {
+        let slot: ModelSlot<u32> = ModelSlot::new();
+        assert_eq!(slot.try_clear(), Cleared::Empty, "nothing was resident");
+        drop(
+            slot.acquire::<Infallible>(Path::new("m"), |_| Ok(7))
+                .await
+                .unwrap(),
+        );
+        let held = slot
+            .acquire::<Infallible>(Path::new("m"), |_| Ok(7))
+            .await
+            .unwrap();
+        assert_eq!(slot.try_clear(), Cleared::Busy, "a held slot is not freed");
+        drop(held);
+        assert_eq!(
+            slot.try_clear(),
+            Cleared::Dropped(PathBuf::from("m")),
+            "and a resident model is named when it is dropped"
+        );
+        assert_eq!(slot.loaded_key(), None);
+    }
+
+    /// The invariant `SlotGuard::evict` exists for: the holder's model is
+    /// gone BEFORE the lock is released, so the request queued behind it
+    /// finds an empty slot and loads — it is never handed the evicted model.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_evicted_model_is_never_handed_to_the_request_queued_behind_it() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+        static SLOT: ModelSlot<u32> = ModelSlot::new();
+        let loads = Arc::new(AtomicU32::new(0));
+        let load = {
+            let loads = loads.clone();
+            move |_: &Path| Ok::<_, Infallible>(loads.fetch_add(1, SeqCst) + 1)
+        };
+        let held = SLOT.acquire(Path::new("m"), load.clone()).await.unwrap();
+        assert_eq!(*held, 1);
+        let queued = tokio::spawn({
+            let load = load.clone();
+            async move { *SLOT.acquire(Path::new("m"), load).await.unwrap() }
+        });
+        // Let the second request reach the lock and wait on it.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(held.evict(), PathBuf::from("m"));
+        assert_eq!(
+            queued.await.unwrap(),
+            2,
+            "the queued request was handed the evicted model instead of a fresh load"
+        );
+        assert_eq!(loads.load(SeqCst), 2);
     }
 
     #[test]

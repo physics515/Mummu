@@ -292,11 +292,28 @@ function secs(s) {
 const widthPct = (used, total) => Math.max(0, Math.min(100, (used / total) * 100)).toFixed(1) + "%";
 
 // The status object's `error`, as one line: what failed, what happens next,
-// and when. Shared, character for character, with logs.html.
+// and when. Shared, character for character, with the other page.
 function failureText(e) {
   const when = new Date(e.at_ms).toLocaleTimeString();
   // A replayed failure names the previous process in its own message.
   return `${e.message} (${when})`;
+}
+
+// What recovery is doing, as the status object reports it — never a fixed
+// promise. A label that said "the next request loads the model again" while
+// the process was exiting, or while a spent restart budget kept it from
+// restarting, would be the lie the error phase exists to end. Shared,
+// character for character, with the other page; a server test pins that
+// every value `recovery::Recovery` can send has its own words here.
+function recoveryText(e) {
+  switch (e && e.recovery) {
+    case "reload": return "the next request loads the model again";
+    case "restart": return "mummu is restarting for a clean GPU context — back in a minute";
+    case "restarted": return "the previous process restarted the GPU backend; the next request loads the model";
+    case "cooldown": return "a reload did not hold and the restart budget is spent — each request tries a fresh load";
+    case "unsupervised": return "a reload did not hold and nothing will restart mummu — each request tries a fresh load";
+    default: return "see the message below";
+  }
 }
 
 // Build the bar + gauges. Returns { root, render }. Everything is written with
@@ -363,7 +380,7 @@ function makeProgress() {
       // is exactly when an empty bubble would be the worst answer.
       if (st.phase !== "error" && !st.error) return false;
       label.textContent = st.phase === "error"
-        ? "error — the GPU backend failed; this request loads the model again"
+        ? `error — the GPU backend failed; ${recoveryText(st.error)}`
         : "";
       track.className = "track rest";
       fill.style.width = "0%";

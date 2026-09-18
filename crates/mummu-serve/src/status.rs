@@ -655,7 +655,9 @@ pub fn with_error(error: Option<&crate::recovery::BackendError>, poisoned: bool)
         // the phase so the copies cannot drift again.
         "working": working,
         // `null`, or `{message, at_ms, at, recovery, previous_process,
-        // faults}` — see `recovery::BackendError`.
+        // faults, device}` — see `recovery::BackendError`. `recovery` is one
+        // of reload | restart | restarted | cooldown | unsupervised, and the
+        // pages render each as what it is (`recoveryText`).
         "error": error.map_or(Value::Null, crate::recovery::BackendError::to_json),
         // Which load these numbers belong to. A client that sees it change
         // knows the previous load is over, whatever the other fields say.
@@ -805,6 +807,7 @@ mod tests {
             recovery: Recovery::Reload,
             previous_process: false,
             faults: 30,
+            device: "GPU (cuda)".into(),
         };
         let s = with_error(Some(&failure), true);
         assert_eq!(
