@@ -1265,27 +1265,31 @@ fn who_failed(devices: &[DeviceKey], labels: &str) -> String {
 }
 
 /// The client-facing sentence for a decision.
+///
+/// Worded to be true whether the failure hit a resident model or a load that
+/// never finished: "unloaded the model" told a client whose FIRST load failed
+/// that something had been unloaded when nothing was ever resident.
 fn decision_message(decision: Decision, who: &str, cause: &str) -> String {
     match decision {
         Decision::Reload => format!(
-            "{who} ({cause}). mummu unloaded the model and will load it again on the next \
-             request — try again in a moment"
+            "{who} ({cause}). mummu dropped everything it had placed on the device and will \
+             load the model fresh on the next request — try again in a moment"
         ),
         Decision::Restart => format!(
-            "{who} again after a reload ({cause}). mummu is restarting to get a clean GPU \
-             context — try again in a minute"
+            "{who} again after a reload ({cause}). mummu is restarting itself for a clean \
+             start — try again in a minute"
         ),
         Decision::ReloadCoolingDown { last_restart_ms } => format!(
             "{who} again after a reload ({cause}). mummu already restarted itself at {} and will \
-             not restart again before {}; it unloaded the model and the next request tries a \
-             fresh load",
+             not restart again before {}; it dropped what it had placed on the device and the \
+             next request tries a fresh load",
             rfc3339_ms(last_restart_ms),
             rfc3339_ms(last_restart_ms + RESTART_COOLDOWN.as_millis() as u64),
         ),
         Decision::ReloadUnsupervised => format!(
             "{who} again after a reload ({cause}). Nothing supervises this process, so it will \
-             not restart itself; it unloaded the model and the next request tries a fresh load \
-             — restart mummu if this keeps happening"
+             not restart itself; it dropped what it had placed on the device and the next \
+             request tries a fresh load — restart mummu if this keeps happening"
         ),
     }
 }
@@ -1501,46 +1505,62 @@ fn run_exit(supervisor: &Supervisor, reason: &str, device: &str, timing: ExitTim
     };
     let rendered = evidence::render(&header, &logs::tail(EVIDENCE_LINES));
     // The copy the next process can count on, first.
-    match evidence::write_private(&supervisor.local, &rendered) {
-        Ok(path) => eprintln!(
-            "[mummu-serve] recovery: the restart history and the last log lines are in {} for \
-             the next process",
-            path.display()
-        ),
-        Err(e) => eprintln!(
-            "[mummu-serve] recovery: could not write {} ({e}); trying only the models root",
-            supervisor.local.display()
-        ),
-    }
-    // The second copy, on the models root — which may be the failing array,
-    // and a stall there is not an error. Waited for, but not past the budget.
-    let (tx, rx) = std::sync::mpsc::channel();
-    let target = supervisor.models_dir.clone();
-    let spawned = std::thread::Builder::new()
-        .name("mummu-evidence-copy".to_owned())
-        .spawn(move || {
-            let _ = tx.send(evidence::write(&target, &rendered));
-        });
-    match spawned.map(|_| rx.recv_timeout(timing.copy_wait)) {
-        Ok(Ok(Ok(path))) => eprintln!(
-            "[mummu-serve] recovery: a second copy is in {}",
-            path.display()
-        ),
-        Ok(Ok(Err(e))) => eprintln!(
-            "[mummu-serve] recovery: no second copy in {} ({e})",
-            supervisor.models_dir.display()
-        ),
-        Ok(Err(std::sync::mpsc::RecvTimeoutError::Timeout)) => eprintln!(
-            "[mummu-serve] recovery: the copy to {} did not finish within {:?} (a stalled disk?) \
-             — exiting without it",
-            supervisor.models_dir.display(),
-            timing.copy_wait
-        ),
-        Ok(Err(std::sync::mpsc::RecvTimeoutError::Disconnected)) => eprintln!(
-            "[mummu-serve] recovery: the copy to {} failed without a result",
-            supervisor.models_dir.display()
-        ),
-        Err(e) => eprintln!("[mummu-serve] recovery: no second copy (no thread: {e})"),
+    let local_written = match evidence::write_private(&supervisor.local, &rendered) {
+        Ok(path) => {
+            eprintln!(
+                "[mummu-serve] recovery: the restart history and the last log lines are in {} for \
+                 the next process",
+                path.display()
+            );
+            true
+        }
+        Err(e) => {
+            eprintln!(
+                "[mummu-serve] recovery: could not write {} ({e}); trying the models root instead",
+                supervisor.local.display()
+            );
+            false
+        }
+    };
+    // The models root is a FALLBACK, never a second copy. The local copy is in
+    // the container's writable layer, which Docker's restart of this same
+    // container keeps — and a self-restart is always that. The models root is
+    // `/mnt/deepmem/AI Models` in production, the btrfs array whose sda was
+    // throwing SATA link resets on 2026-09-18, and the watchdog's `_exit`
+    // cannot end a thread parked in uninterruptible I/O: a best-effort fsync
+    // there could hold the whole exit for as long as the disk takes to time
+    // out. So the exit only touches it when there is nothing else.
+    if !local_written {
+        // A stall there is not an error. Waited for, but not past the budget.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let target = supervisor.models_dir.clone();
+        let spawned = std::thread::Builder::new()
+            .name("mummu-evidence-copy".to_owned())
+            .spawn(move || {
+                let _ = tx.send(evidence::write(&target, &rendered));
+            });
+        match spawned.map(|_| rx.recv_timeout(timing.copy_wait)) {
+            Ok(Ok(Ok(path))) => eprintln!(
+                "[mummu-serve] recovery: the fallback copy is in {}",
+                path.display()
+            ),
+            Ok(Ok(Err(e))) => eprintln!(
+                "[mummu-serve] recovery: no fallback copy in {} either ({e}) — the next process \
+                 starts without the restart history",
+                supervisor.models_dir.display()
+            ),
+            Ok(Err(std::sync::mpsc::RecvTimeoutError::Timeout)) => eprintln!(
+                "[mummu-serve] recovery: the copy to {} did not finish within {:?} (a stalled \
+                 disk?) — exiting without it",
+                supervisor.models_dir.display(),
+                timing.copy_wait
+            ),
+            Ok(Err(std::sync::mpsc::RecvTimeoutError::Disconnected)) => eprintln!(
+                "[mummu-serve] recovery: the copy to {} failed without a result",
+                supervisor.models_dir.display()
+            ),
+            Err(e) => eprintln!("[mummu-serve] recovery: no fallback copy (no thread: {e})"),
+        }
     }
     #[cfg(feature = "fault-injection")]
     crate::fault::before_exit();
@@ -2588,13 +2608,17 @@ mod tests {
         assert_eq!(EXITS.load(SeqCst), before + 1, "taken once");
         assert_eq!(LAST_CODE.load(SeqCst), EXIT_RESTART);
 
-        for place in [local.path().to_path_buf(), root.path().join(EVIDENCE_DIR)] {
-            let written = place.join(EVIDENCE_FILE);
-            let taken = evidence::parse(&std::fs::read_to_string(&written).expect("evidence left"));
-            let header = taken.header.expect("a header");
-            assert_eq!(header.exit_code, EXIT_RESTART);
-            assert_eq!(header.restarts_ms.len(), 1);
-        }
+        let written = local.path().join(EVIDENCE_FILE);
+        let taken = evidence::parse(&std::fs::read_to_string(&written).expect("evidence left"));
+        let header = taken.header.expect("a header");
+        assert_eq!(header.exit_code, EXIT_RESTART);
+        assert_eq!(header.restarts_ms.len(), 1);
+        // The models root is only the fallback for a local write that failed
+        // (see run_exit), so with the local copy on disk it is left alone.
+        assert!(
+            !root.path().join(EVIDENCE_DIR).join(EVIDENCE_FILE).exists(),
+            "the exit wrote to the models root although the local copy was on disk"
+        );
         reset_for_tests();
     }
 
@@ -2976,9 +3000,10 @@ mod tests {
 
     /// MINOR 3, the evidence half: a models root whose write BLOCKS (a FIFO
     /// at the file the writer opens stalls `open()` exactly as the failing
-    /// array can — a stall, not an error) does not hold the exit. The local
-    /// copy is on disk first, the models-root copy is waited for only as long
-    /// as its budget, and the exit is taken within the deadline.
+    /// array can — a stall, not an error) does not hold the exit. The models
+    /// root is only a fallback, so this makes the LOCAL write fail first (its
+    /// directory sits under a regular file) — otherwise the fallback would
+    /// never run and the budget below would be tested by nothing.
     #[cfg(unix)]
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // serializes tests; nothing else waits on it
@@ -2988,13 +3013,16 @@ mod tests {
         install_panic_hook();
         let root = Scratch::new("stall");
         let local = Scratch::new("stall-local");
+        let blocker = local.path().join("not-a-dir");
+        std::fs::write(&blocker, b"").expect("blocker file");
+        let unwritable_local = blocker.join("evidence");
         let dir = root.path().join(EVIDENCE_DIR);
         std::fs::create_dir_all(&dir).expect("dir");
         let fifo = dir.join(format!("{EVIDENCE_FILE}.tmp"));
         mkfifo(&fifo);
         supervise_for_tests(
             root.path(),
-            local.path(),
+            &unwritable_local,
             stalled_exit,
             never_called,
             NO_WATCHDOG,
@@ -3013,8 +3041,49 @@ mod tests {
             "the exit waited on a stalled models root: {took:?} and counting"
         );
         assert!(
+            !unwritable_local.join(EVIDENCE_FILE).exists(),
+            "the local write was meant to fail, so that the fallback ran into the stall"
+        );
+        reset_for_tests();
+    }
+
+    /// The exit never touches the models root when the local copy was
+    /// written. In production the models root is the btrfs array whose sda
+    /// was throwing SATA link resets, and `_exit` cannot end a thread parked
+    /// in uninterruptible I/O — so a best-effort second copy there could hold
+    /// the restart for as long as the disk takes to time out. The local copy
+    /// is what Docker's restart of the same container keeps, so it is enough.
+    #[test]
+    fn a_written_local_copy_keeps_the_exit_off_the_models_root() {
+        let _serial = crate::progress_serial();
+        reset_for_tests();
+        install_panic_hook();
+        let root = Scratch::new("offroot");
+        let local = Scratch::new("offroot-local");
+        supervise_for_tests(
+            root.path(),
+            local.path(),
+            stalled_exit,
+            never_called,
+            NO_WATCHDOG,
+        );
+        let before = STALLED_EXITS.load(SeqCst);
+
+        let _ = record_failure("m", &[CUDA0], "out of device memory");
+        let _ = record_failure("m", &[CUDA0], "out of device memory");
+        assert!(restarting());
+        assert!(
+            wait_for(&STALLED_EXITS, before + 1, Duration::from_secs(3)),
+            "the exit was not taken"
+        );
+        wait_for_exit_threads();
+        assert!(
             local.path().join(EVIDENCE_FILE).exists(),
             "the local copy is the one the next process can count on — and it was not written"
+        );
+        assert!(
+            !root.path().join(EVIDENCE_DIR).exists(),
+            "the exit wrote to the models root although the local copy was already on disk"
         );
         reset_for_tests();
     }

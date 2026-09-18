@@ -707,6 +707,26 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       nothing checks that the middleware hands `quiet_request` the real response status. Also worth
       knowing: the quiet rule ignores latency, so a successful `/api/models` that takes 30 s under a cold
       load's seek storm is hidden by default.
+- [ ] **What v0.3.2's review left open on self-recovery** *(2026-09-18)* — two reviewers said ship;
+      none of these blocked it. (1) **Guards still missing** at five production sites: deleting drive's
+      `Ok(Err(e)) if e.needs_decision()` arm (an Err-path failure is then decided only AFTER the slot is
+      released); the in-flight hold on the WebSocket and both ollama-shim paths (only native SSE is
+      tested); the `recovery::supervised(&root)` call in `main.rs` and `serve_on`'s
+      `install_panic_hook()` (delete either and the suite stays green while production loses the
+      self-restart); which device drive charges a request-path failure to; and the rule that ANY epoch
+      movement fails a load. (2) **A stale reload of a tiered model keeps the old tier runtime** —
+      `likely_cold` is false for the same key, so `clear_tiers_if_slot` is skipped and the old
+      `ExpertPool` keeps its GPU experts while the loader builds a new one (the production 27B is
+      layered, not tiered, so it is unaffected; OLMoE-style models are not). (3) The evidence header
+      stamps `exited_at_ms` when it is rendered, and the watchdog's own line is never persisted, so a
+      hung exit looks ~20 s earlier and clean on `/logs`. (4) The pages' red label still says "GPU"
+      for a failure charged to the host, and a `[previous process]` note can outlive a load on another
+      device. (5) Any device panic evicts the resident model even when its weights are intact (a
+      transient activation OOM after a verified load) — a conscious trade-off that costs one ~2-minute
+      reload; worth revisiting once `MUMMU_VRAM_LIVE_BUDGET` makes such OOMs rare. Closed before the
+      tag: the exit no longer writes to the models root when the local copy is on disk (the array's
+      failing sda could hold `_exit` in uninterruptible I/O), and the client sentence no longer says
+      "unloaded the model" after a load that never finished.
 - [ ] **The gap to a fused runtime is a KERNEL problem, not a placement one — measured, and the reason
       scheduler tuning stops here.** *(2026-08-24)* Five measured iterations took the 27B from 4.88 to
       **3.91 s/token** and moved the discrete GPU from 996 to **1784 of 2048 clusters**. Then the
