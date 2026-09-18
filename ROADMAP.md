@@ -633,6 +633,20 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       a card another tenant has filled — but on a box where plex and deepseek-ocr move VRAM underneath,
       it can also demote layers over a transient dip. Wants: a cold 27B timed both ways with the
       placement line from each, and a run with a co-tenant deliberately allocating during the load.
+- [ ] **What v0.3.1's review left open on `/logs`** *(2026-09-18)* — none blocked the deploy; each is
+      a way the page can still lose or misstate history. (1) **A LOUD flood still evicts the load**: 404s
+      stay loud by design, so one scanner sweep of more than 2000 paths on the public shim pushes the
+      cold-load lines out of the main ring — the thing v0.3.1 fixed for polling, still open for probing.
+      A third ring for error responses, or a small reserved share for server output, would close it.
+      (2) An open tab that trims loud rows after a main-ring overrun also drops the quiet rows in front of
+      them, so its "show health/poll traffic" view loses its probe history until a reload
+      (`logs.html` `trim`). (3) `dropped` counts main evictions after `since` including those past the
+      page's own last line, so an API client paging with a small `limit` is told about the same loss
+      twice; the embedded pages page with the full limit and never see it. (4) Two guards are missing:
+      nothing pins `oldest` as the minimum over BOTH rings (the restart replay depends on it), and
+      nothing checks that the middleware hands `quiet_request` the real response status. Also worth
+      knowing: the quiet rule ignores latency, so a successful `/api/models` that takes 30 s under a cold
+      load's seek storm is hidden by default.
 - [ ] **The gap to a fused runtime is a KERNEL problem, not a placement one — measured, and the reason
       scheduler tuning stops here.** *(2026-08-24)* Five measured iterations took the 27B from 4.88 to
       **3.91 s/token** and moved the discrete GPU from 996 to **1784 of 2048 clusters**. Then the
