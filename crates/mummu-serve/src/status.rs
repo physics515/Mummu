@@ -44,9 +44,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-/// The crate version, which is the workspace version — bumped to 0.3.0 for
-/// the release this ships in. It had sat at 0.1.0 through the v0.1.0, v0.1.1
-/// and v0.2.0 tags, which is exactly why nobody could tell what was deployed.
+/// The crate version, which is the workspace version — bumped with every
+/// release since v0.3.0. It had sat at 0.1.0 through the v0.1.0, v0.1.1 and
+/// v0.2.0 tags, which is exactly why nobody could tell what was deployed.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The git short sha this binary was built from, `<sha>-dirty` when it was
@@ -590,7 +590,7 @@ fn finite(v: Option<f64>) -> Value {
 ///
 /// ```json
 /// "status": {
-///   "version": "0.3.0", "build": "abc1234",
+///   "version": "0.3.1", "build": "abc1234",
 ///   "phase": "loading", "working": true, "generation": 7, "model": "gemma3:27b",
 ///   "done": 673, "total": 851, "unit": "tensors", "step": 1,
 ///   "bytes": 15527000000,

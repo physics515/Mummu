@@ -136,7 +136,7 @@
     <option value="shim">shim (11435)</option>
   </select>
   <input id="search" type="search" placeholder="filter (plain text)" style="width:220px">
-  <label class="check"><input id="quiet" type="checkbox"> show health/poll traffic</label>
+  <label class="check" title="Successful page and listing reads that arrive on a timer: Docker's health probe, dashboard monitors, flows, ollama clients. The server keeps the most recent few hundred in a ring of their own, so they can never push anything else out."><input id="quiet" type="checkbox"> show health/poll traffic</label>
   <span style="flex:1"></span>
   <button id="pause" title="Stop polling. The server keeps logging; a gap marker appears if the ring overran while you were paused.">Pause</button>
   <button id="clear" title="Clear what is on screen (the server's ring is untouched)">Clear</button>
@@ -163,10 +163,19 @@
 const $ = id => document.getElementById(id);
 const feed = $("feed");
 
-// Keep the DOM at the size of the server's ring: past that the page is showing
-// lines the server has already forgotten, and a browser tab left open for a
-// week would grow without bound.
-const MAX_ROWS = 2000;
+// Keep the DOM at the size of the server's rings: past that the page is
+// showing lines the server has already forgotten, and a browser tab left open
+// for a week would grow without bound.
+//
+// TWO caps, like the server's two rings, and for the same reason. One cap over
+// every row lets the hidden health/poll rows push the visible ones off the top:
+// production polls ~360 times an hour, so a tab left open overnight would trim
+// away the very cold load it was left open to show, to make room for rows
+// nobody could see. Taken from each response (`capacity`, `quiet_capacity`),
+// so the page follows the server instead of a copy of its numbers; these are
+// only the values until the first answer arrives.
+let maxRows = 2000;       // main ring: server output and loud requests
+let maxQuietRows = 500;   // quiet ring: health and monitor polls
 // Never faster than this, whatever happens — a log reader must not be able to
 // cost the server more than the thing it is watching.
 const MIN_POLL_MS = 1000;
@@ -214,7 +223,7 @@ for (const el of ["source", "search", "quiet"]) $(el).addEventListener("input", 
 
 function toBottom() { feed.scrollTop = feed.scrollHeight; }
 
-// Cap the LINES, not every child.
+// Cap the LINES, not every child — and the quiet ones on a count of their own.
 //
 // A gap marker only ever appears in front of a full ring's worth of lines —
 // that is what "the ring overran" means — so a cap that counted markers too
@@ -222,11 +231,19 @@ function toBottom() { feed.scrollTop = feed.scrollHeight; }
 // about, every single time. Counting rows keeps the newest marker pinned at
 // the top where it belongs; older ones reach the front as the rows ahead of
 // them go, and are dropped there, annotating nothing.
+//
+// Quiet rows are trimmed first, oldest first, wherever they sit, and only
+// against their own cap, so they never cost a visible row its place. Loud rows
+// are then trimmed from the front exactly as before, and anything sitting ahead
+// of a trimmed row (an older quiet row, a spent marker) goes with it.
 function trim() {
-  let lines = feed.querySelectorAll(".row").length;
-  while (lines > MAX_ROWS && feed.firstElementChild) {
-    if (feed.firstElementChild.classList.contains("row")) lines--;
-    feed.removeChild(feed.firstElementChild);
+  const quiet = feed.querySelectorAll(".row.quiet");
+  for (let i = 0; i < quiet.length - maxQuietRows; i++) quiet[i].remove();
+  let lines = feed.querySelectorAll(".row:not(.quiet)").length;
+  while (lines > maxRows && feed.firstElementChild) {
+    const first = feed.firstElementChild;
+    if (first.classList.contains("row") && !first.classList.contains("quiet")) lines--;
+    feed.removeChild(first);
   }
 }
 
@@ -460,11 +477,12 @@ let inflight = false;
 
 // How many times one poll may immediately continue itself.
 //
-// The server bounds ONE response's size (see MAX_PAGE_BYTES), so a bootstrap
-// of the whole ring can come back in chunks. Following them here keeps the
-// reader's experience what it was — the page fills in one go — instead of a
-// chunk per second. Sixteen covers the largest ring the server can hold even
-// if every line in it is at the truncation limit, and it is a ceiling rather
+// The server bounds ONE response's size (see MAX_PAGE_BYTES) and its length
+// (`limit` is clamped to the main ring, and a full read of both rings is up to
+// one quiet ring longer), so a bootstrap can come back in chunks. Following
+// them here keeps the reader's experience what it was — the page fills in one
+// go — instead of a chunk per second. Sixteen covers both rings full even if
+// every server line is at the truncation limit, and it is a ceiling rather
 // than a condition, so a server that answered "more" forever could not spin
 // this.
 const MAX_CATCHUP = 16;
@@ -483,12 +501,16 @@ async function pollOnce() {
 }
 
 async function poll() {
-  // limit = the whole ring: a since-cursor makes the normal answer a handful
-  // of lines, and asking for the maximum means a burst can never leave the
-  // page a poll behind.
+  // limit = the most the server will give (its clamp): a since-cursor makes
+  // the normal answer a handful of lines, and asking for the maximum means a
+  // burst can never leave the page a poll behind.
   const resp = await fetch(`/api/logs?since=${cursor}&limit=2000&source=all`, { cache: "no-store" });
   if (!resp.ok) throw new Error("HTTP " + resp.status);
   const page = await resp.json();
+  // Absent from a server older than v0.3.1, which had one ring; keep the
+  // defaults then rather than cap at `undefined`.
+  if (page.capacity > 0) maxRows = page.capacity;
+  if (page.quiet_capacity > 0) maxQuietRows = page.quiet_capacity;
   // Drawn before the lines: on a cold load the bar is what the reader is
   // watching, and it must not wait behind up to 2000 rows being built.
   bar.render(page.status);
@@ -496,9 +518,17 @@ async function poll() {
   // restarted under us and re-synced us to everything it still holds — which
   // is the new process's startup, the thing you restarted it to watch.
   if (page.cursor < cursor) addNote("⋯ server restarted — the log resumes from the start of the new process ⋯");
+  // A gap is what the server SAYS was lost — `dropped` — and never a jump in
+  // seq. Quiet lines age out of their own smaller ring, so consecutive lines
+  // in a merged read routinely skip seqs that nobody was missing; and quiet
+  // evictions are not in `dropped` at all, so a marker here is always a
+  // marker for lines this page would have shown.
   if (page.dropped > 0) {
     const n = page.dropped;
-    addNote(`⋯ ${n} line${n === 1 ? "" : "s"} dropped — the server's ring overran ⋯`);
+    // `dropped_exact: false` means the server could only bound the gap (a
+    // cursor more than two whole rings behind): say "at least", not a count.
+    const count = page.dropped_exact === false ? `at least ${n}` : `${n}`;
+    addNote(`⋯ ${count} line${n === 1 ? "" : "s"} dropped — the server's ring overran ⋯`);
   }
   for (const line of page.lines) addRow(line);
   cursor = page.cursor;
@@ -506,7 +536,8 @@ async function poll() {
   trim();
   updateCounts();
   if (stick) toBottom();
-  $("cursorinfo").textContent = `seq ${page.newest} / ring ${page.capacity}`;
+  $("cursorinfo").textContent = `seq ${page.newest} / ring ${page.capacity}`
+    + (page.quiet_capacity ? ` + ${page.quiet_capacity} quiet` : "");
   // The server stopped this page early (on `limit` or on its byte budget) and
   // is holding more. Told, rather than re-derived from the cursor.
   return page.more === true;

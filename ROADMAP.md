@@ -575,9 +575,11 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       listeners shares the ring and one seq space, so `/logs` is a true chronological merge of server
       output and API calls; the middleware sits outermost, so it also records what the layers below
       reject. Docker's 30 s health probe and the ollama client's polling are recorded but flagged quiet,
-      so they cannot evict the load progress the page exists to show. **The page is public** (owner's
-      call, 2026-09-18) — `mummu.basicautomation.io/logs`, no auth, so one response is capped at 512 KiB
-      rather than rate-limited.
+      which hides them on the page — **and, as shipped, did not stop them taking slots in the one ring,
+      so they could and did evict the load progress the page exists to show** (measured, and fixed in
+      v0.3.1: see the end of this entry). **The page is public** (owner's call, 2026-09-18) —
+      `mummu.basicautomation.io/logs`, no auth, so one response is capped at 512 KiB rather than
+      rate-limited.
       **The bar reads atomics, not log text.** The loader prints once every 15 s — right for `docker
       logs`, hopeless for a bar that would freeze for a quarter of a minute at a time — so
       `mummu::progress` keeps the counts in relaxed atomics, updated once per tensor beside work that
@@ -612,11 +614,39 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       have printed a red `RESIDENCY SUSPECT` about a healthy load; a wedged NVML freezing the gauge not
       for a while but forever; and twice, a regression pin that could not fail — one searching a source
       file for a needle the test itself quoted, one exercising a primitive beside the rule it named.
+      **v0.3.1 (2026-09-18): the quiet flag hid the polling but did not stop it evicting.** Six hours
+      after the v0.3.0 deploy the live ring held exactly four hours (05:03 to 09:03), 97% of it polling:
+      720 × `GET /api/health` and 245 × shim `GET /` (both quiet), plus 243 × `GET /` and 242 ×
+      `GET /api/models` from a Glance monitor and a Kestra flow (both loud). The cold 27B load had
+      already been evicted. Quiet requests now have a 500-line ring of their own (~80 minutes of
+      that traffic) in the same seq space, so a read is still one chronological merge and nothing on a
+      timer can take a slot from server output; `dropped` counts main-ring losses only, and everything
+      `/api/logs` gained is a new field. Quiet is now a rule pinned by a table — a *successful* `GET` or
+      `HEAD` of a page or listing (`/`, `/logs`, `/api/models`, `/favicon.ico` — now a 204 — the probe,
+      the shim's four) — and every POST, the WebSocket upgrade and every non-2xx/3xx stays loud: the
+      same window held scanners probing the public shim for `/.env` and `/.git/config`. Measured
+      locally: after 13,440 quiet requests the startup lines, both chats and the scanner 404s were all
+      still held, `dropped` was 0, and `/logs` had polled through all of it without drawing a single gap
+      marker; a deliberate overrun of the main ring then drew exactly one, for exactly the 100 lost.
 - [ ] **Measure `MUMMU_VRAM_LIVE_BUDGET` on the 27B and decide whether it becomes the default.** The
       live reading should let the planner use VRAM another tenant has freed, and stop it overcommitting
       a card another tenant has filled — but on a box where plex and deepseek-ocr move VRAM underneath,
       it can also demote layers over a transient dip. Wants: a cold 27B timed both ways with the
       placement line from each, and a run with a co-tenant deliberately allocating during the load.
+- [ ] **What v0.3.1's review left open on `/logs`** *(2026-09-18)* — none blocked the deploy; each is
+      a way the page can still lose or misstate history. (1) **A LOUD flood still evicts the load**: 404s
+      stay loud by design, so one scanner sweep of more than 2000 paths on the public shim pushes the
+      cold-load lines out of the main ring — the thing v0.3.1 fixed for polling, still open for probing.
+      A third ring for error responses, or a small reserved share for server output, would close it.
+      (2) An open tab that trims loud rows after a main-ring overrun also drops the quiet rows in front of
+      them, so its "show health/poll traffic" view loses its probe history until a reload
+      (`logs.html` `trim`). (3) `dropped` counts main evictions after `since` including those past the
+      page's own last line, so an API client paging with a small `limit` is told about the same loss
+      twice; the embedded pages page with the full limit and never see it. (4) Two guards are missing:
+      nothing pins `oldest` as the minimum over BOTH rings (the restart replay depends on it), and
+      nothing checks that the middleware hands `quiet_request` the real response status. Also worth
+      knowing: the quiet rule ignores latency, so a successful `/api/models` that takes 30 s under a cold
+      load's seek storm is hidden by default.
 - [ ] **The gap to a fused runtime is a KERNEL problem, not a placement one — measured, and the reason
       scheduler tuning stops here.** *(2026-08-24)* Five measured iterations took the 27B from 4.88 to
       **3.91 s/token** and moved the discrete GPU from 996 to **1784 of 2048 clusters**. Then the
