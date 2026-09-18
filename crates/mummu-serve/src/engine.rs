@@ -211,6 +211,59 @@ impl Drop for LoadInFlight {
     }
 }
 
+/// The [`mummu::progress::Load`] guard for a load that *actually happened*.
+///
+/// # Why the guard cannot just be a local in `drive`
+///
+/// A guard has to be created before the load and dropped after the first
+/// token, which is a span `drive` owns — but the decision "is this a load?"
+/// belongs to [`ModelSlot::acquire`], which takes the slot lock and runs its
+/// closure only on a miss. Asking beforehand (`loaded_key_async`) releases
+/// that lock before `acquire` re-takes it, and an eviction in the window —
+/// `POST /api/unload`, or the 5 s host-pressure watcher — makes a "warm"
+/// answer wrong. The load then ran with no guard, while the loaders wrote
+/// their counts through the free functions regardless, and the bar reached
+/// N/N `loading` and stayed there: nothing owned it to finish it.
+///
+/// So the guard is armed from inside the load closure and parked here, where
+/// `drive` can still reach it. One cell, written once under the slot lock,
+/// read a handful of times after.
+///
+/// `Mutex` for the interior mutability (the closure only ever gets `&self`)
+/// and for `Sync`: `drive`'s future holds a reference to this across `.await`
+/// points and `tokio::spawn` will not take a future that is not `Send`.
+#[derive(Default)]
+struct LoadProgress(std::sync::Mutex<Option<mummu::progress::Load>>);
+
+impl LoadProgress {
+    /// A poisoned cell still holds a live guard, and dropping a progress bar
+    /// because a *bar* lock was poisoned would be absurd.
+    fn cell(&self) -> std::sync::MutexGuard<'_, Option<mummu::progress::Load>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A load for `model` is starting. Called from inside the slot's load
+    /// closure, so this happens exactly as often as a load does.
+    fn begin(&self, model: &str) {
+        *self.cell() = Some(mummu::progress::Load::begin(model));
+    }
+
+    /// Move the phase on — nothing at all when no load ran, because a warm
+    /// request must not put a bar on screen.
+    fn phase(&self, p: mummu::progress::Phase) {
+        if let Some(load) = self.cell().as_ref() {
+            load.phase(p);
+        }
+    }
+
+    /// The model is up and answering: settle on `Ready` and disarm the reset.
+    fn ready(&self) {
+        if let Some(load) = self.cell().as_ref() {
+            load.ready();
+        }
+    }
+}
+
 /// The model dir a load is currently bringing up, if any.
 pub fn load_in_flight() -> Option<std::path::PathBuf> {
     LOADING
@@ -221,11 +274,19 @@ pub fn load_in_flight() -> Option<std::path::PathBuf> {
 }
 
 /// Drop any resident model (frees VRAM/RAM).
+///
+/// Also retracts the progress state's `ready — <model>` claim, which is about
+/// a model that is resident *now*: leaving it standing after an unload put
+/// "ready — qwen3.5-2b" on `/logs` next to a RAM gauge that had just dropped
+/// 7 GiB. `SLOT.clear()` is a `try_lock`, so a `true` here means nothing held
+/// the slot — no load can have been in flight — and `progress::evicted`
+/// declines to touch a working phase in any case.
 pub fn unload_all() -> bool {
     clear_tiers();
     let freed = SLOT.clear();
     if freed {
         RESIDENT.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        mummu::progress::evicted();
     }
     freed
 }
@@ -2364,6 +2425,22 @@ fn layer_prefix_that_fits(
 /// Advisory, not fatal: the reading is process-wide and absent without NVML,
 /// so it must not take down a server that is generating correctly. It exists
 /// so this failure is legible the FIRST time rather than the fifth.
+///
+/// # Why the failure line hedges and the success line does not
+///
+/// `before` and `after` are NVML's **global** `used` — every process on the
+/// card, not this one. On the box this ships to that card is shared with
+/// deepseek-ocr and plex, so a tenant releasing 3 GiB during a load subtracts
+/// itself from our delta and can drive `observed` under the floor for a
+/// placement that is perfectly resident. Shouting `RESIDENCY FAILED` in red
+/// at that is how a monitoring line stops being read at all.
+///
+/// A per-process reading would settle it — NVML has
+/// `nvmlDeviceGetComputeRunningProcesses` — and that is the real fix, in its
+/// own change. Until then the line says what it measured and what else could
+/// explain it, and stays loud: the failure it exists to catch (nothing
+/// resident at all, decode silently on the host for five runs) still reads as
+/// the emergency it is.
 fn certify_residency(main: BackendChoice, planned: u64, before: Option<u64>) {
     if main == BackendChoice::Cpu || planned == 0 {
         return;
@@ -2379,10 +2456,8 @@ fn certify_residency(main: BackendChoice, planned: u64, before: Option<u64>) {
     // must catch is total (nothing resident at all), not marginal.
     if observed * 2 < planned {
         eprintln!(
-            "[mummu-serve] RESIDENCY FAILED: planned {:.2} GiB on {}, card grew {:.2} GiB.              The plan was NOT realized — decode is running on the host and the placement              line above is fiction.",
-            gib(planned),
-            label_of(main),
-            gib(observed),
+            "{}",
+            residency_suspect_line(planned, observed, label_of(main))
         );
     } else {
         eprintln!(
@@ -2392,6 +2467,27 @@ fn certify_residency(main: BackendChoice, planned: u64, before: Option<u64>) {
             label_of(main),
         );
     }
+}
+
+/// The line [`certify_residency`] prints when the card did not grow the way
+/// the plan said it would.
+///
+/// Its own function so the wording is testable. Two things have to hold at
+/// once and they pull in opposite directions: it must not assert a failure it
+/// cannot distinguish from a neighbour freeing VRAM, and it must still reach
+/// the operator in red — `logs::classify` guesses severity from the text, so
+/// a line that stops reading as an error stops being seen.
+fn residency_suspect_line(planned: u64, observed: u64, label: &str) -> String {
+    let gib = |b: u64| b as f64 / f64::from(1u32 << 30);
+    format!(
+        "[mummu-serve] RESIDENCY SUSPECT: planned {:.2} GiB on {label}, card grew {:.2} GiB. \
+         Either the placement failed and decode is running on the host, which makes the \
+         placement line above fiction — or another process on this card freed memory while \
+         we loaded: this is NVML's GLOBAL used, not ours alone. Check the decode rate \
+         before trusting the placement line.",
+        gib(planned),
+        gib(observed),
+    )
 }
 
 /// Load host-resident layers at Q4 instead of F16 (`MUMMU_HOST_LAYERS=q4`).
@@ -2726,6 +2822,10 @@ fn ensure_host_room(need: u64, keep: BackendChoice) {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .retain(|(b, _, _)| *b != BackendChoice::Cpu);
+            // The model this state called `ready` is the one just evicted;
+            // same reason as `unload_all`, and this path reaches it without
+            // anybody asking, from a 5 s timer.
+            mummu::progress::evicted();
         } else {
             // Busy: a generation holds the model. Say so — pretending the
             // eviction happened is how the caller walks into an OOM.
@@ -2788,6 +2888,58 @@ fn vram_margin_bytes(m: &mummu::vram::Memory) -> u64 {
     wm.guard_bytes().saturating_sub(ambient).max(512 << 20)
 }
 
+/// Is the planner allowed to size the GPU budget from the LIVE VRAM reading?
+///
+/// # A display change must not be a placement change
+///
+/// Reading VRAM and *planning against* VRAM are two different features, and
+/// v0.3.0 was asked for the first one: "add a loading progress bar", "showing
+/// loading to memory and vram". The gauges, the status object and
+/// [`certify_residency`] all read the card, everywhere, and that is the
+/// feature.
+///
+/// Wiring the same reading into this function is not. On origin/main
+/// `vram::memory()` was a hard `None` on linux, so the arm below always took
+/// `None => configured`; making it live would, in the same release that adds
+/// a progress bar, change which layers land on the card — and bring the
+/// static `Watermark`/`ALLOC_FAILED` machinery to life on linux for the first
+/// time ever. Every test run of this branch was `MUMMU_BACKEND=cpu`, so that
+/// path has been executed zero times, and its first execution would be on a
+/// shared 16 GiB card with other tenants (deepseek-ocr, plex) moving VRAM
+/// underneath it. The reading is a quantile estimator with hysteresis fed by
+/// a global number; it wants a measurement, not a guess, and it deserves its
+/// own change with its own evidence.
+///
+/// So on linux it is **opt-in**: `MUMMU_VRAM_LIVE_BUDGET=1` turns it on, and
+/// unset means the planner behaves exactly as v0.2.0 did. Turn it on
+/// deliberately, watch a load, and make that its own commit.
+///
+/// Windows is untouched: the reading has been live there since 2026-08-23,
+/// where it was added because a 9.8 GiB placement inside its configured
+/// budget died with `out of device memory` mid-generation. Gating a platform
+/// that already depends on this would be a regression dressed as caution.
+///
+/// Takes the variable's value as an argument rather than reading the
+/// environment itself, so the rule can be tested without a process-global
+/// `set_var` race.
+fn planner_vram_reading(opt_in: Option<&str>) -> Option<mummu::vram::Memory> {
+    if cfg!(windows) || live_budget_opt_in(opt_in) {
+        mummu::vram::memory()
+    } else {
+        None
+    }
+}
+
+/// Does `MUMMU_VRAM_LIVE_BUDGET` say yes? Unset, empty, `0` and anything
+/// unrecognised all mean no, because the default has to be the safe one.
+fn live_budget_opt_in(value: Option<&str>) -> bool {
+    value.map(str::trim).is_some_and(|v| {
+        ["1", "true", "yes", "on"]
+            .iter()
+            .any(|yes| v.eq_ignore_ascii_case(yes))
+    })
+}
+
 fn backend_budget(backend: BackendChoice) -> u64 {
     let inv = mummu::backend::inventory();
     match backend {
@@ -2829,6 +2981,11 @@ fn backend_budget(backend: BackendChoice) -> u64 {
         // NVML caps it. `MUMMU_GPU_BUDGET_GB` still means "never use more
         // than this", which is what an operator setting it wants; it just no
         // longer means "this much is definitely available".
+        //
+        // On linux that capping is OFF unless `MUMMU_VRAM_LIVE_BUDGET=1` says
+        // otherwise, and the budget line below prints which state it is in —
+        // see `planner_vram_reading` for why a release that adds a gauge is
+        // not the release that changes where layers land.
         _ => {
             let configured = std::env::var("MUMMU_GPU_BUDGET_GB")
                 .ok()
@@ -2842,7 +2999,9 @@ fn backend_budget(backend: BackendChoice) -> u64 {
                         .map(|b| b / 8 * 7)
                 })
                 .unwrap_or(15 << 30);
-            match mummu::vram::memory() {
+            // NOT `vram::memory()` — the gauges read that, the planner does
+            // not, unless it was asked to. See `planner_vram_reading`.
+            match planner_vram_reading(std::env::var("MUMMU_VRAM_LIVE_BUDGET").ok().as_deref()) {
                 // Leave the desktop room for what ambient consumption may
                 // GROW to, not a hand-picked constant: the margin comes from
                 // the chance-constrained watermark (`vram_margin_bytes` —
@@ -2865,9 +3024,29 @@ fn backend_budget(backend: BackendChoice) -> u64 {
                     }
                     configured.min(live)
                 }
-                // No reading: hold the configured value rather than guess in
-                // either direction.
-                None => configured,
+                // No reading the planner may use: hold the configured value
+                // rather than guess in either direction. Said once, because
+                // "the gauge shows a card the budget ignores" is otherwise a
+                // silent difference between two boxes.
+                None => {
+                    static SAID: std::sync::Once = std::sync::Once::new();
+                    SAID.call_once(|| {
+                        let gated = !cfg!(windows)
+                            && !live_budget_opt_in(
+                                std::env::var("MUMMU_VRAM_LIVE_BUDGET").ok().as_deref(),
+                            );
+                        eprintln!(
+                            "[mummu-serve] VRAM: budget {:.1} GiB, uncapped by any live reading — {}",
+                            configured as f64 / f64::from(1u32 << 30),
+                            if gated {
+                                "the planner is not reading the card's free bytes (MUMMU_VRAM_LIVE_BUDGET=1 opts in; the gauges read it either way)"
+                            } else {
+                                "nothing on this machine reports VRAM"
+                            },
+                        );
+                    });
+                    configured
+                }
             }
         }
     }
@@ -3074,32 +3253,51 @@ async fn drive(
     // planner's decision cosmetic.
     let device = device_of(backend);
     let key = spec.dir(models_root);
-    // Exactly one question, asked once: is this request going to pay for a
-    // load? `loaded_key_async` waits for the slot rather than reporting busy,
-    // so the answer is the truth and not "busy, can't tell" — which matters,
-    // because claiming a load that is not happening would put a creeping bar
-    // under a warm request that is about to answer in milliseconds.
-    let cold = slot.loaded_key_async().await.as_deref() != Some(key.as_path());
-    if cold && tiers_pack_in(&key).is_none() {
+    // Is this request likely to pay for a load? `loaded_key_async` waits for
+    // the slot rather than reporting busy, so the answer is the truth and not
+    // "busy, can't tell".
+    //
+    // It is not, however, a DECISION — it cannot be. The lock it takes to look
+    // is released the moment it returns, and `acquire` below takes that lock
+    // again; anything that evicts in between (`POST /api/unload`, the 5 s
+    // host-pressure watcher) turns a warm answer into a real load. This is
+    // only used for the tier bookkeeping, which is idempotent either way.
+    let likely_cold = slot.loaded_key_async().await.as_deref() != Some(key.as_path());
+    if likely_cold && tiers_pack_in(&key).is_none() {
         // This slot is about to evict its occupant; if that was the tiered
         // model, its experts on the *other* devices go with it.
         clear_tiers_if_slot(backend);
     }
     // The progress guard covers the load AND the first forward, because to the
-    // person watching an empty bubble those are one wait. It is created here
-    // rather than around `plan_fit` in `run_chat` for the reason above: this
-    // is the first point at which "a load is happening" is a fact.
+    // person watching an empty bubble those are one wait.
     //
-    // Every way out of this function from here on drops it — an early `?`, a
-    // panic in a kernel, a cancelled task when the browser tab closes — and
-    // the Drop returns the phase to Idle. Only `ready()` below disarms that.
-    let progress = cold.then(|| mummu::progress::Load::begin(&spec.name));
+    // It is armed from INSIDE the slot's load closure, which is the only place
+    // that knows a load is happening rather than guessing: `acquire` runs that
+    // closure under the slot lock and only on a miss, so "a load ran" and "the
+    // guard exists" are the same event and cannot come apart. Deciding out
+    // here from `likely_cold` let them: an eviction in the window above made a
+    // load run with no guard at all, the loaders wrote their phase and counts
+    // through the free functions anyway, and the bar sat at N/N `loading`
+    // forever because nothing owned it to call `finish()`. That is exactly the
+    // state `Load`'s doc comment promises `Drop` covers.
+    //
+    // From the moment it is armed, every way out of this function drops it —
+    // an early `?`, a panic in a kernel, a cancelled task when the browser tab
+    // closes — and the Drop returns the phase to Idle. Only `ready()` disarms.
+    //
+    // The trade, stated: a request that is QUEUED behind another generation
+    // now shows no bar until it reaches the front, where before it claimed to
+    // be loading from the moment it arrived. That claim was the wrong one —
+    // it was waiting, not loading, and it might never load at all.
+    let progress = LoadProgress::default();
+    let arming = &progress;
     // The load closure and the async body both want `device`; give the loader
     // its own handle so the future can capture the original by reference.
     let load_device = device.clone();
     let flag_key = key.clone();
     let m = slot
         .acquire(&key, move |_| {
+            arming.begin(&spec.name);
             // One bar for the whole load: a profiled COLD request would
             // otherwise smear minutes of import across the decode graph.
             let _s = mummu::prof::scope("model_load");
@@ -3110,9 +3308,7 @@ async fn drive(
     // The weights are resident. What is left before the first token is kernel
     // compilation and autotune — one pass whose duration is the unknown, so
     // it renders indeterminate rather than as a fake percentage.
-    if let Some(p) = &progress {
-        p.phase(mummu::progress::Phase::Warming);
-    }
+    progress.phase(mummu::progress::Phase::Warming);
     {
         // ChatML renderers leave specials to the tokenizer; the Tulu
         // render already embeds its own BOS (the real_olmoe.rs pattern).
@@ -3147,10 +3343,8 @@ async fn drive(
                 // exists for is over. Said here rather than after `generate`
                 // returns, because the rest of a 512-token decode is not a
                 // load and must not keep a progress bar on screen.
-                if ids.is_empty()
-                    && let Some(p) = &progress
-                {
-                    p.ready();
+                if ids.is_empty() {
+                    progress.ready();
                 }
                 ids.push(id);
                 // Incremental decode: re-decode the whole tail and emit the
@@ -3401,5 +3595,207 @@ mod host_watch_tests {
             Some(floor - 1).is_some_and(|a: u64| a < floor),
             "one byte under the floor is pressure"
         );
+    }
+}
+
+#[cfg(test)]
+mod observability_tests {
+    use super::*;
+    use mummu::progress::{Phase, snapshot};
+
+    // -- MAJOR: the planner's use of the live VRAM reading is opt-in ---------
+
+    /// The gate itself. Anything that is not an unambiguous yes is a no,
+    /// because the default has to be the behaviour v0.2.0 shipped with.
+    #[test]
+    fn only_an_unambiguous_yes_opts_into_live_vram_budgeting() {
+        for yes in ["1", "true", "TRUE", "yes", "On", " 1 "] {
+            assert!(live_budget_opt_in(Some(yes)), "{yes:?} means yes");
+        }
+        for no in ["", "0", "false", "no", "off", "  ", "2", "maybe"] {
+            assert!(!live_budget_opt_in(Some(no)), "{no:?} must not mean yes");
+        }
+        assert!(!live_budget_opt_in(None), "unset is the safe default");
+    }
+
+    /// The separation this release turns on: the gauges read the card
+    /// everywhere, the PLANNER does not — because reading VRAM and planning
+    /// against VRAM are different features and only the first one was asked
+    /// for. On linux `vram::memory()` was a hard `None` before this branch,
+    /// so leaving it live here would have changed placement on a shared card
+    /// in a release about a progress bar.
+    #[test]
+    fn the_planner_ignores_the_live_vram_reading_until_it_is_asked_for() {
+        // The reading itself is unconditional — this is what the gauges,
+        // the status object and `certify_residency` all use.
+        let readable = mummu::vram::memory().is_some();
+
+        if cfg!(windows) {
+            assert_eq!(
+                planner_vram_reading(None).is_some(),
+                readable,
+                "windows has budgeted from the live reading since 2026-08-23; \
+                 gating it there would be a regression"
+            );
+            return;
+        }
+        assert!(
+            planner_vram_reading(None).is_none(),
+            "off by default: v0.2.0's placement, unchanged"
+        );
+        assert!(planner_vram_reading(Some("0")).is_none());
+        assert_eq!(
+            planner_vram_reading(Some("1")).is_some(),
+            readable,
+            "opted in, the planner sees exactly what the gauges see"
+        );
+    }
+
+    /// The alarm has to survive being made honest. `logs::classify` guesses
+    /// severity from the text, so a line reworded out of certainty must not
+    /// also be reworded out of the red.
+    #[test]
+    fn the_residency_alarm_is_hedged_but_still_loud() {
+        let line = residency_suspect_line(9 << 30, 1 << 29, "GPU (wgpu)");
+        assert_eq!(
+            crate::logs::classify(&line),
+            crate::logs::Level::Error,
+            "still an error on /logs: {line}"
+        );
+        assert!(
+            line.contains("GLOBAL"),
+            "it must say whose bytes it measured: {line}"
+        );
+        assert!(
+            line.contains("Either") && line.contains("or another process"),
+            "a reading this ambiguous must not be stated as a fact: {line}"
+        );
+        assert!(
+            line.contains("9.00 GiB") && line.contains("0.50 GiB"),
+            "{line}"
+        );
+    }
+
+    // -- MINOR: the progress guard cannot be skipped -------------------------
+
+    /// A warm request arms nothing: no load ran, so no bar may appear, and
+    /// the phase must be exactly what it was.
+    #[test]
+    fn a_progress_cell_that_was_never_armed_touches_nothing() {
+        let _serial = crate::progress_serial();
+        mummu::progress::idle();
+        let before = snapshot();
+        {
+            let p = LoadProgress::default();
+            p.phase(Phase::Warming);
+            p.ready();
+            assert_eq!(snapshot(), before, "a warm request drew a bar");
+        }
+        assert_eq!(snapshot(), before, "and dropping it is also nothing");
+    }
+
+    /// Armed from inside the load closure, the cell owns the whole load: it
+    /// carries the phase forward, and — the case that pinned the bar at N/N
+    /// `loading` forever — a load that ends without a first token still
+    /// returns to Idle when the cell drops.
+    #[test]
+    fn an_armed_progress_cell_covers_the_load_and_resets_on_drop() {
+        let _serial = crate::progress_serial();
+        {
+            let p = LoadProgress::default();
+            p.begin("qwen3.5-2b");
+            assert_eq!(snapshot().phase, Phase::Loading);
+            assert_eq!(snapshot().model, "qwen3.5-2b");
+            // The loaders write counts through the free functions; they do
+            // not know about the cell, which is exactly why the cell has to
+            // exist whenever they run.
+            mummu::progress::begin(Phase::Loading, 851);
+            mummu::progress::advance(851, 14 << 30);
+            p.phase(Phase::Warming);
+            assert_eq!(snapshot().phase, Phase::Warming);
+        }
+        assert_eq!(
+            snapshot().phase,
+            Phase::Idle,
+            "a load that never produced a token must not leave a bar up"
+        );
+    }
+
+    /// The happy path: the first token disarms the reset and settles on
+    /// Ready, which survives the drop.
+    #[test]
+    fn a_progress_cell_that_reached_a_token_settles_on_ready() {
+        let _serial = crate::progress_serial();
+        {
+            let p = LoadProgress::default();
+            p.begin("qwen3.5-2b");
+            p.phase(Phase::Warming);
+            p.ready();
+            assert_eq!(snapshot().phase, Phase::Ready);
+        }
+        assert_eq!(snapshot().phase, Phase::Ready, "resident, and still is");
+        mummu::progress::idle();
+    }
+
+    /// And eviction retracts it — the `/logs` line that read
+    /// `ready — qwen3.5-2b` next to a RAM gauge 7 GiB lighter.
+    #[test]
+    fn an_unload_retracts_the_ready_claim() {
+        let _serial = crate::progress_serial();
+        {
+            let p = LoadProgress::default();
+            p.begin("qwen3.5-2b");
+            p.ready();
+        }
+        assert_eq!(snapshot().phase, Phase::Ready);
+        // What `unload_all` and the host-pressure eviction both now call
+        // once the slot is actually cleared.
+        mummu::progress::evicted();
+        assert_eq!(snapshot().phase, Phase::Idle);
+        assert_eq!(snapshot().model, "");
+    }
+
+    // -- MINOR: both pages clamp the bar ------------------------------------
+
+    /// `done` and `expected` are separate relaxed stores, so a snapshot can
+    /// catch them mid-`begin` and carry a count past its own total. The
+    /// memory gauges already clamp; the load bar did not, and drew past its
+    /// track with a label reading raw counts.
+    ///
+    /// Asserted against the embedded pages because they are shipped bytes
+    /// with no test runner of their own, and because the two are meant to be
+    /// the same widget in two places — a fix applied to one and not the other
+    /// is the failure mode this catches.
+    #[test]
+    fn both_pages_clamp_the_load_bar_the_way_they_clamp_the_gauges() {
+        for (name, html) in [("ui.html", crate::UI_HTML), ("logs.html", crate::LOGS_HTML)] {
+            let bar = html
+                .lines()
+                .find(|l| l.contains("fill.style.width = determinate"))
+                .unwrap_or_else(|| panic!("{name} no longer draws a determinate bar"));
+            assert!(
+                bar.contains("widthPct(st.done, st.total)"),
+                "{name} draws the bar unclamped: {bar}"
+            );
+            let label = html
+                .lines()
+                .find(|l| l.contains("tensors`"))
+                .unwrap_or_else(|| panic!("{name} no longer labels the bar"));
+            assert!(
+                label.contains("Math.min(st.done, st.total)"),
+                "{name} labels a torn snapshot with raw counts: {label}"
+            );
+        }
+        // And the clamp itself, stated once and shared by both pages.
+        for (name, html) in [("ui.html", crate::UI_HTML), ("logs.html", crate::LOGS_HTML)] {
+            assert!(
+                html.contains("const widthPct = (used, total) =>"),
+                "{name} has no shared clamp"
+            );
+            assert!(
+                html.contains("Math.max(0, Math.min(100,"),
+                "{name}'s clamp does not bound both ends"
+            );
+        }
     }
 }

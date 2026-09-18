@@ -267,6 +267,16 @@ function secs(s) {
   return m + " min " + String(Math.round(s - m * 60)).padStart(2, "0") + " s";
 }
 
+// A width in percent, clamped to its own track — the one place either bar
+// works out how wide to be.
+//
+// Clamping is not defensive decoration. `done` and `expected` reach the server
+// as separate relaxed atomic stores (see mummu::progress), so a snapshot may
+// legitimately catch them mid-`begin` and carry a count past its own total. A
+// gauge reading 103% simply draws past the end of its track; the load bar did
+// exactly that, and the label beside it printed the raw counts.
+const widthPct = (used, total) => Math.max(0, Math.min(100, (used / total) * 100)).toFixed(1) + "%";
+
 // Build the bar + gauges. Returns { root, render }. Everything is written with
 // textContent and style widths — never innerHTML — because a model name the
 // client chose reaches the label.
@@ -303,7 +313,7 @@ function makeProgress() {
       return;
     }
     g.track.classList.remove("na");
-    g.fill.style.width = Math.max(0, Math.min(100, (used / total) * 100)).toFixed(1) + "%";
+    g.fill.style.width = widthPct(used, total);
     g.value.textContent = `${(used / GIB).toFixed(1)} / ${gib(total)}`;
     if (mine != null) g.value.textContent += ` · mummu ${(mine / GIB).toFixed(1)}`;
   };
@@ -321,7 +331,9 @@ function makeProgress() {
     if (!working) return false;
     const parts = [st.model ? `${st.phase} ${st.model}` : st.phase];
     const determinate = st.total > 0;
-    if (determinate) parts.push(`${st.done}/${st.total} tensors`);
+    // Clamped for the same reason the width is: a torn snapshot must read
+    // "851/851 tensors", never "900/851".
+    if (determinate) parts.push(`${Math.min(st.done, st.total)}/${st.total} tensors`);
     if (st.bytes > 0) {
       // MiB/s labelled "MB/s", matching the server's own load line exactly —
       // the two sit next to each other on /logs and must not disagree.
@@ -335,7 +347,7 @@ function makeProgress() {
     else if (st.elapsed_s != null) parts.push(`${secs(st.elapsed_s)} so far`);
     label.textContent = parts.join(" — ");
     track.className = determinate ? "track" : "track indet";
-    fill.style.width = determinate ? ((st.done / st.total) * 100).toFixed(1) + "%" : "";
+    fill.style.width = determinate ? widthPct(st.done, st.total) : "";
     return true;
   };
   return { root, render };
