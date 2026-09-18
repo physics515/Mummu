@@ -181,6 +181,38 @@ pub fn idle() {
     model().clear();
 }
 
+/// The resident model is gone: something dropped it out from under this state.
+///
+/// [`Phase::Ready`] is not a memory of a load that once succeeded, it is a
+/// claim that a model is resident **now** — so an eviction makes it a lie, and
+/// a visible one: after `POST /api/unload` the page read `ready — qwen3.5-2b`
+/// beside a RAM gauge that had just dropped 7 GiB, which is the same "the
+/// display disagrees with the machine" confusion the whole panel exists to
+/// end. `finish()` has an owner (the load that succeeded); losing residency
+/// does not, so it gets a free function of its own.
+///
+/// # Why a working phase is left alone
+///
+/// A load in flight owns this state through its [`Load`] guard, and blanking
+/// a bar that is legitimately moving would be the worse lie of the two. The
+/// caller's own structure normally rules that out — mummu-serve's eviction
+/// path cannot take the model slot while a load holds it — but "normally" is
+/// not a thing to leave a global on, and the guard's `Drop` settles a load
+/// that really is abandoned anyway.
+pub fn evicted() {
+    let generation = GENERATION.load(Relaxed);
+    // Only a `Ready` claim needs retracting. A working phase owns this state,
+    // and `Idle` already IS the answer — re-asserting it would restart the
+    // clock every 5 seconds for the watcher that calls this on a timer.
+    if Phase::from_u8(PHASE.load(Relaxed)) != Phase::Ready {
+        return;
+    }
+    // A load that began while we were deciding owns the state now.
+    if GENERATION.load(Relaxed) == generation {
+        idle();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The lifecycle guard.
 // ---------------------------------------------------------------------------
@@ -598,6 +630,63 @@ mod tests {
         assert_eq!(s.model, "new-model");
         drop(fresh);
         idle();
+    }
+
+    /// The state `/logs` showed live after `POST /api/unload`: phase `ready`,
+    /// model `qwen3.5-2b`, and 7 GiB less RAM held than the sentence implies.
+    /// `Ready` is a claim about right now, so losing the model has to retract
+    /// it — name included, or the next idle page still says whose model it is.
+    #[test]
+    fn an_eviction_retracts_the_ready_claim() {
+        let _serial = serial();
+        let load = Load::begin("qwen3.5-2b");
+        load.ready();
+        assert_eq!(snapshot().phase, Phase::Ready);
+        assert_eq!(snapshot().model, "qwen3.5-2b");
+
+        evicted();
+        assert_eq!(
+            snapshot().phase,
+            Phase::Idle,
+            "nothing is resident, so nothing is ready"
+        );
+        assert_eq!(snapshot().model, "", "and no model is named");
+        drop(load);
+    }
+
+    /// Eviction is also reachable from a 5 s watcher that knows nothing about
+    /// loads. It must not blank a bar that is moving — a load in flight owns
+    /// this state and its guard is what ends it.
+    #[test]
+    fn an_eviction_leaves_a_load_in_flight_alone() {
+        let _serial = serial();
+        let load = Load::begin("gemma3:27b");
+        load.begin_phase(Phase::Loading, 851);
+        advance(300, 5 << 30);
+
+        evicted();
+        let s = snapshot();
+        assert_eq!(s.phase, Phase::Loading, "the live load kept its phase");
+        assert_eq!((s.done, s.expected), (300, 851), "and its counts");
+        assert_eq!(s.model, "gemma3:27b");
+
+        // The same for the uncounted phases — `Warming` is work too.
+        load.phase(Phase::Warming);
+        evicted();
+        assert_eq!(snapshot().phase, Phase::Warming);
+        drop(load);
+        assert_eq!(snapshot().phase, Phase::Idle);
+    }
+
+    /// Evicting when nothing was resident is a no-op, not a state change —
+    /// the watcher calls this on a timer and must not churn the generation.
+    #[test]
+    fn evicting_nothing_changes_nothing() {
+        let _serial = serial();
+        idle();
+        let before = snapshot();
+        evicted();
+        assert_eq!(snapshot(), before);
     }
 
     #[test]
