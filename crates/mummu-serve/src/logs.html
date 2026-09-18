@@ -1,0 +1,543 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mummu logs</title>
+<!--
+  The merged log feed for GET /api/logs.
+
+  Standalone on purpose: same CSS variables and the same dark look as ui.html,
+  but its own file with no shared build step and no external asset, because
+  both pages are `include_str!`d into the binary and served by a box that may
+  have no internet at all. A framework or a CDN font would be one more thing
+  that can fail on the day you are trying to find out why nothing works.
+-->
+<style>
+  :root {
+    --bg: #101014; --panel: #17171d; --panel2: #1e1e26; --border: #2a2a35;
+    --text: #e7e7ee; --dim: #8a8a99; --accent: #7aa2f7; --user: #24283b;
+    --err: #f7768e; --ok: #9ece6a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.55 system-ui, "Segoe UI", sans-serif;
+    display: flex; flex-direction: column; height: 100dvh;
+  }
+  header {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 10px 14px; background: var(--panel); border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 16px; margin: 0 6px 0 0; font-weight: 600; letter-spacing: .04em; }
+  header h1 span { color: var(--accent); }
+  select, input, button {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 6px 10px; font: inherit;
+  }
+  button { cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button.on { border-color: var(--accent); color: var(--accent); }
+  a.nav {
+    color: var(--dim); text-decoration: none; font-size: 13px;
+    border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px;
+  }
+  a.nav:hover { color: var(--accent); border-color: var(--accent); }
+  .badge {
+    font-size: 12px; color: var(--dim); border: 1px solid var(--border);
+    border-radius: 999px; padding: 2px 10px; white-space: nowrap;
+  }
+  .badge.live { color: var(--ok); }
+  .badge.down { color: var(--err); }
+  label.check { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--dim); }
+  label.check input { width: auto; padding: 0; }
+
+  #feed {
+    flex: 1; overflow-y: auto; padding: 8px 0 14px;
+    font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  .row {
+    display: flex; gap: 10px; padding: 1px 14px; white-space: pre-wrap; word-break: break-word;
+  }
+  .row:hover { background: var(--panel); }
+  .row[hidden] { display: none; }
+  .ts { color: var(--dim); flex: none; }
+  .chip {
+    flex: none; width: 52px; text-align: center; border-radius: 4px;
+    background: var(--panel2); font-size: 11px; letter-spacing: .04em;
+  }
+  .chip.server { color: var(--dim); }
+  .chip.api { color: var(--ok); }
+  .chip.shim { color: var(--accent); }
+  .txt { flex: 1; min-width: 0; }
+  /* Level colouring, from the same four variables the chat UI uses. */
+  .lvl-error .txt { color: var(--err); }
+  .lvl-warn .txt { color: var(--accent); }
+  .quiet .txt, .quiet .chip { opacity: .5; }
+
+  .gap {
+    color: var(--err); padding: 4px 14px; text-align: center;
+    border-top: 1px dashed var(--border); border-bottom: 1px dashed var(--border);
+    margin: 4px 0;
+  }
+  #empty { text-align: center; color: var(--dim); margin-top: 12vh; font-family: system-ui, sans-serif; }
+  #empty .big { font-size: 40px; }
+
+  /* The load bar and the two memory gauges, pinned under the header and
+     visible ALWAYS — not only during a load. Idle it reads "ready" beside the
+     two gauges, which makes this page double as a live memory monitor, which
+     is the thing it gets left open for.
+
+     Shared, character for character, with ui.html. Both pages are
+     include_str!'d into the binary with no build step (see the comment at the
+     top of this file), so the duplication is deliberate; keep them in step. */
+  #bar {
+    padding: 7px 14px 9px; background: var(--panel); border-bottom: 1px solid var(--border);
+    font: 11.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  .prog .plabel { color: var(--dim); white-space: pre-wrap; word-break: break-word; }
+  .track {
+    height: 6px; background: var(--panel2); border-radius: 3px;
+    overflow: hidden; margin-top: 4px; max-width: 620px;
+  }
+  .track > i {
+    display: block; height: 100%; width: 0; background: var(--accent);
+    border-radius: 3px; transition: width .35s linear;
+  }
+  /* A phase with no count (packing, warming) sweeps instead of lying about a
+     percentage. `transform`, not `width`, so it costs no layout. */
+  .track.indet > i { width: 32%; transition: none; animation: sweep 1.5s ease-in-out infinite; }
+  /* Idle: an inert, empty track rather than an animation that suggests work. */
+  .track.rest > i { width: 0; animation: none; }
+  @keyframes sweep { from { transform: translateX(-110%); } to { transform: translateX(350%); } }
+  .gauges { display: flex; gap: 16px; margin-top: 6px; flex-wrap: wrap; }
+  .gauge { display: flex; align-items: center; gap: 6px; color: var(--dim); }
+  .gauge .gname { letter-spacing: .04em; }
+  .gauge .gtrack { width: 84px; height: 5px; background: var(--panel2); border-radius: 3px; overflow: hidden; }
+  .gauge .gtrack > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .35s linear; }
+  /* No reading at all: the track is visibly inert, never a full-looking 0%. */
+  .gauge .gtrack.na { opacity: .3; }
+  footer {
+    padding: 6px 14px; background: var(--panel); border-top: 1px solid var(--border);
+    font-size: 12px; color: var(--dim); display: flex; gap: 14px; align-items: center; flex-wrap: wrap;
+  }
+  #tail { display: none; }
+  #tail.show { display: inline-block; }
+</style>
+</head>
+<body>
+<header>
+  <h1><span>mummu</span> logs</h1>
+  <a class="nav" href="/">&larr; Chat</a>
+  <select id="source" title="which source to show">
+    <option value="all">all sources</option>
+    <option value="server">server (stdout/stderr)</option>
+    <option value="api">api (8095)</option>
+    <option value="shim">shim (11435)</option>
+  </select>
+  <input id="search" type="search" placeholder="filter (plain text)" style="width:220px">
+  <label class="check"><input id="quiet" type="checkbox"> show health/poll traffic</label>
+  <span style="flex:1"></span>
+  <button id="pause" title="Stop polling. The server keeps logging; a gap marker appears if the ring overran while you were paused.">Pause</button>
+  <button id="clear" title="Clear what is on screen (the server's ring is untouched)">Clear</button>
+  <span id="status" class="badge">…</span>
+  <!-- Which build is actually running. "Is the new release deployed?" was
+       asked and could not be answered from the server at all. -->
+  <span id="build" class="badge" title="running version (git commit)"></span>
+</header>
+
+<div id="bar"></div>
+
+<div id="feed"><div id="empty"><div class="big">𒀯</div>Waiting for the first line…</div></div>
+
+<footer>
+  <span id="counts">0 lines</span>
+  <span id="dropped"></span>
+  <span style="flex:1"></span>
+  <button id="tail">Jump to newest &darr;</button>
+  <span id="cursorinfo"></span>
+</footer>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const feed = $("feed");
+
+// Keep the DOM at the size of the server's ring: past that the page is showing
+// lines the server has already forgotten, and a browser tab left open for a
+// week would grow without bound.
+const MAX_ROWS = 2000;
+// Never faster than this, whatever happens — a log reader must not be able to
+// cost the server more than the thing it is watching.
+const MIN_POLL_MS = 1000;
+const HIDDEN_POLL_MS = 5000;
+const MAX_BACKOFF_MS = 15000;
+
+let cursor = 0;          // 0 = "everything you still have"
+let paused = false;
+let failures = 0;
+let stick = true;        // auto-scroll: true while the reader is at the bottom
+let droppedTotal = 0;
+
+function shortTime(ms) {
+  const d = new Date(ms);
+  const p = n => String(n).padStart(2, "0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+// --- filtering -------------------------------------------------------------
+//
+// Every line the server hands over is kept in the DOM and merely hidden, so
+// changing the filter or the search is instant and never loses history the
+// server may already have dropped. The source filter is applied here rather
+// than through the endpoint's `source=` parameter for the same reason:
+// switching from "api" to "all" would otherwise show nothing before the switch.
+
+function matches(row) {
+  if (row.classList.contains("gap")) return true;
+  const want = $("source").value;
+  if (want !== "all" && row.dataset.source !== want) return false;
+  if (!$("quiet").checked && row.dataset.quiet === "1") return false;
+  const needle = $("search").value.trim().toLowerCase();
+  if (needle && !row.dataset.text.includes(needle)) return false;
+  return true;
+}
+
+function applyFilter(row) { row.hidden = !matches(row); }
+function reapplyAll() {
+  for (const row of feed.children) if (row.dataset) applyFilter(row);
+  if (stick) toBottom();
+}
+for (const el of ["source", "search", "quiet"]) $(el).addEventListener("input", reapplyAll);
+
+// --- the feed --------------------------------------------------------------
+
+function toBottom() { feed.scrollTop = feed.scrollHeight; }
+
+// Cap the LINES, not every child.
+//
+// A gap marker only ever appears in front of a full ring's worth of lines —
+// that is what "the ring overran" means — so a cap that counted markers too
+// would trim away the confession along with the lines it was confessing
+// about, every single time. Counting rows keeps the newest marker pinned at
+// the top where it belongs; older ones reach the front as the rows ahead of
+// them go, and are dropped there, annotating nothing.
+function trim() {
+  let lines = feed.querySelectorAll(".row").length;
+  while (lines > MAX_ROWS && feed.firstElementChild) {
+    if (feed.firstElementChild.classList.contains("row")) lines--;
+    feed.removeChild(feed.firstElementChild);
+  }
+}
+
+function addRow(line) {
+  const empty = $("empty");
+  if (empty) empty.remove();
+  const row = document.createElement("div");
+  row.className = "row lvl-" + line.level + (line.quiet ? " quiet" : "");
+  row.dataset.source = line.source;
+  row.dataset.quiet = line.quiet ? "1" : "0";
+  row.dataset.text = String(line.text).toLowerCase();
+  const ts = document.createElement("span");
+  ts.className = "ts";
+  ts.textContent = shortTime(line.ts);
+  ts.title = new Date(line.ts).toISOString() + `  (seq ${line.seq})`;
+  const chip = document.createElement("span");
+  chip.className = "chip " + line.source;
+  chip.textContent = line.source;
+  const txt = document.createElement("span");
+  txt.className = "txt";
+  txt.textContent = line.text;   // textContent, never innerHTML: log lines carry
+  row.append(ts, chip, txt);     // model names and paths a client chose
+  feed.appendChild(row);
+  applyFilter(row);
+}
+
+// A break, not a silent splice: the feed says where it is missing something
+// rather than joining two stretches of time as if nothing happened between.
+function addNote(text) {
+  const empty = $("empty");
+  if (empty) empty.remove();
+  const note = document.createElement("div");
+  note.className = "gap";
+  note.textContent = text;
+  feed.appendChild(note);
+}
+
+feed.addEventListener("scroll", () => {
+  // Within a couple of lines of the bottom counts as "at the bottom", so a
+  // smooth-scroll or a fractional device pixel does not silently unstick it.
+  stick = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 24;
+  $("tail").classList.toggle("show", !stick);
+});
+$("tail").addEventListener("click", () => { stick = true; toBottom(); $("tail").classList.remove("show"); });
+
+$("clear").addEventListener("click", () => {
+  feed.textContent = "";
+  updateCounts();
+  // The cursor is deliberately NOT reset: Clear means "stop showing me this",
+  // not "replay the ring".
+});
+
+$("pause").addEventListener("click", () => {
+  paused = !paused;
+  $("pause").textContent = paused ? "Resume" : "Pause";
+  $("pause").classList.toggle("on", paused);
+  setStatus();
+});
+
+// Counted off the DOM rather than kept in a variable, so Clear, the row cap
+// and the gap markers cannot drift it out of agreement with what is on screen.
+function updateCounts() {
+  const rows = feed.querySelectorAll(".row").length;
+  $("counts").textContent = `${rows} line${rows === 1 ? "" : "s"} held`;
+  $("dropped").textContent = droppedTotal ? `· ${droppedTotal} dropped since start` : "";
+}
+
+function setStatus(extra) {
+  const badge = $("status");
+  badge.classList.toggle("live", !paused && failures === 0);
+  badge.classList.toggle("down", failures > 0);
+  badge.textContent = paused ? "paused" : failures > 0 ? `unreachable (retry ${failures})` : (extra || "live");
+}
+
+// --- the load bar and the memory gauges ------------------------------------
+//
+// Fed by the `status` object that rides this page's existing /api/logs poll,
+// NOT by parsing the lines below it. The loader prints its progress once every
+// 15 seconds — right for `docker logs`, hopeless for a bar, which would sit
+// still for a quarter of a minute and then jump. The status object is fed by
+// atomics the loader updates once per tensor (crates/mummu/src/progress.rs).
+//
+// Kept up even when nothing is loading, so this page is also the answer to
+// "how much RAM is that thing holding right now".
+
+const GIB = 1024 ** 3;
+const MIB = 1024 ** 2;
+
+// GiB with a sensible number of digits: "14.5 GiB", "124 GiB".
+function gib(bytes) {
+  const g = bytes / GIB;
+  return (g >= 100 ? g.toFixed(0) : g.toFixed(1)) + " GiB";
+}
+
+// Seconds as something a person reads off a bar.
+function secs(s) {
+  if (s < 60) return Math.round(s) + " s";
+  const m = Math.floor(s / 60);
+  return m + " min " + String(Math.round(s - m * 60)).padStart(2, "0") + " s";
+}
+
+// A width in percent, clamped to its own track — the one place either bar
+// works out how wide to be.
+//
+// Clamping is not defensive decoration. `done` and `expected` reach the server
+// as separate relaxed atomic stores (see mummu::progress), so a snapshot may
+// legitimately catch them mid-`begin` and carry a count past its own total. A
+// gauge reading 103% simply draws past the end of its track; the load bar did
+// exactly that, and the label beside it printed the raw counts.
+const widthPct = (used, total) => Math.max(0, Math.min(100, (used / total) * 100)).toFixed(1) + "%";
+
+// Build the bar + gauges into #bar. Everything is written with textContent and
+// style widths — never innerHTML — because a model name the client chose
+// reaches the label.
+const bar = (() => {
+  const el = (tag, cls) => { const e = document.createElement(tag); if (cls) e.className = cls; return e; };
+  const root = el("div", "prog");
+  const label = el("div", "plabel");
+  const track = el("div", "track");
+  const fill = el("i");
+  track.appendChild(fill);
+  const gauges = el("div", "gauges");
+  const gauge = name => {
+    const g = el("div", "gauge");
+    const n = el("span", "gname"); n.textContent = name;
+    const t = el("span", "gtrack");
+    const f = el("i");
+    t.appendChild(f);
+    const v = el("span", "gval");
+    g.append(n, t, v);
+    gauges.appendChild(g);
+    return { track: t, fill: f, value: v };
+  };
+  const ram = gauge("RAM"), vram = gauge("VRAM");
+  root.append(label, track, gauges);
+  $("bar").appendChild(root);
+
+  // One gauge: `used` of `total`, plus an optional "mine" note naming this
+  // process's share. A null reading renders "n/a" with an inert track, never
+  // an empty one that reads as 0%.
+  const setGauge = (g, used, total, mine) => {
+    if (total == null || total <= 0) {
+      g.track.classList.add("na");
+      g.fill.style.width = "0%";
+      g.value.textContent = "n/a";
+      return;
+    }
+    g.track.classList.remove("na");
+    g.fill.style.width = widthPct(used, total);
+    g.value.textContent = `${(used / GIB).toFixed(1)} / ${gib(total)}`;
+    if (mine != null) g.value.textContent += ` · mummu ${(mine / GIB).toFixed(1)}`;
+  };
+
+  const render = st => {
+    if (!st) return;
+    $("build").textContent = st.version ? `v${st.version} (${st.build || "unknown"})` : "";
+    setGauge(ram, st.host ? st.host.total - st.host.available : null,
+             st.host ? st.host.total : null, st.host ? st.host.rss : null);
+    setGauge(vram, st.vram ? st.vram.used : null, st.vram ? st.vram.total : null, null);
+
+    // The SERVER decides whether a phase is work (`Phase::is_working`). This
+    // used to be a list of phase names held here, and a phase added on the
+    // server then drew no bar at all — which is exactly what would have
+    // happened to `importing` and `partitioning`, the two phases that cover
+    // the longest part of a first-ever load.
+    if (!st.working) {
+      // Resting, not working. "ready" once a model is resident, "idle" before
+      // the first one — both honest, neither an animation suggesting work.
+      label.textContent = st.phase === "ready"
+        ? (st.model ? `ready — ${st.model}` : "ready")
+        : "idle";
+      track.className = "track rest";
+      fill.style.width = "0%";
+      return;
+    }
+    const determinate = st.total > 0;
+    // "step 2" is not decoration. The tiered and partitioned paths load in two
+    // counted passes, and the second one legitimately restarts at 0 with a
+    // different denominator and a fresh eta; without the step a bar that
+    // resets mid-load reads as a hang to the person watching it. Shown only
+    // beside a count, because the count is the thing that restarted.
+    const phase = determinate && st.step > 1 ? `${st.phase} (step ${st.step})` : st.phase;
+    const parts = [st.model ? `${phase} ${st.model}` : phase];
+    // Clamped for the same reason the width is: a torn snapshot must read
+    // "851/851 tensors", never "900/851". The UNIT comes from the server: the
+    // three loaders count tensors, layers and experts, and this said "tensors"
+    // for all three.
+    if (determinate) parts.push(`${Math.min(st.done, st.total)}/${st.total} ${st.unit || "tensors"}`);
+    if (st.bytes > 0) {
+      // MiB/s labelled "MB/s", matching the server's own load line exactly —
+      // the two sit next to each other on this page and must not disagree.
+      const rate = st.rate_bps == null ? "" : ` at ${(st.rate_bps / MIB).toFixed(0)} MB/s`;
+      parts.push(gib(st.bytes) + rate);
+    }
+    // No eta is rendered as no eta. The server sends null when it cannot know
+    // one (no total, nothing done yet, no measurable time) and the page does
+    // not get to invent a number the server refused to guess.
+    if (st.eta_s != null) parts.push(`about ${secs(st.eta_s)} left`);
+    else if (st.elapsed_s != null) parts.push(`${secs(st.elapsed_s)} so far`);
+    label.textContent = parts.join(" — ");
+    track.className = determinate ? "track" : "track indet";
+    fill.style.width = determinate ? widthPct(st.done, st.total) : "";
+  };
+  render(null);
+  label.textContent = "connecting…";
+  return { render };
+})();
+
+// --- polling ---------------------------------------------------------------
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function nextDelay() {
+  if (failures > 0) return Math.min(MIN_POLL_MS * 2 ** failures, MAX_BACKOFF_MS);
+  return document.hidden ? HIDDEN_POLL_MS : MIN_POLL_MS;
+}
+
+// ONE poll in flight at a time.
+//
+// Without this, the visibilitychange handler below can fire while the loop's
+// fetch is still open; both reads then start from the SAME `cursor` and append
+// the same lines twice. The window is one fetch round trip — small on
+// localhost, a Cloudflare round trip in production — and a duplicated
+// "load: 673/851 tensors" reads as the server having printed it twice, which
+// is precisely the wrong thing for a page whose job is to be believed.
+//
+// The flag is set before the first await, so nothing can slip between the
+// check and the claim. Returns whether it actually ran, so a skipped poll is
+// not mistaken by the loop for a successful one.
+let inflight = false;
+
+// How many times one poll may immediately continue itself.
+//
+// The server bounds ONE response's size (see MAX_PAGE_BYTES), so a bootstrap
+// of the whole ring can come back in chunks. Following them here keeps the
+// reader's experience what it was — the page fills in one go — instead of a
+// chunk per second. Sixteen covers the largest ring the server can hold even
+// if every line in it is at the truncation limit, and it is a ceiling rather
+// than a condition, so a server that answered "more" forever could not spin
+// this.
+const MAX_CATCHUP = 16;
+
+async function pollOnce() {
+  if (inflight) return false;
+  inflight = true;
+  try {
+    for (let i = 0; i < MAX_CATCHUP; i++) {
+      if (!await poll()) break;
+    }
+    return true;
+  } finally {
+    inflight = false;
+  }
+}
+
+async function poll() {
+  // limit = the whole ring: a since-cursor makes the normal answer a handful
+  // of lines, and asking for the maximum means a burst can never leave the
+  // page a poll behind.
+  const resp = await fetch(`/api/logs?since=${cursor}&limit=2000&source=all`, { cache: "no-store" });
+  if (!resp.ok) throw new Error("HTTP " + resp.status);
+  const page = await resp.json();
+  // Drawn before the lines: on a cold load the bar is what the reader is
+  // watching, and it must not wait behind up to 2000 rows being built.
+  bar.render(page.status);
+  // A cursor that comes back LOWER than the one we sent means the server
+  // restarted under us and re-synced us to everything it still holds — which
+  // is the new process's startup, the thing you restarted it to watch.
+  if (page.cursor < cursor) addNote("⋯ server restarted — the log resumes from the start of the new process ⋯");
+  if (page.dropped > 0) {
+    const n = page.dropped;
+    addNote(`⋯ ${n} line${n === 1 ? "" : "s"} dropped — the server's ring overran ⋯`);
+  }
+  for (const line of page.lines) addRow(line);
+  cursor = page.cursor;
+  droppedTotal = page.dropped_total;
+  trim();
+  updateCounts();
+  if (stick) toBottom();
+  $("cursorinfo").textContent = `seq ${page.newest} / ring ${page.capacity}`;
+  // The server stopped this page early (on `limit` or on its byte budget) and
+  // is holding more. Told, rather than re-derived from the cursor.
+  return page.more === true;
+}
+
+async function loop() {
+  for (;;) {
+    await sleep(nextDelay());
+    if (paused) continue;
+    try {
+      // A skipped poll (one already in flight) is not evidence the server is
+      // reachable, so it must not clear a backoff that a real failure set.
+      if (await pollOnce()) {
+        failures = 0;
+        setStatus();
+      }
+    } catch (e) {
+      failures++;
+      setStatus();
+    }
+  }
+}
+
+// A tab that comes back to the foreground should not wait out a 5 s sleep.
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && !paused) pollOnce().then(() => setStatus(), () => {});
+});
+
+updateCounts();
+setStatus("connecting…");
+pollOnce().then(() => setStatus(), () => { failures = 1; setStatus(); }).finally(loop);
+</script>
+</body>
+</html>

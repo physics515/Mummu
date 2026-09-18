@@ -16,6 +16,14 @@ use std::process::ExitCode;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
+    // FIRST, before anything in this process prints a byte. Everything written
+    // before the tee is installed reaches only `docker logs` — and the very
+    // first lines (the rayon warning below, the adapter inventory, the device
+    // policy) are the ones an operator asking "is it doing anything?" wants.
+    // `serve_on` installs it too, for the desktop shell that never runs main;
+    // it is idempotent, so the second call is free.
+    mummu_serve::logs::install();
+
     // Raise the Windows system timer to 1 ms for this process. This was
     // theory six of the ~28 ms/layer readback stall (two default quanta,
     // 2 x 15.625 ms — a suspicious fit) and it measurably changed NOTHING:

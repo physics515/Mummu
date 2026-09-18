@@ -42,6 +42,9 @@ pub mod pack;
 pub mod partition;
 pub mod plan;
 pub mod prof;
+/// Structured load progress — what a progress bar reads instead of scraping
+/// the loader's once-per-15-seconds log line (SPEC: see the module header).
+pub mod progress;
 pub mod quant;
 pub mod registry;
 pub mod safetensors;

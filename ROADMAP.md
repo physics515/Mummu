@@ -563,6 +563,60 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       blocking pool, which would have turned the async decode loop back into blocking work. Pings then
       arrive at 16/31/46 s and hold a 544-second connection. `MissedTickBehavior::Delay` on the interval,
       because a burst of late pings proves nothing to a proxy that already timed out.
+- [x] **A server that says what it is doing: a merged log feed, a load bar, and RAM/VRAM gauges.**
+      *(2026-09-17, v0.3.0)* The 27B answered in 121 seconds and the browser showed an empty bubble for
+      every one of them. mummu-serve was printing `[mummu] load: 673/851 tensors — 14.46 GiB off the
+      pack in 91s (162 MB/s)` the whole time — to stderr, where only `docker logs` could see it.
+      **Capture is fd-level, so not one existing print had to change.** `logs.rs` dups fds 1 and 2, puts
+      a pipe over them, and writes every chunk BACK to the original fd before classifying it: `docker
+      logs` stays byte-identical, and a panic — which the runtime writes straight to fd 2 — lands in the
+      ring like anything else. That last part is not hypothetical: the CUDA failure earlier the same day
+      showed up ONLY as a panic on stderr, while `/api/health` still said `ok`. Request logging on both
+      listeners shares the ring and one seq space, so `/logs` is a true chronological merge of server
+      output and API calls; the middleware sits outermost, so it also records what the layers below
+      reject. Docker's 30 s health probe and the ollama client's polling are recorded but flagged quiet,
+      so they cannot evict the load progress the page exists to show. **The page is public** (owner's
+      call, 2026-09-18) — `mummu.basicautomation.io/logs`, no auth, so one response is capped at 512 KiB
+      rather than rate-limited.
+      **The bar reads atomics, not log text.** The loader prints once every 15 s — right for `docker
+      logs`, hopeless for a bar that would freeze for a quarter of a minute at a time — so
+      `mummu::progress` keeps the counts in relaxed atomics, updated once per tensor beside work that
+      dequantizes a whole tensor, and `/api/logs` carries a `status` object beside the lines. **The
+      phases that take the longest are counted too**, which took two passes to get right: a first-ever
+      load spends ~58 s importing the pack and ~115 s partitioning FFNs (measured on qwen3.5-2b-q8)
+      before the tensor count starts, and both of those reported `done 0, total 0` until `Importing`
+      and `Partitioning` became counted phases of their own. The count carries its unit and its pass,
+      because the tiered and partitioned paths count experts and layers rather than tensors: a bar that
+      silently restarts at 0 reads as a hang. Published from the shared GGUF dequant pass, so Qwen2,
+      Qwen3, Lfm2 and OLMoE get it too instead of a spinner.
+      **NVML on linux — and deliberately NOT in the planner.** `vram::memory()` was Windows-only, so
+      every GPU load in the container printed `residency: no VRAM reading — placement unverified`. It is
+      `dlopen`'d now (`libnvidia-ml.so.1`, mirroring the Windows module including its cache-only-a-success
+      rule), which feeds the gauges and makes the residency certificate real. But wiring it up also
+      changes what `backend_budget` returns on linux — from the configured ceiling to
+      `min(configured, free − margin)`, bringing the watermark/alloc-failed machinery alive on a shared
+      16 GiB card — and that path had executed exactly zero times, since every test run is
+      `MUMMU_BACKEND=cpu`. **A display change must not be a placement change**: the planner's use of the
+      live reading sits behind `MUMMU_VRAM_LIVE_BUDGET`, default off, so v0.3.0 places exactly what
+      v0.2.0 placed.
+      **Build identity, because "is the new release deployed?" had no answer.** `/api/health` reported no
+      version at all, and the workspace version had sat at `0.1.0` through v0.1.0, v0.1.1 and v0.2.0. It
+      now reports `version` and the short sha — handed in through a docker `ARG`, because
+      `.dockerignore` excludes `.git/` and a build script inside the image finds no repository to ask.
+      The sha must carry its own `-dirty`: the build context is a copy of the working tree and the stamp
+      is taken verbatim.
+      **What the review rounds were actually for.** Five passes, and the findings that mattered were all
+      the same species — *a panel that states something untrue is worse than no panel*. A retraction
+      that raced a load and blanked its model name; a load that succeeded without a first token and
+      reported `idle` while answering warm; a residency baseline that lost its freshness bound and would
+      have printed a red `RESIDENCY SUSPECT` about a healthy load; a wedged NVML freezing the gauge not
+      for a while but forever; and twice, a regression pin that could not fail — one searching a source
+      file for a needle the test itself quoted, one exercising a primitive beside the rule it named.
+- [ ] **Measure `MUMMU_VRAM_LIVE_BUDGET` on the 27B and decide whether it becomes the default.** The
+      live reading should let the planner use VRAM another tenant has freed, and stop it overcommitting
+      a card another tenant has filled — but on a box where plex and deepseek-ocr move VRAM underneath,
+      it can also demote layers over a transient dip. Wants: a cold 27B timed both ways with the
+      placement line from each, and a run with a co-tenant deliberately allocating during the load.
 - [ ] **The gap to a fused runtime is a KERNEL problem, not a placement one — measured, and the reason
       scheduler tuning stops here.** *(2026-08-24)* Five measured iterations took the 27B from 4.88 to
       **3.91 s/token** and moved the discrete GPU from 996 to **1784 of 2048 clusters**. Then the

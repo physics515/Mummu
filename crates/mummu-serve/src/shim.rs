@@ -56,6 +56,10 @@ pub(crate) fn router() -> Router {
         .fallback(not_found_path)
         .method_not_allowed_fallback(not_found_path)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES + 1))
+        // Same ring as the native API, tagged `shim`: an ollama client and a
+        // browser talking to the same resident model belong in one feed, in
+        // the order they arrived. Outermost, so rejections are recorded too.
+        .layer(axum::middleware::from_fn(crate::logs::record_shim))
 }
 
 async fn root() -> &'static str {

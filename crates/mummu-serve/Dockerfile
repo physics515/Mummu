@@ -34,6 +34,43 @@
 FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY . .
+# Which commit is this? The image cannot work it out for itself: `.dockerignore`
+# excludes `.git/` (deliberately — the repository is history the image has no
+# use for), so the tree `COPY . .` lands has no repository in it, `build.rs`
+# finds no git to ask, and the binary would stamp itself `unknown`.
+#
+# For the record, because the field it fills is the one people check under
+# pressure: the deployed v0.2.0 does NOT answer "build":"unknown" — it answers
+# /api/health with no `build` field and no `version` field at all. Both are new
+# in v0.3.0, and until they shipped the only way to tell what a container was
+# running was to go and look at what had been pushed.
+#
+# So the sha is passed IN, and it must already carry the dirty marker:
+# `build_sha::stamp` returns a preset verbatim and never appends `-dirty`
+# itself, while the build context here is a COPY OF THE WORKING TREE. A stamp
+# naming a commit the image does not match is precisely the confusion the
+# marker exists to prevent.
+#
+# Deploy (verified on the DeepStack Linux host, compose project `deepstack`).
+# The flags are not optional: a bare `docker compose` in that directory picks
+# up docker-compose.yaml — the WINDOWS set — and dies on a missing env file.
+#   cd "/mnt/deepmem/Docker Containers"
+#   sha=$(git -C /mnt/deepmem/Development/mummu rev-parse --short=7 HEAD)
+#   git -C /mnt/deepmem/Development/mummu diff --quiet HEAD || sha="$sha-dirty"
+#   MUMMU_BUILD_SHA="$sha" docker compose -f docker-compose.linux.yaml \
+#       --env-file .env.linux build mummu
+#   docker compose -f docker-compose.linux.yaml --env-file .env.linux \
+#       up -d --no-deps mummu
+#
+# The compose service forwards the variable (`build.args` in ai.yaml), so the
+# build itself cannot forget it. Left unset it degrades to `unknown` — a build
+# that says it does not know, never a build that fails.
+#
+# Outside compose the same rule holds, dirty marker included:
+#   docker build --build-arg MUMMU_BUILD_SHA="$sha" \
+#                -f crates/mummu-serve/Dockerfile -t mummu-serve:local .
+ARG MUMMU_BUILD_SHA=unknown
+ENV MUMMU_BUILD_SHA=${MUMMU_BUILD_SHA}
 RUN cargo build --release -p mummu-serve --features cuda
 
 # Runtime: CUDA base (sets up the NVIDIA apt repo + LD_LIBRARY_PATH) plus

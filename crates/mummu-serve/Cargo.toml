@@ -36,3 +36,12 @@ axum = { workspace = true }
 futures = { workspace = true }
 async-stream = { workspace = true }
 tokio-stream = { workspace = true }
+# `Body::size_hint`, so the request log can say how many bytes a buffered
+# response actually carried (axum sets no content-length header of its own).
+http-body = { workspace = true }
+
+# The stdout/stderr tee behind `GET /api/logs` re-points fds 1 and 2 at a pipe,
+# which needs dup/dup2/pipe — no std equivalent exists. Unix only: the module
+# compiles the capture to a no-op elsewhere and says so.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }

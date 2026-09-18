@@ -15,7 +15,9 @@
 //! parked on minutes of CPU/GPU work. Endpoints:
 //!
 //! - `GET  /`            the embedded chat UI
+//! - `GET  /logs`        the embedded merged-log page (see [`logs`])
 //! - `GET  /api/health`  device policy + adapter inventory
+//! - `GET  /api/logs`    the merged server/api/shim log ring, since a cursor
 //! - `GET  /api/models`  the catalog with installed flags
 //! - `POST /api/pull`    download a catalog model (SSE progress)
 //! - `POST /api/chat`    stream a chat completion (SSE deltas)
@@ -31,8 +33,28 @@
 //! `MUMMU_BACKEND` / `MUMMU_FORCE_CPU` / fit-planner variables stay where
 //! they were, read at the point of use.
 
+/// How a build names itself. Compiled here only for the tests: `build.rs`
+/// includes the same file with `#[path]` and is the thing that calls it, and
+/// a build script is not a test target — so without this the stamp rules
+/// would be the one part of the release nothing checks.
+#[cfg(test)]
+mod build_sha;
 mod engine;
+pub mod logs;
 mod shim;
+pub mod status;
+
+/// `mummu::progress` is process-wide state and `cargo test` runs this crate's
+/// tests in parallel threads of one process, so every test that WRITES it —
+/// in any module of this crate — takes this first. Reading it under the lock
+/// is what makes an assertion about the phase mean anything.
+#[cfg(test)]
+pub(crate) static PROGRESS_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn progress_serial() -> std::sync::MutexGuard<'static, ()> {
+    PROGRESS_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -60,6 +82,10 @@ pub use engine::device_label;
 /// that wants to embed the same bytes (the Tauri app's offline fallback) has
 /// one source of truth instead of a copy that drifts.
 pub const UI_HTML: &str = include_str!("ui.html");
+
+/// The logs page, exactly as `GET /logs` serves it — same reason as
+/// [`UI_HTML`].
+pub const LOGS_HTML: &str = logs::LOGS_HTML;
 
 /// Default listen address of the native API + UI.
 pub const DEFAULT_ADDR: &str = "0.0.0.0:8095";
@@ -173,10 +199,20 @@ pub async fn serve_on<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    // Before anything else prints: everything written before the tee is
+    // installed reaches only `docker logs`, and the lines worth seeing start
+    // at the first model load. Idempotent, so the binary having already
+    // installed it (earlier, in `main`) costs nothing.
+    logs::install();
     // Start watching host memory as soon as we are serving: the pressure it
     // guards against arrives from OTHER processes, so it must not depend on
     // this one receiving traffic. See `engine::spawn_host_pressure_watch`.
     engine::spawn_host_pressure_watch();
+    // And take the first memory readings now. The VRAM cache answers from its
+    // last sample and refreshes behind it, so the first load's baseline would
+    // otherwise be "nothing sampled yet" on a server nobody has polled —
+    // see `status::prime`.
+    status::prime();
     // One trigger, two listeners: `with_graceful_shutdown` consumes a
     // future, and futures aren't cloneable, so the trigger fans out through
     // a watch channel.
@@ -240,7 +276,12 @@ pub fn router() -> Router {
     Router::new()
         .route("/", get(ui))
         .route("/index.html", get(ui))
+        // The merged log feed and the page that reads it. Beside /api/health
+        // because they answer the same question — is this thing alive? — and
+        // the log is the half that says what it is *doing*.
+        .route("/logs", get(logs::page))
         .route("/api/health", get(health))
+        .route("/api/logs", get(logs::endpoint))
         .route("/api/models", get(models))
         .route("/api/pull", post(pull))
         .route("/api/chat", post(chat))
@@ -259,6 +300,10 @@ pub fn router() -> Router {
         // `+ 1` so a body just over the ceiling still reaches the handler
         // and gets the JSON "body too large" the sync reader produced.
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES + 1))
+        // Outermost, so it also records the requests the layers below reject
+        // (a body over the ceiling, a route that does not exist) — those are
+        // exactly the ones an operator is hunting when nothing works.
+        .layer(axum::middleware::from_fn(logs::record_api))
 }
 
 /// The ollama-compatibility router, for a caller that wants to mount or
@@ -340,31 +385,42 @@ async fn ui() -> Response {
 }
 
 async fn health() -> Response {
-    blocking(|| {
-        let inv = mummu::backend::inventory();
-        let gpus: Vec<_> = inv
-            .gpus
-            .iter()
-            .map(|g| {
-                json!({
-                    "name": g.name,
-                    "api": format!("{:?}", g.backend),
-                    "kind": format!("{:?}", g.device_type),
-                    "shader_f16": g.shader_f16,
-                })
-            })
-            .collect();
-        json_response(
-            200,
+    blocking(|| json_response(200, health_json())).await
+}
+
+/// The health body, as a value.
+///
+/// Split out from the handler so a test can pin the shape without standing up
+/// a runtime — and the shape is worth pinning, because clients read these
+/// fields and a probe silently losing `status` would look like a healthy
+/// server right up until something depended on it.
+fn health_json() -> serde_json::Value {
+    let inv = mummu::backend::inventory();
+    let gpus: Vec<_> = inv
+        .gpus
+        .iter()
+        .map(|g| {
             json!({
-                "status": "ok",
-                "device": engine::device_label(),
-                "gpus": gpus,
-                "cpu_cores": inv.cpu.logical_cores,
-            }),
-        )
+                "name": g.name,
+                "api": format!("{:?}", g.backend),
+                "kind": format!("{:?}", g.device_type),
+                "shader_f16": g.shader_f16,
+            })
+        })
+        .collect();
+    let (version, build) = status::build_json();
+    json!({
+        "status": "ok",
+        "device": engine::device_label(),
+        "gpus": gpus,
+        "cpu_cores": inv.cpu.logical_cores,
+        // "Is the new release deployed?" — asked, and unanswerable from here
+        // until now. The version alone does not settle it (two builds of
+        // 0.3.0 from either side of a fix carry the same string), so the
+        // commit comes with it.
+        "version": version,
+        "build": build,
     })
-    .await
 }
 
 async fn models() -> Response {
@@ -907,6 +963,34 @@ mod tests {
     fn absent_max_tokens_falls_back_to_default() {
         let parsed = chat_request(r#"{"model": "m", "messages": []}"#);
         assert_eq!(parsed.max_tokens(), DEFAULT_MAX_TOKENS);
+    }
+
+    /// `GET /api/health` is the one endpoint other things are wired to. Its
+    /// existing fields are a contract — a client reads `status`, a dashboard
+    /// reads `device`, the UI badge reads `gpus` — and this release ADDS to
+    /// it rather than reshaping it.
+    #[test]
+    fn health_keeps_its_fields_and_now_names_the_build() {
+        let h = health_json();
+        let o = h.as_object().expect("health is an object");
+        for key in ["status", "device", "gpus", "cpu_cores"] {
+            assert!(o.contains_key(key), "health lost its {key} field");
+        }
+        assert_eq!(h["status"], json!("ok"));
+        assert!(h["gpus"].is_array());
+        assert!(h["cpu_cores"].is_u64());
+        // The new half: which release, and which commit of it.
+        assert_eq!(h["version"], json!(status::VERSION));
+        assert_eq!(
+            h["version"],
+            json!("0.3.0"),
+            "this branch ships as v0.3.0; the workspace version is what says so"
+        );
+        let build = h["build"].as_str().expect("build is a string");
+        assert!(
+            !build.is_empty(),
+            "a build with no git to ask reads \"unknown\", never empty"
+        );
     }
 
     #[test]

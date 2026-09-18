@@ -157,6 +157,20 @@ pub use burn::store::FloatCastAdapter;
 /// is an [`ImportError::Incomplete`] carrying the store's own readable
 /// report. Unused checkpoint tensors are *allowed* (e.g. BERT's
 /// intentionally-skipped `pooler.*`) — callers that care inspect the report.
+///
+/// # This call cannot feed the progress bar, and that is not an oversight
+///
+/// It is one call into burn's store and one result back: the store walks the
+/// module and the checkpoint itself, with no per-tensor hook to report
+/// through and no count available before it starts. So a load whose bytes
+/// come through here — every `load_from_dir`, i.e. the safetensors path for
+/// qwen2, qwen3, lfm2, olmoe and minilm — renders **indeterminate** rather
+/// than as a percentage invented from nothing. The GGUF paths are counted,
+/// because their dequant pass is ours to instrument
+/// ([`GgufFile::dequant_into`](crate::gguf::GgufFile)); the safetensors
+/// checkpoints this serves are also the small ones (a `model.safetensors`
+/// that fits one file), where the wait being explained is seconds rather
+/// than the minutes a packed 27B takes.
 pub fn load_checked<M, S>(
     module: &mut M,
     store: &mut S,
@@ -301,6 +315,18 @@ impl Drop for ScratchFile {
 /// dtype from `device`. Under burn 0.22 the float element type is a per-device
 /// runtime setting rather than a backend type parameter, so the dtype a load
 /// casts to is decided by the device the caller hands in.
+///
+/// # What the progress bar shows across this call
+///
+/// The dequant pass counts itself, per tensor, inside
+/// [`GgufFile::dequant_into`] — that is the counted bar qwen2, qwen3, lfm2 and
+/// olmoe get, and it is the part that reads the disk. What follows it, in the
+/// caller, is burn's `load_checked` installing weights that are already
+/// written out, and burn's store gives no per-tensor hook to count: it is one
+/// call in and one result back. So this hands the bar back as an
+/// **indeterminate** `loading` rather than leaving a finished 320/320 on
+/// screen for the seconds that install takes. An honest sweep beats a bar
+/// that says 100% and is not done.
 pub fn gguf_store(
     f: &GgufFile,
     map: &dyn Fn(&GgufTensorInfo) -> Option<GgufMap>,
@@ -321,6 +347,7 @@ pub fn gguf_store(
                 .dequant_to_safetensors(map)
                 .map_err(|e| parse(e.to_string()))?;
             assert!(blob.len() > 8, "a parsed GGUF yields a non-empty blob");
+            crate::progress::phase(crate::progress::Phase::Loading);
             let store = SafetensorsStore::from_bytes(Some(blob))
                 .with_from_adapter(adapter)
                 .allow_partial(true);
@@ -334,6 +361,7 @@ pub fn gguf_store(
                 .dequant_to_safetensors_file(map, scratch.path())
                 .map_err(|e| parse(e.to_string()))?;
             assert!(bytes > 0, "a parsed GGUF yields a non-empty payload");
+            crate::progress::phase(crate::progress::Phase::Loading);
             let store = SafetensorsStore::from_file(scratch.path().to_path_buf())
                 .with_from_adapter(adapter)
                 .allow_partial(true);

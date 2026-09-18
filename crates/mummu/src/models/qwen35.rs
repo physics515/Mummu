@@ -1241,7 +1241,18 @@ pub fn load_from_gguf_quantized(
     let trunk = config.num_layers;
     let mut model = build(&config, device, untied);
 
+    // The pack-less path: every tensor is read and quantized straight out of
+    // the GGUF, which on a spinning array is the slowest load there is. Bytes
+    // come from the tensors' own on-disk sizes, so the rate reported is the
+    // disk's, not the f32 expansion's.
+    let expected = expected_tensor_count(&config, untied);
+    crate::progress::begin(
+        crate::progress::Phase::Loading,
+        expected as u64,
+        crate::progress::Unit::Tensors,
+    );
     let mut assigned = 0usize;
+    let mut bytes_read = 0u64;
     for info in &f.tensors {
         let mapped = gguf_tensor_map(info, trunk)
             .ok_or_else(|| parse(format!("unmapped tensor name '{}'", info.name)))?;
@@ -1269,12 +1280,13 @@ pub fn load_from_gguf_quantized(
         )
         .map_err(parse)?;
         assigned += 1;
+        bytes_read += info.byte_len();
+        crate::progress::advance(assigned as u64, bytes_read);
     }
 
     // Both directions of completeness, loudly: every mapped tensor landed
     // (assign_param errors otherwise) and the count matches what the
     // architecture requires.
-    let expected = expected_tensor_count(&config, untied);
     if assigned != expected {
         return Err(parse(format!(
             "GGUF supplied {assigned} trunk tensors, the architecture needs {expected}"
@@ -1726,6 +1738,14 @@ pub fn load_from_pack_layered(
     // range near the front of the manifest, so the first between-tensor
     // progress check can be tens of seconds out.
     eprintln!("[mummu] load: assigning {expected} tensors from the pack");
+    // The same numbers, structured, for a progress bar: the print above is
+    // throttled to one line per 15 s so `docker logs` stays readable, which is
+    // far too coarse for a bar. See `crate::progress`.
+    crate::progress::begin(
+        crate::progress::Phase::Loading,
+        expected as u64,
+        crate::progress::Unit::Tensors,
+    );
 
     let mut assigned = 0usize;
     for entry in &pack.manifest.tensors {
@@ -1761,6 +1781,9 @@ pub fn load_from_pack_layered(
         };
         assign_param(&mut model, &path, src, QuantPolicy::Off, &device).map_err(parse)?;
         assigned += 1;
+        // Every tensor, not every 15 s: three relaxed stores next to a
+        // multi-megabyte disk read and a dequantize.
+        crate::progress::advance(assigned as u64, pack.bytes_read());
         if last_progress.elapsed().as_secs() >= 15 {
             let gib = pack.bytes_read() as f64 / f64::from(1u32 << 30);
             let secs = load_started.elapsed().as_secs_f64();
@@ -1923,6 +1946,15 @@ fn load_from_pack_inner(
             }
             _ => std::collections::HashMap::new(),
         };
+    // Same structured signal as the layered loader: this is the other pack
+    // path a chat request can take, and a bar that only moves for one of them
+    // is worse than no bar. No print here — this loader has never had one, and
+    // the log page's lines are not what the bar reads (see `crate::progress`).
+    crate::progress::begin(
+        crate::progress::Phase::Loading,
+        expected_tensor_count(&config, untied) as u64,
+        crate::progress::Unit::Tensors,
+    );
     let mut assigned = 0usize;
     for entry in &pack.manifest.tensors {
         let Some(path) = pack_param_path(&entry.name, trunk) else {
@@ -1969,6 +2001,7 @@ fn load_from_pack_inner(
             )
             .map_err(parse)?;
             assigned += 1;
+            crate::progress::advance(assigned as u64, pack.bytes_read());
             continue;
         }
         let precision = {
@@ -2001,6 +2034,7 @@ fn load_from_pack_inner(
         };
         assign_param(&mut model, &path, src, QuantPolicy::Off, device).map_err(parse)?;
         assigned += 1;
+        crate::progress::advance(assigned as u64, pack.bytes_read());
     }
     let expected = expected_tensor_count(&config, untied);
     if assigned != expected {

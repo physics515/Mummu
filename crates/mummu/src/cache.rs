@@ -249,6 +249,49 @@ mod tests {
         assert_eq!(slot.loaded_key(), None);
     }
 
+    /// `loaded_key_async` is a reading, not a reservation: it takes the slot
+    /// lock, answers, and **releases it** — so anything that clears the slot
+    /// before the caller's own `acquire` re-takes it turns a "warm" answer
+    /// into a real load.
+    ///
+    /// This is not hypothetical bookkeeping. mummu-serve decided from exactly
+    /// this answer whether to arm its progress guard, and a `POST /api/unload`
+    /// (or the 5 s host-pressure eviction) landing in the window produced a
+    /// load with no guard at all: the loaders kept writing their counts to the
+    /// global progress state, the bar reached N/N `loading`, and nothing owned
+    /// it to finish it. Whatever a caller wants to happen once per load
+    /// belongs inside the `load` closure, which runs under the lock and only
+    /// on a miss.
+    #[tokio::test]
+    async fn a_clear_between_the_peek_and_the_acquire_makes_a_warm_answer_cold() {
+        use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+        let slot: ModelSlot<String> = ModelSlot::new();
+        let key = Path::new("model-a");
+        let loads = AtomicU32::new(0);
+        let load = |_: &Path| {
+            loads.fetch_add(1, SeqCst);
+            Ok::<_, Infallible>("model-a".to_owned())
+        };
+
+        drop(slot.acquire(key, load).await.unwrap());
+        assert_eq!(loads.load(SeqCst), 1);
+        assert_eq!(
+            slot.loaded_key_async().await.as_deref(),
+            Some(key),
+            "the peek says warm — and is telling the truth, for now"
+        );
+
+        // The window. Nothing is held here; the peek's lock is long gone.
+        assert!(slot.clear(), "an unload lands between the two");
+
+        drop(slot.acquire(key, load).await.unwrap());
+        assert_eq!(
+            loads.load(SeqCst),
+            2,
+            "the request the peek called warm paid for a load after all"
+        );
+    }
+
     #[test]
     #[should_panic(expected = "empty key")]
     fn empty_key_is_rejected() {

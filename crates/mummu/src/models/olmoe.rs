@@ -990,8 +990,20 @@ pub fn load_from_gguf_quantized(
         Ok(dev_tensor2(values, [out, inp]).swap_dims(0, 1))
     };
 
+    // The counted bar for the OLMoE streaming import. One line per tensor,
+    // three relaxed stores each — see `crate::progress`. Bytes are the GGUF's
+    // own on-disk sizes, so the rate reported is the disk's and not the f32
+    // expansion's.
+    crate::progress::begin(
+        crate::progress::Phase::Loading,
+        f.tensors.len() as u64,
+        crate::progress::Unit::Tensors,
+    );
     let mut assigned = 0usize;
+    let mut bytes_read = 0u64;
     for info in &f.tensors {
+        crate::progress::advance(assigned as u64, bytes_read);
+        bytes_read += info.byte_len();
         let dims_rev: Vec<usize> = info.dims.iter().rev().map(|&d| d as usize).collect();
         let name = &info.name;
 
@@ -1126,6 +1138,7 @@ pub fn load_from_gguf_quantized(
         }
         assigned += 1;
     }
+    crate::progress::advance(assigned as u64, bytes_read);
 
     // 6 attention + 2 norms + 1 router + 3 banks per layer, plus embedding,
     // final norm, and the untied head.
@@ -1270,6 +1283,21 @@ fn load_from_pack_inner(
         Tensor::<1>::from_data(TensorData::new(values, [n]), (device, dtype))
     };
 
+    // The counted bar for the OLMoE pack path. The denominator is what THIS
+    // pass will assign, not what the pack holds: `load_trunk_from_pack`
+    // leaves every expert to the pool, and counting experts it is going to
+    // skip would park the bar at 3% for a load that finished.
+    let will_assign = pack
+        .manifest
+        .tensors
+        .iter()
+        .filter(|e| with_experts || !matches!(e.role, Role::Expert { .. }))
+        .count();
+    crate::progress::begin(
+        crate::progress::Phase::Loading,
+        will_assign as u64,
+        crate::progress::Unit::Tensors,
+    );
     let mut assigned = 0usize;
     for entry in &pack.manifest.tensors {
         // Experts: addressed by role, not by name.
@@ -1294,6 +1322,7 @@ fn load_from_pack_inner(
                 other => return Err(parse(format!("unknown expert proj '{other}'"))),
             }
             assigned += 1;
+            crate::progress::advance(assigned as u64, pack.bytes_read());
             continue;
         }
         let mapped = olmoe_gguf_name(&entry.name)
@@ -1371,6 +1400,7 @@ fn load_from_pack_inner(
             }
         }
         assigned += 1;
+        crate::progress::advance(assigned as u64, pack.bytes_read());
     }
     // 9 non-bank tensors per layer + 3 banks × experts, plus embed, norm, head.
     let per_layer = if with_experts {
