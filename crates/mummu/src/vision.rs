@@ -203,6 +203,74 @@ fn gelu(x: Tensor<2>) -> Tensor<2> {
     burn::tensor::activation::gelu(x)
 }
 
+/// Base for the vision tower's rotary frequencies. Not stored in the
+/// checkpoint (RoPE has no weights), so it is the architecture's constant.
+const VISION_ROPE_THETA: f32 = 10_000.0;
+
+/// 2-D rotary tables for a `gh x gw` patch grid: `[n, head_dim]` cos and
+/// sin, in the same row-major patch order the tower is fed in.
+///
+/// **Why this exists.** The learned table added before the blocks is an
+/// *absolute* signal; Qwen3-VL's encoder also rotates queries and keys by
+/// each patch's (y, x) inside attention, which is what carries *relative*
+/// geometry. Without it the tower aggregates colour and texture correctly
+/// and loses spatial structure: measured 2026-09-20, two hot dogs on a
+/// plate came back as "a single long strip of nachos" — condiment right,
+/// shape and count wrong.
+///
+/// The head splits in half: the low half rotates by the row, the high half
+/// by the column, each laid out as the pairs [`rotate_half`] expects.
+fn rope_2d(gh: usize, gw: usize, head_dim: usize, device: &Device) -> (Tensor<2>, Tensor<2>) {
+    let half = head_dim / 2;
+    let pairs = half / 2;
+    let n = gh * gw;
+    let mut cos = vec![0f32; n * head_dim];
+    let mut sin = vec![0f32; n * head_dim];
+    for y in 0..gh {
+        for x in 0..gw {
+            let row = (y * gw + x) * head_dim;
+            for i in 0..pairs {
+                #[allow(clippy::cast_precision_loss)]
+                let inv = 1.0 / VISION_ROPE_THETA.powf(2.0 * i as f32 / half as f32);
+                #[allow(clippy::cast_precision_loss)]
+                let angles = [(0usize, y as f32 * inv), (half, x as f32 * inv)];
+                for (base, angle) in angles {
+                    let (c, sn) = (angle.cos(), angle.sin());
+                    cos[row + base + i] = c;
+                    cos[row + base + pairs + i] = c;
+                    sin[row + base + i] = sn;
+                    sin[row + base + pairs + i] = sn;
+                }
+            }
+        }
+    }
+    (
+        Tensor::<2>::from_data(TensorData::new(cos, [n, head_dim]), device),
+        Tensor::<2>::from_data(TensorData::new(sin, [n, head_dim]), device),
+    )
+}
+
+/// The `(a, b) -> (-b, a)` companion of [`rope_2d`]'s layout, applied within
+/// each half independently so the row and column rotations never mix.
+fn rotate_half(x: Tensor<3>) -> Tensor<3> {
+    let [h, n, d] = x.dims();
+    let half = d / 2;
+    let q = half / 2;
+    let lo_a = x.clone().slice([0..h, 0..n, 0..q]);
+    let lo_b = x.clone().slice([0..h, 0..n, q..half]);
+    let hi_a = x.clone().slice([0..h, 0..n, half..half + q]);
+    let hi_b = x.slice([0..h, 0..n, half + q..d]);
+    Tensor::cat(vec![-lo_b, lo_a, -hi_b, hi_a], 2)
+}
+
+/// Apply the rotation to `[heads, n, head_dim]`.
+fn apply_rope(x: Tensor<3>, cos: &Tensor<2>, sin: &Tensor<2>) -> Tensor<3> {
+    let [heads, n, d] = x.dims();
+    let c = cos.clone().reshape([1, n, d]).repeat_dim(0, heads);
+    let s = sin.clone().reshape([1, n, d]).repeat_dim(0, heads);
+    x.clone() * c + rotate_half(x) * s
+}
+
 struct Block {
     ln1_w: Tensor<1>,
     ln1_b: Tensor<1>,
@@ -377,6 +445,7 @@ impl VisionTower {
 
         let mut x =
             linear(patches, &self.patch_w, &self.patch_b) + self.positions_for(gh, gw, device);
+        let (cos, sin) = rope_2d(gh, gw, hd, device);
 
         for b in &self.blocks {
             // Attention: bidirectional, no mask, no RoPE — the position
@@ -392,6 +461,9 @@ impl VisionTower {
                     .swap_dims(0, 1)
             };
             let (q, k, v) = (head(0), head(1), head(2));
+            // Queries and keys carry the 2-D rotation; values do not.
+            let q = apply_rope(q, &cos, &sin);
+            let k = apply_rope(k, &cos, &sin);
             let scores = q.matmul(k.swap_dims(1, 2)) / (hd as f32).sqrt();
             let probs = burn::tensor::activation::softmax(scores, 2);
             let attn = probs.matmul(v).swap_dims(0, 1).reshape([n, h]);
