@@ -437,9 +437,11 @@ impl VisionTower {
 /// Each one costs a position in the language model's context and a slice of
 /// prefill. Qwen3-VL will happily take thousands from a big photo; on a 27B
 /// decoding at sub-token-per-second that turns a meal snapshot into minutes
-/// of prefill before the first word. 256 tokens is a 32x32 patch grid — a
-/// 512x512 view of the image — which is ample for "what food is this".
-pub const MAX_IMAGE_TOKENS: usize = 256;
+/// of prefill before the first word. 512 merged tokens is enough to keep a
+/// 4:3 photo at roughly 26x19 cells, which preserves the shape of what is
+/// in it; the whole tower measured ~22 s against 0.83 s per decoded token,
+/// so the budget belongs on detail, not on prefill thrift.
+pub const MAX_IMAGE_TOKENS: usize = 512;
 
 /// An image, preprocessed into the tower's input.
 pub struct Patches {
@@ -454,23 +456,34 @@ impl VisionConfig {
     ///
     /// Both sides land on a multiple of `patch * merge`, because a partial
     /// merge block has no meaning, and the total is capped at
-    /// [`MAX_IMAGE_TOKENS`] merged tokens with the aspect ratio preserved.
+    /// [`MAX_IMAGE_TOKENS`] merged tokens.
+    ///
+    /// **Both axes scale by the same factor.** An earlier version shrank the
+    /// longer side one cell at a time until the budget was met, which
+    /// converges on a square: a 1500x1125 photo became a 16x16 grid, and the
+    /// model read two hot dogs as "slices stacked in a row" and reported the
+    /// image as rotated. Aspect ratio is not cosmetic here — it is most of
+    /// what distinguishes one food from another.
     fn grid_for(&self, w: u32, h: u32) -> (usize, usize) {
         let step = self.patch * self.merge;
-        let round = |px: u32| ((px as usize).div_ceil(step)).max(1);
-        let (mut gh, mut gw) = (round(h), round(w));
-        // Shrink along the longer side until the merged count fits.
-        while gh * gw > MAX_IMAGE_TOKENS {
-            if gh >= gw {
-                gh -= 1;
-            } else {
-                gw -= 1;
+        // Work in merged cells; the patch grid is this times `merge`.
+        let cells = |px: u32| ((px as usize).div_ceil(step)).max(1);
+        let (mut mh, mut mw) = (cells(h), cells(w));
+        if mh * mw > MAX_IMAGE_TOKENS {
+            #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+            let scale = (MAX_IMAGE_TOKENS as f64 / (mh * mw) as f64).sqrt();
+            mh = ((mh as f64 * scale).floor() as usize).max(1);
+            mw = ((mw as f64 * scale).floor() as usize).max(1);
+            // Flooring both can leave budget on the table; spend it on the
+            // longer side, which is the one carrying the shape.
+            while (mh + 1) * mw <= MAX_IMAGE_TOKENS && mh <= mw {
+                mh += 1;
             }
-            if gh == 0 || gw == 0 {
-                return (self.merge, self.merge);
+            while mh * (mw + 1) <= MAX_IMAGE_TOKENS && mw <= mh {
+                mw += 1;
             }
         }
-        (gh * self.merge, gw * self.merge)
+        (mh * self.merge, mw * self.merge)
     }
 
     /// Decode `bytes` and lay it out as patches for [`VisionTower::forward`].

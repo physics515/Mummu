@@ -717,6 +717,7 @@ pub async fn run_chat(
     opts: &SamplerOptions,
     max_tokens: usize,
     format: Option<crate::OutputFormat>,
+    think: bool,
     images: Vec<mummu::vision::Patches>,
     on_delta: impl FnMut(&str) -> ControlFlow<()>,
 ) -> Result<ChatResult, ChatError> {
@@ -728,6 +729,9 @@ pub async fn run_chat(
     // failure that latched the restart moved the fault epoch, so every
     // resident model is stale and the slot must load. A check here would be
     // a third copy that no test could tell apart from the other two.
+    // The planner runs below this and cannot see which model it is serving,
+    // so the tower's footprint is published before planning starts.
+    set_vision_reserve(vision_reserve_bytes(spec, models_root));
     let prompt = render_prompt(spec.architecture, turns)?;
     // Land a line in the log the moment a request enters the engine: the fit
     // planning below can legitimately take minutes on a busy disk, and a
@@ -758,6 +762,7 @@ pub async fn run_chat(
         max_tokens,
         plan,
         format,
+        think,
         images,
         on_delta,
     )
@@ -3317,7 +3322,33 @@ fn live_budget_opt_in(value: Option<&str>) -> bool {
     })
 }
 
+/// Bytes the current request's vision tower will take on the accelerator,
+/// held process-wide because the fit planner is several layers below the
+/// place that knows which model is being served.
+static VISION_RESERVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Tell the planner how much to keep back for a vision tower. Set per
+/// request in [`run_chat`]; zero for a text-only model.
+pub(crate) fn set_vision_reserve(bytes: u64) {
+    VISION_RESERVE.store(bytes, SeqCst);
+}
+
 fn backend_budget(backend: BackendChoice) -> u64 {
+    // The tower is loaded onto the accelerator AFTER the planner has placed
+    // layers to fill this budget, so it has to come out of it here — the one
+    // place every consumer passes through. Without it a 9 GiB budget put
+    // 7.78 GiB of model on a 16 GiB card, the tower went on top, and the
+    // first image request panicked the backend out of device memory
+    // (measured 2026-09-20); in this server that drops the model and
+    // reloads, so it takes text chat down with it.
+    let reserve = match backend {
+        BackendChoice::Cpu => 0,
+        _ => VISION_RESERVE.load(SeqCst),
+    };
+    backend_budget_gross(backend).saturating_sub(reserve)
+}
+
+fn backend_budget_gross(backend: BackendChoice) -> u64 {
     let inv = mummu::backend::inventory();
     match backend {
         // RAM that is actually free right now (a shared VM's total lies):
@@ -3628,6 +3659,7 @@ async fn drive(
     max_tokens: usize,
     plan: FitPlan,
     format: Option<crate::OutputFormat>,
+    think: bool,
     images: Vec<mummu::vision::Patches>,
     mut on_delta: impl FnMut(&str) -> ControlFlow<()>,
 ) -> Result<ChatResult, ChatError> {
@@ -3768,6 +3800,7 @@ async fn drive(
         opts,
         max_tokens,
         format,
+        think,
         &images,
         models_root,
         &device,
@@ -3848,6 +3881,7 @@ async fn generate_on(
     opts: &SamplerOptions,
     max_tokens: usize,
     format: Option<crate::OutputFormat>,
+    think: bool,
     images: &[mummu::vision::Patches],
     models_root: &Path,
     device: &Device,
@@ -3875,6 +3909,11 @@ async fn generate_on(
     let start = Instant::now();
     let mut ids: Vec<u32> = Vec::new();
     let mut emitted = String::new();
+    // A reasoning model opens with `<think>…</think>`. Unless the request
+    // asked for it, that is suppressed here — between the decoder and the
+    // client — so it never reaches a sink and never counts against what the
+    // caller sees. `think` passes it through untouched.
+    let mut thinking = (!think).then(crate::think::Filter::default);
     // Tell the bounded head how many candidates THIS request's
     // sampler will consult: greedy reads only the argmax (k = 1,
     // where the norm bound prunes hardest — the first live run
@@ -3956,7 +3995,14 @@ async fn generate_on(
                 }
                 let delta = text[emitted.len()..].to_string();
                 emitted = text;
-                on_delta(&delta)
+                let visible = match thinking.as_mut() {
+                    Some(f) => f.push(&delta),
+                    None => delta,
+                };
+                if visible.is_empty() {
+                    return ControlFlow::Continue(());
+                }
+                on_delta(&visible)
             },
             constraint
                 .as_mut()
@@ -3983,7 +4029,14 @@ async fn generate_on(
                 }
                 let delta = text[emitted.len()..].to_string();
                 emitted = text;
-                on_delta(&delta)
+                let visible = match thinking.as_mut() {
+                    Some(f) => f.push(&delta),
+                    None => delta,
+                };
+                if visible.is_empty() {
+                    return ControlFlow::Continue(());
+                }
+                on_delta(&visible)
             },
             constraint
                 .as_mut()
@@ -3992,10 +4045,27 @@ async fn generate_on(
         .await?
     };
 
-    let text = m
+    let mut text = m
         .tokenizer
         .decode(&out, true)
         .map_err(|e| format!("decode: {e}"))?;
+    if !think {
+        // The buffered path never went through the streaming filter, so it
+        // is filtered whole here. A block the token cap cut short leaves no
+        // answer at all, which is worth saying rather than returning "".
+        let mut f = crate::think::Filter::default();
+        let mut visible = f.push(&text);
+        visible.push_str(&f.finish());
+        if visible.trim().is_empty() && f.truncated() {
+            return Err(format!(
+                "the model spent all {max_tokens} tokens inside a <think> block and never \
+                 reached an answer — raise the token limit, or set \"think\": true to see the \
+                 reasoning"
+            )
+            .into());
+        }
+        text = visible;
+    }
     let elapsed_ms = start.elapsed().as_millis();
     // Every completed generation is one placement's worth of evidence.
     observe_placement(out.len(), elapsed_ms);
@@ -4822,6 +4892,34 @@ fn mmproj_path(spec: &ModelSpec, models_root: &Path) -> Option<std::path::PathBu
 /// Is this model able to take images at all?
 pub fn supports_vision(spec: &ModelSpec, models_root: &Path) -> bool {
     spec.architecture == Architecture::Qwen35 && mmproj_path(spec, models_root).is_some()
+}
+
+/// On-device bytes a model's vision tower will occupy, or 0 when it has
+/// none.
+///
+/// The fit planner places language-model layers to fill the GPU budget; the
+/// tower is loaded *afterwards*, on top, and nothing was subtracting it.
+/// Measured 2026-09-20: a 9 GiB budget put 7.78 GiB of model on a 16 GiB
+/// card, the tower went on top, and the first image request took the
+/// backend out with an out-of-device-memory panic — which in this server
+/// means a dropped model and a reload, so it costs text chat too.
+pub fn vision_reserve_bytes(spec: &ModelSpec, models_root: &Path) -> u64 {
+    let Some(path) = mmproj_path(spec, models_root) else {
+        return 0;
+    };
+    // DOUBLE the file, not the file. `VisionTower::load` reads through
+    // `read_tensor_f32`, so an F16 checkpoint is materialized as f32 on the
+    // card — 0.93 GB on disk becomes ~1.85 GiB resident. Reserving the file
+    // size would under-reserve by half and OOM exactly the way reserving
+    // nothing did.
+    //
+    // Loading the tower at f16 instead is not currently available: burn
+    // configures a float dtype per *device*, not per tensor (see
+    // `mummu::backend::gpu_device_f16`), so an f16 tower would mean an f16
+    // device for the language model too. Worth revisiting — it would halve
+    // this — but it is a bigger change than a reserve.
+    let weights = std::fs::metadata(&path).map_or(0, |m| m.len());
+    weights.saturating_mul(2) + (512 << 20)
 }
 
 /// Load (or reuse) the tower for `spec` on `device`.

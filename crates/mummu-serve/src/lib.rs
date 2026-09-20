@@ -51,6 +51,7 @@ mod openai;
 pub mod recovery;
 mod shim;
 pub mod status;
+mod think;
 
 /// `mummu::progress` is process-wide state and `cargo test` runs this crate's
 /// tests in parallel threads of one process, so every test that WRITES it —
@@ -1139,6 +1140,7 @@ fn start_chat(parsed: ChatRequest) -> Result<ChatStream, Rejection> {
             &opts,
             max_tokens,
             None,
+            false,
             Vec::new(),
             |delta| sink.delta(delta),
         )

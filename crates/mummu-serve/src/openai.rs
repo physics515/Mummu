@@ -184,6 +184,11 @@ struct ChatCompletionRequest {
     tools: Option<serde_json::Value>,
     #[serde(default)]
     n: Option<u32>,
+    /// OpenAI's reasoning control. Anything but `"none"` opts in; absent
+    /// means off, so a client that never asked for thinking does not get
+    /// its token budget spent on it (see `crate::think`).
+    #[serde(default)]
+    reasoning_effort: Option<String>,
 }
 
 impl ChatCompletionRequest {
@@ -241,7 +246,11 @@ impl ChatCompletionRequest {
 
         // `plan` answers in the ollama error shape, which would be wrong
         // here; re-dress whatever it says as an OpenAI error.
-        let mut p = plan(&self.model, &messages, &options, None).map_err(|r| reshape(*r))?;
+        let think = self
+            .reasoning_effort
+            .as_deref()
+            .is_some_and(|r| !r.eq_ignore_ascii_case("none"));
+        let mut p = plan(&self.model, &messages, &options, None, think).map_err(|r| reshape(*r))?;
         p.format = format;
         Ok(p)
     }
@@ -409,6 +418,7 @@ async fn respond(model: String, p: RunPlan, stream: bool) -> Response {
             &p.opts,
             p.max_tokens,
             p.format,
+            p.think,
             p.images,
             |_| ControlFlow::Continue(()),
         );
@@ -477,6 +487,7 @@ async fn respond(model: String, p: RunPlan, stream: bool) -> Response {
             &p.opts,
             p.max_tokens,
             p.format,
+            p.think,
             p.images,
             move |delta| {
                 let frame = chunk(&cid, &cmodel, created, json!({"content": delta}));

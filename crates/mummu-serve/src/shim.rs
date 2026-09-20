@@ -489,6 +489,11 @@ struct OllamaChatRequest {
     stream: Option<bool>,
     #[serde(default)]
     format: Option<OllamaFormat>,
+    /// Ollama's opt-in for reasoning output. Absent means off: a client
+    /// that did not ask for thinking should not have its token budget
+    /// spent on it (see `crate::think`).
+    #[serde(default)]
+    think: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -503,6 +508,8 @@ struct OllamaGenerateRequest {
     stream: Option<bool>,
     #[serde(default)]
     format: Option<OllamaFormat>,
+    #[serde(default)]
+    think: Option<bool>,
 }
 
 /// Everything a chat/generate run needs after validation.
@@ -514,6 +521,8 @@ pub(crate) struct RunPlan {
     pub(crate) max_tokens: usize,
     pub(crate) format: Option<OutputFormat>,
     pub(crate) images: Vec<mummu::vision::Patches>,
+    /// Pass a reasoning model's `<think>` block through to the client.
+    pub(crate) think: bool,
 }
 
 /// Validate a request into a `RunPlan`, or hand back the error response.
@@ -522,6 +531,7 @@ pub(crate) fn plan(
     messages: &[ChatMessage],
     options: &OllamaOptions,
     format: Option<&OllamaFormat>,
+    think: bool,
 ) -> Result<RunPlan, Box<Response>> {
     let root = models_root();
     let manager = ModelManager::new(root.clone());
@@ -565,6 +575,7 @@ pub(crate) fn plan(
         max_tokens,
         format,
         images,
+        think,
     })
 }
 
@@ -681,6 +692,7 @@ async fn run(
             &p.opts,
             p.max_tokens,
             p.format,
+            p.think,
             p.images,
             |delta| sink.delta(delta),
         )
@@ -778,6 +790,7 @@ pub(crate) async fn chat(body: Bytes) -> Response {
         &parsed.messages,
         &parsed.options,
         parsed.format.as_ref(),
+        parsed.think.unwrap_or(false),
     ) {
         Ok(p) => p,
         Err(response) => return *response,
@@ -827,6 +840,7 @@ async fn generate(body: Bytes) -> Response {
         &messages,
         &parsed.options,
         parsed.format.as_ref(),
+        parsed.think.unwrap_or(false),
     ) {
         Ok(p) => p,
         Err(response) => return *response,
