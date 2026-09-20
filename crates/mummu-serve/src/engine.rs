@@ -7,6 +7,7 @@ use std::ops::ControlFlow;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use burn::tensor::Device;
@@ -15,7 +16,6 @@ use mummu::cache::ModelSlot;
 use mummu::chat::{ChatMl, Role, Turn};
 use mummu::decode::SamplerOptions;
 use mummu::gguf::GgufFile;
-use mummu::models::CausalLm;
 use mummu::models::{lfm2, olmoe, qwen2, qwen3, qwen35};
 use mummu::registry::{Architecture, ModelSpec, WeightFormat};
 use tokenizers::Tokenizer;
@@ -67,31 +67,44 @@ impl AnyLm {
         opts: &SamplerOptions,
         device: &Device,
         on_token: impl FnMut(u32) -> ControlFlow<()>,
+        constraint: Option<&mut dyn mummu::constrain::Constraint>,
     ) -> Result<Vec<u32>, String> {
         match self {
             Self::Qwen2(m) => {
-                m.generate(prompt_ids, max_tokens, opts, device, on_token)
-                    .await
+                mummu::models::generate_constrained(
+                    m, prompt_ids, max_tokens, opts, device, on_token, constraint,
+                )
+                .await
             }
             Self::Qwen3(m) => {
-                m.generate(prompt_ids, max_tokens, opts, device, on_token)
-                    .await
+                mummu::models::generate_constrained(
+                    m, prompt_ids, max_tokens, opts, device, on_token, constraint,
+                )
+                .await
             }
             Self::Lfm2(m) => {
-                m.generate(prompt_ids, max_tokens, opts, device, on_token)
-                    .await
+                mummu::models::generate_constrained(
+                    m, prompt_ids, max_tokens, opts, device, on_token, constraint,
+                )
+                .await
             }
             Self::Olmoe(m) => {
-                m.generate(prompt_ids, max_tokens, opts, device, on_token)
-                    .await
+                mummu::models::generate_constrained(
+                    m, prompt_ids, max_tokens, opts, device, on_token, constraint,
+                )
+                .await
             }
             Self::OlmoeQ(m) => {
-                m.generate(prompt_ids, max_tokens, opts, device, on_token)
-                    .await
+                mummu::models::generate_constrained(
+                    m, prompt_ids, max_tokens, opts, device, on_token, constraint,
+                )
+                .await
             }
             Self::Qwen35(m) => {
-                m.generate(prompt_ids, max_tokens, opts, device, on_token)
-                    .await
+                mummu::models::generate_constrained(
+                    m, prompt_ids, max_tokens, opts, device, on_token, constraint,
+                )
+                .await
             }
         }
     }
@@ -703,6 +716,8 @@ pub async fn run_chat(
     turns: &[Turn],
     opts: &SamplerOptions,
     max_tokens: usize,
+    format: Option<crate::OutputFormat>,
+    images: Vec<mummu::vision::Patches>,
     on_delta: impl FnMut(&str) -> ControlFlow<()>,
 ) -> Result<ChatResult, ChatError> {
     // No `restarting` check here. The entry points refuse a NEW chat during a
@@ -742,6 +757,8 @@ pub async fn run_chat(
         opts,
         max_tokens,
         plan,
+        format,
+        images,
         on_delta,
     )
     .await
@@ -3601,6 +3618,7 @@ fn plan_fresh(spec: &ModelSpec, models_root: &Path) -> Result<FitPlan, String> {
 }
 
 #[allow(clippy::too_many_arguments)] // one call site, mirrors the plan
+#[allow(clippy::too_many_arguments)] // one request's worth of parameters
 async fn drive(
     slot: &ModelSlot<Loaded>,
     spec: &ModelSpec,
@@ -3609,6 +3627,8 @@ async fn drive(
     opts: &SamplerOptions,
     max_tokens: usize,
     plan: FitPlan,
+    format: Option<crate::OutputFormat>,
+    images: Vec<mummu::vision::Patches>,
     mut on_delta: impl FnMut(&str) -> ControlFlow<()>,
 ) -> Result<ChatResult, ChatError> {
     let key = spec.dir(models_root);
@@ -3747,6 +3767,9 @@ async fn drive(
         prompt,
         opts,
         max_tokens,
+        format,
+        &images,
+        models_root,
         &device,
         label,
         &progress,
@@ -3778,6 +3801,42 @@ async fn drive(
     Err(decided)
 }
 
+/// Head width for a constrained request. The bounded head only guarantees
+/// the top k logits are exact; a constraint that rejects the argmax then
+/// walks the rest in descending order, so too narrow a k would have it
+/// settle on a token whose rank is an artefact of pruning rather than a real
+/// runner-up. Greedy's k = 1 is far too narrow for that; this is the window
+/// the fallback searches.
+const CONSTRAINED_HEAD_K: usize = 256;
+
+/// Decoded token bytes per model, built once and shared.
+///
+/// Building one walks the whole vocabulary through the tokenizer's decoder.
+/// That is cheap next to a generation but not next to a *token*, so it must
+/// not happen per request — it would land entirely on the first token's
+/// latency, which is the one users feel.
+static TOKEN_BYTES: Mutex<Option<(String, Arc<mummu::constrain::TokenBytes>)>> = Mutex::new(None);
+
+/// The table for `model`, building it if the cached one is for another
+/// model. One slot, because one model is resident at a time.
+fn token_bytes_for(model: &str, tok: &Tokenizer) -> Arc<mummu::constrain::TokenBytes> {
+    let mut slot = TOKEN_BYTES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((cached, table)) = slot.as_ref()
+        && cached == model
+    {
+        return Arc::clone(table);
+    }
+    let started = Instant::now();
+    let table = Arc::new(mummu::constrain::TokenBytes::from_tokenizer(tok));
+    eprintln!(
+        "[mummu-serve] output constraint: decoded {} tokens for {model} in {:?}",
+        table.len(),
+        started.elapsed()
+    );
+    *slot = Some((model.to_string(), Arc::clone(&table)));
+    table
+}
+
 /// The generation itself, on a model the slot handed out. Everything that
 /// can fail here is decided by `drive`, which runs this under
 /// `catch_unwind` while it holds the slot.
@@ -3788,6 +3847,9 @@ async fn generate_on(
     prompt: &str,
     opts: &SamplerOptions,
     max_tokens: usize,
+    format: Option<crate::OutputFormat>,
+    images: &[mummu::vision::Patches],
+    models_root: &Path,
     device: &Device,
     label: &'static str,
     progress: &LoadProgress,
@@ -3819,41 +3881,116 @@ async fn generate_on(
     // measured k = 1024 evaluating ~91% of the vocab), sampling
     // reads its top_k. Overlapping requests combine via fetch_max
     // and the drop falls back to the safe env default.
-    let _head_k = mummu::flex::head::RequestTopK::set(if opts.temperature == 0.0 {
-        1
-    } else {
-        opts.top_k
+    let _head_k = mummu::flex::head::RequestTopK::set(match format {
+        Some(_) => CONSTRAINED_HEAD_K,
+        None if opts.temperature == 0.0 => 1,
+        None => opts.top_k,
     });
-    let out =
-        m.lm.generate(&prompt_ids, max_tokens, opts, device, |id| {
-            // The first token is where warming ends and the wait the bar
-            // exists for is over. Said here rather than after `generate`
-            // returns, because the rest of a 512-token decode is not a
-            // load and must not keep a progress bar on screen.
-            if ids.is_empty() {
-                progress.ready();
-                // The model's devices computed and read back: whatever
-                // failed on THEM before is behind us (see
-                // `recovery::decide`). Only on them — a token on the host
-                // vouches for nothing on the card.
-                recovery::generation_succeeded(&m.devices);
-            }
-            ids.push(id);
-            // Incremental decode: re-decode the whole tail and emit the
-            // suffix beyond what was already streamed. A trailing U+FFFD
-            // means we're mid-way through a multi-byte char — hold the
-            // delta until the next token completes it.
-            let Ok(text) = m.tokenizer.decode(&ids, true) else {
-                return ControlFlow::Continue(());
-            };
-            if text.ends_with('\u{FFFD}') || text.len() <= emitted.len() {
-                return ControlFlow::Continue(());
-            }
-            let delta = text[emitted.len()..].to_string();
-            emitted = text;
-            on_delta(&delta)
-        })
-        .await?;
+    // The grammar, if one was asked for. Held here so it outlives the
+    // borrow the decode loop takes on it.
+    let mut constraint = format.map(|f| match f {
+        crate::OutputFormat::Json => {
+            mummu::constrain::JsonConstraint::new(token_bytes_for(&spec.name, &m.tokenizer))
+        }
+    });
+    // Images, if any: run the tower and match its tokens to the placeholder
+    // runs the prompt reserved. Both halves refuse loudly on a mismatch —
+    // a misaligned splice is not an error anywhere downstream, it is an
+    // answer about a different picture.
+    let placed = if images.is_empty() {
+        Vec::new()
+    } else {
+        let AnyLm::Qwen35(_) = &m.lm else {
+            return Err(format!(
+                "{} is loaded as a text-only architecture and cannot take images",
+                spec.name
+            )
+            .into());
+        };
+        let tower = tower_for(spec, models_root, device)?;
+        let tokens = mummu::vision::VisionTokens::resolve(&m.tokenizer)?;
+        let started = Instant::now();
+        let rows = images
+            .iter()
+            .map(|p| tower.forward(p.to_tensor(device), p.grid_h, p.grid_w, device))
+            .collect::<Result<Vec<_>, _>>()?;
+        eprintln!(
+            "[mummu-serve] vision: {} image(s) encoded in {:?}",
+            rows.len(),
+            started.elapsed()
+        );
+        mummu::vision::place(&prompt_ids, tokens.pad, rows)?
+    };
+
+    let out = if let (AnyLm::Qwen35(vlm), false) = (&m.lm, placed.is_empty()) {
+        mummu::models::generate_multimodal(
+            vlm,
+            &prompt_ids,
+            &placed,
+            max_tokens,
+            opts,
+            device,
+            |id| {
+                // The first token is where warming ends and the wait the bar
+                // exists for is over. Said here rather than after `generate`
+                // returns, because the rest of a 512-token decode is not a
+                // load and must not keep a progress bar on screen.
+                if ids.is_empty() {
+                    progress.ready();
+                    // The model's devices computed and read back: whatever
+                    // failed on THEM before is behind us (see
+                    // `recovery::decide`). Only on them — a token on the host
+                    // vouches for nothing on the card.
+                    recovery::generation_succeeded(&m.devices);
+                }
+                ids.push(id);
+                // Incremental decode: re-decode the whole tail and emit the
+                // suffix beyond what was already streamed. A trailing U+FFFD
+                // means we're mid-way through a multi-byte char — hold the
+                // delta until the next token completes it.
+                let Ok(text) = m.tokenizer.decode(&ids, true) else {
+                    return ControlFlow::Continue(());
+                };
+                if text.ends_with('\u{FFFD}') || text.len() <= emitted.len() {
+                    return ControlFlow::Continue(());
+                }
+                let delta = text[emitted.len()..].to_string();
+                emitted = text;
+                on_delta(&delta)
+            },
+            constraint
+                .as_mut()
+                .map(|c| c as &mut dyn mummu::constrain::Constraint),
+        )
+        .await?
+    } else {
+        m.lm.generate(
+            &prompt_ids,
+            max_tokens,
+            opts,
+            device,
+            |id| {
+                if ids.is_empty() {
+                    progress.ready();
+                    recovery::generation_succeeded(&m.devices);
+                }
+                ids.push(id);
+                let Ok(text) = m.tokenizer.decode(&ids, true) else {
+                    return ControlFlow::Continue(());
+                };
+                if text.ends_with('\u{FFFD}') || text.len() <= emitted.len() {
+                    return ControlFlow::Continue(());
+                }
+                let delta = text[emitted.len()..].to_string();
+                emitted = text;
+                on_delta(&delta)
+            },
+            constraint
+                .as_mut()
+                .map(|c| c as &mut dyn mummu::constrain::Constraint),
+        )
+        .await?
+    };
 
     let text = m
         .tokenizer
@@ -4649,4 +4786,118 @@ pub(crate) mod test_support {
             .iter()
             .any(|(_, d, _)| d == dir)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Vision
+// ---------------------------------------------------------------------------
+
+/// The vision tower for the resident model, loaded once.
+///
+/// Lazy on purpose: the tower is a second ~0.9 GB file, and the overwhelming
+/// majority of requests never carry an image. A text-only deployment should
+/// not pay for it, and a model without an `mmproj` beside it must still
+/// serve text — which is how the 27B ran for weeks before this existed.
+static TOWER: Mutex<Option<(std::path::PathBuf, Arc<mummu::vision::VisionTower>)>> =
+    Mutex::new(None);
+
+/// The `mmproj-*.gguf` sitting beside a model's weights, if any.
+fn mmproj_path(spec: &ModelSpec, models_root: &Path) -> Option<std::path::PathBuf> {
+    let dir = spec.dir(models_root);
+    let mut found: Vec<_> = std::fs::read_dir(&dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("mmproj") && n.ends_with(".gguf"))
+        })
+        .collect();
+    // Deterministic when a directory holds both an F16 and a BF16 tower.
+    found.sort();
+    found.into_iter().next()
+}
+
+/// Is this model able to take images at all?
+pub fn supports_vision(spec: &ModelSpec, models_root: &Path) -> bool {
+    spec.architecture == Architecture::Qwen35 && mmproj_path(spec, models_root).is_some()
+}
+
+/// Load (or reuse) the tower for `spec` on `device`.
+fn tower_for(
+    spec: &ModelSpec,
+    models_root: &Path,
+    device: &Device,
+) -> Result<Arc<mummu::vision::VisionTower>, String> {
+    let path = mmproj_path(spec, models_root).ok_or_else(|| {
+        format!(
+            "{} has no mmproj-*.gguf beside its weights, so it cannot take images — \
+             the vision tower ships as a separate file from the language model",
+            spec.name
+        )
+    })?;
+    let mut slot = TOWER.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((cached, tower)) = slot.as_ref()
+        && cached == &path
+    {
+        return Ok(Arc::clone(tower));
+    }
+    let started = Instant::now();
+    let tower = Arc::new(mummu::vision::VisionTower::load(&path, device)?);
+    eprintln!(
+        "[mummu-serve] vision tower loaded from {} in {:?}",
+        path.display(),
+        started.elapsed()
+    );
+    *slot = Some((path, Arc::clone(&tower)));
+    Ok(tower)
+}
+
+/// Decode and lay out every image, returning the patch grids.
+///
+/// Runs before the prompt is rendered, because the number of placeholder
+/// tokens a prompt must reserve is a function of each image's patch grid.
+/// Only the tower's *config* is read here (a header parse), not its weights.
+pub fn prepare_images(
+    spec: &ModelSpec,
+    models_root: &Path,
+    images: &[Vec<u8>],
+) -> Result<Vec<mummu::vision::Patches>, String> {
+    if images.is_empty() {
+        return Ok(Vec::new());
+    }
+    if spec.architecture != Architecture::Qwen35 {
+        return Err(format!(
+            "{} is a text-only architecture ({:?}) and cannot take images",
+            spec.name, spec.architecture
+        ));
+    }
+    let path = mmproj_path(spec, models_root).ok_or_else(|| {
+        format!(
+            "{} has no mmproj-*.gguf beside its weights, so it cannot take images",
+            spec.name
+        )
+    })?;
+    let f = GgufFile::open(&path).map_err(|e| format!("open mmproj: {e:?}"))?;
+    let cfg = mummu::vision::VisionConfig::from_gguf(&f)?;
+    images.iter().map(|b| cfg.preprocess(b)).collect()
+}
+
+/// The placeholder text for each prepared image, in order.
+pub fn placeholders(
+    spec: &ModelSpec,
+    models_root: &Path,
+    patches: &[mummu::vision::Patches],
+) -> Result<Vec<String>, String> {
+    if patches.is_empty() {
+        return Ok(Vec::new());
+    }
+    let path = mmproj_path(spec, models_root).ok_or("no mmproj")?;
+    let f = GgufFile::open(&path).map_err(|e| format!("open mmproj: {e:?}"))?;
+    let cfg = mummu::vision::VisionConfig::from_gguf(&f)?;
+    Ok(patches
+        .iter()
+        .map(|p| mummu::vision::placeholder_text(mummu::vision::token_count(p, cfg.merge)))
+        .collect())
 }

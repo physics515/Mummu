@@ -47,6 +47,7 @@ mod engine;
 #[cfg(feature = "fault-injection")]
 mod fault;
 pub mod logs;
+mod openai;
 pub mod recovery;
 mod shim;
 pub mod status;
@@ -873,6 +874,26 @@ async fn drive_chat_ws(
 pub(crate) struct ChatMessage {
     pub(crate) role: String,
     pub(crate) content: String,
+    /// Base64 image payloads, ollama's per-message spelling. OpenAI puts
+    /// them in `content` parts instead; both land here before planning.
+    #[serde(default)]
+    pub(crate) images: Vec<String>,
+}
+
+/// An output grammar the decoder must obey, asked for by a request.
+///
+/// Both compatibility surfaces spell the same thing differently — ollama's
+/// `"format": "json"` and OpenAI's `"response_format": {"type":
+/// "json_object"}` — so they translate into this one type and share the
+/// machinery in `mummu::constrain`.
+///
+/// Before this existed, `format` was parsed by nobody: serde dropped the
+/// unknown field and the request generated ordinary prose. A client asking
+/// for JSON got prose, its parse failed, and nothing anywhere said why.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OutputFormat {
+    /// A single JSON object or array, enforced token by token.
+    Json,
 }
 
 #[derive(Deserialize, Default)]
@@ -1111,9 +1132,16 @@ fn start_chat(parsed: ChatRequest) -> Result<ChatStream, Rejection> {
     let profile = parsed.profile || std::env::var("MUMMU_PROFILE").is_ok();
     let name = spec.name.clone();
     Ok(spawn_chat(name, profile, move |sink| async move {
-        engine::run_chat(&spec, &root, &turns, &opts, max_tokens, |delta| {
-            sink.delta(delta)
-        })
+        engine::run_chat(
+            &spec,
+            &root,
+            &turns,
+            &opts,
+            max_tokens,
+            None,
+            Vec::new(),
+            |delta| sink.delta(delta),
+        )
         .await
     }))
 }

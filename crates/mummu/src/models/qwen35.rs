@@ -2098,24 +2098,15 @@ impl LoadedQwen35 {
     /// and computes the final norm + lm_head only when `need_logits` —
     /// a non-final prefill chunk advances every cache without paying the
     /// head projection (~68 ms/call on the 27B's host head).
-    fn forward_impl(
-        &self,
-        new_ids: &[u32],
-        past: usize,
-        cache: &mut [Qwen35Kv],
-        device: &Device,
-        need_logits: bool,
-    ) -> Option<Tensor<2>> {
+    /// Look `new_ids` up in the embedding table: `[1, t, hidden]` on
+    /// `device`.
+    ///
+    /// Split out of [`Self::forward_impl`] so a caller can splice non-text
+    /// rows into the sequence — image tokens from the vision tower — and
+    /// hand the result to [`Self::forward_embeds`]. Text-only decoding goes
+    /// through exactly the same code as before.
+    pub fn embed(&self, new_ids: &[u32], device: &Device) -> Tensor<3> {
         let t = new_ids.len();
-        assert!(t >= 1, "qwen35 forward: need at least one token");
-        assert!(
-            cache.len() == self.config.num_layers,
-            "qwen35 forward: cache has {} layers, model has {}",
-            cache.len(),
-            self.config.num_layers
-        );
-        let cfg = &self.config;
-
         // The embedding may live on a different device from the rest of the
         // model (it is a gather, so it is often left on the host to keep VRAM
         // for weights that compute — see `load_from_pack_partitioned_split`).
@@ -2129,11 +2120,46 @@ impl LoadedQwen35 {
             (&embed_device, crate::backend::int_dtype(&embed_device)),
         )
         .reshape([1, t]);
+        let _s = crate::prof::scope("embed");
+        self.model.embed_tokens.forward(input).to_device(device)
+    }
+
+    fn forward_impl(
+        &self,
+        new_ids: &[u32],
+        past: usize,
+        cache: &mut [Qwen35Kv],
+        device: &Device,
+        need_logits: bool,
+    ) -> Option<Tensor<2>> {
+        let x = self.embed(new_ids, device);
+        self.forward_embeds(x, past, cache, device, need_logits)
+    }
+
+    /// The trunk, over embeddings that are already in hidden space.
+    ///
+    /// This is [`Self::forward_impl`] from the embedding onwards; the split
+    /// exists so image embeddings can enter the sequence without pretending
+    /// to be token ids (there is no id that means "this patch").
+    pub fn forward_embeds(
+        &self,
+        x: Tensor<3>,
+        past: usize,
+        cache: &mut [Qwen35Kv],
+        device: &Device,
+        need_logits: bool,
+    ) -> Option<Tensor<2>> {
+        let t = x.dims()[1];
+        assert!(t >= 1, "qwen35 forward: need at least one token");
+        assert!(
+            cache.len() == self.config.num_layers,
+            "qwen35 forward: cache has {} layers, model has {}",
+            cache.len(),
+            self.config.num_layers
+        );
+        let cfg = &self.config;
         let _prof_forward = crate::prof::scope("forward");
-        let mut x = {
-            let _s = crate::prof::scope("embed");
-            self.model.embed_tokens.forward(input).to_device(device)
-        };
+        let mut x = x;
 
         let (cos, sin) = rope_tables(t, past, cfg.rope_dim, cfg.rope_theta, device);
         let mask = (t > 1).then(|| causal_mask(t, past, device));

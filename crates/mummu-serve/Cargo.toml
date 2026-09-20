@@ -28,6 +28,7 @@ fault-injection = []
 [dependencies]
 rayon = { workspace = true }
 mummu = { path = "../mummu", default-features = false, features = ["flamegraph"] }
+base64 = { workspace = true }
 burn = { workspace = true }
 tokenizers = { workspace = true }
 serde = { workspace = true }

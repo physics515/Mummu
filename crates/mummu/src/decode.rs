@@ -6,6 +6,8 @@ use std::ops::ControlFlow;
 
 use burn::tensor::Tensor;
 
+use crate::constrain::Constraint;
+
 /// Hard ceiling on the vocab a sampled step will read back to the CPU
 /// (~4 MB of f32 at the bound); anything larger is a wiring bug, not a model.
 const VOCAB_READBACK_BOUND: usize = 1 << 20;
@@ -133,6 +135,27 @@ impl Pcg32 {
 /// callers should use [`argmax_id`] instead (asserted here).
 #[must_use]
 pub fn sample_id(logits: &[f32], opts: &SamplerOptions, rng: &mut Pcg32) -> u32 {
+    sample_id_filtered(logits, opts, rng, |_| true)
+        .expect("an unfiltered candidate set is never empty")
+}
+
+/// [`sample_id`] restricted to the ids `allowed` accepts — the constrained
+/// sampling path.
+///
+/// The filter is applied **inside** the top-k candidate set, so a constraint
+/// costs at most `top_k` grammar tests per token rather than one per
+/// vocabulary entry, and the nucleus is renormalized over what survives.
+/// That keeps the draw a proper sample from the restricted distribution
+/// instead of sample-then-reject, which would quietly bias toward whatever
+/// the grammar happens to permit. `None` means the grammar rejected every
+/// candidate in the top-k; callers widen the search from there.
+#[must_use]
+pub fn sample_id_filtered(
+    logits: &[f32],
+    opts: &SamplerOptions,
+    rng: &mut Pcg32,
+    allowed: impl Fn(u32) -> bool,
+) -> Option<u32> {
     opts.validate();
     assert!(!logits.is_empty(), "sample_id: empty logits");
     assert!(
@@ -154,6 +177,10 @@ pub fn sample_id(logits: &[f32], opts: &SamplerOptions, rng: &mut Pcg32) -> u32 
         idx.truncate(k);
     }
     idx.sort_unstable_by(by_logit_desc);
+    idx.retain(|&i| allowed(i));
+    if idx.is_empty() {
+        return None;
+    }
 
     // Temperature softmax over the candidates (max-subtracted: never overflows).
     let max_logit = logits[idx[0] as usize];
@@ -195,7 +222,35 @@ pub fn sample_id(logits: &[f32], opts: &SamplerOptions, rng: &mut Pcg32) -> u32 
         (chosen as usize) < logits.len(),
         "sampled id out of the vocab"
     );
-    chosen
+    Some(chosen)
+}
+
+/// The highest-logit id `allowed` accepts, or `None` when it accepts none.
+///
+/// Two-stage on purpose: the legal token is essentially always among the
+/// strongest few hundred, and `select_nth` is linear where a full sort of a
+/// ~150k vocabulary is not. The tail is only sorted when the head had
+/// nothing, which in practice means a grammar that has painted the model
+/// into a corner.
+#[must_use]
+pub fn best_allowed(logits: &[f32], allowed: impl Fn(u32) -> bool) -> Option<u32> {
+    /// Head width for the first stage.
+    const PROBE: usize = 512;
+
+    let by_logit_desc = |&a: &u32, &b: &u32| logits[b as usize].total_cmp(&logits[a as usize]);
+    let mut idx: Vec<u32> = (0..logits.len() as u32).collect();
+    if idx.len() > PROBE {
+        idx.select_nth_unstable_by(PROBE - 1, by_logit_desc);
+        let (head, tail) = idx.split_at_mut(PROBE);
+        head.sort_unstable_by(by_logit_desc);
+        if let Some(&hit) = head.iter().find(|&&i| allowed(i)) {
+            return Some(hit);
+        }
+        tail.sort_unstable_by(by_logit_desc);
+        return tail.iter().copied().find(|&i| allowed(i));
+    }
+    idx.sort_unstable_by(by_logit_desc);
+    idx.into_iter().find(|&i| allowed(i))
 }
 
 /// Prompt tokens fed per prefill call (`MUMMU_PREFILL_CHUNK`; `0`/`off`
@@ -225,6 +280,11 @@ pub fn prefill_chunk_len() -> usize {
 /// of a chunked prefill, where a computed head projection is a throwaway
 /// (~68 ms/token of host head on the 27B, once per chunk). Models plug in
 /// via `CausalLm::forward` / `CausalLm::forward_advance`.
+///
+/// `constraint`, when present, decides which ids may be emitted (see
+/// [`crate::constrain`]). It also owns the stop condition: EOS is suppressed
+/// until the constrained value is complete, and the loop ends the moment it
+/// is.
 pub async fn generate_loop(
     mut step: impl FnMut(&[u32], usize, bool) -> Option<Tensor<2>>,
     prompt_ids: &[u32],
@@ -232,6 +292,7 @@ pub async fn generate_loop(
     opts: &SamplerOptions,
     is_eos: impl Fn(u32) -> bool,
     mut on_token: impl FnMut(u32) -> ControlFlow<()>,
+    mut constraint: Option<&mut dyn Constraint>,
 ) -> Result<Vec<u32>, String> {
     opts.validate();
     assert!(!prompt_ids.is_empty(), "generate_loop: empty prompt");
@@ -275,17 +336,48 @@ pub async fn generate_loop(
         // is the sync point, so GPU-side FFN time surfaces HERE, not in the
         // scopes that enqueued it.
         let readback_started = std::time::Instant::now();
-        let next = if greedy {
-            argmax_id(logits).await?
-        } else {
-            let v = logits
-                .into_data_async()
-                .await
-                .map_err(|e| format!("logits readback: {e:?}"))?
-                .convert::<f32>()
-                .try_to_vec::<f32>()
-                .map_err(|e| format!("logits readback: {e:?}"))?;
-            sample_id(&v, opts, &mut rng)
+        let next = match constraint.as_deref() {
+            // Unconstrained: unchanged. Greedy keeps its argmax on-device and
+            // never reads a vocabulary back.
+            None => {
+                if greedy {
+                    argmax_id(logits).await?
+                } else {
+                    let v = read_logits(logits).await?;
+                    sample_id(&v, opts, &mut rng)
+                }
+            }
+            Some(c) => {
+                // EOS counts as legal only once the value is complete — the
+                // rule that stops a model abandoning an object halfway and
+                // handing the client something that cannot parse.
+                let legal = |id: u32| {
+                    if is_eos(id) {
+                        c.is_complete()
+                    } else {
+                        c.allows(id)
+                    }
+                };
+                if greedy {
+                    // Fast path: test the model's own pick, which costs one
+                    // automaton replay. A model already emitting valid JSON
+                    // never pays for the readback the slow path needs.
+                    let probe = argmax_id(logits.clone()).await?;
+                    if probe < vocab && legal(probe) {
+                        probe
+                    } else {
+                        let v = read_logits(logits).await?;
+                        best_allowed(&v, legal).ok_or_else(|| no_legal_token(past))?
+                    }
+                } else {
+                    // Sampling already reads the vocabulary back, so masking
+                    // inside the top-k is the whole added cost.
+                    let v = read_logits(logits).await?;
+                    sample_id_filtered(&v, opts, &mut rng, &legal)
+                        .or_else(|| best_allowed(&v, &legal))
+                        .ok_or_else(|| no_legal_token(past))?
+                }
+            }
         };
         crate::prof::record("logits_readback+sample", readback_started.elapsed());
         // A GPU argmax over NaN logits can return an out-of-range sentinel
@@ -300,7 +392,16 @@ pub async fn generate_loop(
             break;
         }
         out.push(next);
+        if let Some(c) = constraint.as_deref_mut() {
+            c.accept(next);
+        }
         if on_token(next).is_break() {
+            break;
+        }
+        // The constrained value closed. Nothing after it can belong to the
+        // value, and letting the model free-associate past the last brace
+        // costs a full token of decode per word of it.
+        if constraint.as_deref().is_some_and(|c| c.is_complete()) {
             break;
         }
         // Cooperative yield: a CPU-backend decode is a long stretch of
@@ -314,6 +415,29 @@ pub async fn generate_loop(
     }
     debug_assert!(out.len() <= max_tokens);
     Ok(out)
+}
+
+/// Pull a `[1, vocab]` logit row back to the host as f32.
+async fn read_logits(logits: Tensor<2>) -> Result<Vec<f32>, String> {
+    logits
+        .into_data_async()
+        .await
+        .map_err(|e| format!("logits readback: {e:?}"))?
+        .convert::<f32>()
+        .try_to_vec::<f32>()
+        .map_err(|e| format!("logits readback: {e:?}"))
+}
+
+/// The constraint left the decoder with nowhere to go. Unreachable for the
+/// JSON grammar over a real vocabulary — every state has a legal
+/// continuation and a byte-level BPE can spell all of them — so this names
+/// the constraint as the suspect rather than the model.
+fn no_legal_token(step: usize) -> String {
+    format!(
+        "decode step {step}: the output constraint rejected every token in the vocabulary — \
+         the grammar has no legal continuation here, which is a constraint bug, not a \
+         model failure"
+    )
 }
 
 #[cfg(test)]
@@ -453,6 +577,7 @@ mod tests {
             &SamplerOptions::greedy(),
             |id| id == 3, // treat the follow-up token as EOS
             |_| std::ops::ControlFlow::Continue(()),
+            None,
         )
         .await
         .unwrap();
@@ -477,6 +602,7 @@ mod tests {
                     std::ops::ControlFlow::Continue(())
                 }
             },
+            None,
         )
         .await
         .unwrap();

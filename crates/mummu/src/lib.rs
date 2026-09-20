@@ -17,6 +17,7 @@ pub mod attrib;
 pub mod backend;
 pub mod cache;
 pub mod chat;
+pub mod constrain;
 pub mod decode;
 pub mod diskcache;
 /// Host CPU kernels: the packed-nibble Q4 GEMV at the DRAM roofline
@@ -57,5 +58,6 @@ pub mod tier;
 pub mod tok_config;
 pub mod tokenizer;
 pub mod tune;
+pub mod vision;
 pub mod vram;
 pub mod workingset;
