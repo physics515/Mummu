@@ -521,6 +521,14 @@ impl VisionTower {
 /// so the budget belongs on detail, not on prefill thrift.
 pub const MAX_IMAGE_TOKENS: usize = 512;
 
+/// Floor on merged tokens per image, for the same reason there is a cap.
+///
+/// The position table is fitted at one grid; too far below it and the
+/// encoder's spatial signal degrades just as it does too far above. 480 is
+/// just under the cap, so every image lands in a narrow band around the
+/// grid that was measured working, whatever size it arrived at.
+pub const MIN_IMAGE_TOKENS: usize = 480;
+
 /// An image, preprocessed into the tower's input.
 pub struct Patches {
     /// `[gh * gw, 3 * patch * patch]`, each row one patch in `(c, y, x)`.
@@ -547,6 +555,20 @@ impl VisionConfig {
         // Work in merged cells; the patch grid is this times `merge`.
         let cells = |px: u32| ((px as usize).div_ceil(step)).max(1);
         let (mut mh, mut mw) = (cells(h), cells(w));
+        // Scale UP as well as down. The learned position table is trained at
+        // one grid (48x48 here) and the encoder reads a grid far from it
+        // poorly: measured 2026-09-20 on one photo of two hot dogs, a 40x50
+        // patch grid described it correctly and a 24x32 grid called it
+        // "three crepes". A small image is therefore enlarged to land near
+        // the same working range rather than passed through at its own tiny
+        // grid — upsampling invents no detail, but it keeps the position
+        // signal in the regime the table was fitted for.
+        if mh * mw < MIN_IMAGE_TOKENS {
+            #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+            let scale = (MIN_IMAGE_TOKENS as f64 / (mh * mw) as f64).sqrt();
+            mh = ((mh as f64 * scale).round() as usize).max(1);
+            mw = ((mw as f64 * scale).round() as usize).max(1);
+        }
         if mh * mw > MAX_IMAGE_TOKENS {
             #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
             let scale = (MAX_IMAGE_TOKENS as f64 / (mh * mw) as f64).sqrt();
