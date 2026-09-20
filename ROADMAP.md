@@ -1478,6 +1478,42 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
 
 ## Phases
 
+### Vision (qwen3-vl tower) — shipped, not yet correct
+
+- [ ] **Instrument the image pipeline before touching it again.** *(2026-09-20)* The tower runs end to
+      end — mmproj loads, the ViT encodes, the merger projects, the rows splice into the prefill — and
+      it describes the same photo differently depending on the file it arrived in. Two of seven test
+      images correct, both the same source: two hot dogs read correctly at 1500x1125, as "three
+      sunflowers" at 512x384, "three tacos" at 900x675, "a single, large, multi-layered crepe cake" at
+      1200x900, and "three hot dogs" at 3000x2250 (food right, count wrong).
+      **The reason this is an instrumentation item and not another fix:** 900x675 and 1500x1125 compute
+      to an *identical* 40x50 patch grid and are both resized to 800x640 before patchifying, so the
+      tensors entering the tower should be near-identical — and they disagree anyway. That contradicts
+      the model of the code, which means the code is not doing what the arithmetic says. Print the real
+      grid, the post-resize dimensions, and a checksum of the patch tensor per request; find where
+      reality diverges from `grid_for`. Guessing has already cost four rebuild/retest cycles.
+      **Fixed getting this far** (all real, all kept): `grid_for` converged toward a square and
+      destroyed the aspect ratio; the encoder had no 2-D RoPE at all, only the absolute position table
+      (Qwen3-VL uses both — the llama.cpp port computes both host-side and validates at ~0.999 cosine
+      similarity against the HF reference); and there was no floor on the patch grid.
+      **Disproved, so do not re-try blind:** switching `positions_for` to `align_corners=False` (which
+      is what `F.interpolate` does) changed the three-resolution results *not at all*; and JPEG
+      encoding is not the variable — re-encoding the working file at its own size still works.
+      **The real gate is numerical**, not behavioural: dump the projected image tokens for a fixed
+      input and compare against the HF reference (or llama.cpp's mtmd) by cosine similarity. Every
+      conclusion in this item rests on asking a 27B what it sees, which cannot distinguish "the
+      embeddings are subtly wrong" from "the model miscounted".
+
+- [ ] **Load the vision tower at f16.** *(2026-09-20)* `VisionTower::load` reads through
+      `read_tensor_f32`, so the F16 mmproj lands on the card as f32: 0.93 GB becomes ~1.85 GiB, and
+      `vision_reserve_bytes` has to reserve double to match. That reserve costs 10 of 64 layers on the
+      27B (33/64 -> 23/64 at a 9 GiB budget) and takes decode from ~0.83 to ~2.3 s/token — for *text*
+      requests too, because placement is decided once at load. Blocked on burn configuring a float
+      dtype per **device**, not per tensor (`backend::gpu_device_f16`), so an f16 tower means an f16
+      language model as well. Worth revisiting with the 0.22 migration, where dtype stops being a type
+      parameter. Alternative that needs no burn change: evict the tower when idle and take a ~6 s
+      reload on the next image.
+
 ### P0 — Workspace scaffold
 - [ ] **Prepare the burn 0.22 migration** — v0.22.0-pre.1 (2026-07-29) is a breaking release aimed right
       at Mummu's core seams: (a) the `Tensor` **backend generic is removed** (a high-level `Device`
