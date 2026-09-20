@@ -386,14 +386,20 @@ impl VisionTower {
             .try_into_vec::<f32>()
             .expect("position table readback");
         let mut out = vec![0f32; gh * gw * h];
-        // Align corners, matching the reference resamplers: a single output
-        // cell maps to the table's centre, not its corner.
+        // `align_corners = False`, which is what `F.interpolate` does by
+        // default and therefore what the reference resampler does: an output
+        // cell maps to the CENTRE of its source footprint, `(i + 0.5) *
+        // g / n - 0.5`, not to a corner-anchored fraction.
+        //
+        // The distinction is not academic. Corner-anchored interpolation
+        // agrees closely when the target grid is near the table's native
+        // 48x48 and drifts as the scale factor moves away — measured
+        // 2026-09-20, the same photo read correctly at 40x50 patches and
+        // came back as "three crepes" at 24x32 and "12 tacos" at 50x40.
+        #[allow(clippy::cast_precision_loss)]
         let scale = |i: usize, n: usize| -> f32 {
-            if n <= 1 {
-                0.0
-            } else {
-                i as f32 * (g - 1) as f32 / (n - 1) as f32
-            }
+            let src = (i as f32 + 0.5) * (g as f32 / n as f32) - 0.5;
+            src.clamp(0.0, (g - 1) as f32)
         };
         for y in 0..gh {
             let fy = scale(y, gh);
