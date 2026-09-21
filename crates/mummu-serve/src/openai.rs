@@ -126,6 +126,22 @@ impl Content {
     }
 }
 
+/// One entry of OpenAI's `tools` array.
+#[derive(Deserialize)]
+struct ToolDef {
+    #[serde(default)]
+    function: Option<FunctionDef>,
+}
+
+#[derive(Deserialize)]
+struct FunctionDef {
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    parameters: serde_json::Value,
+}
+
 #[derive(Deserialize)]
 struct Message {
     role: String,
@@ -179,9 +195,11 @@ struct ChatCompletionRequest {
     stream: Option<bool>,
     #[serde(default)]
     response_format: Option<ResponseFormat>,
-    /// Recognised only to refuse it — see the module comment.
+    /// OpenAI function definitions. Rendered into the prompt through the
+    /// family's own tool convention (Hermes `<tools>` for Qwen), and the
+    /// model's `<tool_call>` blocks are parsed back out of the answer.
     #[serde(default)]
-    tools: Option<serde_json::Value>,
+    tools: Option<Vec<ToolDef>>,
     #[serde(default)]
     n: Option<u32>,
     /// OpenAI's reasoning control. Anything but `"none"` opts in; absent
@@ -196,12 +214,6 @@ impl ChatCompletionRequest {
     /// and its catalog lookup so the two surfaces cannot drift apart on what
     /// counts as a valid request.
     fn to_plan(&self) -> Result<RunPlan, Response> {
-        if self.tools.is_some() {
-            return Err(bad_request(
-                "tools / function calling are not supported by this server",
-                "unsupported_parameter",
-            ));
-        }
         if self.n.is_some_and(|n| n != 1) {
             return Err(bad_request(
                 "n > 1 is not supported — this server returns a single choice",
@@ -246,12 +258,29 @@ impl ChatCompletionRequest {
 
         // `plan` answers in the ollama error shape, which would be wrong
         // here; re-dress whatever it says as an OpenAI error.
+        let tools: Vec<mummu::chat::ToolSpec> = self
+            .tools
+            .iter()
+            .flatten()
+            .filter_map(|t| t.function.as_ref())
+            .map(|f| mummu::chat::ToolSpec {
+                name: f.name.clone(),
+                description: f.description.clone(),
+                parameters: if f.parameters.is_null() {
+                    serde_json::json!({"type": "object", "properties": {}})
+                } else {
+                    f.parameters.clone()
+                },
+            })
+            .collect();
+
         let think = self
             .reasoning_effort
             .as_deref()
             .is_some_and(|r| !r.eq_ignore_ascii_case("none"));
         let mut p = plan(&self.model, &messages, &options, None, think).map_err(|r| reshape(*r))?;
         p.format = format;
+        p.tools = tools;
         Ok(p)
     }
 }
@@ -420,30 +449,60 @@ async fn respond(model: String, p: RunPlan, stream: bool) -> Response {
             p.format,
             p.think,
             p.images,
+            p.tools,
             |_| ControlFlow::Continue(()),
         );
         return match recovery::contain(&model, run).await {
-            Ok(r) => json_response(
-                200,
-                json!({
-                    "id": id,
-                    "object": "chat.completion",
-                    "created": created,
-                    "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "message": {"role": "assistant", "content": r.text},
-                        "finish_reason": "stop",
-                    }],
-                    // `prompt_tokens` is not counted here; reporting 0 rather
-                    // than a guess keeps a client's arithmetic honest.
-                    "usage": {
-                        "prompt_tokens": 0,
-                        "completion_tokens": r.tokens,
-                        "total_tokens": r.tokens,
-                    },
-                }),
-            ),
+            Ok(r) => {
+                // The model answers a tool request as `<tool_call>{…}</tool_call>`
+                // in its text; OpenAI clients expect them lifted into a
+                // structured field, with `finish_reason` saying so — a client
+                // that gets the raw markers in `content` has no way to act.
+                let (calls, prose) = mummu::chat::parse_tool_calls(&r.text)
+                    .unwrap_or_else(|_| (Vec::new(), r.text.clone()));
+                let message = if calls.is_empty() {
+                    json!({"role": "assistant", "content": r.text})
+                } else {
+                    json!({
+                        "role": "assistant",
+                        "content": (!prose.trim().is_empty()).then_some(prose),
+                        "tool_calls": calls.iter().enumerate().map(|(i, c)| json!({
+                            "id": format!("call_{i}_{}", c.name),
+                            "type": "function",
+                            "function": {
+                                "name": c.name,
+                                "arguments": c.arguments.to_string(),
+                            },
+                        })).collect::<Vec<_>>(),
+                    })
+                };
+                let finish = if calls.is_empty() {
+                    "stop"
+                } else {
+                    "tool_calls"
+                };
+                json_response(
+                    200,
+                    json!({
+                        "id": id,
+                        "object": "chat.completion",
+                        "created": created,
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "message": message,
+                            "finish_reason": finish,
+                        }],
+                        // `prompt_tokens` is not counted here; reporting 0 rather
+                        // than a guess keeps a client's arithmetic honest.
+                        "usage": {
+                            "prompt_tokens": 0,
+                            "completion_tokens": r.tokens,
+                            "total_tokens": r.tokens,
+                        },
+                    }),
+                )
+            }
             Err(e) => {
                 eprintln!("[mummu-serve] openai chat {model}: {}", e.message);
                 json_response(
@@ -489,6 +548,7 @@ async fn respond(model: String, p: RunPlan, stream: bool) -> Response {
             p.format,
             p.think,
             p.images,
+            p.tools,
             move |delta| {
                 let frame = chunk(&cid, &cmodel, created, json!({"content": delta}));
                 if deltas.send(sse(&frame)).is_err() {

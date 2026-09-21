@@ -667,13 +667,35 @@ fn load_any(
 /// hardcoded renderer in the library yet, so it is spelled out here in the
 /// shape `tests/real_olmoe.rs` decodes with.
 fn render_prompt(arch: Architecture, turns: &[Turn]) -> Result<String, String> {
+    render_prompt_with_tools(arch, &[], turns)
+}
+
+/// [`render_prompt`] advertising `tools` to the model.
+///
+/// Empty `tools` renders exactly as before — the tool block is what the
+/// family's template emits only when there is something to put in it.
+fn render_prompt_with_tools(
+    arch: Architecture,
+    tools: &[mummu::chat::ToolSpec],
+    turns: &[Turn],
+) -> Result<String, String> {
+    let chatml = |t: ChatMl| {
+        if tools.is_empty() {
+            t.render(turns)
+        } else {
+            t.render_with_tools(tools, turns)
+        }
+    };
     match arch {
-        Architecture::Qwen2 => Ok(ChatMl::qwen2().render(turns)),
-        Architecture::Qwen3 => Ok(ChatMl::qwen3().render(turns)),
+        Architecture::Qwen2 => Ok(chatml(ChatMl::qwen2())),
+        Architecture::Qwen3 => Ok(chatml(ChatMl::qwen3())),
         // qwen35's imported chat template is ChatML with Qwen3's think
         // conventions (its vision macros never fire on text-only turns).
-        Architecture::Qwen35 => Ok(ChatMl::qwen3().render(turns)),
-        Architecture::Lfm2 => Ok(ChatMl::lfm2().render(turns)),
+        Architecture::Qwen35 => Ok(chatml(ChatMl::qwen3())),
+        Architecture::Lfm2 => Ok(chatml(ChatMl::lfm2())),
+        Architecture::Olmoe if !tools.is_empty() => {
+            Err("the OLMoE template has no tool-call convention".into())
+        }
         Architecture::Olmoe => {
             let mut out = String::from("<|endoftext|>");
             for t in turns {
@@ -719,6 +741,7 @@ pub async fn run_chat(
     format: Option<crate::OutputFormat>,
     think: bool,
     images: Vec<mummu::vision::Patches>,
+    tools: Vec<mummu::chat::ToolSpec>,
     on_delta: impl FnMut(&str) -> ControlFlow<()>,
 ) -> Result<ChatResult, ChatError> {
     // No `restarting` check here. The entry points refuse a NEW chat during a
@@ -732,7 +755,7 @@ pub async fn run_chat(
     // The planner runs below this and cannot see which model it is serving,
     // so the tower's footprint is published before planning starts.
     set_vision_reserve(vision_reserve_bytes(spec, models_root));
-    let prompt = render_prompt(spec.architecture, turns)?;
+    let prompt = render_prompt_with_tools(spec.architecture, &tools, turns)?;
     // Land a line in the log the moment a request enters the engine: the fit
     // planning below can legitimately take minutes on a busy disk, and a
     // request that logs nothing until it finishes reads as a hang (it did,

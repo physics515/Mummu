@@ -523,6 +523,8 @@ pub(crate) struct RunPlan {
     pub(crate) images: Vec<mummu::vision::Patches>,
     /// Pass a reasoning model's `<think>` block through to the client.
     pub(crate) think: bool,
+    /// Tool definitions to advertise to the model.
+    pub(crate) tools: Vec<mummu::chat::ToolSpec>,
 }
 
 /// Validate a request into a `RunPlan`, or hand back the error response.
@@ -576,6 +578,7 @@ pub(crate) fn plan(
         format,
         images,
         think,
+        tools: Vec::new(),
     })
 }
 
@@ -694,6 +697,7 @@ async fn run(
             p.format,
             p.think,
             p.images,
+            p.tools,
             |delta| sink.delta(delta),
         )
         .await

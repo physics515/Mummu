@@ -951,6 +951,11 @@ pub(crate) fn to_turns(messages: &[ChatMessage]) -> Result<Vec<Turn>, String> {
             "system" => Ok(Turn::system(m.content.clone())),
             "user" => Ok(Turn::user(m.content.clone())),
             "assistant" => Ok(Turn::assistant(m.content.clone())),
+            // The second half of a tool loop: the client ran the function
+            // and is handing back its result. The family renderer decides
+            // where that goes — Hermes puts it in a `<tool_response>` block
+            // of a user turn, LFM gives it a turn of its own.
+            "tool" | "function" => Ok(Turn::tool_response(m.content.clone())),
             other => Err(format!("unsupported role {other:?}")),
         })
         .collect::<Result<_, _>>()?;
@@ -1141,6 +1146,7 @@ fn start_chat(parsed: ChatRequest) -> Result<ChatStream, Rejection> {
             max_tokens,
             None,
             false,
+            Vec::new(),
             Vec::new(),
             |delta| sink.delta(delta),
         )
