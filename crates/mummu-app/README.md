@@ -59,7 +59,7 @@ install, no firewall rule as long as the bind stays on loopback.
 | `MUMMU_FORCE_CPU`       | unset              | `1` pins the CPU backend (wins over all)                 |
 
 Everything else in [mummu-serve's README](../mummu-serve/README.md#configuration)
-— `MUMMU_QUANT`, `MUMMU_GPU_BUDGET_GB`, `MUMMU_PACK`, `MUMMU_TIERS`, the FFN
+— `MUMMU_QUANT`, `MUMMU_PACK`, `MUMMU_TIERS`, the FFN
 skip knobs — applies unchanged; the app reads none of them itself.
 
 `MUMMU_ADDR` / `MUMMU_OLLAMA_ADDR` are honored as fallbacks so a host that
@@ -225,9 +225,10 @@ straight copy:
   point of the move — the parity-validated wgpu/Vulkan stack takes over and
   both GPUs are visible. Set it again only to A/B the two backends, and only
   in a `--features cuda` build.
-- **`MUMMU_GPU_BUDGET_GB: "9"` — keep it.** The reasoning is unchanged and if
-  anything stronger: the 16 GB card is shared with the desktop, and now with
-  this app's own webview as well.
+- **`MUMMU_GPU_BUDGET_GB` — drop it.** The card's budget is measured live
+  (mummu-serve's `placement`): what the desktop, this app's webview and any
+  other tenant hold is tracked as ambient and guarded against, so a fixed
+  number is no longer needed or read.
 - **`MUMMU_MODELS_DIR: /models` — repoint it.** `/models` is a *bind* mount,
   not a named volume, so the weights already live on the host at whatever
   `MUMMU_DATA_DIR` resolves to for that stack (`docker inspect -f

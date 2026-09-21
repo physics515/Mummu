@@ -5099,7 +5099,7 @@ dependencies = [
 
 [[package]]
 name = "mummu"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "burn",
  "burn-cubecl",
@@ -5132,7 +5132,7 @@ dependencies = [
 
 [[package]]
 name = "mummu-app"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "mummu-serve",
  "tauri",
@@ -5142,7 +5142,7 @@ dependencies = [
 
 [[package]]
 name = "mummu-bench"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "burn",
  "criterion",
@@ -5153,15 +5153,15 @@ dependencies = [
 
 [[package]]
 name = "mummu-mix"
-version = "0.3.3"
+version = "0.4.0"
 
 [[package]]
 name = "mummu-schedule"
-version = "0.3.3"
+version = "0.4.0"
 
 [[package]]
 name = "mummu-serve"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "async-stream",
  "axum",

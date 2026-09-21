@@ -295,6 +295,9 @@ where
     // guards against arrives from OTHER processes, so it must not depend on
     // this one receiving traffic. See `engine::spawn_host_pressure_watch`.
     engine::spawn_host_pressure_watch();
+    // And the card: which layers live there, at what precision, follows what
+    // the card has free — also without waiting for traffic.
+    engine::spawn_placement_watch();
     // And take the first memory readings now. The VRAM cache answers from its
     // last sample and refreshes behind it, so the first load's baseline would
     // otherwise be "nothing sampled yet" on a server nobody has polled —
@@ -1508,8 +1511,8 @@ mod tests {
         assert_eq!(h["version"], json!(status::VERSION));
         assert_eq!(
             h["version"],
-            json!("0.3.3"),
-            "this branch ships as v0.3.3; the workspace version is what says so"
+            json!("0.4.0"),
+            "this branch ships as v0.4.0; the workspace version is what says so"
         );
         let build = h["build"].as_str().expect("build is a string");
         assert!(

@@ -63,6 +63,15 @@ pub struct WatermarkConfig {
     /// slack. This is also what makes the guard strictly exceed the most
     /// recent spike rather than merely equal it.
     pub frag_slack_bytes: u64,
+    /// Samples the quantile remembers; 0 = all of them (the P² estimator
+    /// over the whole history). A bounded window is for a NON-stationary
+    /// ambient: a co-tenant that held the card for three minutes early in a
+    /// process is 36 of the first 100 five-second samples, and the 0.999
+    /// quantile of the whole history then reports it for the next ~50 hours
+    /// — a guard that never lets placement recover. A window of N samples
+    /// forgets it N samples after it left (the shrink still waits for
+    /// `hysteresis_window` quiet ones).
+    pub window: u32,
 }
 
 impl Default for WatermarkConfig {
@@ -72,6 +81,7 @@ impl Default for WatermarkConfig {
             hysteresis_window: 32,
             floor_bytes: 2 * 1024 * 1024 * 1024,
             frag_slack_bytes: 128 * 1024 * 1024,
+            window: 0,
         }
     }
 }
@@ -100,6 +110,8 @@ pub struct Watermark {
     quiet: u32,
     /// Allocation failures reported so far.
     breaches: u32,
+    /// The last `cfg.window` samples, when the quantile is windowed.
+    recent: std::collections::VecDeque<u64>,
 }
 
 impl Watermark {
@@ -117,6 +129,7 @@ impl Watermark {
             guard,
             quiet: 0,
             breaches: 0,
+            recent: std::collections::VecDeque::new(),
         }
     }
 
@@ -145,6 +158,12 @@ impl Watermark {
     pub fn observe_ambient(&mut self, bytes: u64) {
         self.max_seen = self.max_seen.max(bytes);
         self.quantile.observe(bytes as f64);
+        if self.cfg.window > 0 {
+            if self.recent.len() == self.cfg.window as usize {
+                self.recent.pop_front();
+            }
+            self.recent.push_back(bytes);
+        }
 
         // Up immediately: the guard must cover both the steady-state
         // quantile and the sample we are looking at right now.
@@ -200,11 +219,19 @@ impl Watermark {
     /// The (1 - alpha) quantile term with the breach boost applied. Falls
     /// back to the running max while the estimator is still warming up.
     fn q_term(&self) -> f64 {
-        let q = self
-            .quantile
-            .estimate()
-            .unwrap_or(self.max_seen as f64)
-            .max(0.0);
+        let q = if self.cfg.window > 0 && !self.recent.is_empty() {
+            // Exact order statistic over the window (small: sorting a few
+            // hundred u64 per poll is nothing next to an NVML read).
+            let mut v: Vec<u64> = self.recent.iter().copied().collect();
+            v.sort_unstable();
+            let rank = ((1.0 - self.cfg.alpha) * (v.len() - 1) as f64).ceil() as usize;
+            v[rank.min(v.len() - 1)] as f64
+        } else {
+            self.quantile
+                .estimate()
+                .unwrap_or(self.max_seen as f64)
+                .max(0.0)
+        };
         // powi capped so the boost stays finite; the guard saturates at
         // u64::MAX long before 1.5^64 matters.
         q * BREACH_BOOST.powi(self.breaches.min(64) as i32)
@@ -226,6 +253,37 @@ fn to_bytes_saturating(x: f64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A windowed guard forgets a co-tenant that left; the whole-history one
+    /// does not. 36 samples at 10 GiB then 200 at 2 GiB: the unbounded
+    /// 0.999 quantile still reports ~10 GiB, a 60-sample window settles at
+    /// 2 GiB + slack once the hysteresis runs out.
+    #[test]
+    fn a_windowed_guard_forgets_a_co_tenant_that_left() {
+        let cfg = |window| WatermarkConfig {
+            alpha: 1e-3,
+            hysteresis_window: 8,
+            floor_bytes: GIB,
+            frag_slack_bytes: 512 * MIB,
+            window,
+        };
+        let mut forever = Watermark::new(cfg(0));
+        let mut windowed = Watermark::new(cfg(60));
+        for _ in 0..36 {
+            forever.observe_ambient(10 * GIB);
+            windowed.observe_ambient(10 * GIB);
+        }
+        for _ in 0..200 {
+            forever.observe_ambient(2 * GIB);
+            windowed.observe_ambient(2 * GIB);
+        }
+        assert!(
+            forever.guard_bytes() > 9 * GIB,
+            "{}",
+            forever.guard_bytes() / MIB
+        );
+        assert_eq!(windowed.guard_bytes(), 2 * GIB + 512 * MIB);
+    }
 
     const MIB: u64 = 1024 * 1024;
     const GIB: u64 = 1024 * MIB;
@@ -264,6 +322,7 @@ mod tests {
             hysteresis_window: window,
             floor_bytes: 0,
             frag_slack_bytes: 0,
+            window: 0,
         }
     }
 
@@ -326,6 +385,7 @@ mod tests {
             hysteresis_window: 4,
             floor_bytes: 10_000,
             frag_slack_bytes: 0,
+            window: 0,
         };
         let mut wm = Watermark::new(cfg);
         assert_eq!(wm.guard_bytes(), 10_000, "floor from the very start");
@@ -382,6 +442,7 @@ mod tests {
             hysteresis_window: 32,
             floor_bytes: 2 * GIB,
             frag_slack_bytes: 128 * MIB,
+            window: 0,
         };
         let mut wm = Watermark::new(cfg);
         let mut r = Pcg::new(7);

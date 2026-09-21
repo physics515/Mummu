@@ -705,13 +705,50 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       (`compose-linux/ai.yaml`, with the reasoning beside it; backup `ai.yaml.bak.20260918-vram-live-budget`).
       The code default stays OFF: this box's co-tenant pattern is what was measured, and a different
       host should get its own measurement before the default moves.
-- [ ] **A placement made under pressure never recovers when the pressure goes.** The live budget acts
-      only at LOAD time: after the 10 GiB co-tenant released its memory, the resident 27B stayed at 8/64
-      layers and 1.10 tok/s — half its speed on a free card — until something reloaded it (here, a
-      manual restart; 33/64 and full speed came back). Wants: the host-pressure watcher (it already
-      samples every 5 s) noticing that a resident model sits below the plan the card would now allow, and
-      scheduling a reload at an idle moment — never mid-generation, and with hysteresis so a co-tenant
-      that allocates in bursts does not cause a reload storm.
+- [x] **A placement made under pressure never recovers when the pressure goes — and no budget is
+      static any more.** *(2026-09-21)* Layer placement AND per-part precision are now one live
+      decision, `mummu::mix::joint`: a multiple-choice knapsack across devices whose inputs are all
+      measured — every device's seconds-per-pack-byte at every level it can run (a real projection
+      timed at load, under the machine's contention; the host clamped to its DRAM floor), the
+      activation-crossing cost, each layer's state at the context actually being served, and the card's
+      capacity `K = total − Watermark(used − our reserved)`. The allocator residual the analytic terms
+      miss is measured after every generation (vLLM's profile-then-budget), not reserved as a
+      constant. Throughput is the objective; precision is bought only with capacity that can no longer
+      buy a layer, within 1% of token time — so the host picks whatever level its kernels stream
+      fastest (a float for one part, int4 for another if that is what it measures) and the card's
+      leftovers go to the parts whose error costs most. `serve::placement` re-plans **before every
+      request** (a long context or an image repairs the placement first, cheapest relief per byte —
+      precision before layers) and **every 5 s at idle** (repair now; improve only when the saving over
+      the last hour's tokens pays for re-reading the moved bytes, wanted three ticks running, two layers
+      per tick). Moves re-read single layers from the pack (`qwen35::relocate_layers`), releases before
+      arrivals with the freed pages returned to the driver in between. The vision tower is charged only
+      when a request brings an image and is dropped after 10 idle minutes. Removed:
+      `MUMMU_GPU_BUDGET_GB` (reported as ignored), `MUMMU_ACTIVATION_RESERVE_GB`, `MUMMU_VRAM_GUARD_GB`,
+      `MUMMU_CTX`, `MUMMU_LAYER_PREFIX`, `MUMMU_HOST_LAYERS`, the `MUMMU_VRAM_LIVE_BUDGET` gate. Levels
+      are what packs store and kernels run (f32, f16, int8, int4); f64 is never worth its bytes over a
+      4.55-bit source, and f8 / 1-bit need a pack level and a kernel before the solver can pick them.
+      The motivating case: v0.3.2 put 27/64 layers of the 27B on the card from a fixed 9 GiB cap less a
+      1.36 GiB vision reserve held for text traffic, 0.62-1.9 tok/s.
+
+      **Verified** *(2026-09-21, the serve image on the real card beside production, qwen3.5-2b)*:
+      moving four layers to another device and precision and back matches fresh loads of each
+      placement with max |Δlogit| = 0 (`tests/real_qwen35_relocate.rs`, host; the card leg needs the
+      CUDA toolkit, which only the image carries). Cold load with production's 9.6 GiB as ambient:
+      capacity 5.9 GiB, 24/24 layers on the card, residency 1.41 of 1.44 GiB, 11.4 tok/s warm. Cold
+      load with a 4 GiB co-tenant: 15/24, then one repair (1 layer, 0.4 s) once the first generation
+      measured its working set. With production grown to 11 GiB plus a 1.5 GiB co-tenant: 0/24 (capacity
+      0.4 GiB); after the co-tenant left, the hold said why (`4.9 ms/token × 300 tokens < 2.3 s of
+      re-reading`), and once traffic raised the horizon the idle watch moved 10 layers back in 2-layer
+      steps of 0.4-1.8 s. That run also showed 10 -> 9 -> 10 churn at the boundary (a placed layer
+      holds more than its plan), fixed by the dead band: improve only with one layer's room spare.
+      Honest limits found: (1) the predicted ms/token counts weight streaming only — on the 2B, whose
+      248k-vocab head outweighs all its layers and sits on the host, moving 10 layers predicted
+      21.2 -> 16.6 ms and measured 5.1 -> 4.2-5.7 tok/s, i.e. nothing; (2) the card's probe measured
+      Q8 at 490 GB/s against Q4 at 86 GB/s (the packed Q4 GEMV is the slow kernel there), so a roomy
+      card now prefers Q8 — worth a kernel look; (3) the 2B all-host at Q4 (VNNI twins lazily
+      repacked from the i8 slab, a second 4-bit rounding) ignores `think: false` and reasons at length.
+      Open: the head is placed once at load and never moves (it should be a part of the solve);
+      MoE tiers still budget through `free_for_new` rather than the joint solver.
 - [ ] **What v0.3.1's review left open on `/logs`** *(2026-09-18)* — none blocked the deploy; each is
       a way the page can still lose or misstate history. (1) **A LOUD flood still evicts the load**: 404s
       stay loud by design, so one scanner sweep of more than 2000 paths on the public shim pushes the

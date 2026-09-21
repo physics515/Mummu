@@ -63,7 +63,6 @@ Every option is optional; `temperature: 0` is exact greedy. Roles are
 | `MUMMU_BACKEND`    | unset (auto)   | `cuda` \| `wgpu` \| `cpu`; auto = wgpu probe |
 | `MUMMU_FORCE_CPU`  | unset          | `1` forces the CPU backend (wins over all)  |
 | `MUMMU_QUANT`      | unset (off)    | starting quant policy `q8` \| `q4` for the fit planner (qwen35 + OLMoE GGUFs); the planner escalates from here to fit |
-| `MUMMU_GPU_BUDGET_GB` | unset (15 GiB, or 7/8 of inventoried VRAM) | GPU memory budget the fit planner assumes |
 | `MUMMU_PACK`       | unset (on)     | `off` skips the one-time `.mummu` pack import and serves GGUFs through the streaming re-quantizing loader |
 | `MUMMU_PACK_PRECISIONS` | unset (`q4,q8,f16,f32`) | stored levels for the pack import |
 | `MUMMU_TIERS`      | unset (on)     | MoE packs and partitioned dense packs: `off` keeps every expert / FFN cluster on the main backend at the planned level; `cpu` tiers onto the CPU only |
@@ -116,9 +115,25 @@ the model's main backend. Host memory is one pool: before the experts load,
 the server checks `MemAvailable` against the worst-case CPU tier (every
 expert at int8) plus slack and **evicts another model from the CPU slot**
 if that is what it takes — a resident 27B plus a tiered OLMoE once tripped
-the Docker VM's OOM killer. On a GPU shared with a desktop set
-`MUMMU_GPU_BUDGET_GB` below the card (the DeepStack compose uses 11 on a
-16 GB card); the tiers and the fit planner both honor it.
+the Docker VM's OOM killer.
+
+**Live placement (dense qwen35 packs).** There is no GPU budget to set. Which
+device each layer runs on, and at what precision each of its parts is stored
+there, is solved jointly (`mummu::mix::joint`) from measurements: every
+device's streaming rate at every level it can run (timed at load, under the
+machine's real contention), the card's capacity `total − guard(ambient)`
+where ambient is everything on the card that is not this process and the
+guard is a tracked quantile envelope of it, the state the request's own
+context needs, and a working-set residual measured after every generation.
+The placement is re-solved before every request — a long context or an image
+makes room first, so it cannot OOM the card — and every 5 s while idle: a
+co-tenant that grows pushes layers to the host now, and one that leaves gets
+them back once the saving over the last hour's traffic pays for re-reading
+them (`placement repair|improve: …` lines). A vision tower is only held on
+the card while images are being served. The old `MUMMU_GPU_BUDGET_GB`,
+`MUMMU_ACTIVATION_RESERVE_GB`, `MUMMU_VRAM_GUARD_GB`, `MUMMU_CTX`,
+`MUMMU_LAYER_PREFIX`, `MUMMU_HOST_LAYERS` and `MUMMU_VRAM_LIVE_BUDGET` are
+gone; a set `MUMMU_GPU_BUDGET_GB` is reported as ignored.
 
 ## Embedding
 
