@@ -616,6 +616,17 @@ mod tests {
         }
     }
 
+    /// [`toy_config`] with no EOS id, for tests that need a decode to run its
+    /// full `max_tokens`. The toy's weights are an unseeded random draw, and
+    /// about one draw in 800 makes EOS (7) one of the first three greedy
+    /// tokens, which stops the decode short of the bound.
+    fn toy_config_without_eos() -> Lfm2Config {
+        Lfm2Config {
+            eos_token_id: EosIds::None,
+            ..toy_config()
+        }
+    }
+
     #[test]
     fn ff_dim_auto_adjust_matches_reference_formula() {
         let cfg = toy_config();
@@ -718,14 +729,15 @@ mod tests {
     #[tokio::test]
     async fn greedy_generate_respects_max_tokens_bound() {
         let device = crate::backend::cpu_device();
-        let cfg = toy_config();
+        let cfg = toy_config_without_eos();
         let loaded = LoadedLfm2 {
             model: build(&cfg, &device),
             config: cfg,
             tokenizer_config: None,
         };
         let out = loaded.greedy_generate(&[1, 2], 3, &device).await.unwrap();
-        assert!(out.len() <= 3);
+        // With no EOS to end the decode early, only the bound can stop it.
+        assert_eq!(out.len(), 3);
     }
 
     /// A synthetic GGUF header shaped like the LFM2.5-1.2B file.

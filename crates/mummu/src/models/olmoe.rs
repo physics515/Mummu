@@ -574,6 +574,17 @@ mod tests {
         }
     }
 
+    /// [`toy_config`] with no EOS id, for tests that need a decode to run its
+    /// full `max_tokens`. The toy's weights are an unseeded random draw, and
+    /// about one draw in 17 makes EOS (2) one of the first four greedy
+    /// tokens, which stops the decode short of the bound.
+    fn toy_config_without_eos() -> OlmoeConfig {
+        OlmoeConfig {
+            eos_token_id: EosIds::None,
+            ..toy_config()
+        }
+    }
+
     #[test]
     fn config_parses_the_real_1b_7b_shape() {
         // The real OLMoE-1B-7B-0125-Instruct config.json shape.
@@ -786,7 +797,7 @@ mod tests {
     #[tokio::test]
     async fn greedy_generate_respects_max_tokens_bound() {
         let device = crate::backend::cpu_device();
-        let cfg = toy_config();
+        let cfg = toy_config_without_eos();
         let loaded = LoadedOlmoe {
             model: build(&cfg, &device),
             config: cfg,
@@ -796,7 +807,8 @@ mod tests {
             .greedy_generate(&[1, 2, 3], 4, &device)
             .await
             .unwrap();
-        assert!(out.len() <= 4);
+        // With no EOS to end the decode early, only the bound can stop it.
+        assert_eq!(out.len(), 4);
     }
 
     /// The HF per-expert projections fuse onto EXACTLY the module names the
