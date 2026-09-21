@@ -1547,14 +1547,15 @@ fn build_layered_qwen35(
             host.clone()
         }
     };
-    let layers = live.assignment.layers.len();
+
     // Embedding on the host (a gather; see `pack_trunk_bytes`), and the head
-    // with the last layer so the final projection does not cross — unless
-    // `MUMMU_HEAD_DEVICE` pins it.
-    let head = match std::env::var("MUMMU_HEAD_DEVICE").as_deref() {
-        Ok(v) if v.eq_ignore_ascii_case("gpu") => device.clone(),
-        Ok(v) if v.eq_ignore_ascii_case("host") => host.clone(),
-        _ => dev_for(layers.saturating_sub(1)),
+    // where the placement put it: with the last layer on the card only when
+    // its bytes were reserved there (`placement::plan_load`).
+
+    let head = if live.head_on_card {
+        device.clone()
+    } else {
+        host.clone()
     };
     let placed = live.planned_card_bytes();
     // Host room for what stays behind, plus slack.
