@@ -576,10 +576,22 @@ pub fn replan(pb: &Problem, current: &Assignment) -> (Verdict, Outcome) {
     if !now.feasible {
         return (Verdict::Repair, repair(pb, current.clone()));
     }
-    let target = solve(pb);
+    // The dead band: an improvement must fit with one layer to spare on
+    // every accelerator, while a repair fires only on a real violation. A
+    // placed layer holds a little more than its plan (allocator padding), so
+    // without the band the layer an improvement adds at the boundary is the
+    // layer the next reading repairs away — observed live as 10 -> 9 -> 10
+    // layers on an idle server.
+    let mut banded = pb.clone();
+    for d in 1..banded.devices.len() {
+        let margin = band(pb, d);
+        banded.devices[d].capacity = banded.devices[d].capacity.saturating_sub(margin);
+    }
+    let target = solve(&banded);
     if !target.feasible {
         return (Verdict::Hold, now);
     }
+    let target = outcome(pb, target.assignment);
     let saved = now.time_s - target.time_s;
     let cost = changed_bytes(pb, current, &target.assignment) as f64 * pb.disk_s_per_byte;
     if saved > 0.0 && saved * pb.horizon_tokens > cost {
@@ -587,6 +599,20 @@ pub fn replan(pb: &Problem, current: &Assignment) -> (Verdict, Outcome) {
     } else {
         (Verdict::Hold, now)
     }
+}
+
+/// One layer's worth of `d`: the largest layer at its smallest level there.
+fn band(pb: &Problem, d: usize) -> u64 {
+    pb.layers
+        .iter()
+        .filter_map(|l| {
+            choices(l, d, &pb.devices[d], pb.floor)
+                .iter()
+                .map(|c| layer_bytes(pb, l, c))
+                .min()
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// Bring an over-capacity placement back inside (3) with the least time lost
@@ -912,7 +938,32 @@ mod tests {
         roomy.horizon_tokens = 1e6; // a busy server: take it
         let (v, o) = replan(&roomy, &small.assignment);
         assert_eq!(v, Verdict::Improve);
-        assert_eq!(on_card(&o.assignment), 9);
+        // Nine fit exactly; the dead band keeps one layer's room spare.
+        assert_eq!(on_card(&o.assignment), 8);
+    }
+
+    /// The dead band: a placement one layer short of what fits is held, not
+    /// topped up — the top-up is exactly what the next reading repairs away
+    /// when a placed layer holds more than its plan. Two layers short, it
+    /// improves by the one that clears the band.
+    #[test]
+    fn no_churn_at_the_capacity_boundary() {
+        let per = bytes_at(8 * M, Q4) + bytes_at(2 * M, Q4) + 4096 + (1 << 20);
+        let mut pb = problem(10, (64 << 20) + 6 * per + per / 2);
+        pb.horizon_tokens = 1e9;
+        let full = solve(&pb);
+        assert_eq!(on_card(&full.assignment), 6);
+        let (v, _) = replan(&pb, &full.assignment);
+        assert_eq!(v, Verdict::Hold);
+        let mut five = full.assignment.clone();
+        five.layers[5] = fastest_choice(&pb.layers[5], 0, &pb.devices[0], pb.floor).unwrap();
+        let (v, _) = replan(&pb, &five);
+        assert_eq!(v, Verdict::Hold, "one short of the boundary stays put");
+        let mut four = five.clone();
+        four.layers[4] = fastest_choice(&pb.layers[4], 0, &pb.devices[0], pb.floor).unwrap();
+        let (v, o) = replan(&pb, &four);
+        assert_eq!(v, Verdict::Improve);
+        assert_eq!(on_card(&o.assignment), 5);
     }
 
     /// Nothing moves when nothing changed: the solver is deterministic, so a
