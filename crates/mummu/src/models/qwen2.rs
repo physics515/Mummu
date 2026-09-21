@@ -515,6 +515,17 @@ mod tests {
         }
     }
 
+    /// [`toy_config`] with no EOS id, for tests that need a decode to run its
+    /// full `max_tokens`. The toy's weights are an unseeded random draw, and
+    /// about one draw in 1,100 makes EOS (2) the first greedy token, which
+    /// stops the decode before it emits anything.
+    fn toy_config_without_eos() -> Qwen2Config {
+        Qwen2Config {
+            eos_token_id: EosIds::None,
+            ..toy_config()
+        }
+    }
+
     #[test]
     fn config_parses_hf_shape_and_derives_head_dim() {
         let json = br#"{
@@ -782,24 +793,30 @@ mod tests {
     #[tokio::test]
     async fn warm_up_runs_one_prefill_plus_its_steps_and_leaves_the_model_usable() {
         let device = crate::backend::cpu_device();
-        let cfg = toy_config();
+        let cfg = toy_config_without_eos();
         let loaded = LoadedQwen2 {
             model: build(&cfg, &device),
             config: cfg,
             tokenizer_config: None,
         };
+        let before = loaded
+            .greedy_generate(&[1, 2, 3], 2, &device)
+            .await
+            .expect("decodes before a warm-up");
         let forwards = loaded
             .warm_up(&[1, 2, 3], 4, &device)
             .await
             .expect("warm-up runs on a live toy model");
         assert_eq!(forwards, 5, "one prefill plus four decode steps");
         // The warm-up cache is a throwaway: a generation after it starts from
-        // an empty cache and still decodes (nothing leaked into the model).
+        // an empty cache and decodes exactly what it did before (nothing
+        // leaked into the model).
         let out = loaded
             .greedy_generate(&[1, 2, 3], 2, &device)
             .await
             .expect("decodes after a warm-up");
-        assert!(!out.is_empty(), "generation after warm-up produces tokens");
+        assert_eq!(out.len(), 2, "generation after warm-up runs to max_tokens");
+        assert_eq!(out, before, "warm-up changed what the model decodes");
     }
 
     #[test]
@@ -818,7 +835,7 @@ mod tests {
     #[tokio::test]
     async fn greedy_generate_respects_max_tokens_bound() {
         let device = crate::backend::cpu_device();
-        let cfg = toy_config();
+        let cfg = toy_config_without_eos();
         let loaded = LoadedQwen2 {
             model: build(&cfg, &device),
             config: cfg,
@@ -828,6 +845,7 @@ mod tests {
             .greedy_generate(&[1, 2, 3], 4, &device)
             .await
             .unwrap();
-        assert!(out.len() <= 4);
+        // With no EOS to end the decode early, only the bound can stop it.
+        assert_eq!(out.len(), 4);
     }
 }
