@@ -165,6 +165,14 @@ impl Filter {
         self.inside
     }
 
+    /// Every span held back so far, verbatim — tags included, and an
+    /// unclosed one's tail once [`Self::finish`] has run. For a caller that
+    /// puts a think block back where it was (`engine::lift_tool_calls`), or
+    /// asks whether one has opened yet (`crate::shim`).
+    pub(crate) fn withheld(&self) -> &str {
+        &self.withheld
+    }
+
     /// End a stream that held spans back to use them: the text still owed.
     ///
     /// That is the partial tag at the very end, which was ordinary text all
