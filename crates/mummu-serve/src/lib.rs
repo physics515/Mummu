@@ -969,6 +969,9 @@ async fn drive_chat_ws(
 #[derive(Deserialize)]
 pub(crate) struct ChatMessage {
     pub(crate) role: String,
+    /// Absent or `null` on an assistant turn that only made calls, which is
+    /// how ollama's own clients replay one.
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub(crate) content: String,
     /// Base64 image payloads, ollama's per-message spelling. OpenAI puts
     /// them in `content` parts instead; both land here before planning.
@@ -977,8 +980,33 @@ pub(crate) struct ChatMessage {
     /// The calls an assistant turn made, when the client is replaying a
     /// tool loop back to us. Dropping these leaves an EMPTY assistant turn
     /// in the history followed by a tool result the model never asked for.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "replayed_calls")]
     pub(crate) tool_calls: Vec<mummu::chat::ToolCall>,
+}
+
+fn null_as_empty<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
+}
+
+/// A replayed call in either spelling: ollama's `{"function": {"name",
+/// "arguments"}}`, or the flat `{"name", "arguments"}` the native API takes.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ReplayedCall {
+    Wrapped { function: mummu::chat::ToolCall },
+    Flat(mummu::chat::ToolCall),
+}
+
+fn replayed_calls<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Vec<mummu::chat::ToolCall>, D::Error> {
+    let calls = Option::<Vec<ReplayedCall>>::deserialize(d)?.unwrap_or_default();
+    Ok(calls
+        .into_iter()
+        .map(|c| match c {
+            ReplayedCall::Wrapped { function } | ReplayedCall::Flat(function) => function,
+        })
+        .collect())
 }
 
 /// An output grammar the decoder must obey, asked for by a request.

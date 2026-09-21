@@ -19,10 +19,11 @@
 //! and error — the same reason a trailing `:latest` is stripped from model
 //! names.
 //!
-//! Not implemented, and refused by name rather than ignored: `tools` /
-//! function calling, `n` > 1, and image parts in a message (mummu has no
-//! vision path — the text model and the vision tower are separate files and
-//! only the former is loaded).
+//! Not implemented, and refused by name rather than ignored: `n` > 1, an
+//! image by remote URL, and `tools` for a model whose calls nothing reads
+//! back (see `engine::tool_calls`). A streamed answer's tool calls reach the
+//! client as the model's own markup; only a buffered one lifts them into
+//! `tool_calls`.
 
 use std::ops::ControlFlow;
 
@@ -36,7 +37,7 @@ use serde_json::json;
 use tokio::sync::mpsc;
 
 use crate::recovery::{self, InFlight};
-use crate::shim::{OllamaOptions, RunPlan, plan, tags_body};
+use crate::shim::{OllamaOptions, RunPlan, ToolDef, offer_tools, plan, tags_body, tool_specs};
 use crate::{ChatMessage, OutputFormat, engine, json_response, parse_json};
 
 /// Both spellings of every route. See the module comment.
@@ -129,22 +130,6 @@ impl Content {
             }
         }
     }
-}
-
-/// One entry of OpenAI's `tools` array.
-#[derive(Deserialize)]
-struct ToolDef {
-    #[serde(default)]
-    function: Option<FunctionDef>,
-}
-
-#[derive(Deserialize)]
-struct FunctionDef {
-    name: String,
-    #[serde(default)]
-    description: String,
-    #[serde(default)]
-    parameters: serde_json::Value,
 }
 
 #[derive(Deserialize)]
@@ -294,31 +279,20 @@ impl ChatCompletionRequest {
                 .and_then(|n| i64::try_from(n).ok()),
         };
 
-        // `plan` answers in the ollama error shape, which would be wrong
-        // here; re-dress whatever it says as an OpenAI error.
-        let tools: Vec<mummu::chat::ToolSpec> = self
-            .tools
-            .iter()
-            .flatten()
-            .filter_map(|t| t.function.as_ref())
-            .map(|f| mummu::chat::ToolSpec {
-                name: f.name.clone(),
-                description: f.description.clone(),
-                parameters: if f.parameters.is_null() {
-                    serde_json::json!({"type": "object", "properties": {}})
-                } else {
-                    f.parameters.clone()
-                },
-            })
-            .collect();
-
         let think = self
             .reasoning_effort
             .as_deref()
             .is_some_and(|r| !r.eq_ignore_ascii_case("none"));
+        // `plan` answers in the ollama error shape, which would be wrong
+        // here; re-dress whatever it says as an OpenAI error.
         let mut p = plan(&self.model, &messages, &options, None, think).map_err(|r| reshape(*r))?;
         p.format = format;
-        p.tools = tools;
+        offer_tools(
+            &mut p,
+            &self.model,
+            tool_specs(self.tools.as_deref().unwrap_or_default()),
+        )
+        .map_err(|e| bad_request(&e, "unsupported_parameter"))?;
         Ok(p)
     }
 }
@@ -532,18 +506,18 @@ async fn respond(model: String, p: RunPlan, stream: bool, begin: crate::trace::B
             match outcome {
                 Ok(r) => {
                     begin.finish(r.device, r.timings.clone(), padded, Ok(()));
-                    // The model answers a tool request as `<tool_call>{…}</tool_call>`
-                    // in its text; OpenAI clients expect them lifted into a
-                    // structured field, with `finish_reason` saying so — a client
-                    // that gets the raw markers in `content` has no way to act.
-                    let (calls, prose) = mummu::chat::parse_tool_calls(&r.text)
-                        .unwrap_or_else(|_| (Vec::new(), r.text.clone()));
+                    // The model answers a tool request with its family's call
+                    // markup, which the engine lifts out of the text (see
+                    // `engine::lift_tool_calls`); OpenAI clients expect the calls
+                    // in a structured field, with `finish_reason` saying so — a
+                    // client that gets the raw markers in `content` cannot act.
+                    let calls = &r.tool_calls;
                     let message = if calls.is_empty() {
                         json!({"role": "assistant", "content": r.text})
                     } else {
                         json!({
                             "role": "assistant",
-                            "content": (!prose.trim().is_empty()).then_some(prose),
+                            "content": (!r.text.trim().is_empty()).then_some(&r.text),
                             "tool_calls": calls.iter().enumerate().map(|(i, c)| json!({
                                 "id": format!("call_{i}_{}", c.name),
                                 "type": "function",

@@ -8,12 +8,17 @@
 //! Implemented: `GET /`, `GET /api/version`, `GET /api/tags`,
 //! `POST /api/show`, `GET /api/ps`, `POST /api/chat`, `POST /api/generate`
 //! (both stream and non-stream), `POST /api/pull`, `DELETE /api/delete`.
+//! `/api/chat` takes `tools` for the families whose calls mummu reads back,
+//! and `/api/show` reports each model's capabilities from the same source.
 //! Embeddings/create/copy/push answer with an explicit error rather than
 //! pretending. Model names are mummu's catalog names; a trailing `:latest`
 //! (which ollama CLIs append) is accepted and stripped.
 
+use std::borrow::Cow;
 use std::convert::Infallible;
 use std::ops::ControlFlow;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use axum::Router;
@@ -22,13 +27,16 @@ use axum::extract::DefaultBodyLimit;
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete as delete_route, get, post};
+use mummu::chat::{ToolCall, ToolSpec};
 use mummu::manage::ModelManager;
-use mummu::registry::{ModelSpec, WeightFormat};
+use mummu::registry::{Architecture, ModelSpec, WeightFormat};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::mpsc;
 
+use crate::engine::CallSyntax;
 use crate::recovery::{self, ChatError, InFlight};
+use crate::think::Filter;
 use crate::{
     ChatMessage, DEFAULT_MAX_TOKENS, FinalFrame, MAX_BODY_BYTES, MAX_MAX_TOKENS, OutputFormat,
     blocking, engine, json_response, models_root, parse_json, to_turns,
@@ -274,16 +282,52 @@ struct NameRequest {
     model: String,
 }
 
+/// What a model can do, in ollama's words and ollama's order — the
+/// `capabilities` of `/api/show`, which clients read to decide whether to
+/// offer image upload, send tools, or show a thinking toggle.
+///
+/// Each is what a request to THIS server gets, not what the checkpoint could
+/// do in principle: [`engine::supports_vision`], [`engine::supports_tools`]
+/// and [`engine::thinks`] read the same places a request is served from.
+/// all-MiniLM is an embedder, which is what ollama reports for `all-minilm`;
+/// it cannot chat here, so "completion" would only invite a chat that fails
+/// (`/api/embed` answers 501 and says why).
+fn capabilities(spec: &ModelSpec, root: &Path) -> Vec<&'static str> {
+    let arch = spec.architecture;
+    if arch == Architecture::MiniLm {
+        return vec!["embedding"];
+    }
+    let mut caps = vec!["completion"];
+    if engine::supports_vision(spec, root) {
+        caps.push("vision");
+    }
+    if engine::supports_tools(arch) {
+        caps.push("tools");
+    }
+    if engine::thinks(arch) {
+        caps.push("thinking");
+    }
+    caps
+}
+
 async fn show(body: Bytes) -> Response {
     let parsed: NameRequest = match parse_json(&body) {
         Ok(p) => p,
         Err(response) => return *response,
     };
     let root = models_root();
-    let manager = ModelManager::new(root);
+    let manager = ModelManager::new(root.clone());
     let Some(spec) = resolve(&manager, &parsed.model) else {
         return not_found(&parsed.model);
     };
+    // Vision is a file beside the weights, and looking for one is a
+    // directory read — seconds, on a disk a cold load is saturating — so it
+    // stays off the async workers.
+    let (spec, capabilities) = blocking(move || {
+        let caps = capabilities(&spec, &root);
+        (spec, caps)
+    })
+    .await;
     let family = format!("{:?}", spec.architecture).to_lowercase();
     json_response(
         200,
@@ -293,7 +337,7 @@ async fn show(body: Bytes) -> Response {
             "template": "{{ .Prompt }}",
             "details": details(&spec),
             "model_info": { "general.architecture": family },
-            "capabilities": ["completion"],
+            "capabilities": capabilities,
         }),
     )
 }
@@ -494,6 +538,11 @@ struct OllamaChatRequest {
     /// spent on it (see `crate::think`).
     #[serde(default)]
     think: Option<bool>,
+    /// Functions the model may call. Before these were read, serde dropped
+    /// them: the model never saw them, and a client asking for a call got
+    /// prose with no way to tell why.
+    #[serde(default)]
+    tools: Option<Vec<ToolDef>>,
 }
 
 #[derive(Deserialize)]
@@ -512,6 +561,56 @@ struct OllamaGenerateRequest {
     think: Option<bool>,
 }
 
+/// One entry of a request's `tools` array. Ollama and OpenAI spell it the
+/// same way: `{"type": "function", "function": {name, description,
+/// parameters}}`.
+#[derive(Deserialize)]
+pub(crate) struct ToolDef {
+    #[serde(default)]
+    function: Option<FunctionDef>,
+}
+
+#[derive(Deserialize)]
+struct FunctionDef {
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    parameters: serde_json::Value,
+}
+
+/// A request's tool definitions as the renderer takes them. An entry that is
+/// not a function is skipped.
+pub(crate) fn tool_specs(defs: &[ToolDef]) -> Vec<ToolSpec> {
+    defs.iter()
+        .filter_map(|t| t.function.as_ref())
+        .map(|f| ToolSpec {
+            name: f.name.clone(),
+            description: f.description.clone(),
+            parameters: if f.parameters.is_null() {
+                json!({"type": "object", "properties": {}})
+            } else {
+                f.parameters.clone()
+            },
+        })
+        .collect()
+}
+
+/// Offer `tools` to the model a plan runs, or say why it cannot take them —
+/// in the words ollama's own server uses, so a client that recognises that
+/// refusal and retries without tools still can.
+pub(crate) fn offer_tools(
+    p: &mut RunPlan,
+    model: &str,
+    tools: Vec<ToolSpec>,
+) -> Result<(), String> {
+    if !tools.is_empty() && !engine::supports_tools(p.spec.architecture) {
+        return Err(format!("{model:?} does not support tools"));
+    }
+    p.tools = tools;
+    Ok(())
+}
+
 /// Everything a chat/generate run needs after validation.
 pub(crate) struct RunPlan {
     pub(crate) spec: ModelSpec,
@@ -523,8 +622,8 @@ pub(crate) struct RunPlan {
     pub(crate) images: Vec<mummu::vision::Patches>,
     /// Pass a reasoning model's `<think>` block through to the client.
     pub(crate) think: bool,
-    /// Tool definitions to advertise to the model.
-    pub(crate) tools: Vec<mummu::chat::ToolSpec>,
+    /// Tool definitions to advertise to the model (see [`offer_tools`]).
+    pub(crate) tools: Vec<ToolSpec>,
 }
 
 /// Validate a request into a `RunPlan`, or hand back the error response.
@@ -646,6 +745,19 @@ fn done_value(model: &str, r: &engine::ChatResult, started: Instant) -> serde_js
     })
 }
 
+/// An assistant message in ollama's shape, with the calls it made.
+fn assistant_message(content: &str, calls: &[ToolCall]) -> serde_json::Value {
+    let mut message = json!({"role": "assistant", "content": content});
+    if !calls.is_empty() {
+        message["tool_calls"] = calls
+            .iter()
+            .enumerate()
+            .map(|(i, c)| json!({"function": {"index": i, "name": c.name, "arguments": c.arguments}}))
+            .collect();
+    }
+    message
+}
+
 /// Run one completion for the shim: streamed (one NDJSON frame per delta)
 /// or buffered, with `wrap` turning a text delta into the endpoint's frame
 /// shape (`message.content` for /api/chat, `response` for /api/generate).
@@ -704,7 +816,13 @@ async fn run(
         );
     }
     let model = p.spec.name.clone();
-    respond(model, stream, wrap, finish, move |sink| async move {
+    // `offer_tools` let tools through only to a family with a convention.
+    let calls = if p.tools.is_empty() {
+        None
+    } else {
+        engine::tool_calls(p.spec.architecture)
+    };
+    respond(model, stream, calls, wrap, finish, move |sink| async move {
         let r = engine::run_chat(
             &p.spec,
             &p.root,
@@ -741,15 +859,63 @@ struct ShimSink {
     tx: Option<mpsc::UnboundedSender<serde_json::Value>>,
     model: String,
     wrap: fn(&str, &str) -> serde_json::Value,
+    /// For a request that offered tools: holds the family's call markup
+    /// back from the stream. The calls go out structured, and whole, once
+    /// the answer is — see [`tool_tail`].
+    held: Option<Arc<Mutex<Filter>>>,
 }
 
 impl ShimSink {
     fn delta(&self, text: &str) -> ControlFlow<()> {
-        match &self.tx {
-            Some(tx) if tx.send((self.wrap)(&self.model, text)).is_err() => ControlFlow::Break(()),
-            _ => ControlFlow::Continue(()),
+        let Some(tx) = &self.tx else {
+            return ControlFlow::Continue(());
+        };
+        let visible = match &self.held {
+            Some(f) => Cow::Owned(f.lock().unwrap_or_else(|e| e.into_inner()).push(text)),
+            None => Cow::Borrowed(text),
+        };
+        if visible.is_empty() {
+            return ControlFlow::Continue(());
+        }
+        match tx.send((self.wrap)(&self.model, &visible)) {
+            Ok(()) => ControlFlow::Continue(()),
+            Err(_) => ControlFlow::Break(()),
         }
     }
+}
+
+/// What a streamed answer to a request that offered tools still owes its
+/// client once the model is done. Ollama's shape: the calls in a frame of
+/// their own before the final line — taken out of `r`, so the final line
+/// does not repeat them. When the model made none, or wrote markup that did
+/// not parse, whatever was held back goes out as ordinary text instead:
+/// nothing the model wrote goes missing.
+fn tool_tail(
+    model: &str,
+    wrap: fn(&str, &str) -> serde_json::Value,
+    held: &mut Filter,
+    r: &mut engine::ChatResult,
+) -> Vec<serde_json::Value> {
+    // A partial tag at the very end was ordinary text all along.
+    let rest = held.finish();
+    let text = if r.tool_calls.is_empty() {
+        format!("{}{rest}", held.withheld())
+    } else {
+        rest
+    };
+    let mut frames = Vec::new();
+    if !text.is_empty() {
+        frames.push(wrap(model, &text));
+    }
+    if !r.tool_calls.is_empty() {
+        frames.push(json!({
+            "model": model,
+            "created_at": now_rfc3339(),
+            "message": assistant_message("", &std::mem::take(&mut r.tool_calls)),
+            "done": false,
+        }));
+    }
+    frames
 }
 
 /// Turn one generation into the shim's response — the ONE place its outcome
@@ -761,10 +927,13 @@ impl ShimSink {
 /// `done: true`, or ollama's `{"error": "…"}` — and a buffered one on a
 /// non-2xx with `{"error": "…"}`: 503 for the GPU, 500 for anything else.
 /// `run` is the generation; production passes `engine::run_chat`, a test one
-/// that fails the way production did.
+/// that fails the way production did. `calls` is the family's tool-call
+/// convention when the request offered tools: a streamed answer holds that
+/// markup back and sends the calls structured instead (see [`tool_tail`]).
 async fn respond<F, Fut>(
     model: String,
     stream: bool,
+    calls: Option<CallSyntax>,
     wrap: fn(&str, &str) -> serde_json::Value,
     finish: fn(&str, &str, &engine::ChatResult, Instant) -> serde_json::Value,
     run: F,
@@ -779,13 +948,23 @@ where
         let inflight = InFlight::enter();
         tokio::spawn(async move {
             let last = FinalFrame::new(tx.clone(), ended_without_result());
+            let held = calls.map(|c| Arc::new(Mutex::new(Filter::spans(c.open, c.close))));
             let sink = ShimSink {
-                tx: Some(tx),
+                tx: Some(tx.clone()),
                 model: model.clone(),
                 wrap,
+                held: held.clone(),
             };
             let line = match recovery::contain(&model, run(sink)).await {
-                Ok(r) => finish(&model, "", &r, started),
+                Ok(mut r) => {
+                    if let Some(held) = held {
+                        let mut held = held.lock().unwrap_or_else(|e| e.into_inner());
+                        for frame in tool_tail(&model, wrap, &mut held, &mut r) {
+                            let _ = tx.send(frame);
+                        }
+                    }
+                    finish(&model, "", &r, started)
+                }
                 Err(e) => {
                     eprintln!("[mummu-serve] shim chat {model}: {e}");
                     error_line(&e)
@@ -804,6 +983,7 @@ where
             tx: None,
             model: model.clone(),
             wrap,
+            held: None,
         };
         match recovery::contain(&model, run(sink)).await {
             Ok(r) => {
@@ -824,7 +1004,7 @@ pub(crate) async fn chat(body: Bytes) -> Response {
         Ok(p) => p,
         Err(response) => return *response,
     };
-    let p = match plan(
+    let mut p = match plan(
         &parsed.model,
         &parsed.messages,
         &parsed.options,
@@ -834,24 +1014,33 @@ pub(crate) async fn chat(body: Bytes) -> Response {
         Ok(p) => p,
         Err(response) => return *response,
     };
-    run(
-        p,
-        parsed.stream.unwrap_or(true),
-        |model, delta| {
-            json!({
-                "model": model,
-                "created_at": now_rfc3339(),
-                "message": {"role": "assistant", "content": delta},
-                "done": false,
-            })
-        },
-        |model, text, r, started| {
-            let mut v = done_value(model, r, started);
-            v["message"] = json!({"role": "assistant", "content": text});
-            v
-        },
-    )
-    .await
+    let tools = tool_specs(parsed.tools.as_deref().unwrap_or_default());
+    if let Err(e) = offer_tools(&mut p, &parsed.model, tools) {
+        return json_response(400, json!({"error": e}));
+    }
+    run(p, parsed.stream.unwrap_or(true), chat_delta, chat_done).await
+}
+
+/// One streamed piece of an `/api/chat` answer.
+fn chat_delta(model: &str, delta: &str) -> serde_json::Value {
+    json!({
+        "model": model,
+        "created_at": now_rfc3339(),
+        "message": {"role": "assistant", "content": delta},
+        "done": false,
+    })
+}
+
+/// The last line of an `/api/chat` answer — the whole answer, when buffered.
+fn chat_done(
+    model: &str,
+    text: &str,
+    r: &engine::ChatResult,
+    started: Instant,
+) -> serde_json::Value {
+    let mut v = done_value(model, r, started);
+    v["message"] = assistant_message(text, &r.tool_calls);
+    v
 }
 
 async fn generate(body: Bytes) -> Response {
@@ -1033,7 +1222,10 @@ mod tests {
         recovery::reset_for_tests();
         recovery::install_panic_hook();
 
-        let response = respond("m".into(), true, wrap, finish, |_| fails_like_production()).await;
+        let response = respond("m".into(), true, None, wrap, finish, |_| {
+            fails_like_production()
+        })
+        .await;
         let text = body_text(response).await;
         let lines: Vec<serde_json::Value> = text
             .lines()
@@ -1059,7 +1251,10 @@ mod tests {
         recovery::reset_for_tests();
         recovery::install_panic_hook();
 
-        let response = respond("m".into(), false, wrap, finish, |_| fails_like_production()).await;
+        let response = respond("m".into(), false, None, wrap, finish, |_| {
+            fails_like_production()
+        })
+        .await;
         assert_eq!(response.status(), 503);
         let body: serde_json::Value =
             serde_json::from_str(&body_text(response).await).expect("JSON");
@@ -1071,13 +1266,322 @@ mod tests {
         );
 
         recovery::reset_for_tests();
-        let response = respond("m".into(), false, wrap, finish, |_| {
+        let response = respond("m".into(), false, None, wrap, finish, |_| {
             fails_with_an_ordinary_bug()
         })
         .await;
         assert_eq!(response.status(), 500);
         assert!(!recovery::poisoned(), "a bug is not a poisoned GPU");
         recovery::reset_for_tests();
+    }
+
+    // -- capabilities and tools ---------------------------------------------
+
+    /// A models root of the test's own, empty unless the test fills it — so
+    /// nothing here can touch real weights.
+    fn scratch_root(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "mummu-shim-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("scratch root");
+        root
+    }
+
+    fn catalog_spec(name: &str) -> ModelSpec {
+        mummu::registry::catalog()
+            .into_iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("{name} is in the catalog"))
+    }
+
+    fn a_plan_for(spec: ModelSpec, root: &Path) -> RunPlan {
+        RunPlan {
+            spec,
+            root: root.to_path_buf(),
+            turns: vec![mummu::chat::Turn::user("hi")],
+            opts: mummu::decode::SamplerOptions::default(),
+            max_tokens: 16,
+            format: None,
+            images: Vec::new(),
+            think: false,
+            tools: Vec::new(),
+        }
+    }
+
+    fn weather_tool() -> Vec<ToolSpec> {
+        tool_specs(
+            &serde_json::from_value::<Vec<ToolDef>>(json!([{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Current weather for a city",
+                    "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+                },
+            }]))
+            .expect("ollama's tool shape parses"),
+        )
+    }
+
+    fn weather_call() -> ToolCall {
+        ToolCall {
+            name: "get_weather".into(),
+            arguments: json!({"city": "Paris"}),
+        }
+    }
+
+    fn answered(text: &str, tool_calls: Vec<ToolCall>) -> engine::ChatResult {
+        engine::ChatResult {
+            text: text.into(),
+            tokens: 1,
+            device: "test",
+            elapsed_ms: 0,
+            timings: crate::trace::Timings::default(),
+            tool_calls,
+        }
+    }
+
+    fn ndjson(text: &str) -> Vec<serde_json::Value> {
+        text.lines()
+            .map(|l| serde_json::from_str(l).expect("each line is JSON"))
+            .collect()
+    }
+
+    /// The hard-coded `["completion"]` this replaced told every client the
+    /// same thing about every model. Each family's answer is pinned here,
+    /// for every catalog entry, in the strings and order real ollama uses
+    /// (checked 2026-09-21 against ollama's `server/images.go` and its
+    /// registry: qwen2.5 → completion, tools; qwen3 → completion, tools,
+    /// thinking; qwen3.5 → completion, vision, tools, thinking; all-minilm →
+    /// embedding).
+    #[test]
+    fn show_reports_what_a_request_to_each_catalog_model_gets() {
+        let root = scratch_root("caps");
+        for spec in mummu::registry::catalog() {
+            let expected: &[&str] = match spec.architecture {
+                Architecture::Qwen2 => &["completion", "tools"],
+                Architecture::Qwen3 | Architecture::Qwen35 => &["completion", "tools", "thinking"],
+                // LFM2's calls are rendered but not read back, and OLMoE's
+                // template has no tool convention at all.
+                Architecture::Lfm2 | Architecture::Olmoe => &["completion"],
+                Architecture::MiniLm => &["embedding"],
+            };
+            assert_eq!(capabilities(&spec, &root), expected, "{}", spec.name);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Vision is the `mmproj-*.gguf` beside the weights, and only for the
+    /// family whose tower mummu runs — a Qwen2.5 directory holding one does
+    /// not make it see.
+    #[test]
+    fn an_mmproj_beside_a_qwen35_is_vision_and_beside_anything_else_is_not() {
+        let root = scratch_root("vision");
+        for name in ["qwen3.5-2b", "qwen2.5-1.5b-instruct"] {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).expect("model dir");
+            std::fs::write(dir.join("mmproj-F16.gguf"), b"").expect("mmproj");
+        }
+        assert_eq!(
+            capabilities(&catalog_spec("qwen3.5-2b"), &root),
+            ["completion", "vision", "tools", "thinking"],
+            "ollama's own list for qwen3.5, in its order"
+        );
+        assert_eq!(
+            capabilities(&catalog_spec("qwen2.5-1.5b-instruct"), &root),
+            ["completion", "tools"]
+        );
+        // The same Qwen3.5 without its tower is text-only.
+        assert!(!capabilities(&catalog_spec("qwen3.5-2b-q8"), &root).contains(&"vision"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `/api/show` advertises tools exactly where a request carrying them is
+    /// accepted — both answers come from `engine::supports_tools` — and the
+    /// refusal is ollama's own sentence, which clients match on to retry
+    /// without tools.
+    #[test]
+    fn tools_are_advertised_exactly_where_a_request_may_carry_them() {
+        let root = scratch_root("offer");
+        for spec in mummu::registry::catalog() {
+            if spec.architecture == Architecture::MiniLm {
+                continue; // not chat-servable: `plan` never gets this far
+            }
+            let name = spec.name.clone();
+            let advertised = capabilities(&spec, &root).contains(&"tools");
+            let mut p = a_plan_for(spec, &root);
+            match offer_tools(&mut p, &name, weather_tool()) {
+                Ok(()) => {
+                    assert!(advertised, "{name} took tools /api/show does not advertise");
+                    assert_eq!(p.tools.len(), 1, "{name}");
+                }
+                Err(e) => {
+                    assert!(!advertised, "{name} refused tools /api/show advertises");
+                    assert_eq!(e, format!("{name:?} does not support tools"));
+                    assert!(p.tools.is_empty(), "{name}");
+                }
+            }
+            // No tools is never a refusal.
+            let mut p = a_plan_for(catalog_spec(&name), &root);
+            assert!(offer_tools(&mut p, &name, Vec::new()).is_ok(), "{name}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `/api/chat` reads `tools` now. Before, serde dropped the field: the
+    /// model never saw the functions and the client got prose.
+    #[test]
+    fn an_ollama_chat_request_carries_its_tools() {
+        let parsed: OllamaChatRequest = serde_json::from_value(json!({
+            "model": "qwen3-4b",
+            "messages": [{"role": "user", "content": "weather in Paris?"}],
+            "tools": [
+                {"type": "function", "function": {"name": "get_weather", "parameters": null}},
+                {"type": "not-a-function"},
+            ],
+        }))
+        .expect("request parses");
+        let tools = tool_specs(parsed.tools.as_deref().unwrap_or_default());
+        assert_eq!(tools.len(), 1, "an entry with no function is skipped");
+        assert_eq!(tools[0].name, "get_weather");
+        assert_eq!(
+            tools[0].parameters,
+            json!({"type": "object", "properties": {}}),
+            "a null schema becomes an empty object schema"
+        );
+    }
+
+    /// Ollama's clients replay a tool loop with their own call shape and,
+    /// often, no `content` on the assistant turn. Both were a 400 before.
+    #[test]
+    fn a_replayed_tool_loop_parses_in_ollamas_shape_and_the_flat_one() {
+        let messages: Vec<ChatMessage> = serde_json::from_value(json!([
+            {"role": "user", "content": "weather in Paris?"},
+            {"role": "assistant", "tool_calls": [
+                {"function": {"index": 0, "name": "get_weather", "arguments": {"city": "Paris"}}},
+            ]},
+            {"role": "tool", "content": "18C, clear", "tool_name": "get_weather"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"name": "get_weather", "arguments": {"city": "Paris"}},
+            ]},
+        ]))
+        .expect("messages parse");
+        assert_eq!(messages[1].content, "");
+        assert_eq!(messages[1].tool_calls, [weather_call()]);
+        assert_eq!(messages[3].content, "", "null content is empty content");
+        assert_eq!(messages[3].tool_calls, [weather_call()]);
+        let turns = to_turns(&messages[..3]).expect("the loop renders");
+        assert_eq!(turns.len(), 3);
+    }
+
+    /// Streamed, a call goes out the way ollama sends one: the markup never
+    /// reaches `content`, even split across deltas, and the call arrives
+    /// structured in a frame of its own before the final line — which does
+    /// not repeat it.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serializes tests; nothing else waits on it
+    async fn a_streamed_tool_call_arrives_structured_and_its_markup_never_does() {
+        let _serial = crate::progress_serial();
+        let hermes = engine::tool_calls(Architecture::Qwen3);
+        let response = respond(
+            "m".into(),
+            true,
+            hermes,
+            chat_delta,
+            chat_done,
+            |sink| async move {
+                let _ = sink.delta("Checking. <tool");
+                let _ = sink.delta("_call>{\"name\": \"get_weather\", ");
+                let _ = sink.delta("\"arguments\": {\"city\": \"Paris\"}}</tool_call>");
+                // What the engine hands back once it has lifted the call.
+                Ok(answered("Checking.", vec![weather_call()]))
+            },
+        )
+        .await;
+        let lines = ndjson(&body_text(response).await);
+        let content: String = lines
+            .iter()
+            .filter_map(|l| l["message"]["content"].as_str())
+            .collect();
+        assert_eq!(content, "Checking. ", "no markup in content: {lines:?}");
+        let calls: Vec<_> = lines
+            .iter()
+            .filter(|l| l["message"].get("tool_calls").is_some())
+            .collect();
+        assert_eq!(calls.len(), 1, "one frame carries the calls: {lines:?}");
+        assert_eq!(calls[0]["done"], json!(false));
+        assert_eq!(
+            calls[0]["message"]["tool_calls"],
+            json!([{"function": {"index": 0, "name": "get_weather", "arguments": {"city": "Paris"}}}])
+        );
+        let last = lines.last().expect("lines");
+        assert_eq!(last["done"], json!(true));
+        assert!(last["message"].get("tool_calls").is_none(), "{last}");
+    }
+
+    /// Markup that did not parse is not swallowed: what was held back goes
+    /// out as text, so the client sees everything the model wrote.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serializes tests; nothing else waits on it
+    async fn held_back_markup_that_was_not_a_call_is_released_as_text() {
+        let _serial = crate::progress_serial();
+        let hermes = engine::tool_calls(Architecture::Qwen3);
+        let raw = "Hmm <tool_call>{not json</tool_call> then <tool_call>{\"name\": \"cut";
+        let response = respond(
+            "m".into(),
+            true,
+            hermes,
+            chat_delta,
+            chat_done,
+            move |sink| async move {
+                let _ = sink.delta(raw);
+                // The engine could not lift anything, so the text is verbatim.
+                Ok(answered(raw, Vec::new()))
+            },
+        )
+        .await;
+        let lines = ndjson(&body_text(response).await);
+        let content: String = lines
+            .iter()
+            .filter_map(|l| l["message"]["content"].as_str())
+            .collect();
+        assert_eq!(
+            content,
+            "Hmm  then <tool_call>{not json</tool_call><tool_call>{\"name\": \"cut"
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|l| l["message"].get("tool_calls").is_none())
+        );
+    }
+
+    /// Buffered, the one object carries the prose and the calls together.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serializes tests; nothing else waits on it
+    async fn a_buffered_tool_call_comes_back_in_the_message() {
+        let _serial = crate::progress_serial();
+        let hermes = engine::tool_calls(Architecture::Qwen3);
+        let response = respond(
+            "m".into(),
+            false,
+            hermes,
+            chat_delta,
+            chat_done,
+            |_| async { Ok(answered("", vec![weather_call()])) },
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value =
+            serde_json::from_str(&body_text(response).await).expect("JSON");
+        assert_eq!(body["done"], json!(true));
+        assert_eq!(body["message"]["content"], json!(""));
+        assert_eq!(
+            body["message"]["tool_calls"][0]["function"]["name"],
+            json!("get_weather")
+        );
     }
 
     /// A pull ends on its own `status` line: only a chat stream is held to

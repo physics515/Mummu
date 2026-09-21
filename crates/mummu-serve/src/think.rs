@@ -15,19 +15,36 @@
 //! a tag can be split across any number of them — `<`, `th`, `ink>` is three
 //! deltas and one tag. Anything that could still turn into a tag is held
 //! back rather than emitted and regretted.
+//!
+//! The same machinery holds a family's tool-call markup back from a streamed
+//! ollama answer, whose calls go out structured once they are whole (see
+//! `crate::shim`) — [`Filter::spans`] with the family's tags.
 
 const OPEN: &str = "<think>";
 const CLOSE: &str = "</think>";
 
-/// Streaming remover of `<think>…</think>` spans.
-#[derive(Default)]
+/// Streaming remover of `<think>…</think>` spans (or of any other pair of
+/// tags, see [`Filter::spans`]).
 pub(crate) struct Filter {
+    /// The tag a span opens with.
+    open: &'static str,
+    /// The tag that closes it.
+    close: &'static str,
     /// Text held back: either a partial tag, or the inside of a block.
     pending: String,
-    /// Inside a `<think>` block.
+    /// Inside a block.
     inside: bool,
     /// Everything that was suppressed, in order.
     thought: String,
+    /// The same, tags and all: what a caller that cannot use the spans after
+    /// all hands back as ordinary text.
+    withheld: String,
+}
+
+impl Default for Filter {
+    fn default() -> Self {
+        Self::spans(OPEN, CLOSE)
+    }
 }
 
 /// The longest proper prefix of `tag` that `s` ends with — the part that
@@ -41,34 +58,50 @@ fn dangling(s: &str, tag: &str) -> usize {
 }
 
 impl Filter {
+    /// A filter for the spans between `open` and `close`.
+    pub(crate) fn spans(open: &'static str, close: &'static str) -> Self {
+        Self {
+            open,
+            close,
+            pending: String::new(),
+            inside: false,
+            thought: String::new(),
+            withheld: String::new(),
+        }
+    }
+
     /// Feed one delta; returns the part that may be shown now.
     pub(crate) fn push(&mut self, delta: &str) -> String {
         self.pending.push_str(delta);
         let mut out = String::new();
         loop {
             if self.inside {
-                let Some(at) = self.pending.find(CLOSE) else {
+                let Some(at) = self.pending.find(self.close) else {
                     // Hold everything that could still be part of the
                     // closing tag; the rest is thinking and is recorded.
-                    let keep = dangling(&self.pending, CLOSE);
+                    let keep = dangling(&self.pending, self.close);
                     let split = self.pending.len() - keep;
                     self.thought.push_str(&self.pending[..split]);
+                    self.withheld.push_str(&self.pending[..split]);
                     self.pending.drain(..split);
                     break;
                 };
                 self.thought.push_str(&self.pending[..at]);
-                self.pending.drain(..at + CLOSE.len());
+                self.withheld
+                    .push_str(&self.pending[..at + self.close.len()]);
+                self.pending.drain(..at + self.close.len());
                 self.inside = false;
             } else {
-                let Some(at) = self.pending.find(OPEN) else {
-                    let keep = dangling(&self.pending, OPEN);
+                let Some(at) = self.pending.find(self.open) else {
+                    let keep = dangling(&self.pending, self.open);
                     let split = self.pending.len() - keep;
                     out.push_str(&self.pending[..split]);
                     self.pending.drain(..split);
                     break;
                 };
                 out.push_str(&self.pending[..at]);
-                self.pending.drain(..at + OPEN.len());
+                self.withheld.push_str(self.open);
+                self.pending.drain(..at + self.open.len());
                 self.inside = true;
             }
         }
@@ -85,6 +118,7 @@ impl Filter {
         if self.inside {
             let tail = std::mem::take(&mut self.pending);
             self.thought.push_str(&tail);
+            self.withheld.push_str(&tail);
             String::new()
         } else {
             std::mem::take(&mut self.pending)
@@ -94,6 +128,12 @@ impl Filter {
     /// Did the model open a block that never closed?
     pub(crate) fn truncated(&self) -> bool {
         self.inside
+    }
+
+    /// Every span held back so far, verbatim — tags included, and an
+    /// unclosed one's tail once [`Self::finish`] has run.
+    pub(crate) fn withheld(&self) -> &str {
+        &self.withheld
     }
 }
 
@@ -157,6 +197,32 @@ mod tests {
         let mut f = Filter::default();
         let _ = f.push("<think>the reasoning</think>answer");
         assert_eq!(f.thought, "the reasoning");
+    }
+
+    #[test]
+    fn other_tags_are_held_back_the_same_way_and_kept_verbatim() {
+        let mut f = Filter::spans("<tool_call>", "</tool_call>");
+        let shown: String = [
+            "Sure. <tool",
+            "_call>{\"name\": ",
+            "\"x\"}</tool_",
+            "call> done",
+        ]
+        .iter()
+        .map(|d| f.push(d))
+        .collect();
+        assert_eq!(shown + &f.finish(), "Sure.  done");
+        assert_eq!(f.withheld(), "<tool_call>{\"name\": \"x\"}</tool_call>");
+        // A <think> tag means nothing to a filter for other tags.
+        assert_eq!(f.push("<think>kept</think>"), "<think>kept</think>");
+    }
+
+    #[test]
+    fn an_unclosed_span_is_withheld_whole() {
+        let mut f = Filter::spans("<tool_call>", "</tool_call>");
+        assert_eq!(f.push("<tool_call>{\"name\": \"cut off"), "");
+        assert_eq!(f.finish(), "");
+        assert_eq!(f.withheld(), "<tool_call>{\"name\": \"cut off");
     }
 
     #[test]

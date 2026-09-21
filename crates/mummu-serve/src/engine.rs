@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use burn::tensor::Device;
 use futures::FutureExt;
 use mummu::cache::ModelSlot;
-use mummu::chat::{ChatMl, Role, Turn};
+use mummu::chat::{ChatMl, Role, ToolCall, Turn};
 use mummu::decode::SamplerOptions;
 use mummu::gguf::GgufFile;
 use mummu::models::{lfm2, olmoe, qwen2, qwen3, qwen35};
@@ -670,6 +670,93 @@ fn render_prompt(arch: Architecture, turns: &[Turn]) -> Result<String, String> {
     render_prompt_with_tools(arch, &[], turns)
 }
 
+/// Lifts every call out of a whole answer, with the prose around them.
+pub type ReadCalls = fn(&str) -> Result<(Vec<ToolCall>, String), mummu::chat::ToolCallError>;
+
+/// How a family's answer carries tool calls, and how they are read back out
+/// of it.
+#[derive(Clone, Copy)]
+pub struct CallSyntax {
+    /// The tag a call opens with, as it appears in the decoded answer.
+    pub open: &'static str,
+    /// The tag that closes it.
+    pub close: &'static str,
+    pub read: ReadCalls,
+}
+
+/// Hermes: `<tool_call>{json}</tool_call>`. The tags are ordinary added
+/// tokens in Qwen's vocabularies — not special, in the safetensors and GGUF
+/// builds alike — so they survive the decoder's skip-specials pass.
+const HERMES: CallSyntax = CallSyntax {
+    open: "<tool_call>",
+    close: "</tool_call>",
+    read: mummu::chat::parse_tool_calls,
+};
+
+/// A family's prompt template, and what it lets a request do.
+///
+/// The one place a family is mapped to how it is spoken to. Rendering reads
+/// it, and so does everything that asks what a model can do — `/api/show`'s
+/// capabilities, and each surface's check on a request that carries tools —
+/// so what a model is advertised to do is what a request to it gets.
+struct Template {
+    /// mummu's byte-verified ChatML renderer, or `None` for OLMoE-Instruct's
+    /// Tulu template, spelled out in [`render_prompt_with_tools`].
+    chatml: Option<ChatMl>,
+    /// How the model's tool calls are read back. `None` means the family is
+    /// not offered tools at all: a call nothing reads comes back as prose,
+    /// and the client that sent the tools has nothing it can act on.
+    calls: Option<CallSyntax>,
+    /// The checkpoints open an answer with `<think>…</think>`, which a
+    /// request's `think` shows or suppresses (see `crate::think`).
+    thinks: bool,
+}
+
+fn template(arch: Architecture) -> Result<Template, String> {
+    let chatml = |renderer: ChatMl, calls: Option<CallSyntax>, thinks: bool| Template {
+        chatml: Some(renderer),
+        calls,
+        thinks,
+    };
+    Ok(match arch {
+        Architecture::Qwen2 => chatml(ChatMl::qwen2(), Some(HERMES), false),
+        Architecture::Qwen3 => chatml(ChatMl::qwen3(), Some(HERMES), true),
+        // qwen35's imported chat template is ChatML with Qwen3's think
+        // conventions (its vision macros never fire on text-only turns).
+        Architecture::Qwen35 => chatml(ChatMl::qwen3(), Some(HERMES), true),
+        // The renderer speaks LFM's Pythonic tool convention, but nothing
+        // reads `<|tool_call_start|>[…]<|tool_call_end|>` back out of an
+        // answer yet: `mummu::chat::parse_tool_calls_lfm` is not wired in,
+        // and the GGUF build's tokenizer marks those tags CONTROL, so the
+        // decoder's skip-specials pass drops them before any parser looks.
+        Architecture::Lfm2 => chatml(ChatMl::lfm2(), None, false),
+        Architecture::Olmoe => Template {
+            chatml: None,
+            calls: None,
+            thinks: false,
+        },
+        Architecture::MiniLm => {
+            return Err("all-MiniLM is an embedding model — not chat-servable".into());
+        }
+    })
+}
+
+/// The family's tool-call convention, or `None` when it is not offered tools.
+pub fn tool_calls(arch: Architecture) -> Option<CallSyntax> {
+    template(arch).ok()?.calls
+}
+
+/// May a request offer this family tools? Exactly when its calls can be read
+/// back — the same field [`render_prompt_with_tools`] refuses on.
+pub fn supports_tools(arch: Architecture) -> bool {
+    tool_calls(arch).is_some()
+}
+
+/// Does this family reason in a `<think>` block before it answers?
+pub fn thinks(arch: Architecture) -> bool {
+    template(arch).is_ok_and(|t| t.thinks)
+}
+
 /// [`render_prompt`] advertising `tools` to the model.
 ///
 /// Empty `tools` renders exactly as before — the tool block is what the
@@ -679,41 +766,48 @@ fn render_prompt_with_tools(
     tools: &[mummu::chat::ToolSpec],
     turns: &[Turn],
 ) -> Result<String, String> {
-    let chatml = |t: ChatMl| {
-        if tools.is_empty() {
-            t.render(turns)
+    let template = template(arch)?;
+    if !tools.is_empty() && template.calls.is_none() {
+        return Err(format!(
+            "{arch:?} models are not offered tools — nothing reads their calls back"
+        ));
+    }
+    if let Some(chatml) = template.chatml {
+        return Ok(if tools.is_empty() {
+            chatml.render(turns)
         } else {
-            t.render_with_tools(tools, turns)
-        }
+            chatml.render_with_tools(tools, turns)
+        });
+    }
+    let mut out = String::from("<|endoftext|>");
+    for t in turns {
+        let tag = match t.role {
+            Role::System => "<|system|>",
+            Role::User => "<|user|>",
+            Role::Assistant => "<|assistant|>",
+            Role::Tool => return Err("OLMoE template has no tool role".into()),
+        };
+        out.push_str(tag);
+        out.push('\n');
+        out.push_str(&t.content);
+        out.push('\n');
+    }
+    out.push_str("<|assistant|>\n");
+    Ok(out)
+}
+
+/// Lift the calls out of a finished answer to a request that offered tools,
+/// in the convention its prompt was rendered with. Markup that does not
+/// parse stays in the text, where the client can at least read it.
+fn lift_tool_calls(arch: Architecture, r: &mut ChatResult) {
+    let Some(syntax) = tool_calls(arch) else {
+        return;
     };
-    match arch {
-        Architecture::Qwen2 => Ok(chatml(ChatMl::qwen2())),
-        Architecture::Qwen3 => Ok(chatml(ChatMl::qwen3())),
-        // qwen35's imported chat template is ChatML with Qwen3's think
-        // conventions (its vision macros never fire on text-only turns).
-        Architecture::Qwen35 => Ok(chatml(ChatMl::qwen3())),
-        Architecture::Lfm2 => Ok(chatml(ChatMl::lfm2())),
-        Architecture::Olmoe if !tools.is_empty() => {
-            Err("the OLMoE template has no tool-call convention".into())
-        }
-        Architecture::Olmoe => {
-            let mut out = String::from("<|endoftext|>");
-            for t in turns {
-                let tag = match t.role {
-                    Role::System => "<|system|>",
-                    Role::User => "<|user|>",
-                    Role::Assistant => "<|assistant|>",
-                    Role::Tool => return Err("OLMoE template has no tool role".into()),
-                };
-                out.push_str(tag);
-                out.push('\n');
-                out.push_str(&t.content);
-                out.push('\n');
-            }
-            out.push_str("<|assistant|>\n");
-            Ok(out)
-        }
-        Architecture::MiniLm => Err("all-MiniLM is an embedding model — not chat-servable".into()),
+    if let Ok((calls, prose)) = (syntax.read)(&r.text)
+        && !calls.is_empty()
+    {
+        r.text = prose;
+        r.tool_calls = calls;
     }
 }
 
@@ -725,6 +819,11 @@ pub struct ChatResult {
     pub elapsed_ms: u128,
     /// Where the time went, phase by phase (see `crate::trace`).
     pub timings: crate::trace::Timings,
+    /// The calls lifted out of the answer when the request offered tools,
+    /// `text` then holding only the prose around them. Empty when none were
+    /// offered or made, or when the markup did not parse (see
+    /// [`lift_tool_calls`]).
+    pub tool_calls: Vec<ToolCall>,
 }
 
 /// Run one chat completion, streaming decoded-text deltas through `on_delta`
@@ -758,6 +857,7 @@ pub async fn run_chat(
     // so the tower's footprint is published before planning starts.
     set_vision_reserve(vision_reserve_bytes(spec, models_root));
     let prompt = render_prompt_with_tools(spec.architecture, &tools, turns)?;
+    let offered_tools = !tools.is_empty();
     // Land a line in the log the moment a request enters the engine: the fit
     // planning below can legitimately take minutes on a busy disk, and a
     // request that logs nothing until it finishes reads as a hang (it did,
@@ -797,6 +897,9 @@ pub async fn run_chat(
     .await
     .map(|mut r| {
         r.timings.plan_ms = plan_ms;
+        if offered_tools {
+            lift_tool_calls(spec.architecture, &mut r);
+        }
         r
     })
 }
@@ -4172,6 +4275,7 @@ async fn generate_on(
         device: label,
         elapsed_ms,
         timings,
+        tool_calls: Vec::new(),
     })
 }
 
@@ -5083,4 +5187,81 @@ pub fn placeholders(
         .iter()
         .map(|p| mummu::vision::placeholder_text(mummu::vision::token_count(p, cfg.merge)))
         .collect())
+}
+
+#[cfg(test)]
+mod template_tests {
+    use super::*;
+
+    const EVERY_FAMILY: [Architecture; 6] = [
+        Architecture::Qwen2,
+        Architecture::Qwen3,
+        Architecture::Qwen35,
+        Architecture::Lfm2,
+        Architecture::Olmoe,
+        Architecture::MiniLm,
+    ];
+
+    fn a_tool() -> Vec<mummu::chat::ToolSpec> {
+        vec![mummu::chat::ToolSpec {
+            name: "get_weather".into(),
+            description: String::new(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }]
+    }
+
+    /// What `/api/show` advertises and what a request is rendered with are
+    /// one decision: a family renders tools exactly when it is said to
+    /// support them, and every chat family still renders without them.
+    #[test]
+    fn a_family_renders_tools_exactly_when_it_supports_them() {
+        let turns = [Turn::user("weather in Paris?")];
+        for arch in EVERY_FAMILY {
+            let with_tools = render_prompt_with_tools(arch, &a_tool(), &turns);
+            assert_eq!(with_tools.is_ok(), supports_tools(arch), "{arch:?}");
+            if arch != Architecture::MiniLm {
+                assert!(
+                    render_prompt_with_tools(arch, &[], &turns).is_ok(),
+                    "{arch:?}"
+                );
+            }
+        }
+        assert!(!supports_tools(Architecture::MiniLm) && !thinks(Architecture::MiniLm));
+    }
+
+    fn answered(text: &str) -> ChatResult {
+        ChatResult {
+            text: text.into(),
+            tokens: 1,
+            device: "test",
+            elapsed_ms: 0,
+            timings: crate::trace::Timings::default(),
+            tool_calls: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_call_is_lifted_out_of_the_answer_and_bad_markup_is_left_in_it() {
+        let mut r = answered(
+            "Let me check.\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>",
+        );
+        lift_tool_calls(Architecture::Qwen3, &mut r);
+        assert_eq!(r.text, "Let me check.");
+        assert_eq!(r.tool_calls.len(), 1);
+        assert_eq!(r.tool_calls[0].name, "get_weather");
+        assert_eq!(
+            r.tool_calls[0].arguments,
+            serde_json::json!({"city": "Paris"})
+        );
+
+        let broken = "<tool_call>{not json</tool_call>";
+        let mut r = answered(broken);
+        lift_tool_calls(Architecture::Qwen3, &mut r);
+        assert_eq!((r.text.as_str(), r.tool_calls.len()), (broken, 0));
+
+        // A family with no reader is never lifted, whatever the text says.
+        let mut r = answered("<tool_call>{\"name\": \"x\"}</tool_call>");
+        lift_tool_calls(Architecture::Lfm2, &mut r);
+        assert!(r.tool_calls.is_empty());
+    }
 }
