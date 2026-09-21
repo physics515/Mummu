@@ -158,8 +158,14 @@ fn bytes_of(values_i8: &[i8]) -> &[u8] {
 mod tests {
     use super::*;
 
+    /// Serializes this module's tests: each one `clear()`s the process-global
+    /// map, and a clear landing between another test's insert and its
+    /// lookup silently swaps the twin under test for a lazy rebuild.
+    static REGISTRY_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn resolve_builds_once_and_verifies_the_tag() {
+        let _serial = REGISTRY_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         clear();
         let (k, n) = (64usize, 32usize);
         let vals: Vec<f32> = (0..k * n).map(|i| ((i as f32) * 0.13).sin()).collect();
@@ -186,6 +192,7 @@ mod tests {
 
     #[test]
     fn register_from_f32_takes_priority_over_lazy() {
+        let _serial = REGISTRY_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         clear();
         let (k, n) = (64usize, 32usize);
         let vals: Vec<f32> = (0..k * n).map(|i| ((i as f32) * 0.07).cos()).collect();
