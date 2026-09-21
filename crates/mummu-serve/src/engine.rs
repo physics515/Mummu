@@ -3520,6 +3520,7 @@ async fn drive(
         }
     };
     let failed = recovery::attribute(&mark, &m.devices);
+    placement::note_device_failure(&failure);
     let decided = recovery::record_failure(&spec.name, &failed, &recovery::summarize(&failure));
     // The progress guard settles first (see the declaration order above),
     // then the model goes, under the lock.
@@ -3923,6 +3924,7 @@ fn load_for_slot(
              dropped, and nothing is resident",
             spec.name
         );
+        placement::note_device_failure(cause);
         recovery::record_failure(
             &spec.name,
             devices,

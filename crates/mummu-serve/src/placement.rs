@@ -181,7 +181,10 @@ fn guard(ambient: u64) -> u64 {
         })
     });
     wm.observe_ambient(ambient);
-    if super::ALLOC_FAILED.load(std::sync::atomic::Ordering::SeqCst) {
+    // Taken, not read: a breach is one piece of evidence, and reading the
+    // flag on every poll would boost the guard 1.5x per poll until the next
+    // generation cleared it.
+    if super::ALLOC_FAILED.swap(false, std::sync::atomic::Ordering::SeqCst) {
         wm.breach();
     }
     wm.guard_bytes().max(ambient)
@@ -221,22 +224,131 @@ impl Envelope {
     }
 }
 
-/// ε̂ — the allocator residual; prior one pool page until measured.
+/// ε̂ — the allocator residual, measured after every generation.
 static RESIDUAL: Mutex<Envelope> = Mutex::new(Envelope(VecDeque::new()));
-const RESIDUAL_PRIOR: u64 = 1 << 30;
 
-fn residual() -> u64 {
+/// ε̂ before anything was measured: a quarter of the card.
+///
+/// Not a small number on purpose. The first load has to fit BEFORE the first
+/// generation can measure anything, so an optimistic prior is exactly an OOM
+/// on a cold card — v0.4.0's 1 GiB prior put 48 of the 27B's 64 layers on a
+/// 16 GiB card and the load died reserving its 250 MB pool pages. v0.3's
+/// production pool held 4.3 GiB beyond the 27B's 7.05 GiB of weights during
+/// an 1100-token prefill; a quarter of this card is 4 GiB. The measurement
+/// replaces it after the first generation (and persists, see
+/// [`remember_residual`]), so a conservative prior costs one request's worth
+/// of layers, while an optimistic one costs the request.
+fn residual_prior(card_total: Option<u64>) -> u64 {
+    card_total.map_or(1 << 30, |t| (t / 4).max(1 << 30))
+}
+
+fn residual_for(card_total: Option<u64>) -> u64 {
     RESIDUAL
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .max()
-        .unwrap_or(RESIDUAL_PRIOR)
+        .unwrap_or_else(|| residual_prior(card_total))
+}
+
+fn inventory_vram() -> Option<u64> {
+    mummu::backend::inventory()
+        .gpus
+        .iter()
+        .filter_map(|g| g.vram_bytes)
+        .max()
 }
 
 /// Non-weight bytes a planner without a model config should hold back:
-/// the measured residual plus, before any measurement, its prior.
+/// the measured residual, or before any measurement its prior.
 pub(super) fn nonweight_estimate() -> u64 {
-    residual()
+    residual_for(inventory_vram())
+}
+
+/// Where ε̂ is kept between processes: a recovery restart must not forget
+/// what the card taught it and repeat the load that failed.
+static RESIDUAL_FILE: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+fn residual_file_for(pack_dir: &Path) -> Option<PathBuf> {
+    // <models root>/<model>/pack -> <models root>/.mummu-serve/placement-<model>.json
+    let model_dir = pack_dir.parent()?;
+    let root = model_dir.parent()?;
+    let name = model_dir.file_name()?.to_string_lossy().into_owned();
+    Some(
+        root.join(crate::recovery::EVIDENCE_DIR)
+            .join(format!("placement-{name}.json")),
+    )
+}
+
+/// Load the remembered ε̂ for the model at `pack_dir`, if this process has
+/// not measured one yet.
+fn recall_residual(pack_dir: &Path) {
+    let Some(path) = residual_file_for(pack_dir) else {
+        return;
+    };
+    *RESIDUAL_FILE.lock().unwrap_or_else(|e| e.into_inner()) = Some(path.clone());
+    let mut env = RESIDUAL.lock().unwrap_or_else(|e| e.into_inner());
+    if env.max().is_some() {
+        return;
+    }
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Some(v) = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| v["residual_bytes"].as_u64())
+    else {
+        return;
+    };
+    env.push(v);
+    eprintln!(
+        "[mummu-serve] placement: working-set residual {:.2} GiB, remembered from {}",
+        v as f64 / f64::from(1u32 << 30),
+        path.display()
+    );
+}
+
+/// Persist the current ε̂ (best effort; a failed write only costs a prior).
+fn remember_residual() {
+    let Some(path) = RESIDUAL_FILE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    else {
+        return;
+    };
+    let Some(v) = RESIDUAL.lock().unwrap_or_else(|e| e.into_inner()).max() else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(
+        &path,
+        serde_json::json!({ "residual_bytes": v }).to_string(),
+    );
+}
+
+/// A device ran out of memory under a placement this module made: the
+/// working set was bigger than ε̂ said. Double it (and let the guard count a
+/// breach), so the reload that follows plans smaller instead of repeating
+/// the failure — and remember it, so a restart does too.
+pub(super) fn note_device_failure(cause: &str) {
+    if !cause.contains("out of device memory") {
+        return;
+    }
+    super::ALLOC_FAILED.store(true, std::sync::atomic::Ordering::SeqCst);
+    let before = residual_for(inventory_vram());
+    let after = before.saturating_mul(2);
+    RESIDUAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(after);
+    remember_residual();
+    eprintln!(
+        "[mummu-serve] placement: out of device memory — working-set estimate {:.2} -> {:.2} GiB; the next load places fewer layers",
+        before as f64 / f64::from(1u32 << 30),
+        after as f64 / f64::from(1u32 << 30),
+    );
 }
 
 /// Contexts (prompt + budget) of recent requests.
@@ -511,7 +623,9 @@ fn measure_device(
             // Floats are widened to f32 on load (host, wgpu; assumed on CUDA).
             (_, Precision::F16) => numel * 4.0,
             (_, Precision::F32) => numel * 4.0,
-            (false, _) => bytes as f64,
+            // The card's pool pads what it holds: 11.28 GiB resident for a
+            // 10.82 GiB plan on the 27B (v0.4.0's first production load).
+            (false, _) => bytes as f64 * 1.05,
         };
         m.resident.push((q, resident / bytes as f64));
     }
@@ -694,7 +808,7 @@ impl Live {
             let k = capacity(c);
             devices.push(joint::Device {
                 capacity: k.saturating_sub(non_layer),
-                fixed: act_bytes(&self.cfg, ctx) + residual() + tower_pending,
+                fixed: act_bytes(&self.cfg, ctx) + residual_for(Some(c.total)) + tower_pending,
                 rate: self.accel.rate.clone(),
                 resident: self.accel.resident.clone(),
             });
@@ -850,6 +964,7 @@ pub(super) fn plan_load(pack_dir: &Path, backend: BackendChoice) -> Result<Live,
         // driver before we read what is free.
         device_of(backend).memory_cleanup();
     }
+    recall_residual(pack_dir);
     let mut live = Live::measure(pack_dir, backend)?;
     let (ctx, tower) = request().unwrap_or((idle_context(), false));
     let reading = card(backend);
@@ -1133,6 +1248,7 @@ pub(super) fn after_request(ctx: usize, tokens: usize, in_use_before: Option<u64
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push(residual);
+    remember_residual();
 }
 
 /// Make `live` the placement of the model now resident.
