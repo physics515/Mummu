@@ -5112,6 +5112,7 @@ dependencies = [
  "derive-new",
  "half",
  "hf-chat-template",
+ "image",
  "inferno",
  "mummu-mix",
  "mummu-schedule",
@@ -5164,6 +5165,7 @@ version = "0.3.2"
 dependencies = [
  "async-stream",
  "axum",
+ "base64 0.22.1",
  "burn",
  "futures",
  "http-body",

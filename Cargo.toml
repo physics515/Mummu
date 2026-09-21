@@ -16,6 +16,18 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/physics515/Mummu"
 
 [workspace.dependencies]
+# Image payloads arrive base64-encoded on both API surfaces.
+base64 = "0.22"
+# Image decoding for the vision tower (mummu::vision). Only the formats a
+# phone or a browser actually sends are enabled — the default feature set
+# pulls in a dozen codecs (TIFF, EXR, AVIF, ...) that no vision request has
+# ever carried, and every one of them is attack surface on a path that
+# decodes bytes from an HTTP body.
+image = { version = "0.25", default-features = false, features = [
+	"jpeg",
+	"png",
+	"webp",
+] }
 # Intentional pins (see ROADMAP "Stack"): burn 0.21 + wgpu 29 are the parity-validated
 # combination proven in laurelane (byte-identical logits vs Candle). wgpu is not ours to
 # pick — burn 0.21 resolves 29 transitively, so wgpu 30 unblocks with a burn bump, not a

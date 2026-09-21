@@ -30,8 +30,8 @@ use tokio::sync::mpsc;
 
 use crate::recovery::{self, ChatError, InFlight};
 use crate::{
-    ChatMessage, DEFAULT_MAX_TOKENS, FinalFrame, MAX_BODY_BYTES, MAX_MAX_TOKENS, blocking, engine,
-    json_response, models_root, parse_json, to_turns,
+    ChatMessage, DEFAULT_MAX_TOKENS, FinalFrame, MAX_BODY_BYTES, MAX_MAX_TOKENS, OutputFormat,
+    blocking, engine, json_response, models_root, parse_json, to_turns,
 };
 
 /// The shim's routes. Binding and serving them (and draining them on
@@ -54,6 +54,7 @@ pub(crate) fn router() -> Router {
         .route("/api/create", post(unsupported))
         .route("/api/copy", post(unsupported))
         .route("/api/push", post(unsupported))
+        .merge(crate::openai::router())
         .fallback(not_found_path)
         .method_not_allowed_fallback(not_found_path)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES + 1))
@@ -214,9 +215,16 @@ fn store_tags(body: serde_json::Value) {
 }
 
 async fn tags() -> Response {
+    json_response(200, tags_body().await)
+}
+
+/// The `/api/tags` body, cache and all — the catalog source `/v1/models`
+/// maps into OpenAI's shape, so the two surfaces never disagree about what
+/// is installed and neither one walks the disk twice.
+pub(crate) async fn tags_body() -> serde_json::Value {
     let cached = TAGS_CACHE.lock().unwrap_or_else(|e| e.into_inner()).clone();
     match cached {
-        Some((at, body)) if at.elapsed() < TAGS_TTL => json_response(200, body),
+        Some((at, body)) if at.elapsed() < TAGS_TTL => body,
         Some((_, body)) => {
             // Stale: answer with it now and rebuild behind the response —
             // one rebuilder at a time, so a slow disk queues one walk, not
@@ -229,12 +237,12 @@ async fn tags() -> Response {
                     TAGS_REFRESHING.store(false, std::sync::atomic::Ordering::SeqCst);
                 });
             }
-            json_response(200, body)
+            body
         }
         None => {
             let body = blocking(build_tags).await;
             store_tags(body.clone());
-            json_response(200, body)
+            body
         }
     }
 }
@@ -391,12 +399,12 @@ fn ended_without_result() -> serde_json::Value {
 
 /// The sampling knobs ollama clients put in `options` (names are ollama's).
 #[derive(Deserialize, Default)]
-struct OllamaOptions {
-    temperature: Option<f32>,
-    top_p: Option<f32>,
-    top_k: Option<usize>,
-    seed: Option<u64>,
-    num_predict: Option<i64>,
+pub(crate) struct OllamaOptions {
+    pub(crate) temperature: Option<f32>,
+    pub(crate) top_p: Option<f32>,
+    pub(crate) top_k: Option<usize>,
+    pub(crate) seed: Option<u64>,
+    pub(crate) num_predict: Option<i64>,
 }
 
 impl OllamaOptions {
@@ -438,6 +446,39 @@ impl OllamaOptions {
     }
 }
 
+/// Ollama's `format`: the string `"json"`, or a JSON Schema object.
+///
+/// The schema form is accepted as far as *recognising* it and then refused
+/// by name — mummu constrains to "some JSON value", not to a given shape.
+/// Silently downgrading a schema request to plain JSON mode would hand the
+/// client a document that parses and then fails its own validation, which is
+/// the harder bug to find.
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub(crate) enum OllamaFormat {
+    Named(String),
+    Schema(serde_json::Value),
+}
+
+impl OllamaFormat {
+    /// The grammar this asks for, or the reason it cannot be served.
+    pub(crate) fn resolve(&self) -> Result<Option<OutputFormat>, String> {
+        match self {
+            Self::Named(s) if s.eq_ignore_ascii_case("json") => Ok(Some(OutputFormat::Json)),
+            Self::Named(s) if s.is_empty() => Ok(None),
+            Self::Named(s) => Err(format!(
+                "unsupported format {s:?} — this server understands \"json\""
+            )),
+            Self::Schema(_) => Err(
+                "a JSON Schema in `format` is not supported — this server can constrain output \
+                 to JSON, but not to a given schema; use \"format\": \"json\" and validate the \
+                 shape client-side"
+                    .into(),
+            ),
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct OllamaChatRequest {
     model: String,
@@ -446,6 +487,13 @@ struct OllamaChatRequest {
     options: OllamaOptions,
     /// Ollama defaults to streaming.
     stream: Option<bool>,
+    #[serde(default)]
+    format: Option<OllamaFormat>,
+    /// Ollama's opt-in for reasoning output. Absent means off: a client
+    /// that did not ask for thinking should not have its token budget
+    /// spent on it (see `crate::think`).
+    #[serde(default)]
+    think: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -458,22 +506,34 @@ struct OllamaGenerateRequest {
     #[serde(default)]
     options: OllamaOptions,
     stream: Option<bool>,
+    #[serde(default)]
+    format: Option<OllamaFormat>,
+    #[serde(default)]
+    think: Option<bool>,
 }
 
 /// Everything a chat/generate run needs after validation.
-struct RunPlan {
-    spec: ModelSpec,
-    root: std::path::PathBuf,
-    turns: Vec<mummu::chat::Turn>,
-    opts: mummu::decode::SamplerOptions,
-    max_tokens: usize,
+pub(crate) struct RunPlan {
+    pub(crate) spec: ModelSpec,
+    pub(crate) root: std::path::PathBuf,
+    pub(crate) turns: Vec<mummu::chat::Turn>,
+    pub(crate) opts: mummu::decode::SamplerOptions,
+    pub(crate) max_tokens: usize,
+    pub(crate) format: Option<OutputFormat>,
+    pub(crate) images: Vec<mummu::vision::Patches>,
+    /// Pass a reasoning model's `<think>` block through to the client.
+    pub(crate) think: bool,
+    /// Tool definitions to advertise to the model.
+    pub(crate) tools: Vec<mummu::chat::ToolSpec>,
 }
 
 /// Validate a request into a `RunPlan`, or hand back the error response.
-fn plan(
+pub(crate) fn plan(
     model: &str,
     messages: &[ChatMessage],
     options: &OllamaOptions,
+    format: Option<&OllamaFormat>,
+    think: bool,
 ) -> Result<RunPlan, Box<Response>> {
     let root = models_root();
     let manager = ModelManager::new(root.clone());
@@ -483,18 +543,89 @@ fn plan(
     if !engine::is_installed(&spec, &root) {
         return Err(Box::new(not_found(model)));
     }
-    let turns = to_turns(messages).map_err(|e| json_response(400, json!({"error": e})))?;
+    // Images are decoded and sized BEFORE the turns are rendered: the number
+    // of placeholder tokens a prompt must reserve is a function of each
+    // image's patch grid, so the prompt cannot be built until they are laid
+    // out. `prepare_images` only reads the tower's header, not its weights.
+    let raw = match decode_images(messages) {
+        Ok(v) => v,
+        Err(e) => return Err(Box::new(json_response(400, json!({"error": e})))),
+    };
+    let images = match engine::prepare_images(&spec, &root, &raw) {
+        Ok(v) => v,
+        Err(e) => return Err(Box::new(json_response(400, json!({"error": e})))),
+    };
+    let marks = match engine::placeholders(&spec, &root, &images) {
+        Ok(v) => v,
+        Err(e) => return Err(Box::new(json_response(500, json!({"error": e})))),
+    };
+    let messages = with_placeholders(messages, &marks);
+    let turns = to_turns(&messages).map_err(|e| json_response(400, json!({"error": e})))?;
     let opts = options
         .sampler()
         .map_err(|e| json_response(400, json!({"error": e})))?;
     let max_tokens = options.max_tokens();
+    let format = match format.map(OllamaFormat::resolve).transpose() {
+        Ok(f) => f.flatten(),
+        Err(e) => return Err(Box::new(json_response(400, json!({"error": e})))),
+    };
     Ok(RunPlan {
         spec,
         root,
         turns,
         opts,
         max_tokens,
+        format,
+        images,
+        think,
+        tools: Vec::new(),
     })
+}
+
+/// Every message's base64 image payloads, decoded in message order.
+fn decode_images(messages: &[ChatMessage]) -> Result<Vec<Vec<u8>>, String> {
+    use base64::Engine as _;
+    let mut out = Vec::new();
+    for (i, m) in messages.iter().enumerate() {
+        for (j, b64) in m.images.iter().enumerate() {
+            // Some clients send a whole data: URI where the field wants the
+            // payload alone; accept both rather than failing on a comma.
+            let payload = b64.rsplit_once(',').map_or(b64.as_str(), |(_, p)| p);
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(payload.trim())
+                .map_err(|e| format!("message {i} image {j} is not valid base64: {e}"))?;
+            if bytes.is_empty() {
+                return Err(format!("message {i} image {j} is empty"));
+            }
+            out.push(bytes);
+        }
+    }
+    Ok(out)
+}
+
+/// Prefix each image-bearing message with its placeholder runs, in the same
+/// order [`decode_images`] collected them.
+fn with_placeholders(messages: &[ChatMessage], marks: &[String]) -> Vec<ChatMessage> {
+    let mut next = 0;
+    messages
+        .iter()
+        .map(|m| {
+            let mut content = String::new();
+            for _ in 0..m.images.len() {
+                if let Some(mark) = marks.get(next) {
+                    content.push_str(mark);
+                }
+                next += 1;
+            }
+            content.push_str(&m.content);
+            ChatMessage {
+                role: m.role.clone(),
+                content,
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+            }
+        })
+        .collect()
 }
 
 /// Ollama's final frame: timing in nanoseconds.
@@ -532,6 +663,16 @@ async fn run(
         "[mummu-serve] shim chat {}: request accepted (stream = {stream})",
         p.spec.name
     );
+    let begin = crate::trace::Begin {
+        surface: "ollama",
+        model: p.spec.name.clone(),
+        stream,
+        think: p.think,
+        json_mode: p.format.is_some(),
+        tools: p.tools.len(),
+        images: p.images.len(),
+        started: Instant::now(),
+    };
     // The process is exiting to restart the GPU backend (see `recovery`).
     if recovery::restarting() {
         return json_response(503, json!({"error": recovery::restarting_message()}));
@@ -548,6 +689,12 @@ async fn run(
             "[mummu-serve] shim chat {}: 503 — the {loading} load is in flight",
             p.spec.name
         );
+        begin.finish(
+            "",
+            crate::trace::Timings::default(),
+            false,
+            Err(&format!("503: the {loading} load is in flight")),
+        );
         return json_response(
             503,
             json!({"error": format!(
@@ -558,10 +705,32 @@ async fn run(
     }
     let model = p.spec.name.clone();
     respond(model, stream, wrap, finish, move |sink| async move {
-        engine::run_chat(&p.spec, &p.root, &p.turns, &p.opts, p.max_tokens, |delta| {
-            sink.delta(delta)
-        })
-        .await
+        let r = engine::run_chat(
+            &p.spec,
+            &p.root,
+            &p.turns,
+            &p.opts,
+            p.max_tokens,
+            p.format,
+            p.think,
+            p.images,
+            p.tools,
+            |delta| sink.delta(delta),
+        )
+        .await;
+        // Padded exactly when a buffered answer outlived the keep-alive
+        // grace — the condition `keepalive_json` pads on.
+        let padded = !stream && begin.started.elapsed() >= crate::KEEPALIVE_GRACE;
+        match &r {
+            Ok(res) => begin.finish(res.device, res.timings.clone(), padded, Ok(())),
+            Err(e) => begin.finish(
+                "",
+                crate::trace::Timings::default(),
+                padded,
+                Err(&e.message),
+            ),
+        }
+        r
     })
     .await
 }
@@ -626,23 +795,28 @@ where
         });
         return ndjson_response(rx, Some(inflight));
     }
-    // Non-stream: run to completion, answer with one object.
-    let _inflight = InFlight::enter();
-    let sink = ShimSink {
-        tx: None,
-        model: model.clone(),
-        wrap,
-    };
-    match recovery::contain(&model, run(sink)).await {
-        Ok(r) => {
-            let text = r.text.clone();
-            json_response(200, finish(&model, &text, &r, started))
+    // Non-stream: run to completion, answer with one object — under the
+    // keep-alive, because a buffered answer that sends nothing for minutes
+    // is what a proxy reports as a dead origin (see `crate::keepalive_json`).
+    crate::keepalive_json(async move {
+        let _inflight = InFlight::enter();
+        let sink = ShimSink {
+            tx: None,
+            model: model.clone(),
+            wrap,
+        };
+        match recovery::contain(&model, run(sink)).await {
+            Ok(r) => {
+                let text = r.text.clone();
+                (200, finish(&model, &text, &r, started))
+            }
+            Err(e) => {
+                eprintln!("[mummu-serve] shim chat {model}: {e}");
+                (e.http_status(), error_line(&e))
+            }
         }
-        Err(e) => {
-            eprintln!("[mummu-serve] shim chat {model}: {e}");
-            json_response(e.http_status(), error_line(&e))
-        }
-    }
+    })
+    .await
 }
 
 pub(crate) async fn chat(body: Bytes) -> Response {
@@ -650,7 +824,13 @@ pub(crate) async fn chat(body: Bytes) -> Response {
         Ok(p) => p,
         Err(response) => return *response,
     };
-    let p = match plan(&parsed.model, &parsed.messages, &parsed.options) {
+    let p = match plan(
+        &parsed.model,
+        &parsed.messages,
+        &parsed.options,
+        parsed.format.as_ref(),
+        parsed.think.unwrap_or(false),
+    ) {
         Ok(p) => p,
         Err(response) => return *response,
     };
@@ -686,13 +866,23 @@ async fn generate(body: Bytes) -> Response {
         messages.push(ChatMessage {
             role: "system".into(),
             content: system.clone(),
+            images: Vec::new(),
+            tool_calls: Vec::new(),
         });
     }
     messages.push(ChatMessage {
         role: "user".into(),
         content: parsed.prompt.clone(),
+        images: Vec::new(),
+        tool_calls: Vec::new(),
     });
-    let p = match plan(&parsed.model, &messages, &parsed.options) {
+    let p = match plan(
+        &parsed.model,
+        &messages,
+        &parsed.options,
+        parsed.format.as_ref(),
+        parsed.think.unwrap_or(false),
+    ) {
         Ok(p) => p,
         Err(response) => return *response,
     };

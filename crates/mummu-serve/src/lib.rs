@@ -47,9 +47,12 @@ mod engine;
 #[cfg(feature = "fault-injection")]
 mod fault;
 pub mod logs;
+mod openai;
 pub mod recovery;
 mod shim;
 pub mod status;
+mod think;
+pub mod trace;
 
 /// `mummu::progress` is process-wide state and `cargo test` runs this crate's
 /// tests in parallel threads of one process, so every test that WRITES it —
@@ -435,6 +438,100 @@ pub(crate) fn json_response(status: u16, body: serde_json::Value) -> Response {
         body.to_string(),
     )
         .into_response()
+}
+
+/// How long a buffered answer may take before the connection needs
+/// reassuring. Everything that fails fast — validation, an unknown model,
+/// the 503 while a model loads — settles far inside this, so those keep
+/// their real status code.
+pub(crate) const KEEPALIVE_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Gap between keep-alive bytes once padding has started. Comfortably
+/// under every proxy timeout worth caring about.
+const KEEPALIVE_TICK: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Run `work` and answer with its JSON, keeping the connection alive if it
+/// takes a while.
+///
+/// A non-streaming completion sends nothing at all until the whole
+/// generation is done. Behind a proxy with an origin-response timeout that
+/// is indistinguishable from a dead origin: measured live 2026-09-21, a
+/// phone request through Cloudflare was cut at exactly 125.0 s having
+/// received 0 bytes, and the app showed HTTP 524. The generation was fine
+/// and still running.
+///
+/// So a slow answer starts its body immediately and drips whitespace until
+/// the real object is ready. JSON ignores whitespace before a value, so the
+/// response is still exactly one object and every parser accepts it
+/// unchanged.
+///
+/// **The trade-off, stated because it is real:** the status code goes out
+/// with the headers, so an answer that takes longer than
+/// [`KEEPALIVE_GRACE`] is committed to 200 before its outcome is known. A
+/// generation that then fails answers 200 with an error *body* rather than
+/// a 5xx. Racing the grace period first is what keeps that narrow — every
+/// fast failure still gets its proper status, and only a request already
+/// past 20 seconds of real work can land in it.
+pub(crate) async fn keepalive_json<F>(work: F) -> Response
+where
+    // `'static` because the padded path hands the result channel to a
+    // response body, which outlives this call.
+    F: Future<Output = (u16, serde_json::Value)> + Send + 'static,
+{
+    // The work runs on its OWN task, and that is the whole trick. Selecting
+    // directly on the future would put the timer and the generation on one
+    // task, where anything that blocks rather than awaits — `plan_fit` runs
+    // under `block_in_place`, and a cold load is minutes of it — starves the
+    // timer, no padding goes out, and the proxy cuts the connection anyway.
+    //
+    // Measured 2026-09-21: with the work inline, a warm request padded
+    // correctly (first byte at 20.7 s) while a cold one sent nothing and
+    // died at Cloudflare's 125 s. Same code, opposite outcomes, decided
+    // entirely by whether the generation happened to yield.
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let _ = tx.send(work.await);
+    });
+
+    tokio::select! {
+        res = &mut rx => {
+            let (status, body) = res.unwrap_or_else(|_| (500, crate::worker_vanished()));
+            json_response(status, body)
+        }
+        () = tokio::time::sleep(KEEPALIVE_GRACE) => {
+            let stream = async_stream::stream! {
+                loop {
+                    tokio::select! {
+                        res = &mut rx => {
+                            let (_status, body) =
+                                res.unwrap_or_else(|_| (500, crate::worker_vanished()));
+                            yield Ok::<String, Infallible>(body.to_string());
+                            break;
+                        }
+                        () = tokio::time::sleep(KEEPALIVE_TICK) => {
+                            // A space: legal JSON leading whitespace, and one
+                            // byte is enough to prove the origin is alive.
+                            yield Ok(" ".to_string());
+                        }
+                    }
+                }
+            };
+            (
+                [(header::CONTENT_TYPE, "application/json")],
+                axum::body::Body::from_stream(stream),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// The body for a worker that ended without sending its result — the task
+/// panicked outside what `recovery::contain` guards, or the runtime dropped
+/// it. Should be unreachable; said plainly rather than answering with an
+/// empty object.
+fn worker_vanished() -> serde_json::Value {
+    json!({"error": "the server's worker for this request ended without a result — this is a \
+                     mummu-serve bug, not your request; try again"})
 }
 
 /// Parse a JSON body, or hand back the 400 response to return as-is. Keeps
@@ -873,6 +970,31 @@ async fn drive_chat_ws(
 pub(crate) struct ChatMessage {
     pub(crate) role: String,
     pub(crate) content: String,
+    /// Base64 image payloads, ollama's per-message spelling. OpenAI puts
+    /// them in `content` parts instead; both land here before planning.
+    #[serde(default)]
+    pub(crate) images: Vec<String>,
+    /// The calls an assistant turn made, when the client is replaying a
+    /// tool loop back to us. Dropping these leaves an EMPTY assistant turn
+    /// in the history followed by a tool result the model never asked for.
+    #[serde(default)]
+    pub(crate) tool_calls: Vec<mummu::chat::ToolCall>,
+}
+
+/// An output grammar the decoder must obey, asked for by a request.
+///
+/// Both compatibility surfaces spell the same thing differently — ollama's
+/// `"format": "json"` and OpenAI's `"response_format": {"type":
+/// "json_object"}` — so they translate into this one type and share the
+/// machinery in `mummu::constrain`.
+///
+/// Before this existed, `format` was parsed by nobody: serde dropped the
+/// unknown field and the request generated ordinary prose. A client asking
+/// for JSON got prose, its parse failed, and nothing anywhere said why.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OutputFormat {
+    /// A single JSON object or array, enforced token by token.
+    Json,
 }
 
 #[derive(Deserialize, Default)]
@@ -928,7 +1050,18 @@ pub(crate) fn to_turns(messages: &[ChatMessage]) -> Result<Vec<Turn>, String> {
         .map(|m| match m.role.as_str() {
             "system" => Ok(Turn::system(m.content.clone())),
             "user" => Ok(Turn::user(m.content.clone())),
+            // An assistant turn that made calls is re-rendered in the
+            // family's own wire format, so the model sees its own request
+            // and not a blank turn before the answer comes back.
+            "assistant" if !m.tool_calls.is_empty() => {
+                Ok(Turn::assistant_tool_calls(&m.tool_calls))
+            }
             "assistant" => Ok(Turn::assistant(m.content.clone())),
+            // The second half of a tool loop: the client ran the function
+            // and is handing back its result. The family renderer decides
+            // where that goes — Hermes puts it in a `<tool_response>` block
+            // of a user turn, LFM gives it a turn of its own.
+            "tool" | "function" => Ok(Turn::tool_response(m.content.clone())),
             other => Err(format!("unsupported role {other:?}")),
         })
         .collect::<Result<_, _>>()?;
@@ -1111,9 +1244,18 @@ fn start_chat(parsed: ChatRequest) -> Result<ChatStream, Rejection> {
     let profile = parsed.profile || std::env::var("MUMMU_PROFILE").is_ok();
     let name = spec.name.clone();
     Ok(spawn_chat(name, profile, move |sink| async move {
-        engine::run_chat(&spec, &root, &turns, &opts, max_tokens, |delta| {
-            sink.delta(delta)
-        })
+        engine::run_chat(
+            &spec,
+            &root,
+            &turns,
+            &opts,
+            max_tokens,
+            None,
+            false,
+            Vec::new(),
+            Vec::new(),
+            |delta| sink.delta(delta),
+        )
         .await
     }))
 }

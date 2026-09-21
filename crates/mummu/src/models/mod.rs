@@ -89,6 +89,7 @@ pub trait CausalLm {
                 opts,
                 |id| self.is_eos(id),
                 on_token,
+                None,
             )
             .await
         }
@@ -225,4 +226,77 @@ pub trait CausalLm {
             Ok(forwards)
         }
     }
+}
+
+/// [`CausalLm::generate`] with an output grammar.
+///
+/// A free function rather than a trait method on purpose: the returned
+/// future must stay `Send` for mummu-serve to spawn it, and a trait method
+/// returning `impl Future` does not reliably leak that. `constraint` vetoes
+/// any token that would break the grammar and decides when the value is
+/// complete (see [`crate::constrain`]).
+pub async fn generate_constrained<M: CausalLm>(
+    model: &M,
+    prompt_ids: &[u32],
+    max_tokens: usize,
+    opts: &SamplerOptions,
+    device: &Device,
+    on_token: impl FnMut(u32) -> std::ops::ControlFlow<()>,
+    constraint: Option<&mut dyn crate::constrain::Constraint>,
+) -> Result<Vec<u32>, String> {
+    let mut cache = model.new_cache();
+    generate_loop(
+        |ids, past, need_logits| {
+            if need_logits {
+                Some(model.forward(ids, past, &mut cache, device))
+            } else {
+                model.forward_advance(ids, past, &mut cache, device);
+                None
+            }
+        },
+        prompt_ids,
+        max_tokens,
+        opts,
+        |id| model.is_eos(id),
+        on_token,
+        constraint,
+    )
+    .await
+}
+
+/// [`generate_constrained`] for a prompt that carries images.
+///
+/// Qwen3-VL specific by necessity: the embedding/trunk split it needs
+/// (`embed` + `forward_embeds`) exists on `LoadedQwen35`, because that is
+/// the only architecture in the zoo with a vision tower. Text-only callers
+/// should use [`generate_constrained`], which is the same decode loop
+/// without the splice.
+///
+/// `placed` carries the tower's output and the prompt positions it belongs
+/// at; see [`crate::vision::place`]. The splice happens per prefill chunk,
+/// so an image spanning a chunk boundary is handled in pieces.
+pub async fn generate_multimodal(
+    model: &qwen35::LoadedQwen35,
+    prompt_ids: &[u32],
+    placed: &[crate::vision::Placed],
+    max_tokens: usize,
+    opts: &SamplerOptions,
+    device: &Device,
+    on_token: impl FnMut(u32) -> std::ops::ControlFlow<()>,
+    constraint: Option<&mut dyn crate::constrain::Constraint>,
+) -> Result<Vec<u32>, String> {
+    let mut cache = model.new_cache();
+    generate_loop(
+        |ids, past, need_logits| {
+            let x = crate::vision::splice(model.embed(ids, device), past, placed);
+            model.forward_embeds(x, past, &mut cache, device, need_logits)
+        },
+        prompt_ids,
+        max_tokens,
+        opts,
+        |id| model.is_eos(id),
+        on_token,
+        constraint,
+    )
+    .await
 }

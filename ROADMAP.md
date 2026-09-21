@@ -1478,6 +1478,78 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
 
 ## Phases
 
+### Vision (qwen3-vl tower) — shipped and answering; one measured gap left
+
+- [x] **Instrument the image pipeline before touching it again.** *(2026-09-20, done same day)*
+      `examples/vision-trace.rs` preprocesses images and prints grid, post-resize size and a
+      fingerprint (mean / sd / range / order-sensitive checksum), then optionally runs the tower and
+      reports **pairwise cosine similarity of the projected tokens** — no language model in the loop.
+      It found the bug in one iteration after four rebuild-and-ask-the-27B cycles had found nothing:
+      two images preprocessing to statistically identical tensors produced embeddings 12% apart, and
+      embedding similarity predicted answer agreement exactly. A correct encoder contracts
+      perturbation; that one amplified it ~12x.
+      **The bug:** the rotary table was built [h, h, w, w] with `rotate_half` pairing inside each
+      half, where the reference is `cat(h_freqs, w_freqs)` then `cat(freqs, freqs)` — [h, w, h, w]
+      with pairing i ↔ i + half. Both are self-consistent, so it compiled and answered fluently while
+      half of every head rotated on the wrong axis. Fixed: worst pair 0.8825 → 0.9526, control
+      (same photo re-encoded) 0.9978, and the behavioural gate went from 2/7 to 5/5 across
+      1500x1125, 1200x900, 900x675, 512x384 and a rotated portrait.
+      **Method note worth keeping:** the 1500x1125 image passed *reproducibly* while the encoder was
+      broken. Reproducible is not robust, and "it works" after one image was the worst claim made
+      during that run.
+
+- [ ] **Close the residual drift: 0.95, not 0.99.** *(2026-09-20; localized 2026-09-21)*
+      **Where it enters, measured** (`MUMMU_VISION_STAGES=1` in `examples/vision-trace.rs`, two
+      near-identical inputs): agreement is 0.9970 at `pos_add`, so the inputs enter the tower
+      essentially identical and the drift is amplification, *not* different pixels. It falls first at
+      blocks 1-2 (0.989 -> 0.938). Activations spike 52x at block 9 (maxabs 11 -> 585) and reach 6164
+      at block 26, which `post_ln` normalizes back to 18 — and `post_ln` is where agreement bottoms out
+      (0.81) before the projector recovers it to 0.95. SigLIP-family encoders are known to carry
+      massive activations in a few channels, so the spikes may be normal; blocks 1-2 are the
+      stronger lead. The tower runs end to
+      end — mmproj loads, the ViT encodes, the merger projects, the rows splice into the prefill — and
+      The encoder answers correctly across resolutions now, but it still drifts: two resamplings of
+      one photo give projected tokens at cos 0.95, where the control (same photo, re-encoded) sits at
+      0.998. Roughly 5x amplification of a ~0.1% input change — better than the 12x the axis bug
+      caused, and not yet the contraction a correct encoder shows. Some of the gap is legitimate
+      (those really are different pixels); the rest is probably another small convention mismatch.
+      **The real gate is numerical**, not behavioural: dump the projected image tokens for a fixed
+      input and compare against the HF reference (or llama.cpp's mtmd) by cosine similarity — the
+      llama.cpp port reaches ~0.999. `examples/vision-trace.rs` already does the comparison; it needs
+      a reference vector to compare *against* instead of a sibling resampling. Everything concluded
+      behaviourally rests on asking a 27B what it sees, which cannot separate "the embeddings are
+      subtly wrong" from "the model miscounted".
+      **Disproved, so do not re-try blind:** `positions_for` with `align_corners=False` (what
+      `F.interpolate` does) changed the three-resolution results *not at all*; JPEG encoding is not
+      the variable; and neither is input resolution — identical grids gave opposite answers.
+      **Also fixed getting here, both real:** `grid_for` converged toward a square and destroyed the
+      aspect ratio, and there was no floor on the patch grid (kept — it makes prefill cost
+      predictable regardless of camera resolution).
+
+- [x] **Load the vision tower at f16.** *(2026-09-21, done)* Weights are stored at the checkpoint's
+      own precision and widened to f32 at each use, so the reserve is one mmproj file rather than two:
+      the 27B went from 23/64 to 27/64 GPU layers at a 9 GiB budget, and decode measured ~1.4 tok/s
+      where the f32 tower had it near 0.43 (not a same-session comparison — see the decode-drift note;
+      direction certain, magnitude indicative). Projected tokens are **bit-for-bit as accurate** as the
+      f32 tower: cos 0.9526 against a sibling image either way.
+      **Two corrections for the record.** This item was previously marked *blocked*, on the claim that
+      burn sets a float dtype per device so an f16 tower would force an f16 language model. That was
+      never checked and was false — `Tensor::cast(FloatDType::F16)` is per tensor. And the first f16
+      build cast the *weights* and not the *operations*: burn refuses mixed-dtype matmuls
+      (`matmul: dtype mismatch, left: F32, right: F16`), so it panicked on its first image. It had
+      been deployed after checking that it compiled and that the layer count rose — never with an
+      image, the one input it changes.
+
+- [ ] **Cut image-request prefill.** *(2026-09-21)* The per-request traces (`GET /api/requests`)
+      put a warm image request at ~36 s to first token, of which the vision tower is **0.4-1.0 s** and
+      **prefill is 31-35 s** — the language model reading ~500 image tokens at ~16 tok/s with 37 of 64
+      layers on the host. The tower was never the cost. Levers, cheapest first: fewer image tokens
+      (`MIN/MAX_IMAGE_TOKENS`, currently 480/512 — 256 would roughly halve prefill, at a detail cost
+      that needs measuring on real photos, since the budget was raised specifically to preserve the
+      shape that the "eggplant slices" misreading lost); more layers on the GPU; and a batched host
+      prefill path, which is compute-bound where decode is bandwidth-bound and so is a different
+      optimization problem.
+
 ### P0 — Workspace scaffold
 - [ ] **Prepare the burn 0.22 migration** — v0.22.0-pre.1 (2026-07-29) is a breaking release aimed right
       at Mummu's core seams: (a) the `Tensor` **backend generic is removed** (a high-level `Device`

@@ -7,6 +7,7 @@ use std::ops::ControlFlow;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use burn::tensor::Device;
@@ -15,7 +16,6 @@ use mummu::cache::ModelSlot;
 use mummu::chat::{ChatMl, Role, Turn};
 use mummu::decode::SamplerOptions;
 use mummu::gguf::GgufFile;
-use mummu::models::CausalLm;
 use mummu::models::{lfm2, olmoe, qwen2, qwen3, qwen35};
 use mummu::registry::{Architecture, ModelSpec, WeightFormat};
 use tokenizers::Tokenizer;
@@ -67,31 +67,44 @@ impl AnyLm {
         opts: &SamplerOptions,
         device: &Device,
         on_token: impl FnMut(u32) -> ControlFlow<()>,
+        constraint: Option<&mut dyn mummu::constrain::Constraint>,
     ) -> Result<Vec<u32>, String> {
         match self {
             Self::Qwen2(m) => {
-                m.generate(prompt_ids, max_tokens, opts, device, on_token)
-                    .await
+                mummu::models::generate_constrained(
+                    m, prompt_ids, max_tokens, opts, device, on_token, constraint,
+                )
+                .await
             }
             Self::Qwen3(m) => {
-                m.generate(prompt_ids, max_tokens, opts, device, on_token)
-                    .await
+                mummu::models::generate_constrained(
+                    m, prompt_ids, max_tokens, opts, device, on_token, constraint,
+                )
+                .await
             }
             Self::Lfm2(m) => {
-                m.generate(prompt_ids, max_tokens, opts, device, on_token)
-                    .await
+                mummu::models::generate_constrained(
+                    m, prompt_ids, max_tokens, opts, device, on_token, constraint,
+                )
+                .await
             }
             Self::Olmoe(m) => {
-                m.generate(prompt_ids, max_tokens, opts, device, on_token)
-                    .await
+                mummu::models::generate_constrained(
+                    m, prompt_ids, max_tokens, opts, device, on_token, constraint,
+                )
+                .await
             }
             Self::OlmoeQ(m) => {
-                m.generate(prompt_ids, max_tokens, opts, device, on_token)
-                    .await
+                mummu::models::generate_constrained(
+                    m, prompt_ids, max_tokens, opts, device, on_token, constraint,
+                )
+                .await
             }
             Self::Qwen35(m) => {
-                m.generate(prompt_ids, max_tokens, opts, device, on_token)
-                    .await
+                mummu::models::generate_constrained(
+                    m, prompt_ids, max_tokens, opts, device, on_token, constraint,
+                )
+                .await
             }
         }
     }
@@ -654,13 +667,35 @@ fn load_any(
 /// hardcoded renderer in the library yet, so it is spelled out here in the
 /// shape `tests/real_olmoe.rs` decodes with.
 fn render_prompt(arch: Architecture, turns: &[Turn]) -> Result<String, String> {
+    render_prompt_with_tools(arch, &[], turns)
+}
+
+/// [`render_prompt`] advertising `tools` to the model.
+///
+/// Empty `tools` renders exactly as before — the tool block is what the
+/// family's template emits only when there is something to put in it.
+fn render_prompt_with_tools(
+    arch: Architecture,
+    tools: &[mummu::chat::ToolSpec],
+    turns: &[Turn],
+) -> Result<String, String> {
+    let chatml = |t: ChatMl| {
+        if tools.is_empty() {
+            t.render(turns)
+        } else {
+            t.render_with_tools(tools, turns)
+        }
+    };
     match arch {
-        Architecture::Qwen2 => Ok(ChatMl::qwen2().render(turns)),
-        Architecture::Qwen3 => Ok(ChatMl::qwen3().render(turns)),
+        Architecture::Qwen2 => Ok(chatml(ChatMl::qwen2())),
+        Architecture::Qwen3 => Ok(chatml(ChatMl::qwen3())),
         // qwen35's imported chat template is ChatML with Qwen3's think
         // conventions (its vision macros never fire on text-only turns).
-        Architecture::Qwen35 => Ok(ChatMl::qwen3().render(turns)),
-        Architecture::Lfm2 => Ok(ChatMl::lfm2().render(turns)),
+        Architecture::Qwen35 => Ok(chatml(ChatMl::qwen3())),
+        Architecture::Lfm2 => Ok(chatml(ChatMl::lfm2())),
+        Architecture::Olmoe if !tools.is_empty() => {
+            Err("the OLMoE template has no tool-call convention".into())
+        }
         Architecture::Olmoe => {
             let mut out = String::from("<|endoftext|>");
             for t in turns {
@@ -688,6 +723,8 @@ pub struct ChatResult {
     pub tokens: usize,
     pub device: &'static str,
     pub elapsed_ms: u128,
+    /// Where the time went, phase by phase (see `crate::trace`).
+    pub timings: crate::trace::Timings,
 }
 
 /// Run one chat completion, streaming decoded-text deltas through `on_delta`
@@ -703,6 +740,10 @@ pub async fn run_chat(
     turns: &[Turn],
     opts: &SamplerOptions,
     max_tokens: usize,
+    format: Option<crate::OutputFormat>,
+    think: bool,
+    images: Vec<mummu::vision::Patches>,
+    tools: Vec<mummu::chat::ToolSpec>,
     on_delta: impl FnMut(&str) -> ControlFlow<()>,
 ) -> Result<ChatResult, ChatError> {
     // No `restarting` check here. The entry points refuse a NEW chat during a
@@ -713,7 +754,10 @@ pub async fn run_chat(
     // failure that latched the restart moved the fault epoch, so every
     // resident model is stale and the slot must load. A check here would be
     // a third copy that no test could tell apart from the other two.
-    let prompt = render_prompt(spec.architecture, turns)?;
+    // The planner runs below this and cannot see which model it is serving,
+    // so the tower's footprint is published before planning starts.
+    set_vision_reserve(vision_reserve_bytes(spec, models_root));
+    let prompt = render_prompt_with_tools(spec.architecture, &tools, turns)?;
     // Land a line in the log the moment a request enters the engine: the fit
     // planning below can legitimately take minutes on a busy disk, and a
     // request that logs nothing until it finishes reads as a hang (it did,
@@ -723,12 +767,15 @@ pub async fn run_chat(
     // read pins the worker for its duration, so it declares itself blocking
     // the same way the model load in `mummu::cache` does (and with the same
     // current-thread-runtime escape hatch, where `block_in_place` panics).
+    let plan_started = Instant::now();
     let plan = match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
         Ok(tokio::runtime::RuntimeFlavor::MultiThread) => {
             tokio::task::block_in_place(|| plan_fit(spec, models_root))?
         }
         _ => plan_fit(spec, models_root)?,
     };
+    #[allow(clippy::cast_possible_truncation)]
+    let plan_ms = plan_started.elapsed().as_millis() as u64;
     eprintln!(
         "[mummu-serve] fit plan for {}: {:?} @ {:?}",
         spec.name, plan.backend, plan.policy
@@ -742,9 +789,16 @@ pub async fn run_chat(
         opts,
         max_tokens,
         plan,
+        format,
+        think,
+        images,
         on_delta,
     )
     .await
+    .map(|mut r| {
+        r.timings.plan_ms = plan_ms;
+        r
+    })
 }
 
 /// The device a backend choice denotes (burn 0.22 selects at runtime).
@@ -3300,7 +3354,33 @@ fn live_budget_opt_in(value: Option<&str>) -> bool {
     })
 }
 
+/// Bytes the current request's vision tower will take on the accelerator,
+/// held process-wide because the fit planner is several layers below the
+/// place that knows which model is being served.
+static VISION_RESERVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Tell the planner how much to keep back for a vision tower. Set per
+/// request in [`run_chat`]; zero for a text-only model.
+pub(crate) fn set_vision_reserve(bytes: u64) {
+    VISION_RESERVE.store(bytes, SeqCst);
+}
+
 fn backend_budget(backend: BackendChoice) -> u64 {
+    // The tower is loaded onto the accelerator AFTER the planner has placed
+    // layers to fill this budget, so it has to come out of it here — the one
+    // place every consumer passes through. Without it a 9 GiB budget put
+    // 7.78 GiB of model on a 16 GiB card, the tower went on top, and the
+    // first image request panicked the backend out of device memory
+    // (measured 2026-09-20); in this server that drops the model and
+    // reloads, so it takes text chat down with it.
+    let reserve = match backend {
+        BackendChoice::Cpu => 0,
+        _ => VISION_RESERVE.load(SeqCst),
+    };
+    backend_budget_gross(backend).saturating_sub(reserve)
+}
+
+fn backend_budget_gross(backend: BackendChoice) -> u64 {
     let inv = mummu::backend::inventory();
     match backend {
         // RAM that is actually free right now (a shared VM's total lies):
@@ -3601,6 +3681,7 @@ fn plan_fresh(spec: &ModelSpec, models_root: &Path) -> Result<FitPlan, String> {
 }
 
 #[allow(clippy::too_many_arguments)] // one call site, mirrors the plan
+#[allow(clippy::too_many_arguments)] // one request's worth of parameters
 async fn drive(
     slot: &ModelSlot<Loaded>,
     spec: &ModelSpec,
@@ -3609,6 +3690,9 @@ async fn drive(
     opts: &SamplerOptions,
     max_tokens: usize,
     plan: FitPlan,
+    format: Option<crate::OutputFormat>,
+    think: bool,
+    images: Vec<mummu::vision::Patches>,
     mut on_delta: impl FnMut(&str) -> ControlFlow<()>,
 ) -> Result<ChatResult, ChatError> {
     let key = spec.dir(models_root);
@@ -3668,6 +3752,13 @@ async fn drive(
     // was found stale is recorded for the load's own log line.
     let stale = AtomicBool::new(false);
     let found_stale = &stale;
+    // `acquire_valid` both waits for the slot and, on a miss, loads into it.
+    // Timing the load closure separately is what splits "stuck behind
+    // another request" from "loading weights" — the two look identical from
+    // outside and have entirely different fixes.
+    let load_ms = std::sync::atomic::AtomicU64::new(0);
+    let load_ms_ref = &load_ms;
+    let acquire_started = Instant::now();
     let m = slot
         .acquire_valid(
             &key,
@@ -3679,17 +3770,25 @@ async fn drive(
                 valid
             },
             move |_| {
-                load_for_slot(
+                let t = Instant::now();
+                let r = load_for_slot(
                     spec,
                     models_root,
                     plan,
                     arming,
                     flag_key,
                     found_stale.load(SeqCst),
-                )
+                );
+                #[allow(clippy::cast_possible_truncation)]
+                load_ms_ref.store(t.elapsed().as_millis() as u64, SeqCst);
+                r
             },
         )
         .await?;
+    #[allow(clippy::cast_possible_truncation)]
+    let acquire_ms = acquire_started.elapsed().as_millis() as u64;
+    let load_ms = load_ms.load(SeqCst);
+    let queue_ms = acquire_ms.saturating_sub(load_ms);
     resident_note.loaded = true;
     // DECLARATION ORDER IS DROP ORDER HERE, reversed: the last binding
     // declared is the first one dropped. The progress guard must be declared
@@ -3747,6 +3846,10 @@ async fn drive(
         prompt,
         opts,
         max_tokens,
+        format,
+        think,
+        &images,
+        models_root,
         &device,
         label,
         &progress,
@@ -3755,7 +3858,11 @@ async fn drive(
     .catch_unwind()
     .await;
     let failure = match outcome {
-        Ok(Ok(result)) => return Ok(result),
+        Ok(Ok(mut result)) => {
+            result.timings.queue_ms = queue_ms;
+            result.timings.load_ms = load_ms;
+            return Ok(result);
+        }
         Ok(Err(e)) if e.needs_decision() => e.message,
         Ok(Err(e)) => return Err(e),
         Err(payload) => {
@@ -3778,6 +3885,42 @@ async fn drive(
     Err(decided)
 }
 
+/// Head width for a constrained request. The bounded head only guarantees
+/// the top k logits are exact; a constraint that rejects the argmax then
+/// walks the rest in descending order, so too narrow a k would have it
+/// settle on a token whose rank is an artefact of pruning rather than a real
+/// runner-up. Greedy's k = 1 is far too narrow for that; this is the window
+/// the fallback searches.
+const CONSTRAINED_HEAD_K: usize = 256;
+
+/// Decoded token bytes per model, built once and shared.
+///
+/// Building one walks the whole vocabulary through the tokenizer's decoder.
+/// That is cheap next to a generation but not next to a *token*, so it must
+/// not happen per request — it would land entirely on the first token's
+/// latency, which is the one users feel.
+static TOKEN_BYTES: Mutex<Option<(String, Arc<mummu::constrain::TokenBytes>)>> = Mutex::new(None);
+
+/// The table for `model`, building it if the cached one is for another
+/// model. One slot, because one model is resident at a time.
+fn token_bytes_for(model: &str, tok: &Tokenizer) -> Arc<mummu::constrain::TokenBytes> {
+    let mut slot = TOKEN_BYTES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((cached, table)) = slot.as_ref()
+        && cached == model
+    {
+        return Arc::clone(table);
+    }
+    let started = Instant::now();
+    let table = Arc::new(mummu::constrain::TokenBytes::from_tokenizer(tok));
+    eprintln!(
+        "[mummu-serve] output constraint: decoded {} tokens for {model} in {:?}",
+        table.len(),
+        started.elapsed()
+    );
+    *slot = Some((model.to_string(), Arc::clone(&table)));
+    table
+}
+
 /// The generation itself, on a model the slot handed out. Everything that
 /// can fail here is decided by `drive`, which runs this under
 /// `catch_unwind` while it holds the slot.
@@ -3788,6 +3931,10 @@ async fn generate_on(
     prompt: &str,
     opts: &SamplerOptions,
     max_tokens: usize,
+    format: Option<crate::OutputFormat>,
+    think: bool,
+    images: &[mummu::vision::Patches],
+    models_root: &Path,
     device: &Device,
     label: &'static str,
     progress: &LoadProgress,
@@ -3813,52 +3960,185 @@ async fn generate_on(
     let start = Instant::now();
     let mut ids: Vec<u32> = Vec::new();
     let mut emitted = String::new();
+    // A reasoning model opens with `<think>…</think>`. Unless the request
+    // asked for it, that is suppressed here — between the decoder and the
+    // client — so it never reaches a sink and never counts against what the
+    // caller sees. `think` passes it through untouched.
+    let mut thinking = (!think).then(crate::think::Filter::default);
     // Tell the bounded head how many candidates THIS request's
     // sampler will consult: greedy reads only the argmax (k = 1,
     // where the norm bound prunes hardest — the first live run
     // measured k = 1024 evaluating ~91% of the vocab), sampling
     // reads its top_k. Overlapping requests combine via fetch_max
     // and the drop falls back to the safe env default.
-    let _head_k = mummu::flex::head::RequestTopK::set(if opts.temperature == 0.0 {
-        1
-    } else {
-        opts.top_k
+    let _head_k = mummu::flex::head::RequestTopK::set(match format {
+        Some(_) => CONSTRAINED_HEAD_K,
+        None if opts.temperature == 0.0 => 1,
+        None => opts.top_k,
     });
-    let out =
-        m.lm.generate(&prompt_ids, max_tokens, opts, device, |id| {
-            // The first token is where warming ends and the wait the bar
-            // exists for is over. Said here rather than after `generate`
-            // returns, because the rest of a 512-token decode is not a
-            // load and must not keep a progress bar on screen.
-            if ids.is_empty() {
-                progress.ready();
-                // The model's devices computed and read back: whatever
-                // failed on THEM before is behind us (see
-                // `recovery::decide`). Only on them — a token on the host
-                // vouches for nothing on the card.
-                recovery::generation_succeeded(&m.devices);
-            }
-            ids.push(id);
-            // Incremental decode: re-decode the whole tail and emit the
-            // suffix beyond what was already streamed. A trailing U+FFFD
-            // means we're mid-way through a multi-byte char — hold the
-            // delta until the next token completes it.
-            let Ok(text) = m.tokenizer.decode(&ids, true) else {
-                return ControlFlow::Continue(());
-            };
-            if text.ends_with('\u{FFFD}') || text.len() <= emitted.len() {
-                return ControlFlow::Continue(());
-            }
-            let delta = text[emitted.len()..].to_string();
-            emitted = text;
-            on_delta(&delta)
-        })
-        .await?;
+    // The grammar, if one was asked for. Held here so it outlives the
+    // borrow the decode loop takes on it.
+    let mut constraint = format.map(|f| match f {
+        crate::OutputFormat::Json => {
+            mummu::constrain::JsonConstraint::new(token_bytes_for(&spec.name, &m.tokenizer))
+        }
+    });
+    // Images, if any: run the tower and match its tokens to the placeholder
+    // runs the prompt reserved. Both halves refuse loudly on a mismatch —
+    // a misaligned splice is not an error anywhere downstream, it is an
+    // answer about a different picture.
+    let vision_started = Instant::now();
+    let placed = if images.is_empty() {
+        Vec::new()
+    } else {
+        let AnyLm::Qwen35(_) = &m.lm else {
+            return Err(format!(
+                "{} is loaded as a text-only architecture and cannot take images",
+                spec.name
+            )
+            .into());
+        };
+        let tower = tower_for(spec, models_root, device)?;
+        let tokens = mummu::vision::VisionTokens::resolve(&m.tokenizer)?;
+        let started = Instant::now();
+        let rows = images
+            .iter()
+            .map(|p| tower.forward(p.to_tensor(device), p.grid_h, p.grid_w, device))
+            .collect::<Result<Vec<_>, _>>()?;
+        eprintln!(
+            "[mummu-serve] vision: {} image(s) encoded in {:?}",
+            rows.len(),
+            started.elapsed()
+        );
+        mummu::vision::place(&prompt_ids, tokens.pad, rows)?
+    };
+    #[allow(clippy::cast_possible_truncation)]
+    let vision_ms = if images.is_empty() {
+        0
+    } else {
+        vision_started.elapsed().as_millis() as u64
+    };
+    let image_tokens: usize = placed.iter().map(|p| p.rows.dims()[0]).sum();
+    // The first token is the boundary between prefill and decode; stamped
+    // from inside the token callback, where it is known exactly. A plain
+    // captured `Option`, like `ids` and `emitted` — NOT a `Cell`: the
+    // callback is held across the decode loop's awaits, and `&Cell` is not
+    // `Send` (`Cell` is not `Sync`), which fails every caller that spawns a
+    // generation with an error naming the whole future.
+    let mut first_token_at: Option<Instant> = None;
+    let generation_started = Instant::now();
 
-    let text = m
+    let out = if let (AnyLm::Qwen35(vlm), false) = (&m.lm, placed.is_empty()) {
+        mummu::models::generate_multimodal(
+            vlm,
+            &prompt_ids,
+            &placed,
+            max_tokens,
+            opts,
+            device,
+            |id| {
+                // The first token is where warming ends and the wait the bar
+                // exists for is over. Said here rather than after `generate`
+                // returns, because the rest of a 512-token decode is not a
+                // load and must not keep a progress bar on screen.
+                if ids.is_empty() {
+                    progress.ready();
+                    // The model's devices computed and read back: whatever
+                    // failed on THEM before is behind us (see
+                    // `recovery::decide`). Only on them — a token on the host
+                    // vouches for nothing on the card.
+                    recovery::generation_succeeded(&m.devices);
+                }
+                if first_token_at.is_none() {
+                    first_token_at = Some(Instant::now());
+                }
+                ids.push(id);
+                // Incremental decode: re-decode the whole tail and emit the
+                // suffix beyond what was already streamed. A trailing U+FFFD
+                // means we're mid-way through a multi-byte char — hold the
+                // delta until the next token completes it.
+                let Ok(text) = m.tokenizer.decode(&ids, true) else {
+                    return ControlFlow::Continue(());
+                };
+                if text.ends_with('\u{FFFD}') || text.len() <= emitted.len() {
+                    return ControlFlow::Continue(());
+                }
+                let delta = text[emitted.len()..].to_string();
+                emitted = text;
+                let visible = match thinking.as_mut() {
+                    Some(f) => f.push(&delta),
+                    None => delta,
+                };
+                if visible.is_empty() {
+                    return ControlFlow::Continue(());
+                }
+                on_delta(&visible)
+            },
+            constraint
+                .as_mut()
+                .map(|c| c as &mut dyn mummu::constrain::Constraint),
+        )
+        .await?
+    } else {
+        m.lm.generate(
+            &prompt_ids,
+            max_tokens,
+            opts,
+            device,
+            |id| {
+                if ids.is_empty() {
+                    progress.ready();
+                    recovery::generation_succeeded(&m.devices);
+                }
+                if first_token_at.is_none() {
+                    first_token_at = Some(Instant::now());
+                }
+                ids.push(id);
+                let Ok(text) = m.tokenizer.decode(&ids, true) else {
+                    return ControlFlow::Continue(());
+                };
+                if text.ends_with('\u{FFFD}') || text.len() <= emitted.len() {
+                    return ControlFlow::Continue(());
+                }
+                let delta = text[emitted.len()..].to_string();
+                emitted = text;
+                let visible = match thinking.as_mut() {
+                    Some(f) => f.push(&delta),
+                    None => delta,
+                };
+                if visible.is_empty() {
+                    return ControlFlow::Continue(());
+                }
+                on_delta(&visible)
+            },
+            constraint
+                .as_mut()
+                .map(|c| c as &mut dyn mummu::constrain::Constraint),
+        )
+        .await?
+    };
+
+    let mut text = m
         .tokenizer
         .decode(&out, true)
         .map_err(|e| format!("decode: {e}"))?;
+    if !think {
+        // The buffered path never went through the streaming filter, so it
+        // is filtered whole here. A block the token cap cut short leaves no
+        // answer at all, which is worth saying rather than returning "".
+        let mut f = crate::think::Filter::default();
+        let mut visible = f.push(&text);
+        visible.push_str(&f.finish());
+        if visible.trim().is_empty() && f.truncated() {
+            return Err(format!(
+                "the model spent all {max_tokens} tokens inside a <think> block and never \
+                 reached an answer — raise the token limit, or set \"think\": true to see the \
+                 reasoning"
+            )
+            .into());
+        }
+        text = visible;
+    }
     let elapsed_ms = start.elapsed().as_millis();
     // Every completed generation is one placement's worth of evidence.
     observe_placement(out.len(), elapsed_ms);
@@ -3874,11 +4154,24 @@ async fn generate_on(
     if matches!(&m.lm, AnyLm::OlmoeQ(q) if q.pool.is_some()) {
         rebalance_tiers();
     }
+    let generation_done = Instant::now();
+    let first = first_token_at.unwrap_or(generation_done);
+    #[allow(clippy::cast_possible_truncation)]
+    let timings = crate::trace::Timings {
+        vision_ms,
+        prefill_ms: first.duration_since(generation_started).as_millis() as u64,
+        decode_ms: generation_done.duration_since(first).as_millis() as u64,
+        prompt_tokens: prompt_ids.len(),
+        image_tokens,
+        completion_tokens: out.len(),
+        ..crate::trace::Timings::default()
+    };
     Ok(ChatResult {
         text,
         tokens: out.len(),
         device: label,
         elapsed_ms,
+        timings,
     })
 }
 
@@ -4649,4 +4942,145 @@ pub(crate) mod test_support {
             .iter()
             .any(|(_, d, _)| d == dir)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Vision
+// ---------------------------------------------------------------------------
+
+/// The vision tower for the resident model, loaded once.
+///
+/// Lazy on purpose: the tower is a second ~0.9 GB file, and the overwhelming
+/// majority of requests never carry an image. A text-only deployment should
+/// not pay for it, and a model without an `mmproj` beside it must still
+/// serve text — which is how the 27B ran for weeks before this existed.
+static TOWER: Mutex<Option<(std::path::PathBuf, Arc<mummu::vision::VisionTower>)>> =
+    Mutex::new(None);
+
+/// The `mmproj-*.gguf` sitting beside a model's weights, if any.
+fn mmproj_path(spec: &ModelSpec, models_root: &Path) -> Option<std::path::PathBuf> {
+    let dir = spec.dir(models_root);
+    let mut found: Vec<_> = std::fs::read_dir(&dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("mmproj") && n.ends_with(".gguf"))
+        })
+        .collect();
+    // Deterministic when a directory holds both an F16 and a BF16 tower.
+    found.sort();
+    found.into_iter().next()
+}
+
+/// Is this model able to take images at all?
+pub fn supports_vision(spec: &ModelSpec, models_root: &Path) -> bool {
+    spec.architecture == Architecture::Qwen35 && mmproj_path(spec, models_root).is_some()
+}
+
+/// On-device bytes a model's vision tower will occupy, or 0 when it has
+/// none.
+///
+/// The fit planner places language-model layers to fill the GPU budget; the
+/// tower is loaded *afterwards*, on top, and nothing was subtracting it.
+/// Measured 2026-09-20: a 9 GiB budget put 7.78 GiB of model on a 16 GiB
+/// card, the tower went on top, and the first image request took the
+/// backend out with an out-of-device-memory panic — which in this server
+/// means a dropped model and a reload, so it costs text chat too.
+pub fn vision_reserve_bytes(spec: &ModelSpec, models_root: &Path) -> u64 {
+    let Some(path) = mmproj_path(spec, models_root) else {
+        return 0;
+    };
+    // The file, plus slack for the ViT's activations. `VisionTower::load`
+    // casts each weight back to the checkpoint's own width (see
+    // `vision::half_precision`), so an F16 mmproj occupies about its file
+    // size on the card rather than double it.
+    //
+    // It reserved double until 2026-09-21, on the belief that burn could
+    // only set a float dtype per *device*. `Tensor::cast` has been per
+    // tensor all along; the wide copy was costing 10 of the 27B's 64 layers
+    // and taking decode from ~0.83 to ~2.3 s/token — for text requests too,
+    // since placement is decided once at load.
+    let weights = std::fs::metadata(&path).map_or(0, |m| m.len());
+    weights + (512 << 20)
+}
+
+/// Load (or reuse) the tower for `spec` on `device`.
+fn tower_for(
+    spec: &ModelSpec,
+    models_root: &Path,
+    device: &Device,
+) -> Result<Arc<mummu::vision::VisionTower>, String> {
+    let path = mmproj_path(spec, models_root).ok_or_else(|| {
+        format!(
+            "{} has no mmproj-*.gguf beside its weights, so it cannot take images — \
+             the vision tower ships as a separate file from the language model",
+            spec.name
+        )
+    })?;
+    let mut slot = TOWER.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((cached, tower)) = slot.as_ref()
+        && cached == &path
+    {
+        return Ok(Arc::clone(tower));
+    }
+    let started = Instant::now();
+    let tower = Arc::new(mummu::vision::VisionTower::load(&path, device)?);
+    eprintln!(
+        "[mummu-serve] vision tower loaded from {} in {:?}",
+        path.display(),
+        started.elapsed()
+    );
+    *slot = Some((path, Arc::clone(&tower)));
+    Ok(tower)
+}
+
+/// Decode and lay out every image, returning the patch grids.
+///
+/// Runs before the prompt is rendered, because the number of placeholder
+/// tokens a prompt must reserve is a function of each image's patch grid.
+/// Only the tower's *config* is read here (a header parse), not its weights.
+pub fn prepare_images(
+    spec: &ModelSpec,
+    models_root: &Path,
+    images: &[Vec<u8>],
+) -> Result<Vec<mummu::vision::Patches>, String> {
+    if images.is_empty() {
+        return Ok(Vec::new());
+    }
+    if spec.architecture != Architecture::Qwen35 {
+        return Err(format!(
+            "{} is a text-only architecture ({:?}) and cannot take images",
+            spec.name, spec.architecture
+        ));
+    }
+    let path = mmproj_path(spec, models_root).ok_or_else(|| {
+        format!(
+            "{} has no mmproj-*.gguf beside its weights, so it cannot take images",
+            spec.name
+        )
+    })?;
+    let f = GgufFile::open(&path).map_err(|e| format!("open mmproj: {e:?}"))?;
+    let cfg = mummu::vision::VisionConfig::from_gguf(&f)?;
+    images.iter().map(|b| cfg.preprocess(b)).collect()
+}
+
+/// The placeholder text for each prepared image, in order.
+pub fn placeholders(
+    spec: &ModelSpec,
+    models_root: &Path,
+    patches: &[mummu::vision::Patches],
+) -> Result<Vec<String>, String> {
+    if patches.is_empty() {
+        return Ok(Vec::new());
+    }
+    let path = mmproj_path(spec, models_root).ok_or("no mmproj")?;
+    let f = GgufFile::open(&path).map_err(|e| format!("open mmproj: {e:?}"))?;
+    let cfg = mummu::vision::VisionConfig::from_gguf(&f)?;
+    Ok(patches
+        .iter()
+        .map(|p| mummu::vision::placeholder_text(mummu::vision::token_count(p, cfg.merge)))
+        .collect())
 }
