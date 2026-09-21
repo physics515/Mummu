@@ -275,6 +275,7 @@ pub async fn generate_constrained<M: CausalLm>(
 /// `placed` carries the tower's output and the prompt positions it belongs
 /// at; see [`crate::vision::place`]. The splice happens per prefill chunk,
 /// so an image spanning a chunk boundary is handled in pieces.
+#[allow(clippy::too_many_arguments)] // `generate_constrained`'s arity plus the image rows
 pub async fn generate_multimodal(
     model: &qwen35::LoadedQwen35,
     prompt_ids: &[u32],

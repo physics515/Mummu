@@ -661,15 +661,6 @@ fn load_any(
     }
 }
 
-/// Render `turns` into the family's prompt string. The ChatML families are
-/// mummu's byte-verified renderers; OLMoE-Instruct speaks the Tulu template
-/// (`<|user|>` / `<|assistant|>` behind an `<|endoftext|>` BOS), which has no
-/// hardcoded renderer in the library yet, so it is spelled out here in the
-/// shape `tests/real_olmoe.rs` decodes with.
-fn render_prompt(arch: Architecture, turns: &[Turn]) -> Result<String, String> {
-    render_prompt_with_tools(arch, &[], turns)
-}
-
 /// Lifts every call out of a whole answer, with the prose around them.
 pub type ReadCalls = fn(&str) -> Result<(Vec<ToolCall>, String), mummu::chat::ToolCallError>;
 
@@ -757,10 +748,15 @@ pub fn thinks(arch: Architecture) -> bool {
     template(arch).is_ok_and(|t| t.thinks)
 }
 
-/// [`render_prompt`] advertising `tools` to the model.
+/// Render `turns` into the family's prompt string. The ChatML families are
+/// mummu's byte-verified renderers; OLMoE-Instruct speaks the Tulu template
+/// (`<|user|>` / `<|assistant|>` behind an `<|endoftext|>` BOS), which has no
+/// hardcoded renderer in the library yet, so it is spelled out here in the
+/// shape `tests/real_olmoe.rs` decodes with.
 ///
-/// Empty `tools` renders exactly as before — the tool block is what the
-/// family's template emits only when there is something to put in it.
+/// `tools` are advertised to the model. Empty `tools` renders the plain chat
+/// prompt — the tool block is what the family's template emits only when
+/// there is something to put in it.
 fn render_prompt_with_tools(
     arch: Architecture,
     tools: &[mummu::chat::ToolSpec],
@@ -833,6 +829,7 @@ pub struct ChatResult {
 /// Callers run this under [`crate::recovery::contain`], which is what turns a
 /// panic in here — a GPU failure surfacing as a failed read, say — into an
 /// error the client is actually sent.
+#[allow(clippy::too_many_arguments)] // one request's worth of parameters, for every surface
 pub async fn run_chat(
     spec: &ModelSpec,
     models_root: &Path,
@@ -3783,8 +3780,7 @@ fn plan_fresh(spec: &ModelSpec, models_root: &Path) -> Result<FitPlan, String> {
     })
 }
 
-#[allow(clippy::too_many_arguments)] // one call site, mirrors the plan
-#[allow(clippy::too_many_arguments)] // one request's worth of parameters
+#[allow(clippy::too_many_arguments)] // one call site: one request's worth of parameters
 async fn drive(
     slot: &ModelSlot<Loaded>,
     spec: &ModelSpec,
@@ -5079,7 +5075,8 @@ fn mmproj_path(spec: &ModelSpec, models_root: &Path) -> Option<std::path::PathBu
     found.into_iter().next()
 }
 
-/// Is this model able to take images at all?
+/// Is this model able to take images at all? What `/api/show` reports as
+/// "vision" (see `crate::shim`).
 pub fn supports_vision(spec: &ModelSpec, models_root: &Path) -> bool {
     spec.architecture == Architecture::Qwen35 && mmproj_path(spec, models_root).is_some()
 }

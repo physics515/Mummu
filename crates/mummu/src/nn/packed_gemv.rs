@@ -805,10 +805,30 @@ mod fusion_impl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::tensor::{Distribution, Tensor};
+    use burn::tensor::{Distribution, Tensor, TensorData};
 
-    /// Serializes the two flex-path tests: `force_disable` is process-global
-    /// and they set it in opposite directions.
+    /// SplitMix64: a tiny deterministic generator for test inputs whose
+    /// assertion depends on the draw.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        /// Uniform in `[-1, 1)`.
+        fn uniform_vec(&mut self, len: usize) -> Vec<f32> {
+            (0..len)
+                .map(|_| (self.next_u64() >> 40) as f32 / (1u64 << 23) as f32 - 1.0)
+                .collect()
+        }
+    }
+
+    /// Serializes the flex-path tests: `force_disable` is process-global and
+    /// they set it in opposite directions.
     static FLEX_PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Restores the packed host path on drop, so a failing assert cannot
@@ -860,14 +880,23 @@ mod tests {
     /// requantization + activation budget of the device-grid reference —
     /// a few percent — while the tight per-row bounds are asserted in
     /// `flex::kernels`). K % 64 == 0 here, the production shape class.
+    ///
+    /// Seeded, because the ratio is a property of the draw, not of the
+    /// kernel: the lazy twin re-rounds the device grid along K, and that
+    /// second rounding alone spreads the max-abs ratio over uniform draws
+    /// at p50 0.035 / p99 0.057 / max 0.086 (20k draws; the activation term
+    /// never exceeded 0.01). About 4.5% of unseeded draws cleared 0.05, and
+    /// that was this test's flake. This seed measures 0.028; a broken twin
+    /// (wrong scales, a ghost weight, a dropped offset) lands at O(1).
     #[test]
     fn q4s_gemv_vnni_twin_is_deterministic_and_faithful() {
         let _serial = FLEX_PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         crate::flex::registry::force_disable(false);
         let device = crate::backend::cpu_device();
         let (k, n) = (256, 96);
-        let x = Tensor::<2>::random([1, k], Distribution::Uniform(-1.0, 1.0), &device);
-        let w = Tensor::<2>::random([k, n], Distribution::Uniform(-1.0, 1.0), &device);
+        let mut rng = Rng(0);
+        let x = Tensor::<2>::from_data(TensorData::new(rng.uniform_vec(k), [1, k]), &device);
+        let w = Tensor::<2>::from_data(TensorData::new(rng.uniform_vec(k * n), [k, n]), &device);
         let wq = crate::quant::quantize_weight(crate::quant::QuantPolicy::Q4, w);
 
         let a = try_q4s_gemv(&x, &wq).expect("packed path must engage");

@@ -221,12 +221,12 @@ impl ChatCompletionRequest {
     /// Translate into the shim's validated plan, reusing its sampler checks
     /// and its catalog lookup so the two surfaces cannot drift apart on what
     /// counts as a valid request.
-    fn to_plan(&self) -> Result<RunPlan, Response> {
+    fn to_plan(&self) -> Result<RunPlan, Box<Response>> {
         if self.n.is_some_and(|n| n != 1) {
-            return Err(bad_request(
+            return Err(Box::new(bad_request(
                 "n > 1 is not supported — this server returns a single choice",
                 "unsupported_parameter",
-            ));
+            )));
         }
         let messages = self
             .messages
@@ -258,11 +258,11 @@ impl ChatCompletionRequest {
                 })
             })
             .collect::<Result<Vec<_>, String>>()
-            .map_err(|e| bad_request(&e, "unsupported_parameter"))?;
+            .map_err(|e| Box::new(bad_request(&e, "unsupported_parameter")))?;
 
         let format = match self.response_format.as_ref().map(ResponseFormat::resolve) {
             Some(Ok(f)) => f,
-            Some(Err(e)) => return Err(bad_request(&e, "unsupported_parameter")),
+            Some(Err(e)) => return Err(Box::new(bad_request(&e, "unsupported_parameter"))),
             None => None,
         };
 
@@ -285,14 +285,15 @@ impl ChatCompletionRequest {
             .is_some_and(|r| !r.eq_ignore_ascii_case("none"));
         // `plan` answers in the ollama error shape, which would be wrong
         // here; re-dress whatever it says as an OpenAI error.
-        let mut p = plan(&self.model, &messages, &options, None, think).map_err(|r| reshape(*r))?;
+        let mut p = plan(&self.model, &messages, &options, None, think)
+            .map_err(|r| Box::new(reshape(*r)))?;
         p.format = format;
         offer_tools(
             &mut p,
             &self.model,
             tool_specs(self.tools.as_deref().unwrap_or_default()),
         )
-        .map_err(|e| bad_request(&e, "unsupported_parameter"))?;
+        .map_err(|e| Box::new(bad_request(&e, "unsupported_parameter")))?;
         Ok(p)
     }
 }
@@ -428,7 +429,7 @@ async fn chat_completions(body: Bytes) -> Response {
                     status.as_u16()
                 )),
             );
-            return response;
+            return *response;
         }
     };
 
@@ -436,7 +437,7 @@ async fn chat_completions(body: Bytes) -> Response {
         return json_response(
             503,
             error_body(
-                &recovery::restarting_message(),
+                recovery::restarting_message(),
                 "server_error",
                 "server_restarting",
             ),

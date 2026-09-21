@@ -130,13 +130,13 @@ impl VisionConfig {
             std: rgb("clip.vision.image_std"),
             out_dim: u("clip.vision.projection_dim")?,
         };
-        if cfg.patch == 0 || cfg.heads == 0 || cfg.hidden % cfg.heads != 0 {
+        if cfg.patch == 0 || cfg.heads == 0 || !cfg.hidden.is_multiple_of(cfg.heads) {
             return Err(format!(
                 "inconsistent vision geometry: hidden {} over {} heads, patch {}",
                 cfg.hidden, cfg.heads, cfg.patch
             ));
         }
-        if cfg.image_size % cfg.patch != 0 {
+        if !cfg.image_size.is_multiple_of(cfg.patch) {
             return Err(format!(
                 "image_size {} is not a multiple of patch {}",
                 cfg.image_size, cfg.patch
@@ -589,7 +589,7 @@ impl VisionTower {
             }
         };
         let m = self.cfg.merge;
-        if gh % m != 0 || gw % m != 0 {
+        if !gh.is_multiple_of(m) || !gw.is_multiple_of(m) {
             return Err(format!(
                 "patch grid {gh}x{gw} is not a multiple of the {m}x{m} spatial merge"
             ));
