@@ -927,16 +927,15 @@ async fn run(p: RunPlan, stream: bool, wrap: Wrap, finish: Finish) -> Response {
 /// blank line Qwen writes after `</think>`. The trailing whitespace of the
 /// reasoning is kept, as there. A streamed answer and a buffered one go
 /// through the same splitter, so the two cannot disagree.
+///
+/// The answer's side of that is the think filter's own rule, the one a
+/// request that did not ask to see the thinking gets too (see
+/// `crate::think`); only the thinking's side is trimmed here.
 #[derive(Default)]
 struct Reasoning {
     filter: Filter,
     /// Some thinking has been shown: its whitespace is its own from here on.
     thinking: bool,
-    /// Some answer has been shown, likewise.
-    answering: bool,
-    /// Whitespace the answer opened with, held until it is known whether it
-    /// was the gap around a think block (dropped) or the answer's own (kept).
-    gap: String,
 }
 
 impl Reasoning {
@@ -959,43 +958,17 @@ impl Reasoning {
     /// thinking all the same, and goes out as `thinking`.
     fn finish(&mut self) -> Split {
         let split = self.filter.finish_split();
-        let mut out = self.shape(split);
-        if !self.answering && !self.opened() {
-            // No block, and an answer of nothing but whitespace: that was
-            // the answer.
-            out.visible.insert_str(0, &std::mem::take(&mut self.gap));
-        }
-        out
-    }
-
-    /// Has a think block opened?
-    fn opened(&self) -> bool {
-        !self.filter.withheld().is_empty()
+        self.shape(split)
     }
 
     fn shape(&mut self, split: Split) -> Split {
         let Split {
-            mut visible,
+            visible,
             mut thought,
         } = split;
         if !self.thinking {
             thought = thought.trim_start().to_owned();
             self.thinking = !thought.is_empty();
-        }
-        if !self.answering {
-            let body = visible.trim_start();
-            if body.is_empty() {
-                self.gap.push_str(&visible);
-                visible.clear();
-            } else {
-                self.answering = true;
-                let gap = std::mem::take(&mut self.gap);
-                visible = if self.opened() {
-                    body.to_owned()
-                } else {
-                    gap + &visible
-                };
-            }
         }
         Split { visible, thought }
     }
@@ -2243,6 +2216,9 @@ mod tests {
             ("\n", "", "\n"),
             ("5 < 7 and 8 > 2", "", "5 < 7 and 8 > 2"),
             ("café <think>☕</think> ok", "☕", "café  ok"),
+            // The answer began before the block, so its leading whitespace
+            // is its own — however the text was cut up.
+            ("  hi <think>x</think> there", "x", "  hi  there"),
         ];
         for (text, thinking, content) in cases {
             let whole = Reasoning::split(text);
