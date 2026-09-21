@@ -473,24 +473,43 @@ const KEEPALIVE_TICK: std::time::Duration = std::time::Duration::from_secs(10);
 /// past 20 seconds of real work can land in it.
 pub(crate) async fn keepalive_json<F>(work: F) -> Response
 where
-    // `'static` because the padded path hands the future to a response body,
-    // which outlives this call.
+    // `'static` because the padded path hands the result channel to a
+    // response body, which outlives this call.
     F: Future<Output = (u16, serde_json::Value)> + Send + 'static,
 {
-    let mut work = Box::pin(work);
+    // The work runs on its OWN task, and that is the whole trick. Selecting
+    // directly on the future would put the timer and the generation on one
+    // task, where anything that blocks rather than awaits — `plan_fit` runs
+    // under `block_in_place`, and a cold load is minutes of it — starves the
+    // timer, no padding goes out, and the proxy cuts the connection anyway.
+    //
+    // Measured 2026-09-21: with the work inline, a warm request padded
+    // correctly (first byte at 20.7 s) while a cold one sent nothing and
+    // died at Cloudflare's 125 s. Same code, opposite outcomes, decided
+    // entirely by whether the generation happened to yield.
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let _ = tx.send(work.await);
+    });
+
     tokio::select! {
-        (status, body) = &mut work => json_response(status, body),
+        res = &mut rx => {
+            let (status, body) = res.unwrap_or_else(|_| (500, crate::worker_vanished()));
+            json_response(status, body)
+        }
         () = tokio::time::sleep(KEEPALIVE_GRACE) => {
             let stream = async_stream::stream! {
                 loop {
                     tokio::select! {
-                        (_status, body) = &mut work => {
+                        res = &mut rx => {
+                            let (_status, body) =
+                                res.unwrap_or_else(|_| (500, crate::worker_vanished()));
                             yield Ok::<String, Infallible>(body.to_string());
                             break;
                         }
                         () = tokio::time::sleep(KEEPALIVE_TICK) => {
-                            // A space: legal JSON leading whitespace, and
-                            // one byte is enough to prove the origin lives.
+                            // A space: legal JSON leading whitespace, and one
+                            // byte is enough to prove the origin is alive.
                             yield Ok(" ".to_string());
                         }
                     }
@@ -503,6 +522,15 @@ where
                 .into_response()
         }
     }
+}
+
+/// The body for a worker that ended without sending its result — the task
+/// panicked outside what `recovery::contain` guards, or the runtime dropped
+/// it. Should be unreachable; said plainly rather than answering with an
+/// empty object.
+fn worker_vanished() -> serde_json::Value {
+    json!({"error": "the server's worker for this request ended without a result — this is a \
+                     mummu-serve bug, not your request; try again"})
 }
 
 /// Parse a JSON body, or hand back the 400 response to return as-is. Keeps

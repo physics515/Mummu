@@ -166,10 +166,28 @@ fn weight_2d(
             data.len()
         ));
     }
-    Ok(Tensor::<2>::from_data(
+    Ok(half_precision(Tensor::<2>::from_data(
         TensorData::new(data, [out, inp]),
         device,
-    ))
+    )))
+}
+
+/// Store a loaded weight at the precision the checkpoint used.
+///
+/// `read_tensor_f32` materializes everything as f32, so an F16 mmproj would
+/// otherwise land on the card at double its file size — 0.93 GB becoming
+/// ~1.85 GiB, all of which the fit planner has to reserve and therefore take
+/// away from the language model's layers (measured: 10 of 64 on the 27B, and
+/// decode from ~0.83 to ~2.3 s/token, for text requests too).
+///
+/// Casting back to f16 is lossless here: the values came from f16 in the
+/// file. `MUMMU_VISION_F32=1` keeps the wide copy for a numerics
+/// investigation.
+fn half_precision<const D: usize>(t: Tensor<D>) -> Tensor<D> {
+    if std::env::var("MUMMU_VISION_F32").is_ok_and(|v| v != "0") {
+        return t;
+    }
+    t.cast(burn::tensor::FloatDType::F16)
 }
 
 fn vector(f: &GgufFile, name: &str, n: usize, device: &Device) -> Result<Tensor<1>, String> {
@@ -179,7 +197,12 @@ fn vector(f: &GgufFile, name: &str, n: usize, device: &Device) -> Result<Tensor<
     if data.len() != n {
         return Err(format!("{name}: expected {n} values, got {}", data.len()));
     }
-    Ok(Tensor::<1>::from_data(TensorData::new(data, [n]), device))
+    // Biases and norms are F32 in the file; casting them too keeps every
+    // operand of a matmul at one width.
+    Ok(half_precision(Tensor::<1>::from_data(
+        TensorData::new(data, [n]),
+        device,
+    )))
 }
 
 /// `y = x · Wᵀ + b` for `[tokens, in] · [out, in]ᵀ`.

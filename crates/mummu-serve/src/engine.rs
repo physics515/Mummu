@@ -4930,19 +4930,18 @@ pub fn vision_reserve_bytes(spec: &ModelSpec, models_root: &Path) -> u64 {
     let Some(path) = mmproj_path(spec, models_root) else {
         return 0;
     };
-    // DOUBLE the file, not the file. `VisionTower::load` reads through
-    // `read_tensor_f32`, so an F16 checkpoint is materialized as f32 on the
-    // card — 0.93 GB on disk becomes ~1.85 GiB resident. Reserving the file
-    // size would under-reserve by half and OOM exactly the way reserving
-    // nothing did.
+    // The file, plus slack for the ViT's activations. `VisionTower::load`
+    // casts each weight back to the checkpoint's own width (see
+    // `vision::half_precision`), so an F16 mmproj occupies about its file
+    // size on the card rather than double it.
     //
-    // Loading the tower at f16 instead is not currently available: burn
-    // configures a float dtype per *device*, not per tensor (see
-    // `mummu::backend::gpu_device_f16`), so an f16 tower would mean an f16
-    // device for the language model too. Worth revisiting — it would halve
-    // this — but it is a bigger change than a reserve.
+    // It reserved double until 2026-09-21, on the belief that burn could
+    // only set a float dtype per *device*. `Tensor::cast` has been per
+    // tensor all along; the wide copy was costing 10 of the 27B's 64 layers
+    // and taking decode from ~0.83 to ~2.3 s/token — for text requests too,
+    // since placement is decided once at load.
     let weights = std::fs::metadata(&path).map_or(0, |m| m.len());
-    weights.saturating_mul(2) + (512 << 20)
+    weights + (512 << 20)
 }
 
 /// Load (or reuse) the tower for `spec` on `device`.
