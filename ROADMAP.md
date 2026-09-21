@@ -728,8 +728,27 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       are what packs store and kernels run (f32, f16, int8, int4); f64 is never worth its bytes over a
       4.55-bit source, and f8 / 1-bit need a pack level and a kernel before the solver can pick them.
       The motivating case: v0.3.2 put 27/64 layers of the 27B on the card from a fixed 9 GiB cap less a
-      1.36 GiB vision reserve held for text traffic, 0.62-1.9 tok/s. Open: the head is placed once at
-      load and never moves; MoE tiers still budget through `free_for_new` rather than the joint solver.
+      1.36 GiB vision reserve held for text traffic, 0.62-1.9 tok/s.
+
+      **Verified** *(2026-09-21, the serve image on the real card beside production, qwen3.5-2b)*:
+      moving four layers to another device and precision and back matches fresh loads of each
+      placement with max |Δlogit| = 0 (`tests/real_qwen35_relocate.rs`, host; the card leg needs the
+      CUDA toolkit, which only the image carries). Cold load with production's 9.6 GiB as ambient:
+      capacity 5.9 GiB, 24/24 layers on the card, residency 1.41 of 1.44 GiB, 11.4 tok/s warm. Cold
+      load with a 4 GiB co-tenant: 15/24, then one repair (1 layer, 0.4 s) once the first generation
+      measured its working set. With production grown to 11 GiB plus a 1.5 GiB co-tenant: 0/24 (capacity
+      0.4 GiB); after the co-tenant left, the hold said why (`4.9 ms/token × 300 tokens < 2.3 s of
+      re-reading`), and once traffic raised the horizon the idle watch moved 10 layers back in 2-layer
+      steps of 0.4-1.8 s. That run also showed 10 -> 9 -> 10 churn at the boundary (a placed layer
+      holds more than its plan), fixed by the dead band: improve only with one layer's room spare.
+      Honest limits found: (1) the predicted ms/token counts weight streaming only — on the 2B, whose
+      248k-vocab head outweighs all its layers and sits on the host, moving 10 layers predicted
+      21.2 -> 16.6 ms and measured 5.1 -> 4.2-5.7 tok/s, i.e. nothing; (2) the card's probe measured
+      Q8 at 490 GB/s against Q4 at 86 GB/s (the packed Q4 GEMV is the slow kernel there), so a roomy
+      card now prefers Q8 — worth a kernel look; (3) the 2B all-host at Q4 (VNNI twins lazily
+      repacked from the i8 slab, a second 4-bit rounding) ignores `think: false` and reasons at length.
+      Open: the head is placed once at load and never moves (it should be a part of the solve);
+      MoE tiers still budget through `free_for_new` rather than the joint solver.
 - [ ] **What v0.3.1's review left open on `/logs`** *(2026-09-18)* — none blocked the deploy; each is
       a way the page can still lose or misstate history. (1) **A LOUD flood still evicts the load**: 404s
       stay loud by design, so one scanner sweep of more than 2000 paths on the public shim pushes the
