@@ -199,8 +199,8 @@ fn compare_stages(cfg: &VisionConfig, mmproj: &str, a: &str, b: &str) {
 
     println!("\nstage-by-stage: {} vs {}", short(a), short(b));
     println!(
-        "  {:<11} {:>9} {:>9} {:>11} {:>9}   {:>8}  {}",
-        "stage", "mean", "sd", "l2", "maxabs", "cos(a,b)", ""
+        "  {:<11} {:>9} {:>9} {:>11} {:>9}   {:>8}  ",
+        "stage", "mean", "sd", "l2", "maxabs", "cos(a,b)"
     );
     let mut prev: Option<f64> = None;
     for (x, y) in sa.iter().zip(&sb) {
