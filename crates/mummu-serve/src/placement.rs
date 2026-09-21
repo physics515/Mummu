@@ -473,6 +473,35 @@ fn fixed_precision(e: &TensorEntry) -> Precision {
     e.precisions.keys().copied().max().unwrap_or(Precision::F32)
 }
 
+/// The precision a tensor outside every layer loads at: the embedding, the
+/// output head and the final norm.
+///
+/// NOT [`fixed_precision`]. v0.4.0 sent these through it, so the 27B's head
+/// (`output.weight`, [5120, 248320]) loaded at f32 — a 5.08 GB buffer — and,
+/// following the last layer onto the card, failed to allocate there
+/// (`failed to reserve 5085593600 bytes`); on the host it would have streamed
+/// 5 GB per token instead of 0.7. The rules are the ones the precision mix
+/// applied before: the head is a projection like any other and runs at Q4
+/// (the host's fastest level, and the smallest on the card); the embedding is
+/// a gather that lands at the backend's float dtype either way, so for a
+/// quantization-born source (1-16 bits/param) it is read at f16 — half the
+/// bytes off the disk, holding the source's values well under its own quant
+/// error — and at f32 otherwise.
+fn trunk_precision(e: &TensorEntry, source_bits: f64) -> Precision {
+    match e.role {
+        Role::Embedding
+            if (1.0..16.0).contains(&source_bits) && e.precisions.contains_key(&Precision::F16) =>
+        {
+            Precision::F16
+        }
+        Role::Linear | Role::Expert { .. } => [Precision::Q4, Precision::Q8]
+            .into_iter()
+            .find(|p| e.precisions.contains_key(p))
+            .unwrap_or_else(|| fixed_precision(e)),
+        _ => fixed_precision(e),
+    }
+}
+
 /// One layer's tensors grouped the way the solver chooses them.
 #[derive(Debug, Clone)]
 struct LayerMap {
@@ -663,6 +692,12 @@ pub(super) struct Live {
     crossing_s: f64,
     pub assignment: joint::Assignment,
     improve_wanted: u32,
+    source_bits: f64,
+    /// The head's bytes on the card at its load precision, and whether the
+    /// load put it there (it follows the last layer, and its bytes were
+    /// reserved in the solve that decided so).
+    head_card_bytes: u64,
+    pub head_on_card: bool,
 }
 
 pub(super) static LIVE: Mutex<Option<Live>> = Mutex::new(None);
@@ -672,7 +707,13 @@ impl Live {
     pub fn measure(pack_dir: &Path, backend: BackendChoice) -> Result<Self, String> {
         let pack = Pack::open(pack_dir)?;
         let cfg = qwen35::Qwen35Config::from_gguf(&pack.header()?)?;
-        let ceiling = QuantPolicy::ceiling_for_source(super::source_bits_per_param(&pack));
+        let source_bits = super::source_bits_per_param(&pack);
+        let ceiling = QuantPolicy::ceiling_for_source(source_bits);
+        let head_card_bytes = pack.entry("output.weight").map_or(0, |e| {
+            let bytes = blob_bytes(e, trunk_precision(e, source_bits)).unwrap_or(0);
+            // The card's pool padding, as for the layers.
+            (bytes as f64 * 1.05) as u64
+        });
         let maps = layer_maps(&pack, cfg.num_layers, ceiling);
         let host_dev = mummu::backend::cpu_device();
         let host = measure_device(
@@ -735,6 +776,9 @@ impl Live {
                     .collect(),
             },
             improve_wanted: 0,
+            source_bits,
+            head_card_bytes,
+            head_on_card: false,
         })
     }
 
@@ -861,7 +905,7 @@ impl Live {
                     self.precision_for(l, c, e)
                 }
             }
-            _ => fixed_precision(e),
+            _ => trunk_precision(e, self.source_bits),
         }
     }
 
@@ -968,8 +1012,23 @@ pub(super) fn plan_load(pack_dir: &Path, backend: BackendChoice) -> Result<Live,
     let mut live = Live::measure(pack_dir, backend)?;
     let (ctx, tower) = request().unwrap_or((idle_context(), false));
     let reading = card(backend);
-    let pb = live.problem(ctx, tower, reading.as_ref());
-    let out = joint::solve(&pb);
+    // The head follows the last layer. Solve with its bytes reserved on the
+    // card first; if the last layer does not land there after all, the head
+    // stays on the host and the reservation is given back to layers.
+    let mut pb = live.problem(ctx, tower, reading.as_ref());
+    let with_head = pb.devices.len() > 1 && live.head_card_bytes > 0;
+    if with_head {
+        pb.devices[1].fixed += live.head_card_bytes;
+    }
+    let mut out = joint::solve(&pb);
+    let last_on_card = out.assignment.layers.last().is_some_and(|c| c.device == 1);
+    if with_head && !last_on_card {
+        pb.devices[1].fixed -= live.head_card_bytes;
+        out = joint::solve(&pb);
+        // Freed room may have pulled the last layer on after all; the head
+        // was not reserved for, so it stays home.
+    }
+    live.head_on_card = with_head && last_on_card;
     if !out.feasible {
         eprintln!(
             "[mummu-serve] placement: nothing fits everywhere (host {:.1} GiB needed of {:.1}) — loading anyway at the fastest host levels",
