@@ -439,6 +439,72 @@ pub(crate) fn json_response(status: u16, body: serde_json::Value) -> Response {
         .into_response()
 }
 
+/// How long a buffered answer may take before the connection needs
+/// reassuring. Everything that fails fast — validation, an unknown model,
+/// the 503 while a model loads — settles far inside this, so those keep
+/// their real status code.
+const KEEPALIVE_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Gap between keep-alive bytes once padding has started. Comfortably
+/// under every proxy timeout worth caring about.
+const KEEPALIVE_TICK: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Run `work` and answer with its JSON, keeping the connection alive if it
+/// takes a while.
+///
+/// A non-streaming completion sends nothing at all until the whole
+/// generation is done. Behind a proxy with an origin-response timeout that
+/// is indistinguishable from a dead origin: measured live 2026-09-21, a
+/// phone request through Cloudflare was cut at exactly 125.0 s having
+/// received 0 bytes, and the app showed HTTP 524. The generation was fine
+/// and still running.
+///
+/// So a slow answer starts its body immediately and drips whitespace until
+/// the real object is ready. JSON ignores whitespace before a value, so the
+/// response is still exactly one object and every parser accepts it
+/// unchanged.
+///
+/// **The trade-off, stated because it is real:** the status code goes out
+/// with the headers, so an answer that takes longer than
+/// [`KEEPALIVE_GRACE`] is committed to 200 before its outcome is known. A
+/// generation that then fails answers 200 with an error *body* rather than
+/// a 5xx. Racing the grace period first is what keeps that narrow — every
+/// fast failure still gets its proper status, and only a request already
+/// past 20 seconds of real work can land in it.
+pub(crate) async fn keepalive_json<F>(work: F) -> Response
+where
+    // `'static` because the padded path hands the future to a response body,
+    // which outlives this call.
+    F: Future<Output = (u16, serde_json::Value)> + Send + 'static,
+{
+    let mut work = Box::pin(work);
+    tokio::select! {
+        (status, body) = &mut work => json_response(status, body),
+        () = tokio::time::sleep(KEEPALIVE_GRACE) => {
+            let stream = async_stream::stream! {
+                loop {
+                    tokio::select! {
+                        (_status, body) = &mut work => {
+                            yield Ok::<String, Infallible>(body.to_string());
+                            break;
+                        }
+                        () = tokio::time::sleep(KEEPALIVE_TICK) => {
+                            // A space: legal JSON leading whitespace, and
+                            // one byte is enough to prove the origin lives.
+                            yield Ok(" ".to_string());
+                        }
+                    }
+                }
+            };
+            (
+                [(header::CONTENT_TYPE, "application/json")],
+                axum::body::Body::from_stream(stream),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// Parse a JSON body, or hand back the 400 response to return as-is. Keeps
 /// the sync server's error wire format (`{"error": "bad json: …"}`).
 pub(crate) fn parse_json<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, Box<Response>> {

@@ -766,23 +766,28 @@ where
         });
         return ndjson_response(rx, Some(inflight));
     }
-    // Non-stream: run to completion, answer with one object.
-    let _inflight = InFlight::enter();
-    let sink = ShimSink {
-        tx: None,
-        model: model.clone(),
-        wrap,
-    };
-    match recovery::contain(&model, run(sink)).await {
-        Ok(r) => {
-            let text = r.text.clone();
-            json_response(200, finish(&model, &text, &r, started))
+    // Non-stream: run to completion, answer with one object — under the
+    // keep-alive, because a buffered answer that sends nothing for minutes
+    // is what a proxy reports as a dead origin (see `crate::keepalive_json`).
+    crate::keepalive_json(async move {
+        let _inflight = InFlight::enter();
+        let sink = ShimSink {
+            tx: None,
+            model: model.clone(),
+            wrap,
+        };
+        match recovery::contain(&model, run(sink)).await {
+            Ok(r) => {
+                let text = r.text.clone();
+                (200, finish(&model, &text, &r, started))
+            }
+            Err(e) => {
+                eprintln!("[mummu-serve] shim chat {model}: {e}");
+                (e.http_status(), error_line(&e))
+            }
         }
-        Err(e) => {
-            eprintln!("[mummu-serve] shim chat {model}: {e}");
-            json_response(e.http_status(), error_line(&e))
-        }
-    }
+    })
+    .await
 }
 
 pub(crate) async fn chat(body: Bytes) -> Response {
