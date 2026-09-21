@@ -1569,6 +1569,9 @@ fn build_layered_qwen35(
         .map_err(|e| e.to_string())?;
     let secs = started.elapsed().as_secs_f32();
     eprintln!("[mummu-serve] layered model resident in {secs:.0}s");
+    // The load is the first measurement of what re-reading a layer costs,
+    // which is what an improvement has to pay for.
+    placement::note_disk(live.planned_disk_bytes(), f64::from(secs));
     certify_residency(main, placed, vram_before);
     // The bytes are down; what follows is CPU work on weights already in RAM,
     // and it has no count of its own — so the bar goes indeterminate rather

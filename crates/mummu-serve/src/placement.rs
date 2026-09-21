@@ -174,6 +174,9 @@ fn guard(ambient: u64) -> u64 {
         Watermark::new(WatermarkConfig {
             floor_bytes: 1 << 30,
             frag_slack_bytes: 512 << 20,
+            // Ten minutes of 5 s polls: long enough to cover a co-tenant's
+            // bursts, short enough that one that left gives the card back.
+            window: 120,
             ..WatermarkConfig::default()
         })
     });
@@ -269,7 +272,7 @@ fn horizon_tokens() -> f64 {
 /// 150 MB/s until a load or a move measures it).
 static DISK_S_PER_BYTE: Mutex<f64> = Mutex::new(1.0 / 150e6);
 
-fn note_disk(bytes: u64, secs: f64) {
+pub(super) fn note_disk(bytes: u64, secs: f64) {
     if bytes < (64 << 20) || secs <= 0.0 {
         return;
     }
@@ -764,6 +767,24 @@ impl Live {
                             .map_or(1.0, |x| x.1);
                         (b as f64 * r) as u64
                     })
+                    .sum::<u64>()
+                    + m.fixed_bytes
+            })
+            .sum()
+    }
+
+    /// Pack bytes the placement reads — what a load of it costs the disk.
+    pub fn planned_disk_bytes(&self) -> u64 {
+        self.assignment
+            .layers
+            .iter()
+            .zip(&self.maps)
+            .filter(|(c, _)| !c.levels.is_empty())
+            .map(|(c, m)| {
+                m.parts
+                    .iter()
+                    .zip(&c.levels)
+                    .map(|(p, &q)| p.levels.iter().find(|(x, _)| *x == q).map_or(0, |x| x.1))
                     .sum::<u64>()
                     + m.fixed_bytes
             })
