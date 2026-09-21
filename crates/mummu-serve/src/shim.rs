@@ -666,7 +666,8 @@ pub(crate) fn plan(
         Err(e) => return Err(Box::new(json_response(500, json!({"error": e})))),
     };
     let messages = with_placeholders(messages, &marks);
-    let turns = to_turns(&messages).map_err(|e| json_response(400, json!({"error": e})))?;
+    let turns = to_turns(&messages, spec.architecture)
+        .map_err(|e| json_response(400, json!({"error": e})))?;
     let opts = options
         .sampler()
         .map_err(|e| json_response(400, json!({"error": e})))?;
@@ -1362,11 +1363,12 @@ mod tests {
         let root = scratch_root("caps");
         for spec in mummu::registry::catalog() {
             let expected: &[&str] = match spec.architecture {
-                Architecture::Qwen2 => &["completion", "tools"],
+                // LFM2's Pythonic calls are read back like Hermes ones, in
+                // both builds (see `engine::preserved_tokens`).
+                Architecture::Qwen2 | Architecture::Lfm2 => &["completion", "tools"],
                 Architecture::Qwen3 | Architecture::Qwen35 => &["completion", "tools", "thinking"],
-                // LFM2's calls are rendered but not read back, and OLMoE's
-                // template has no tool convention at all.
-                Architecture::Lfm2 | Architecture::Olmoe => &["completion"],
+                // OLMoE's Tulu template has no tool convention at all.
+                Architecture::Olmoe => &["completion"],
                 Architecture::MiniLm => &["embedding"],
             };
             assert_eq!(capabilities(&spec, &root), expected, "{}", spec.name);
@@ -1473,8 +1475,102 @@ mod tests {
         assert_eq!(messages[1].tool_calls, [weather_call()]);
         assert_eq!(messages[3].content, "", "null content is empty content");
         assert_eq!(messages[3].tool_calls, [weather_call()]);
-        let turns = to_turns(&messages[..3]).expect("the loop renders");
+        let turns = to_turns(&messages[..3], Architecture::Qwen3).expect("the loop renders");
         assert_eq!(turns.len(), 3);
+    }
+
+    /// The model is shown the call it made the way it made it: Hermes JSON
+    /// for Qwen, LFM's Pythonic list for LFM2 — which is shown a turn it
+    /// never wrote if it gets Hermes, with or without tools on the request.
+    #[test]
+    fn a_replayed_call_is_written_back_in_the_familys_own_syntax() {
+        let messages: Vec<ChatMessage> = serde_json::from_value(json!([
+            {"role": "user", "content": "weather in Paris?"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"function": {"name": "get_weather", "arguments": {"city": "Paris"}}},
+            ]},
+            {"role": "tool", "content": "18C, clear"},
+        ]))
+        .expect("messages parse");
+        let lfm = to_turns(&messages, Architecture::Lfm2).expect("LFM2 replays");
+        assert_eq!(
+            lfm[1].content,
+            "<|tool_call_start|>[get_weather(city=\"Paris\")]<|tool_call_end|>"
+        );
+        assert_eq!(lfm[1].tool_calls, [weather_call()]);
+        let qwen = to_turns(&messages, Architecture::Qwen3).expect("Qwen3 replays");
+        assert_eq!(
+            qwen[1].content,
+            mummu::chat::Turn::assistant_tool_calls(&[weather_call()]).content
+        );
+        // No convention of its own: Hermes, which at least reads as a call.
+        let olmoe = to_turns(&messages, Architecture::Olmoe).expect("renders");
+        assert_eq!(olmoe[1].content, qwen[1].content);
+    }
+
+    /// A replayed call is whatever the client sent, and the renderers assert
+    /// their input — an LFM2 history with a string for arguments panicked
+    /// mid-request. Each is refused as the client's mistake instead, for
+    /// every family, and a JSON-encoded object (OpenAI's spelling) is read.
+    #[test]
+    fn a_replayed_call_the_renderers_cannot_take_is_refused_not_panicked_on() {
+        let with_calls = |calls: serde_json::Value| -> Vec<ChatMessage> {
+            serde_json::from_value(json!([
+                {"role": "user", "content": "weather in Paris?"},
+                {"role": "assistant", "tool_calls": calls},
+                {"role": "tool", "content": "18C, clear"},
+            ]))
+            .expect("messages parse")
+        };
+        // As deep as the Pythonic renderer goes, and one level past it.
+        let mut at_bound = json!("bottom");
+        for _ in 0..mummu::chat::MAX_VALUE_DEPTH {
+            at_bound = json!([at_bound]);
+        }
+        let deep = json!([at_bound.clone()]);
+        let too_many: Vec<_> = (0..=mummu::chat::MAX_TOOL_CALLS)
+            .map(|_| json!({"name": "get_weather", "arguments": {}}))
+            .collect();
+        let refused = [
+            (
+                json!([{"name": "get_weather", "arguments": "{not json"}]),
+                "not JSON",
+            ),
+            (
+                json!([{"name": "get_weather", "arguments": "\"Paris\""}]),
+                "must be an object",
+            ),
+            (
+                json!([{"name": "get_weather", "arguments": ["Paris"]}]),
+                "must be an object",
+            ),
+            (json!([{"name": "", "arguments": {}}]), "no name"),
+            (
+                json!([{"name": "f", "arguments": {"x": deep}}]),
+                "deeper than",
+            ),
+            (json!(too_many), "more than"),
+        ];
+        for arch in [
+            Architecture::Qwen2,
+            Architecture::Qwen3,
+            Architecture::Lfm2,
+            Architecture::Olmoe,
+        ] {
+            for (calls, why) in &refused {
+                let e = to_turns(&with_calls(calls.clone()), arch).expect_err(why);
+                assert!(e.contains(why), "{arch:?}: {e}");
+                assert!(e.starts_with("message 1: "), "{arch:?}: {e}");
+            }
+            let encoded = with_calls(json!([
+                {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"},
+                {"name": "get_weather", "arguments": null},
+                {"name": "f", "arguments": {"x": at_bound.clone()}},
+            ]));
+            let turns = to_turns(&encoded, arch).expect("a JSON-encoded object is read");
+            assert_eq!(turns[1].tool_calls[0], weather_call(), "{arch:?}");
+            assert_eq!(turns[1].tool_calls.len(), 3, "{arch:?}");
+        }
     }
 
     /// Streamed, a call goes out the way ollama sends one: the markup never

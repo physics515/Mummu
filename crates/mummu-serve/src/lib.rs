@@ -1066,24 +1066,41 @@ impl ChatRequest {
     }
 }
 
-pub(crate) fn to_turns(messages: &[ChatMessage]) -> Result<Vec<Turn>, String> {
+/// A request's messages as `arch`'s renderer takes them.
+///
+/// The family matters for one kind of turn: an assistant turn replaying the
+/// calls the model made is written back in the family's own call syntax
+/// (see `engine::CallSyntax::replay`) — an LFM model shown Hermes JSON for
+/// its own request is shown a turn it never wrote.
+pub(crate) fn to_turns(
+    messages: &[ChatMessage],
+    arch: mummu::registry::Architecture,
+) -> Result<Vec<Turn>, String> {
     if messages.is_empty() {
         return Err("messages must be non-empty".into());
     }
     if messages.len() > MAX_TURNS {
         return Err(format!("more than {MAX_TURNS} messages"));
     }
+    // A family with no call syntax of its own is never offered tools; a
+    // history that carries calls anyway gets them in Hermes, which at
+    // least reads as what it is.
+    let replay = engine::tool_calls(arch).map_or(
+        Turn::assistant_tool_calls as fn(&[mummu::chat::ToolCall]) -> Turn,
+        |c| c.replay,
+    );
     let turns: Vec<Turn> = messages
         .iter()
-        .map(|m| match m.role.as_str() {
+        .enumerate()
+        .map(|(i, m)| match m.role.as_str() {
             "system" => Ok(Turn::system(m.content.clone())),
             "user" => Ok(Turn::user(m.content.clone())),
-            // An assistant turn that made calls is re-rendered in the
-            // family's own wire format, so the model sees its own request
-            // and not a blank turn before the answer comes back.
-            "assistant" if !m.tool_calls.is_empty() => {
-                Ok(Turn::assistant_tool_calls(&m.tool_calls))
-            }
+            // An assistant turn that made calls keeps them, so the model
+            // sees its own request and not a blank turn before the answer
+            // comes back.
+            "assistant" if !m.tool_calls.is_empty() => replayable(&m.tool_calls)
+                .map(|calls| replay(&calls))
+                .map_err(|e| format!("message {i}: {e}")),
             "assistant" => Ok(Turn::assistant(m.content.clone())),
             // The second half of a tool loop: the client ran the function
             // and is handing back its result. The family renderer decides
@@ -1237,6 +1254,67 @@ impl Rejection {
     }
 }
 
+/// A client's replayed calls, checked against what the renderers assume —
+/// they assert it, and a replayed call is whatever the client sent.
+///
+/// Arguments must be an object, as ollama's own API types them; one that
+/// arrives JSON-encoded in a string, OpenAI's spelling, is decoded. `null`
+/// is a call with no arguments.
+fn replayable(calls: &[mummu::chat::ToolCall]) -> Result<Vec<mummu::chat::ToolCall>, String> {
+    use mummu::chat::{MAX_TOOL_CALLS, MAX_VALUE_DEPTH};
+    use serde_json::Value;
+    /// Every value within the Pythonic renderer's nesting bound, counted
+    /// the way it counts: an argument's value is depth 0.
+    fn shallow(v: &Value, depth: usize) -> bool {
+        depth <= MAX_VALUE_DEPTH
+            && match v {
+                Value::Array(items) => items.iter().all(|v| shallow(v, depth + 1)),
+                Value::Object(map) => map.values().all(|v| shallow(v, depth + 1)),
+                _ => true,
+            }
+    }
+    if calls.len() > MAX_TOOL_CALLS {
+        return Err(format!("more than {MAX_TOOL_CALLS} tool calls in one turn"));
+    }
+    calls
+        .iter()
+        .map(|c| {
+            if c.name.trim().is_empty() {
+                return Err("a replayed tool call has no name".to_string());
+            }
+            let arguments = match &c.arguments {
+                Value::String(s) => serde_json::from_str(s).map_err(|e| {
+                    format!(
+                        "tool call {:?}: arguments are a string that is not JSON: {e}",
+                        c.name
+                    )
+                })?,
+                other => other.clone(),
+            };
+            match &arguments {
+                Value::Object(map) if map.values().all(|v| shallow(v, 0)) => {}
+                Value::Object(_) => {
+                    return Err(format!(
+                        "tool call {:?}: arguments nest deeper than {MAX_VALUE_DEPTH} levels",
+                        c.name
+                    ));
+                }
+                Value::Null => {}
+                _ => {
+                    return Err(format!(
+                        "tool call {:?}: arguments must be an object",
+                        c.name
+                    ));
+                }
+            }
+            Ok(mummu::chat::ToolCall {
+                name: c.name.clone(),
+                arguments,
+            })
+        })
+        .collect()
+}
+
 /// Validate a chat request and start generating, returning the stream of
 /// events. Shared by the SSE and WebSocket endpoints so the two cannot drift.
 ///
@@ -1248,10 +1326,6 @@ fn start_chat(parsed: ChatRequest) -> Result<ChatStream, Rejection> {
     if recovery::restarting() {
         return Err(reject(503, recovery::restarting_message().to_owned()));
     }
-    let turns = to_turns(&parsed.messages).map_err(|e| reject(400, e))?;
-    let opts = sampler_options(&parsed.options).map_err(|e| reject(400, e))?;
-    let max_tokens = parsed.max_tokens();
-
     let root = models_root();
     let manager = ModelManager::new(root.clone());
     let Some(spec) = manager
@@ -1262,6 +1336,9 @@ fn start_chat(parsed: ChatRequest) -> Result<ChatStream, Rejection> {
     else {
         return Err(reject(404, format!("unknown model {:?}", parsed.model)));
     };
+    let turns = to_turns(&parsed.messages, spec.architecture).map_err(|e| reject(400, e))?;
+    let opts = sampler_options(&parsed.options).map_err(|e| reject(400, e))?;
+    let max_tokens = parsed.max_tokens();
     if !engine::is_installed(&spec, &root) {
         return Err(reject(
             409,
