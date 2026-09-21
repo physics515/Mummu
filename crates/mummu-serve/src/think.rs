@@ -17,8 +17,9 @@
 //! back rather than emitted and regretted.
 //!
 //! The same machinery holds a family's tool-call markup back from a streamed
-//! ollama answer, whose calls go out structured once they are whole (see
-//! `crate::shim`) — [`Filter::spans`] with the family's tags.
+//! answer on both surfaces, whose calls go out structured once they are
+//! whole (see `crate::shim` and `crate::openai`): [`Filter::spans`] with the
+//! family's tags, and [`Filter::settle`] for what is owed at the end.
 
 const OPEN: &str = "<think>";
 const CLOSE: &str = "</think>";
@@ -37,7 +38,7 @@ pub(crate) struct Filter {
     /// Everything that was suppressed, in order.
     thought: String,
     /// The same, tags and all: what a caller that cannot use the spans after
-    /// all hands back as ordinary text.
+    /// all hands back as ordinary text (see [`Filter::settle`]).
     withheld: String,
 }
 
@@ -130,10 +131,19 @@ impl Filter {
         self.inside
     }
 
-    /// Every span held back so far, verbatim — tags included, and an
-    /// unclosed one's tail once [`Self::finish`] has run.
-    pub(crate) fn withheld(&self) -> &str {
-        &self.withheld
+    /// End a stream that held spans back to use them: the text still owed.
+    ///
+    /// That is the partial tag at the very end, which was ordinary text all
+    /// along, and, when the spans went unused (`used` false: nothing in them
+    /// parsed), every span held back, verbatim and tags included, so nothing
+    /// the model wrote goes missing.
+    pub(crate) fn settle(&mut self, used: bool) -> String {
+        let rest = self.finish();
+        if used {
+            rest
+        } else {
+            format!("{}{rest}", self.withheld)
+        }
     }
 }
 
@@ -212,7 +222,7 @@ mod tests {
         .map(|d| f.push(d))
         .collect();
         assert_eq!(shown + &f.finish(), "Sure.  done");
-        assert_eq!(f.withheld(), "<tool_call>{\"name\": \"x\"}</tool_call>");
+        assert_eq!(f.withheld, "<tool_call>{\"name\": \"x\"}</tool_call>");
         // A <think> tag means nothing to a filter for other tags.
         assert_eq!(f.push("<think>kept</think>"), "<think>kept</think>");
     }
@@ -222,7 +232,28 @@ mod tests {
         let mut f = Filter::spans("<tool_call>", "</tool_call>");
         assert_eq!(f.push("<tool_call>{\"name\": \"cut off"), "");
         assert_eq!(f.finish(), "");
-        assert_eq!(f.withheld(), "<tool_call>{\"name\": \"cut off");
+        assert_eq!(f.withheld, "<tool_call>{\"name\": \"cut off");
+    }
+
+    /// What a stream that held calls back still owes at the end: when the
+    /// spans were used, only a partial tag left dangling; when they were not,
+    /// every span as well, so the client still sees all the model wrote.
+    #[test]
+    fn settling_releases_the_spans_only_when_they_went_unused() {
+        let deltas = ["a <tool_call>{\"name\": \"x\"}</tool_call> b <tool_"];
+        let mut used = Filter::spans("<tool_call>", "</tool_call>");
+        assert_eq!(used.push(deltas[0]), "a  b ");
+        assert_eq!(
+            used.settle(true),
+            "<tool_",
+            "a dangling partial tag is text"
+        );
+        let mut unused = Filter::spans("<tool_call>", "</tool_call>");
+        assert_eq!(unused.push(deltas[0]), "a  b ");
+        assert_eq!(
+            unused.settle(false),
+            "<tool_call>{\"name\": \"x\"}</tool_call><tool_"
+        );
     }
 
     #[test]

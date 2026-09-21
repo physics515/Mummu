@@ -903,13 +903,7 @@ fn tool_tail(
     held: &mut Filter,
     r: &mut engine::ChatResult,
 ) -> Vec<serde_json::Value> {
-    // A partial tag at the very end was ordinary text all along.
-    let rest = held.finish();
-    let text = if r.tool_calls.is_empty() {
-        format!("{}{rest}", held.withheld())
-    } else {
-        rest
-    };
+    let text = held.settle(!r.tool_calls.is_empty());
     let mut frames = Vec::new();
     if !text.is_empty() {
         frames.push(wrap(model, &text));
