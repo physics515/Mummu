@@ -666,14 +666,10 @@ fn load_any(
 /// (`<|user|>` / `<|assistant|>` behind an `<|endoftext|>` BOS), which has no
 /// hardcoded renderer in the library yet, so it is spelled out here in the
 /// shape `tests/real_olmoe.rs` decodes with.
-fn render_prompt(arch: Architecture, turns: &[Turn]) -> Result<String, String> {
-    render_prompt_with_tools(arch, &[], turns)
-}
-
-/// [`render_prompt`] advertising `tools` to the model.
 ///
-/// Empty `tools` renders exactly as before — the tool block is what the
-/// family's template emits only when there is something to put in it.
+/// `tools` are advertised to the model. Empty `tools` renders the plain chat
+/// prompt — the tool block is what the family's template emits only when
+/// there is something to put in it.
 fn render_prompt_with_tools(
     arch: Architecture,
     tools: &[mummu::chat::ToolSpec],
@@ -734,6 +730,7 @@ pub struct ChatResult {
 /// Callers run this under [`crate::recovery::contain`], which is what turns a
 /// panic in here — a GPU failure surfacing as a failed read, say — into an
 /// error the client is actually sent.
+#[allow(clippy::too_many_arguments)] // one request's worth of parameters, for every surface
 pub async fn run_chat(
     spec: &ModelSpec,
     models_root: &Path,
@@ -3680,8 +3677,7 @@ fn plan_fresh(spec: &ModelSpec, models_root: &Path) -> Result<FitPlan, String> {
     })
 }
 
-#[allow(clippy::too_many_arguments)] // one call site, mirrors the plan
-#[allow(clippy::too_many_arguments)] // one request's worth of parameters
+#[allow(clippy::too_many_arguments)] // one call site: one request's worth of parameters
 async fn drive(
     slot: &ModelSlot<Loaded>,
     spec: &ModelSpec,
@@ -4973,11 +4969,6 @@ fn mmproj_path(spec: &ModelSpec, models_root: &Path) -> Option<std::path::PathBu
     // Deterministic when a directory holds both an F16 and a BF16 tower.
     found.sort();
     found.into_iter().next()
-}
-
-/// Is this model able to take images at all?
-pub fn supports_vision(spec: &ModelSpec, models_root: &Path) -> bool {
-    spec.architecture == Architecture::Qwen35 && mmproj_path(spec, models_root).is_some()
 }
 
 /// On-device bytes a model's vision tower will occupy, or 0 when it has

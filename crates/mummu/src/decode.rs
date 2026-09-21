@@ -373,8 +373,8 @@ pub async fn generate_loop(
                     // Sampling already reads the vocabulary back, so masking
                     // inside the top-k is the whole added cost.
                     let v = read_logits(logits).await?;
-                    sample_id_filtered(&v, opts, &mut rng, &legal)
-                        .or_else(|| best_allowed(&v, &legal))
+                    sample_id_filtered(&v, opts, &mut rng, legal)
+                        .or_else(|| best_allowed(&v, legal))
                         .ok_or_else(|| no_legal_token(past))?
                 }
             }

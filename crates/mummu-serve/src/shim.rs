@@ -457,7 +457,14 @@ impl OllamaOptions {
 #[serde(untagged)]
 pub(crate) enum OllamaFormat {
     Named(String),
-    Schema(serde_json::Value),
+    Schema(
+        #[expect(
+            dead_code,
+            reason = "refused today; the schema to constrain to once the ROADMAP's \
+                      grammar-constrained decoding (JSON Schema via llguidance) lands"
+        )]
+        serde_json::Value,
+    ),
 }
 
 impl OllamaFormat {
