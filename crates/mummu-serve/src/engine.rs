@@ -4131,7 +4131,9 @@ async fn generate_on(
     // A reasoning model opens with `<think>…</think>`. Unless the request
     // asked for it, that is suppressed here — between the decoder and the
     // client — so it never reaches a sink and never counts against what the
-    // caller sees. `think` passes it through untouched.
+    // caller sees, and the blank line after it goes with it. `think` passes
+    // it through untouched. What the filter still holds when the model stops
+    // goes out in `conclude`.
     let mut thinking = (!think).then(crate::think::Filter::default);
     // Tell the bounded head how many candidates THIS request's
     // sampler will consult: greedy reads only the argmax (k = 1,
@@ -4286,24 +4288,8 @@ async fn generate_on(
         .await?
     };
 
-    let mut text = decode_answer(&m.tokenizer, &out, &keep).map_err(|e| format!("decode: {e}"))?;
-    if !think {
-        // The buffered path never went through the streaming filter, so it
-        // is filtered whole here. A block the token cap cut short leaves no
-        // answer at all, which is worth saying rather than returning "".
-        let mut f = crate::think::Filter::default();
-        let mut visible = f.push(&text);
-        visible.push_str(&f.finish());
-        if visible.trim().is_empty() && f.truncated() {
-            return Err(format!(
-                "the model spent all {max_tokens} tokens inside a <think> block and never \
-                 reached an answer — raise the token limit, or set \"think\": true to see the \
-                 reasoning"
-            )
-            .into());
-        }
-        text = visible;
-    }
+    let text = decode_answer(&m.tokenizer, &out, &keep).map_err(|e| format!("decode: {e}"))?;
+    let text = conclude(thinking, text, max_tokens, on_delta)?;
     let elapsed_ms = start.elapsed().as_millis();
     // Every completed generation is one placement's worth of evidence.
     observe_placement(out.len(), elapsed_ms);
@@ -4339,6 +4325,47 @@ async fn generate_on(
         timings,
         tool_calls: Vec::new(),
     })
+}
+
+/// The answer, once the model has stopped: the stream is sent what its
+/// think filter (`streamed`, present when the request did not ask to see the
+/// thinking) still holds, and the whole `text` comes back filtered the same
+/// way, for the buffered answer and the result.
+///
+/// The filter holds back whatever could still become a tag, so an answer
+/// ending on `<` or `<th` still has those characters in it when the model
+/// stops; the buffered text always had them, and a streamed client gets
+/// them here. The buffered text never went through the streaming filter, so
+/// it is filtered whole — by the same rules, which do not depend on how the
+/// text was cut into deltas, so the two agree. A block the token cap cut
+/// short leaves no answer at all, which is worth saying rather than
+/// returning "".
+fn conclude(
+    streamed: Option<crate::think::Filter>,
+    text: String,
+    max_tokens: usize,
+    on_delta: &mut impl FnMut(&str) -> ControlFlow<()>,
+) -> Result<String, ChatError> {
+    let Some(mut streamed) = streamed else {
+        return Ok(text);
+    };
+    let held = streamed.finish();
+    if !held.is_empty() {
+        // The last delta: a client that hung up has nothing left to stop.
+        let _ = on_delta(&held);
+    }
+    let mut f = crate::think::Filter::default();
+    let mut visible = f.push(&text);
+    visible.push_str(&f.finish());
+    if visible.trim().is_empty() && f.truncated() {
+        return Err(format!(
+            "the model spent all {max_tokens} tokens inside a <think> block and never \
+             reached an answer — raise the token limit, or set \"think\": true to see the \
+             reasoning"
+        )
+        .into());
+    }
+    Ok(visible)
 }
 
 /// Load `spec` into the slot: the closure `drive` hands `acquire_valid`,
@@ -5458,5 +5485,84 @@ mod template_tests {
         lift_tool_calls(Architecture::Qwen3, &mut r);
         assert!(r.tool_calls.is_empty());
         assert_eq!(r.text, only);
+    }
+}
+
+#[cfg(test)]
+mod conclude_tests {
+    use std::ops::ControlFlow;
+
+    use super::conclude;
+    use crate::think::Filter;
+
+    /// One answer the way `generate_on` delivers it: each delta through the
+    /// stream's think filter (off when `think` is set), as the decode
+    /// callback does, then `conclude`. What the stream was sent, and what
+    /// came back for the buffered answer.
+    fn answer(deltas: &[&str], think: bool) -> (String, Result<String, String>) {
+        let mut streamed = String::new();
+        let mut on_delta = |d: &str| {
+            streamed.push_str(d);
+            ControlFlow::Continue(())
+        };
+        let mut thinking = (!think).then(Filter::default);
+        for d in deltas {
+            let visible = match thinking.as_mut() {
+                Some(f) => f.push(d),
+                None => (*d).to_owned(),
+            };
+            if !visible.is_empty() {
+                let _ = on_delta(&visible);
+            }
+        }
+        let buffered =
+            conclude(thinking, deltas.concat(), 64, &mut on_delta).map_err(|e| e.message);
+        (streamed, buffered)
+    }
+
+    /// Measured live on 2026-09-21 against qwen3-0.6b: `"\n\n42"`, streamed
+    /// and buffered.
+    #[test]
+    fn a_think_off_answer_does_not_open_on_the_blank_line_after_the_block() {
+        let deltas = ["<think>", "\n", "Okay.", "\n", "</think>", "\n\n", "4", "2"];
+        let (streamed, buffered) = answer(&deltas, false);
+        assert_eq!(streamed, "42");
+        assert_eq!(buffered.as_deref(), Ok("42"));
+    }
+
+    /// The filter holds back what could still become a tag; the stream used
+    /// to lose it when the model stopped there, though the buffered text had
+    /// it.
+    #[test]
+    fn a_streamed_answer_gets_what_the_filter_held_when_the_model_stopped() {
+        for tail in ["<", "<th"] {
+            let (streamed, buffered) = answer(&["<think>x</think>", "\n\n", "5 ", tail], false);
+            let whole = format!("5 {tail}");
+            assert_eq!(streamed, whole);
+            assert_eq!(buffered, Ok(whole));
+        }
+    }
+
+    #[test]
+    fn an_answer_with_no_block_keeps_its_leading_whitespace() {
+        let (streamed, buffered) = answer(&["\n\n", "  x"], false);
+        assert_eq!(streamed, "\n\n  x");
+        assert_eq!(buffered.as_deref(), Ok("\n\n  x"));
+    }
+
+    #[test]
+    fn a_block_the_token_cap_cut_off_is_an_error_not_an_empty_answer() {
+        let (streamed, buffered) = answer(&["<think>", "still going"], false);
+        assert_eq!(streamed, "");
+        let err = buffered.expect_err("no answer was reached");
+        assert!(err.contains("all 64 tokens"), "{err}");
+    }
+
+    #[test]
+    fn think_on_passes_the_text_through_untouched() {
+        let deltas = ["<think>x</think>", "\n\n42 <"];
+        let (streamed, buffered) = answer(&deltas, true);
+        assert_eq!(streamed, deltas.concat());
+        assert_eq!(buffered, Ok(deltas.concat()));
     }
 }
