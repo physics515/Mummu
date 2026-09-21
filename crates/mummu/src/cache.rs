@@ -184,6 +184,21 @@ impl<T> ModelSlot<T> {
         }
     }
 
+    /// Run `f` on the resident model **only if the slot is free right now**:
+    /// `None` when it is empty or a load/generation holds it.
+    ///
+    /// For background maintenance that must never make a request wait for
+    /// it to start and must never run under one — mummu-serve's placement
+    /// rebalancer moves layers between devices this way, at idle moments.
+    /// It blocks the slot for as long as `f` runs, so `f` should be short or
+    /// chunked; a request arriving meanwhile waits in `acquire` as it would
+    /// behind a generation.
+    pub fn try_with_mut<R>(&self, f: impl FnOnce(&Path, &mut T) -> R) -> Option<R> {
+        let mut guard = self.inner.try_lock().ok()?;
+        let entry = guard.as_mut()?;
+        Some(f(&entry.key, &mut entry.value))
+    }
+
     /// The checkpoint dir currently loaded, if any — for settings UIs.
     ///
     /// A **peek**: `None` when the slot is empty *or* busy serving a
@@ -252,6 +267,20 @@ impl<T> std::ops::Deref for SlotGuard<'_, T> {
         &self
             .guard
             .as_ref()
+            .expect("a slot guard always holds a loaded model")
+            .value
+    }
+}
+
+/// Mutable access for the holder — a request that must re-place the model
+/// before it runs (mummu-serve moves layers off the card when this request's
+/// context would not fit beside them). Holding the guard is what makes that
+/// safe: nothing else can be generating on the model.
+impl<T> std::ops::DerefMut for SlotGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self
+            .guard
+            .as_mut()
             .expect("a slot guard always holds a loaded model")
             .value
     }

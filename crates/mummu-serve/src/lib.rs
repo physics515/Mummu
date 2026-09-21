@@ -295,6 +295,9 @@ where
     // guards against arrives from OTHER processes, so it must not depend on
     // this one receiving traffic. See `engine::spawn_host_pressure_watch`.
     engine::spawn_host_pressure_watch();
+    // And the card: which layers live there, at what precision, follows what
+    // the card has free — also without waiting for traffic.
+    engine::spawn_placement_watch();
     // And take the first memory readings now. The VRAM cache answers from its
     // last sample and refreshes behind it, so the first load's baseline would
     // otherwise be "nothing sampled yet" on a server nobody has polled —

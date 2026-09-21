@@ -504,6 +504,22 @@ pub fn vram_baseline(budget: Duration) -> Option<u64> {
     .map(|m| m.used)
 }
 
+/// The whole VRAM reading, fresh and bounded the same way as
+/// [`vram_baseline`] — the placement planner's input, taken under the model
+/// slot lock where an unbounded driver call would stall every request.
+#[must_use]
+pub fn vram_reading(budget: Duration) -> Option<mummu::vram::Memory> {
+    baseline_of(
+        &VRAM,
+        BASELINE_MAX_AGE,
+        budget,
+        SAMPLE_TTL,
+        "mummu-vram",
+        mummu::vram::memory,
+    )
+    .flatten()
+}
+
 /// The baseline rule itself, over any source.
 ///
 /// `wait_after` returns a reading stamped later than `since`, so a horizon of

@@ -28,6 +28,9 @@ use crate::recovery::{self, ChatError, DeviceKey};
 // planner below, the host-pressure watcher, and the gauge the operator watches.
 use crate::status::mem_available_bytes;
 
+#[path = "placement.rs"]
+mod placement;
+
 /// One chat-servable model: the architecture-erased LM plus its tokenizer.
 pub struct Loaded {
     pub lm: AnyLm,
@@ -919,8 +922,25 @@ pub async fn run_chat(
     // a third copy that no test could tell apart from the other two.
     // The planner runs below this and cannot see which model it is serving,
     // so the tower's footprint is published before planning starts.
-    set_vision_reserve(vision_reserve_bytes(spec, models_root));
+    // Only a request that brings an image needs the tower, and only a tower
+    // that is not already resident needs room made for it: held back for
+    // every text request, it cost 6 of the 27B's layers.
+    let needs_tower = !images.is_empty();
+    set_vision_reserve(if needs_tower && !tower_resident() {
+        vision_reserve_bytes(spec, models_root)
+    } else {
+        0
+    });
     let prompt = render_prompt_with_tools(spec.architecture, &tools, turns)?;
+    // The context a load must provision for, before the tokenizer is at
+    // hand: ~3 bytes per token over-counts English, which is the safe side
+    // of a fit. `drive` replaces it with the exact count once loaded.
+    // Pre-merge patch count: an upper bound on the tokens an image becomes.
+    let image_tokens: usize = images.iter().map(|p| p.grid_h * p.grid_w).sum();
+    placement::set_request(
+        prompt.len().div_ceil(3) + image_tokens + max_tokens,
+        needs_tower,
+    );
     let offered_tools = !tools.is_empty();
     // Land a line in the log the moment a request enters the engine: the fit
     // planning below can legitimately take minutes on a busy disk, and a
@@ -1156,7 +1176,7 @@ fn tier_devices(
         // allocator does not fail this way.
         match b {
             BackendChoice::Cpu => raw,
-            _ => raw.saturating_sub(activation_reserve()),
+            _ => raw.saturating_sub(placement::nonweight_estimate()),
         }
     };
     // `speed` ranks devices for this workload. Measured on the reference box
@@ -1499,261 +1519,71 @@ fn pack_trunk_bytes(pack: &mummu::pack::Pack, level: mummu::pack::Precision) -> 
     bytes * 135 / 100 + (1 << 30)
 }
 
-/// Bytes one layer of a pack costs on a device at `level` — every tensor
-/// whose parameter path names that layer, trunk and FFN alike.
-fn pack_layer_bytes(
-    pack: &mummu::pack::Pack,
-    level: &dyn Fn(&mummu::pack::TensorEntry) -> mummu::pack::Precision,
-) -> Vec<u64> {
-    use mummu::pack::{Precision, Role};
-    let mut per_layer: std::collections::BTreeMap<usize, u64> = std::collections::BTreeMap::new();
-    for t in &pack.manifest.tensors {
-        // `blk.<n>.` is the GGUF naming the pack preserves.
-        let Some(rest) = t.name.strip_prefix("blk.") else {
-            continue;
-        };
-        let Some((idx, _)) = rest.split_once('.') else {
-            continue;
-        };
-        let Ok(layer) = idx.parse::<usize>() else {
-            continue;
-        };
-        let numel = t.shape.iter().product::<usize>() as u64;
-        let chosen = level(t);
-        let bytes = match (&t.role, t.precisions.get(&chosen)) {
-            (Role::Linear | Role::Expert { .. }, Some(b))
-                if matches!(chosen, Precision::Q4 | Precision::Q8) =>
-            {
-                b.values_len + b.scales_len
-            }
-            _ => numel * 4,
-        };
-        *per_layer.entry(layer).or_insert(0) += bytes;
-    }
-    per_layer.into_values().collect()
-}
-
-/// Device memory held back from weights for everything that is not a weight:
-/// activations, KV and recurrent state, dequantize temporaries, and the
-/// allocator's own chunking. Sized from the failure it prevents — see
-/// [`layer_prefix_that_fits`].
-/// Card bytes held back from weights for everything that is not a weight:
-/// activations, KV/recurrent state, and cubecl's ~1 GiB pool chunking.
+/// Load a dense qwen35 pack with **whole layers** placed by the joint
+/// solver: which device each layer is on and at what precision each of its
+/// parts is stored, from measured device rates and the card's live capacity
+/// (`placement`; the equations are in `mummu::mix::joint` and
+/// `placement`'s module docs). The placement is then kept live — re-planned
+/// before every request and at idle — so what is decided here is only where
+/// the model starts.
 ///
-/// Was a flat 3 GiB, sized for f32 dequantize transients — one
-/// `[5120, 17408]` slab dequantized is 356 MB and several were live at
-/// once. `nn::packed_gemv` deleted that whole class of allocation (VRAM
-/// pool panics went 505-710 per run to zero, 2026-08-25), so the reserve
-/// was guarding against something that no longer happens while ollama ran
-/// the same checkpoint on 1.2 GiB of headroom and reached 92.6% of the
-/// card to our 46%. 1.5 GiB keeps a full pool chunk plus prefill
-/// activations; `MUMMU_ACTIVATION_RESERVE_GB` tunes it without a rebuild.
-fn activation_reserve() -> u64 {
-    static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *BYTES.get_or_init(|| {
-        std::env::var("MUMMU_ACTIVATION_RESERVE_GB")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|gb| *gb >= 0.0)
-            .map_or(3 << 29, |gb| (gb * f64::from(1u32 << 30)) as u64)
-    })
-}
-
-/// How many whole layers fit `budget_bytes`, leaving room for activations.
-/// Load a dense qwen35 pack with **whole layers** on the device — as many as
-/// VRAM holds — and the rest on the host.
-///
-/// This is llama.cpp's `n_gpu_layers` shape, and it exists because the
-/// cluster-granular path is the wrong granularity for a dense model. There,
-/// every layer's FFN is split across devices, and since every cluster runs on
-/// every token there is no selectivity to pay for the crossing: measured
-/// 24.7 s/tok, against 4.8 for a placement that kept layers whole. Whole
-/// layers cross ONCE, where the assignment changes.
-///
-/// Cluster granularity remains correct for a routed MoE, where only top-k of
-/// E experts are touched and the k/E saving does pay for the crossing.
+/// Whole layers, not FFN clusters: every cluster of a dense model runs on
+/// every token, so splitting a layer across devices buys nothing and costs a
+/// crossing (measured 24.7 s/tok split, 4.8 whole). Cluster granularity
+/// stays right for a routed MoE.
 fn build_layered_qwen35(
     pack_dir: &Path,
     main: BackendChoice,
-    policy: mummu::quant::QuantPolicy,
+    _policy: mummu::quant::QuantPolicy,
 ) -> Result<qwen35::LoadedQwen35, String> {
-    use mummu::pack::Pack;
-    let pack = Pack::open(pack_dir)?;
-    // The model's own shapes drive the activation reserve (see
-    // `computed_reserve_bytes`), so the config is needed before placement.
-    let pack_config = qwen35::Qwen35Config::from_gguf(&pack.header()?)?;
-    let level = precision_for(policy);
-    // Per-tensor precision, starting from the best a pack stores and demoting
-    // only as far as this device's live budget forces — so the layers that do
-    // land here carry as much precision as the card can hold, and more of them
-    // fit than a single-precision plan would allow. See `mixed_precision`.
-    let ceiling = match (policy, main) {
-        // An accelerator is precisely the device whose scarce resource is
-        // memory, so it never gets the float rungs: at Off the mix kept 353
-        // tensors at f32 and returned 14.92 GiB against a 9.32 GiB budget,
-        // flagged "OVER — will spill". The spill then happened against a
-        // different budget and the card was handed more than it could hold.
-        (_, m) if m != BackendChoice::Cpu => mummu::quant::QuantPolicy::Q8,
-        (mummu::quant::QuantPolicy::Off, _) => mummu::quant::QuantPolicy::Off,
-        _ => mummu::quant::QuantPolicy::Q8,
-    };
-    // The embedding goes to the host below (`embed_device`), so it must not
-    // be charged against this device's budget.
-    let mix = mixed_precision(&pack, main, ceiling, &|t| {
-        !matches!(t.role, mummu::pack::Role::Embedding)
-    });
-    // Precision the DEVICE gets. Sizing the split needs only this, since the
-    // split is decided by what fits on the device.
-    // The fallback matters as much as the plan: `level` is a FLOAT rung
-    // (Off -> F16), and both flex and wgpu widen a half blob to f32 on load.
-    // A [5120, 17408] FFN weight at f32 is a single 340 MB buffer, which is
-    // over wgpu's 256 MiB max buffer size — so every such tensor failed to
-    // allocate during the layered load (1015 identical
-    // "failed to reserve 356515840 bytes" panics) and the card ended up
-    // holding nothing at all while the planner reported 45/64 layers placed.
-    // On an accelerator the fallback has to be a packed rung.
-    let accel_fallback = main != BackendChoice::Cpu;
-    let device_choose = |e: &mummu::pack::TensorEntry| {
-        mix.get(&e.name).copied().unwrap_or(if accel_fallback {
-            mummu::pack::Precision::Q4
-        } else {
-            level
-        })
-    };
-    let layer_bytes = pack_layer_bytes(&pack, &device_choose);
-    if layer_bytes.is_empty() {
-        return Err("pack has no per-layer tensors".into());
-    }
+    let live = placement::plan_load(pack_dir, main)?;
     let device = device_of(main);
     let host = mummu::backend::cpu_device();
-
-    // Context the reserve must survive. The KV term scales with it, so this
-    // is the one number that trades layers-on-card against how long a
-    // conversation may get before the card runs out of room mid-token.
-    let ctx = std::env::var("MUMMU_CTX")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(4096);
-    let on_device = if main == BackendChoice::Cpu {
-        layer_bytes.len() // everything is already on the host
-    } else {
-        let feasible =
-            layer_prefix_that_fits(&layer_bytes, &pack_config, backend_budget(main), ctx);
-        // What a layer actually costs on each side, measured, not assumed —
-        // with the host reading clamped to its DRAM floor, because the probe
-        // tensor goes L3-warm on the host while production streams every
-        // host layer per token (see `host_probe_floor_ms`).
-        let accel_ms = probe_projection_ms(&pack, &device, mummu::pack::Precision::Q4);
-        let host_precision = if host_layers_q4() {
-            mummu::pack::Precision::Q4
-        } else {
-            mummu::pack::Precision::F16
-        };
-        let host_ms = probe_projection_ms(&pack, &host, host_precision)
-            .map(|m| m.max(host_probe_floor_ms(&pack, host_precision).unwrap_or(0.0)));
-        let show = |m: Option<f64>| m.map_or("n/a".into(), |v| format!("{v:.2} ms"));
-        let n = choose_prefix(feasible, accel_ms, host_ms);
-        probe_contention(&pack);
-        eprintln!(
-            "[mummu-serve] layer cost probe: {} on {}, {} on host — {} of {feasible} feasible layers on the accelerator",
-            show(accel_ms),
-            label_of(main),
-            show(host_ms),
-            n,
-        );
-        n
-    };
-    let total: u64 = layer_bytes.iter().sum();
-    let placed: u64 = layer_bytes.iter().take(on_device).sum();
-    eprintln!(
-        "[mummu-serve] layers: {on_device}/{} on {} ({:.2} of {:.2} GiB); the rest on the host",
-        layer_bytes.len(),
-        label_of(main),
-        placed as f64 / f64::from(1u32 << 30),
-        total as f64 / f64::from(1u32 << 30),
-    );
-
-    // Host room for the layers that stay behind, plus slack.
-    let host_bytes: u64 = layer_bytes.iter().skip(on_device).sum();
-    ensure_host_room(host_bytes + (6u64 << 30), main);
-
+    let on_card = live.loader_choice();
     let dev_for = |l: usize| {
-        if l < on_device {
+        if on_card(l) == main && main != BackendChoice::Cpu {
             device.clone()
         } else {
             host.clone()
         }
     };
+    let layers = live.assignment.layers.len();
     // Embedding on the host (a gather; see `pack_trunk_bytes`), and the head
     // with the last layer so the final projection does not cross — unless
-    // `MUMMU_HEAD_DEVICE` pins it. The admission calculus for that pin is
-    // `mummu_schedule::choices::admit_head` (the head's ms-per-byte
-    // density vs the marginal layers the same bytes would hold); with the
-    // bounded head cutting the host head's cost, measure before pinning.
+    // `MUMMU_HEAD_DEVICE` pins it.
     let head = match std::env::var("MUMMU_HEAD_DEVICE").as_deref() {
         Ok(v) if v.eq_ignore_ascii_case("gpu") => device.clone(),
         Ok(v) if v.eq_ignore_ascii_case("host") => host.clone(),
-        _ => dev_for(layer_bytes.len().saturating_sub(1)),
+        _ => dev_for(layers.saturating_sub(1)),
     };
+    let placed = live.planned_card_bytes();
+    // Host room for what stays behind, plus slack.
+    ensure_host_room(live.planned_host_bytes() + (6u64 << 30), main);
+    let choose = live.loader_precision();
     let started = Instant::now();
-    // What precision a HOST layer carries. Default Q4 (see `host_layers_q4`
-    // for the measured history); at decode the packed VNNI twin
-    // (`flex::kernels`, built at load by `warm_host_twins`) reads
-    // 0.5625 B/param at DRAM speed — measured 46-48 GB/s effective on this
-    // box, 3.4-6.3x the i8 slab path per projection in the streaming
-    // regime. `MUMMU_HOST_LAYERS=f16` restores the float slab.
-    //
-    // Only Linear/Expert weights switch: the embedding is a gather and the
-    // norm vectors anchor the numerics, so both stay as `mixed_precision`
-    // left them.
-    let host_layers = on_device..layer_bytes.len();
-    let choose = |e: &mummu::pack::TensorEntry| {
-        let on_host = match layer_index(&e.name) {
-            Some(l) => host_layers.contains(&l),
-            // Trunk tensors (the head, the final norm) follow the head device.
-            None => on_device < layer_bytes.len(),
-        };
-        let quantizable = matches!(
-            e.role,
-            mummu::pack::Role::Linear | mummu::pack::Role::Expert { .. }
-        );
-        if !(on_host && quantizable) {
-            return device_choose(e);
-        }
-        let want = if host_layers_q4() {
-            mummu::pack::Precision::Q4
-        } else {
-            mummu::pack::Precision::F16
-        };
-        if e.precisions.contains_key(&want) {
-            want
-        } else {
-            device_choose(e)
-        }
-    };
     // The residency baseline, from the sample cache and NOT from the driver:
     // this line runs with the model slot lock held, and a wedged card's
-    // `nvmlDeviceGetMemoryInfo` parks for seconds — see `status::vram_baseline`
-    // for why that is intolerable here and merely ugly in a gauge.
-    //
-    // Taken with a freshness bound, because it is the `before` of a
-    // subtraction: an undated sample can date from after the weights started
-    // landing, which shrinks the observed delta and turns a good load into a
-    // red alarm. No fresh baseline means the verdict says "unverified".
+    // `nvmlDeviceGetMemoryInfo` parks for seconds — see `status::vram_baseline`.
     let vram_before = crate::status::vram_baseline(RESIDENCY_BASELINE_BUDGET);
     let model = qwen35::load_from_pack_layered(pack_dir, &dev_for, &host, &head, &choose)
         .map_err(|e| e.to_string())?;
-    eprintln!(
-        "[mummu-serve] layered model resident in {:.0}s",
-        started.elapsed().as_secs_f32()
-    );
+    let secs = started.elapsed().as_secs_f32();
+    eprintln!("[mummu-serve] layered model resident in {secs:.0}s");
     certify_residency(main, placed, vram_before);
-    RESIDENT_VRAM.store(placed, std::sync::atomic::Ordering::Relaxed);
     // The bytes are down; what follows is CPU work on weights already in RAM,
     // and it has no count of its own — so the bar goes indeterminate rather
     // than freezing at 851/851 for the tens of seconds this takes.
     mummu::progress::phase(mummu::progress::Phase::Packing);
-    warm_host_twins(&model, on_device);
+    warm_host_twins(&model, 0);
+    drop(choose);
+    drop(on_card);
+    // The load's staging pages and the rate probes' buffers go back to the
+    // driver: what the pool holds after this is the model, so the working
+    // set the first generation measures is the generation's own.
+    if main != BackendChoice::Cpu {
+        device.memory_cleanup();
+    }
+    placement::adopt(live);
     Ok(model)
 }
 
@@ -2372,7 +2202,7 @@ fn mixed_precision(
         ceiling
     };
 
-    let budget = backend_budget(backend).saturating_sub(activation_reserve());
+    let budget = backend_budget(backend).saturating_sub(placement::nonweight_estimate());
     // Floor at Q4: it is the least precise thing any pack stores, so it is as
     // far as a *load* can go. Q2 exists below it but is reachable only by
     // requantizing a resident tensor, which is the rebalancer's job.
@@ -2662,203 +2492,6 @@ fn host_probe_floor_ms(pack: &mummu::pack::Pack, precision: mummu::pack::Precisi
     Some(bytes / (host_dram_gbps() * 1e6))
 }
 
-/// How many layers belong on the accelerator, given what each device costs.
-///
-/// Per-layer cost is linear in the layer count on a chain like this, so the
-/// optimum is a corner: fill the card when a layer is cheaper there, and use
-/// none of it when it is not. The memory-feasible maximum is only an upper
-/// bound on the choice, never the choice itself — treating it as the answer
-/// is what put 39 layers on a card that made decode 50% slower.
-fn choose_prefix(feasible_max: usize, accel_ms: Option<f64>, host_ms: Option<f64>) -> usize {
-    if let Ok(v) = std::env::var("MUMMU_LAYER_PREFIX")
-        && let Ok(n) = v.parse::<usize>()
-    {
-        return n.min(feasible_max);
-    }
-    // Fill the accelerator when a layer is measurably cheaper there.
-    //
-    // Measured on the 27B, quiet box, 3 warm runs each, counting ONLY runs
-    // whose residency certificate passed and whose output was coherent:
-    //     42 layers on GPU   2.45-2.60 s/tok
-    //     39 layers on GPU   2.89-3.08
-    //     cluster hybrid     3.35-3.77
-    //      0 on GPU, host Q4 4.18-4.21
-    //      0 on GPU, host F16 4.86-5.76
-    // Monotone: more card, faster decode, exactly as the probe predicts
-    // (1.94 ms on the card against 13.7 ms on the host for one projection).
-    //
-    // An earlier revision of this function hard-defaulted to 0 on the
-    // strength of runs that measured 1.72-2.12 s/tok with the card empty.
-    // Those runs were broken — the loader was failing ~1000 allocations and
-    // the model returned EMPTY completions — so they were timing a model
-    // that could not answer. Speed measured on a model whose output is not
-    // checked is not speed. Hence the residency certificate, and hence this
-    // comment.
-    match (accel_ms, host_ms) {
-        (Some(a), Some(h)) if a >= h => 0,
-        _ => feasible_max,
-    }
-}
-
-/// Pairwise contention: how much slower one device's projection gets while
-/// the other runs the same work. `C = t_paired / t_alone`; 1.0 is no
-/// contention. This is the term the offload literature omits — it assumes
-/// the CPU and GPU have private memory systems, which is false for an iGPU
-/// and unreliable under WDDM. A hide window built from solo numbers
-/// overstates itself by exactly this factor.
-///
-/// Logged, not yet consumed: it is the admission gate for any
-/// overlay/deferral schedule (peer review, 2026-08-26 — "contention-broken
-/// pairs contribute 0, not t_a, to the hide window").
-fn probe_contention(pack: &mummu::pack::Pack) {
-    // A wgpu device must not be CONSTRUCTED where no wgpu adapter exists.
-    // `gpu_device()` is infallible by signature but its cubecl device-server
-    // thread is not: with no adapter it panics "No possible adapter available
-    // for backend ... requested_backends: Backends(VULKAN)", and because that
-    // lands on the DSD server thread (not the caller), the request's tokio
-    // worker then dies on `RecvError` and the HTTP request NEVER RETURNS while
-    // /api/health happily keeps reporting "ok". Measured 2026-09-14 on the
-    // DeepStack container: MUMMU_BACKEND=cuda, a 27B pack load reached here
-    // and every chat request hung with no response and no error to the user.
-    // The inventory already knows the answer, so ask it. This costs nothing
-    // real: the contention figure is logged and, as the doc above says, not
-    // yet consumed by any decision.
-    if !mummu::backend::use_gpu() {
-        return;
-    }
-    let gpu = mummu::backend::gpu_device();
-    let host = mummu::backend::cpu_device();
-    let solo_gpu = probe_projection_ms(pack, &gpu, mummu::pack::Precision::Q4);
-    let solo_host = probe_projection_ms(pack, &host, mummu::pack::Precision::Q4);
-    let (Some(sg), Some(sh)) = (solo_gpu, solo_host) else {
-        return;
-    };
-    // Pair: time the dGPU projection while the host hammers its own, and
-    // vice versa. Scoped threads so the pack borrow stays simple.
-    let stop = std::sync::atomic::AtomicBool::new(false);
-    let paired_gpu = std::thread::scope(|scope| {
-        scope.spawn(|| {
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                let _ = probe_projection_ms(pack, &host, mummu::pack::Precision::Q4);
-            }
-        });
-        let t = probe_projection_ms(pack, &gpu, mummu::pack::Precision::Q4);
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        t
-    });
-    let stop = std::sync::atomic::AtomicBool::new(false);
-    let paired_host = std::thread::scope(|scope| {
-        scope.spawn(|| {
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                let _ = probe_projection_ms(pack, &gpu, mummu::pack::Precision::Q4);
-            }
-        });
-        let t = probe_projection_ms(pack, &host, mummu::pack::Precision::Q4);
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        t
-    });
-    if let (Some(pg), Some(ph)) = (paired_gpu, paired_host) {
-        eprintln!(
-            "[mummu-serve] contention: dGPU {:.2} -> {:.2} ms paired (C={:.2}); host {:.2} -> {:.2} ms paired (C={:.2})",
-            sg,
-            pg,
-            pg / sg,
-            sh,
-            ph,
-            ph / sh,
-        );
-    }
-}
-
-/// Bytes an accelerator must keep free for everything that is NOT a weight,
-/// computed from the model's own shapes instead of guessed.
-///
-/// The old number was a flat 3 GiB, then a flat 1.5 GiB, both picked by hand
-/// against the f32 dequantize transients that `nn::packed_gemv` has since
-/// deleted. A reserve that is too large costs layers on the card (each is
-/// ~0.22 GiB at Q4, so a spare gigabyte is four or five layers); one that is
-/// too small kills a generation mid-token. Neither is a knob worth guessing,
-/// because every term is derivable:
-///
-/// * **KV cache** — full-attention layers only (`(i+1) % interval == 0`),
-///   `2 (k,v) x kv_heads x ctx x head_dim` per layer at the cache's
-///   STORAGE dtype (f32, or f16 under `MUMMU_KV_F16`).
-/// * **Recurrent state** — DeltaNet layers, context-INDEPENDENT:
-///   `conv [b, conv_dim, k-1]` plus `state [b, n_v_heads, d_state, d_state]`.
-/// * **Activation peak** — prefill dominates decode by the prompt length:
-///   mummu does not chunk prefill, so the widest live buffer is
-///   `[tokens, intermediate]` f32 and gate/up/product are live together.
-/// * **Pool slack** — cubecl reserves in ~1 GiB pages, so a partial page is
-///   unavailable to weights whatever the arithmetic says.
-///
-/// `MUMMU_ACTIVATION_RESERVE_GB` still overrides, for the case where a
-/// measurement disagrees with this model.
-fn computed_reserve_bytes(cfg: &qwen35::Qwen35Config, layers_on_device: usize, ctx: usize) -> u64 {
-    if let Some(gb) = std::env::var("MUMMU_ACTIVATION_RESERVE_GB")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|gb| *gb >= 0.0)
-    {
-        return (gb * f64::from(1u32 << 30)) as u64;
-    }
-    let f32b = 4u64;
-    let n = layers_on_device.min(cfg.num_layers);
-    // Layers are placed as a prefix, so count the kinds within that prefix.
-    let full_attn = (0..n).filter(|&l| cfg.is_attention(l)).count() as u64;
-    let delta = n as u64 - full_attn;
-
-    // KV is priced at its STORAGE dtype: the f16 cache (`MUMMU_KV_F16`,
-    // SPEC P2.1) halves the persistent bytes, and pricing it at f32 would
-    // silently waste the layers the halving bought.
-    let kv_bytes = if mummu::nn::kv_f16_enabled() { 2 } else { f32b };
-    let kv = full_attn
-        * 2
-        * cfg.num_key_value_heads as u64
-        * ctx as u64
-        * cfg.head_dim as u64
-        * kv_bytes;
-    let conv = delta * cfg.conv_dim() as u64 * cfg.conv_kernel.saturating_sub(1) as u64 * f32b;
-    let state = delta * cfg.n_v_heads as u64 * (cfg.d_state as u64).pow(2) * f32b;
-    // Three [tokens, intermediate] buffers live at once through SwiGLU.
-    // Prefill is CHUNKED (`mummu::decode::prefill_chunk_len`, default 1024),
-    // so the widest live buffer is [chunk, intermediate], not
-    // [ctx, intermediate] — on the 27B that is ~214 MiB instead of ~816 MiB,
-    // which is two to three more layers on the card. The reserve and the
-    // decode driver read the same knob, so they cannot disagree.
-    let act_tokens = ctx.min(mummu::decode::prefill_chunk_len()) as u64;
-    let act = 3 * act_tokens * cfg.intermediate_size as u64 * f32b;
-    const POOL_SLACK: u64 = 1 << 30;
-
-    kv + conv + state + act + POOL_SLACK
-}
-
-/// The largest layer prefix that fits, with the reserve recomputed at each
-/// candidate count.
-///
-/// The reserve GROWS with the number of layers placed (more KV, more
-/// recurrent state), so "budget minus a constant" is the wrong shape and
-/// overshoots exactly where it matters — at the top of the card. Walk the
-/// prefix and stop at the last `n` whose weights AND own reserve both fit.
-fn layer_prefix_that_fits(
-    layer_bytes: &[u64],
-    cfg: &qwen35::Qwen35Config,
-    budget: u64,
-    ctx: usize,
-) -> usize {
-    let mut used = 0u64;
-    let mut best = 0usize;
-    for (i, &b) in layer_bytes.iter().enumerate() {
-        used += b;
-        let n = i + 1;
-        if used + computed_reserve_bytes(cfg, n, ctx) <= budget {
-            best = n;
-        } else {
-            break;
-        }
-    }
-    best
-}
-
 /// Check that the accelerator actually holds what the plan placed there.
 ///
 /// Five consecutive runs reported "44/64 layers on GPU (9.80 GiB)" while the
@@ -2991,21 +2624,6 @@ fn residency_suspect_line(planned: u64, observed: u64, label: &str) -> String {
         gib(planned),
         gib(observed),
     )
-}
-
-/// Load host-resident layers at Q4 instead of F16 (`MUMMU_HOST_LAYERS=q4`).
-/// Q4 is 1.125 B/param resident on flex against F16's 4 (flex widens the
-/// half blob to f32), and `nn::packed_gemv` reads it directly at decode.
-fn host_layers_q4() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // Default Q4. Measured with every layer on the host: Q4 4.18-4.21 s/tok
-    // against F16's 4.86-5.76, at 1.125 B/param resident instead of 4 — the
-    // packed flex GEMV reads the i8 slab directly, so the old "quantized on
-    // flex is 18x slower" rule died with the dequantize-per-op path it
-    // described. `MUMMU_HOST_LAYERS=f16` restores the float slab.
-    *ON.get_or_init(|| {
-        std::env::var("MUMMU_HOST_LAYERS").map_or(true, |v| !v.eq_ignore_ascii_case("f16"))
-    })
 }
 
 /// The pack precision a fit policy denotes.
@@ -3305,6 +2923,12 @@ fn host_floor_bytes() -> u64 {
         .map_or(HOST_FLOOR_BYTES, |gb| gb << 30)
 }
 
+/// Start the live placement watch: layers and their precisions follow the
+/// card while the server idles (see `placement`).
+pub fn spawn_placement_watch() {
+    placement::spawn_watch();
+}
+
 /// Watch host memory continuously and give the slot back before the machine
 /// runs out.
 ///
@@ -3412,115 +3036,6 @@ fn ensure_host_room(need: u64, keep: BackendChoice) {
 /// else on the machine; `MUMMU_IGPU_BUDGET_GB` overrides.
 const INTEGRATED_GPU_BUDGET: u64 = 8 << 30;
 
-/// VRAM the model's own placement holds (set after a certified load) — the
-/// term that separates "what the card holds" into ours vs ambient for the
-/// watermark. Approximate on unload (it stays until the next load), which
-/// only UNDER-estimates ambient — the conservative direction.
-static RESIDENT_VRAM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// How much free VRAM to leave for ambient growth: the chance-constrained
-/// watermark over ambient consumption (SPEC 3), fed a sample on every call.
-///
-/// `guard_bytes()` tracks the 1-alpha quantile of ambient (everything on the
-/// card that is not ours) with envelope semantics — it covers every spike it
-/// has seen immediately, shrinks only after a quiet window — so the margin
-/// returned here is the headroom between that envelope and ambient right
-/// now. Early in a process the estimator is cold and the margin is just the
-/// fragmentation slack; a session whose compositor/browser actually moves
-/// grows it. `MUMMU_VRAM_GUARD_GB` pins the old fixed-reserve behavior.
-fn vram_margin_bytes(m: &mummu::vram::Memory) -> u64 {
-    if let Some(gb) = std::env::var("MUMMU_VRAM_GUARD_GB")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|gb| *gb >= 0.0)
-    {
-        return (gb * f64::from(1u32 << 30)) as u64;
-    }
-    use mummu::schedule::watermark::{Watermark, WatermarkConfig};
-    static WM: std::sync::Mutex<Option<Watermark>> = std::sync::Mutex::new(None);
-    let ambient = m
-        .used
-        .saturating_sub(RESIDENT_VRAM.load(std::sync::atomic::Ordering::Relaxed));
-    let mut guard = WM.lock().unwrap_or_else(|e| e.into_inner());
-    let wm = guard.get_or_insert_with(|| {
-        Watermark::new(WatermarkConfig {
-            // 1 GiB idle floor + 512 MiB allocator slack: together ~1.5 GiB
-            // at a quiet desktop — a layer or two cheaper than the fixed
-            // 2 GiB, and it grows when ambient actually misbehaves.
-            floor_bytes: 1 << 30,
-            frag_slack_bytes: 512 << 20,
-            ..WatermarkConfig::default()
-        })
-    });
-    wm.observe_ambient(ambient);
-    if ALLOC_FAILED.load(std::sync::atomic::Ordering::SeqCst) {
-        wm.breach();
-    }
-    wm.guard_bytes().saturating_sub(ambient).max(512 << 20)
-}
-
-/// Is the planner allowed to size the GPU budget from the LIVE VRAM reading?
-///
-/// # A display change must not be a placement change
-///
-/// Reading VRAM and *planning against* VRAM are two different features, and
-/// v0.3.0 was asked for the first one: "add a loading progress bar", "showing
-/// loading to memory and vram". The gauges, the status object and
-/// [`certify_residency`] all read the card, everywhere, and that is the
-/// feature.
-///
-/// Wiring the same reading into this function is not. On origin/main
-/// `vram::memory()` was a hard `None` on linux, so the arm below always took
-/// `None => configured`; making it live would, in the same release that adds
-/// a progress bar, change which layers land on the card — and bring the
-/// static `Watermark`/`ALLOC_FAILED` machinery to life on linux for the first
-/// time ever. Every test run of this branch was `MUMMU_BACKEND=cpu`, so that
-/// path has been executed zero times, and its first execution would be on a
-/// shared 16 GiB card with other tenants (deepseek-ocr, plex) moving VRAM
-/// underneath it. The reading is a quantile estimator with hysteresis fed by
-/// a global number; it wants a measurement, not a guess, and it deserves its
-/// own change with its own evidence.
-///
-/// So on linux it is **opt-in**: `MUMMU_VRAM_LIVE_BUDGET=1` turns it on, and
-/// unset means the planner behaves exactly as v0.2.0 did. Turn it on
-/// deliberately, watch a load, and make that its own commit.
-///
-/// Windows is untouched: the reading has been live there since 2026-08-23,
-/// where it was added because a 9.8 GiB placement inside its configured
-/// budget died with `out of device memory` mid-generation. Gating a platform
-/// that already depends on this would be a regression dressed as caution.
-///
-/// Takes the variable's value as an argument rather than reading the
-/// environment itself, so the rule can be tested without a process-global
-/// `set_var` race.
-///
-/// # A note for whoever turns it on
-///
-/// This is the last direct NVML call on the load path, and the load path runs
-/// under the model slot lock — where a wedged card's
-/// `nvmlDeviceGetMemoryInfo` stalls every request behind that slot, not just
-/// this one (`status::vram_baseline` has the whole argument). The gauges and the
-/// residency check were moved off it; the planner was not, because a
-/// placement decision wants a measurement and not whatever was last sampled.
-/// So the change that opts linux in owes this call a bound of its own.
-fn planner_vram_reading(opt_in: Option<&str>) -> Option<mummu::vram::Memory> {
-    if cfg!(windows) || live_budget_opt_in(opt_in) {
-        mummu::vram::memory()
-    } else {
-        None
-    }
-}
-
-/// Does `MUMMU_VRAM_LIVE_BUDGET` say yes? Unset, empty, `0` and anything
-/// unrecognised all mean no, because the default has to be the safe one.
-fn live_budget_opt_in(value: Option<&str>) -> bool {
-    value.map(str::trim).is_some_and(|v| {
-        ["1", "true", "yes", "on"]
-            .iter()
-            .any(|yes| v.eq_ignore_ascii_case(yes))
-    })
-}
-
 /// Bytes the current request's vision tower will take on the accelerator,
 /// held process-wide because the fit planner is several layers below the
 /// place that knows which model is being served.
@@ -3578,83 +3093,23 @@ fn backend_budget_gross(backend: BackendChoice) -> u64 {
                 ram
             }
         }
-        // A GPU budget has to be what is free *now*, not what the card
-        // holds. This desktop runs Firefox, Discord, Steam, Docker and two
-        // driver overlays, which together took enough of a 16 GiB card that
-        // a 9.8 GiB placement — comfortably inside its configured budget —
-        // died with `out of device memory` mid-generation (2026-08-23).
-        //
-        // So the configured value is a CEILING, and the live reading from
-        // NVML caps it. `MUMMU_GPU_BUDGET_GB` still means "never use more
-        // than this", which is what an operator setting it wants; it just no
-        // longer means "this much is definitely available".
-        //
-        // On linux that capping is OFF unless `MUMMU_VRAM_LIVE_BUDGET=1` says
-        // otherwise, and the budget line below prints which state it is in —
-        // see `planner_vram_reading` for why a release that adds a gauge is
-        // not the release that changes where layers land.
+        // A card's budget is measured, never configured: what this process
+        // may occupy under the guard on everyone else's usage, less what it
+        // already holds (`placement::free_for_new`, whose module docs carry
+        // the equations). A configured number was right on one day on one
+        // box — 9 GiB less a vision reserve held for text traffic put 27 of
+        // 64 layers on a card with room for more — and an OOM on any day a
+        // co-tenant grew.
         _ => {
-            let configured = std::env::var("MUMMU_GPU_BUDGET_GB")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .map(|gb| gb << 30)
-                .or_else(|| {
-                    inv.gpus
-                        .iter()
-                        .filter_map(|g| g.vram_bytes)
-                        .max()
-                        .map(|b| b / 8 * 7)
-                })
-                .unwrap_or(15 << 30);
-            // NOT `vram::memory()` — the gauges read that, the planner does
-            // not, unless it was asked to. See `planner_vram_reading`.
-            match planner_vram_reading(std::env::var("MUMMU_VRAM_LIVE_BUDGET").ok().as_deref()) {
-                // Leave the desktop room for what ambient consumption may
-                // GROW to, not a hand-picked constant: the margin comes from
-                // the chance-constrained watermark (`vram_margin_bytes` —
-                // a tracked quantile of ambient VRAM with hysteresis). The
-                // fixed 2 GiB it replaces was sized for this box's idle and
-                // then paid on every box in every session, quiet or not; a
-                // session where ambient actually drifted 1.9 -> 8.9 GiB is
-                // exactly what the quantile tracks and the constant missed.
-                Some(m) => {
-                    let live = m.free.saturating_sub(vram_margin_bytes(&m));
-                    if live < configured {
-                        eprintln!(
-                            "[mummu-serve] VRAM: {:.1} GiB free of {:.1} GiB                              ({:.1} GiB held elsewhere) — budget {:.1} -> {:.1} GiB",
-                            m.free as f64 / f64::from(1u32 << 30),
-                            m.total as f64 / f64::from(1u32 << 30),
-                            m.used as f64 / f64::from(1u32 << 30),
-                            configured as f64 / f64::from(1u32 << 30),
-                            live as f64 / f64::from(1u32 << 30),
-                        );
-                    }
-                    configured.min(live)
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| {
+                if std::env::var_os("MUMMU_GPU_BUDGET_GB").is_some() {
+                    eprintln!(
+                        "[mummu-serve] MUMMU_GPU_BUDGET_GB is ignored: the card's budget is measured live (see placement)"
+                    );
                 }
-                // No reading the planner may use: hold the configured value
-                // rather than guess in either direction. Said once, because
-                // "the gauge shows a card the budget ignores" is otherwise a
-                // silent difference between two boxes.
-                None => {
-                    static SAID: std::sync::Once = std::sync::Once::new();
-                    SAID.call_once(|| {
-                        let gated = !cfg!(windows)
-                            && !live_budget_opt_in(
-                                std::env::var("MUMMU_VRAM_LIVE_BUDGET").ok().as_deref(),
-                            );
-                        eprintln!(
-                            "[mummu-serve] VRAM: budget {:.1} GiB, uncapped by any live reading — {}",
-                            configured as f64 / f64::from(1u32 << 30),
-                            if gated {
-                                "the planner is not reading the card's free bytes (MUMMU_VRAM_LIVE_BUDGET=1 opts in; the gauges read it either way)"
-                            } else {
-                                "nothing on this machine reports VRAM"
-                            },
-                        );
-                    });
-                    configured
-                }
-            }
+            });
+            placement::free_for_new(backend)
         }
     }
 }
@@ -4006,31 +3461,50 @@ async fn drive(
     // one finds an empty slot or a refusal, never the poisoned model, and
     // never a process that has decided to exit but not yet said so.
     let mark = recovery::mark();
-    let outcome = AssertUnwindSafe(generate_on(
-        &m,
-        spec,
-        prompt,
-        opts,
-        max_tokens,
-        format,
-        think,
-        &images,
-        models_root,
-        &device,
-        label,
-        &progress,
-        &mut on_delta,
-    ))
+    // The context this request will actually hold: its prompt, its images'
+    // tokens and its budget. Exact now that the tokenizer is at hand.
+    let needs_tower = !images.is_empty();
+    let ctx = m
+        .tokenizer
+        .encode(prompt, false)
+        .map_or(prompt.len().div_ceil(3), |e| e.len())
+        + images.iter().map(|p| p.grid_h * p.grid_w).sum::<usize>()
+        + max_tokens;
+    let mut m = m;
+    // Inside the same catch as the generation: making room for this request
+    // moves layers, and a device that fails under a move is decided exactly
+    // like one that fails under a token.
+    let outcome = AssertUnwindSafe(async {
+        let before = placement::before_request(&mut m, &key, ctx, needs_tower);
+        let r = generate_on(
+            &m,
+            spec,
+            prompt,
+            opts,
+            max_tokens,
+            format,
+            think,
+            &images,
+            models_root,
+            &device,
+            label,
+            &progress,
+            &mut on_delta,
+        )
+        .await;
+        (r, before)
+    })
     .catch_unwind()
     .await;
     let failure = match outcome {
-        Ok(Ok(mut result)) => {
+        Ok((Ok(mut result), before)) => {
+            placement::after_request(ctx, result.tokens, before);
             result.timings.queue_ms = queue_ms;
             result.timings.load_ms = load_ms;
             return Ok(result);
         }
-        Ok(Err(e)) if e.needs_decision() => e.message,
-        Ok(Err(e)) => return Err(e),
+        Ok((Err(e), _)) if e.needs_decision() => e.message,
+        Ok((Err(e), _)) => return Err(e),
         Err(payload) => {
             let message = recovery::payload_text(&*payload);
             if !(mark.moved() || recovery::is_device_failure(&message)) {
@@ -4391,6 +3865,8 @@ fn load_for_slot(
     if recovery::restarting() {
         return Err(ChatError::restarting());
     }
+    // Whatever placement was live described the model this load replaces.
+    placement::forget(None);
     // A plan from `plan_fit`'s "already resident" shortcut assumed a hit: no
     // fit check, a placeholder policy. The slot is loading, so the
     // assumption was wrong — most often because the resident copy predated a
@@ -4508,6 +3984,7 @@ fn load_for_slot(
 /// process starts with every pool empty. See `recovery`'s "Trade-offs".
 fn evict_held(m: mummu::cache::SlotGuard<'_, Loaded>, dir: &Path, model: &str) {
     clear_tiers_if_slot(m.backend);
+    placement::forget(None);
     forget_resident(dir);
     m.evict();
     mummu::progress::evicted();
@@ -4614,95 +4091,29 @@ mod plan_fit_tests {
     }
 }
 
+/// The 27B this project actually serves, for tests of its placement terms.
 #[cfg(test)]
-mod reserve_tests {
-    use super::*;
-
-    /// The 27B this project actually serves.
-    fn cfg_27b() -> qwen35::Qwen35Config {
-        qwen35::Qwen35Config {
-            vocab_size: 248_320,
-            hidden_size: 5120,
-            num_layers: 64,
-            num_attention_heads: 24,
-            num_key_value_heads: 4,
-            head_dim: 256,
-            intermediate_size: 17408,
-            rms_norm_eps: 1e-6,
-            rope_theta: 10_000.0,
-            rope_dim: 64,
-            full_attention_interval: 4,
-            conv_kernel: 4,
-            d_inner: 4096,
-            d_state: 128,
-            n_k_heads: 16,
-            n_v_heads: 32,
-            gdn_gate: qwen35::GdnGate::Silu,
-            gdn_l2: qwen35::GdnL2::AddEps,
-            eos_token_id: mummu::models::qwen2::EosIds::One(0),
-        }
-    }
-
-    /// The reserve must GROW with the layer count — that is the whole reason
-    /// "budget minus a constant" was the wrong shape.
-    #[test]
-    fn reserve_is_monotone_in_layers() {
-        let cfg = cfg_27b();
-        let mut prev = 0u64;
-        for n in [0usize, 8, 16, 32, 44, 64] {
-            let r = computed_reserve_bytes(&cfg, n, 4096);
-            assert!(r >= prev, "reserve fell from {prev} to {r} at n={n}");
-            prev = r;
-        }
-    }
-
-    /// KV is the context-dependent term; recurrent state is not.
-    #[test]
-    fn reserve_scales_with_context_but_state_does_not() {
-        let cfg = cfg_27b();
-        let short = computed_reserve_bytes(&cfg, 64, 1024);
-        let long = computed_reserve_bytes(&cfg, 64, 8192);
-        assert!(long > short, "longer context must reserve more");
-        // Delta-only prefix (no full-attention layer among the first 3 when
-        // the interval is 4) still carries conv+state, which cannot be zero.
-        let delta_only = computed_reserve_bytes(&cfg, 3, 1024);
-        assert!(
-            delta_only > (1u64 << 30),
-            "pool slack plus state at minimum"
-        );
-    }
-
-    /// A prefix must never be admitted whose weights plus its OWN reserve
-    /// exceed the budget — the bug that let the planner claim 44 layers the
-    /// card could not hold.
-    #[test]
-    fn prefix_never_exceeds_budget() {
-        let cfg = cfg_27b();
-        let per_layer = 239_000_000u64; // ~0.223 GiB, the measured Q4 layer
-        let bytes = vec![per_layer; 64];
-        for budget_gib in [4u64, 8, 10, 13, 16, 64] {
-            let budget = budget_gib << 30;
-            let n = layer_prefix_that_fits(&bytes, &cfg, budget, 4096);
-            let used: u64 = bytes[..n].iter().sum();
-            assert!(
-                used + computed_reserve_bytes(&cfg, n, 4096) <= budget || n == 0,
-                "n={n} overshoots a {budget_gib} GiB budget"
-            );
-            assert!(n <= 64);
-        }
-    }
-
-    /// More budget can never place fewer layers.
-    #[test]
-    fn prefix_is_monotone_in_budget() {
-        let cfg = cfg_27b();
-        let bytes = vec![239_000_000u64; 64];
-        let mut prev = 0usize;
-        for gib in 4..=20u64 {
-            let n = layer_prefix_that_fits(&bytes, &cfg, gib << 30, 4096);
-            assert!(n >= prev, "budget {gib} GiB placed {n} < {prev}");
-            prev = n;
-        }
+fn cfg_27b_for_tests() -> qwen35::Qwen35Config {
+    qwen35::Qwen35Config {
+        vocab_size: 248_320,
+        hidden_size: 5120,
+        num_layers: 64,
+        num_attention_heads: 24,
+        num_key_value_heads: 4,
+        head_dim: 256,
+        intermediate_size: 17408,
+        rms_norm_eps: 1e-6,
+        rope_theta: 10_000.0,
+        rope_dim: 64,
+        full_attention_interval: 4,
+        conv_kernel: 4,
+        d_inner: 4096,
+        d_state: 128,
+        n_k_heads: 16,
+        n_v_heads: 32,
+        gdn_gate: qwen35::GdnGate::Silu,
+        gdn_l2: qwen35::GdnL2::AddEps,
+        eos_token_id: mummu::models::qwen2::EosIds::One(0),
     }
 }
 
@@ -4771,54 +4182,6 @@ mod observability_tests {
     use super::*;
     use mummu::progress::{Phase, snapshot};
 
-    // -- MAJOR: the planner's use of the live VRAM reading is opt-in ---------
-
-    /// The gate itself. Anything that is not an unambiguous yes is a no,
-    /// because the default has to be the behaviour v0.2.0 shipped with.
-    #[test]
-    fn only_an_unambiguous_yes_opts_into_live_vram_budgeting() {
-        for yes in ["1", "true", "TRUE", "yes", "On", " 1 "] {
-            assert!(live_budget_opt_in(Some(yes)), "{yes:?} means yes");
-        }
-        for no in ["", "0", "false", "no", "off", "  ", "2", "maybe"] {
-            assert!(!live_budget_opt_in(Some(no)), "{no:?} must not mean yes");
-        }
-        assert!(!live_budget_opt_in(None), "unset is the safe default");
-    }
-
-    /// The separation this release turns on: the gauges read the card
-    /// everywhere, the PLANNER does not — because reading VRAM and planning
-    /// against VRAM are different features and only the first one was asked
-    /// for. On linux `vram::memory()` was a hard `None` before this branch,
-    /// so leaving it live here would have changed placement on a shared card
-    /// in a release about a progress bar.
-    #[test]
-    fn the_planner_ignores_the_live_vram_reading_until_it_is_asked_for() {
-        // The reading itself is unconditional — this is what the gauges,
-        // the status object and `certify_residency` all use.
-        let readable = mummu::vram::memory().is_some();
-
-        if cfg!(windows) {
-            assert_eq!(
-                planner_vram_reading(None).is_some(),
-                readable,
-                "windows has budgeted from the live reading since 2026-08-23; \
-                 gating it there would be a regression"
-            );
-            return;
-        }
-        assert!(
-            planner_vram_reading(None).is_none(),
-            "off by default: v0.2.0's placement, unchanged"
-        );
-        assert!(planner_vram_reading(Some("0")).is_none());
-        assert_eq!(
-            planner_vram_reading(Some("1")).is_some(),
-            readable,
-            "opted in, the planner sees exactly what the gauges see"
-        );
-    }
-
     /// MAJOR 3: NVML takes the driver's lock and a wedged card does not give
     /// it back for seconds. The load path holds the MODEL SLOT lock while it
     /// runs, so a direct call there does not delay one load — it delays every
@@ -4829,25 +4192,22 @@ mod observability_tests {
     /// load path must reach VRAM through `status`, which answers from the
     /// sample cache and refreshes on a thread of its own.
     ///
-    /// `planner_vram_reading` is the one direct call left, and it is not an
-    /// oversight — it is off on linux unless `MUMMU_VRAM_LIVE_BUDGET` says
-    /// otherwise, and a planner wants a measurement rather than whatever was
-    /// last sampled. It is on the load path all the same, so turning that
-    /// variable on is also the change that owes it a never-block discipline.
+    /// The placement planner is on the load path too, and reads the card the
+    /// same way (`status::vram_reading`), so both files are held to the rule.
     #[test]
     fn the_load_path_reads_vram_through_the_cache_not_the_driver() {
         for line in include_str!("engine.rs")
             .lines()
+            .chain(include_str!("placement.rs").lines())
             .map(str::trim)
             // Not a comment, and not a mention inside a string — the latter is
             // this test naming the rule, not code breaking it.
             .filter(|l| l.contains("vram::memory()") && !l.starts_with("//") && !l.contains('"'))
         {
             assert!(
-                // `planner_vram_reading`'s body, and this module's own probe
-                // for whether a reading exists at all on this machine.
-                line == "mummu::vram::memory()" || line.starts_with("let readable ="),
-                "the load path must read VRAM through status::vram_baseline(), \
+                // This module's own probe for whether a reading exists at all.
+                line.starts_with("let readable ="),
+                "the load path must read VRAM through status::vram_reading(), \
                  never the driver: {line}"
             );
         }
@@ -5150,6 +4510,23 @@ pub(crate) mod test_support {
 static TOWER: Mutex<Option<(std::path::PathBuf, Arc<mummu::vision::VisionTower>)>> =
     Mutex::new(None);
 
+/// Is a vision tower resident? Its bytes are then already in our pool's
+/// in-use count, so a request that needs it needs no room made.
+fn tower_resident() -> bool {
+    TOWER.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+}
+
+/// Drop the resident tower, if any (the placement watch does this after it
+/// sits idle, so its VRAM can hold layers). A request using it holds its own
+/// `Arc`, so this never pulls it out from under a generation.
+fn drop_tower() -> bool {
+    TOWER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .is_some()
+}
+
 /// The `mmproj-*.gguf` sitting beside a model's weights, if any.
 fn mmproj_path(spec: &ModelSpec, models_root: &Path) -> Option<std::path::PathBuf> {
     let dir = spec.dir(models_root);
@@ -5214,6 +4591,7 @@ fn tower_for(
             spec.name
         )
     })?;
+    placement::note_tower_use();
     let mut slot = TOWER.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((cached, tower)) = slot.as_ref()
         && cached == &path

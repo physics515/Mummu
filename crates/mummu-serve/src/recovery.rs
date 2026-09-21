@@ -4,8 +4,9 @@
 //!
 //! Production, 2026-09-18, the first cold load after the v0.3.1 deploy.
 //! deepseek-ocr, a co-tenant on the shared 16 GiB card, was mid-job and held
-//! most of it. The planner reads free VRAM only when `MUMMU_VRAM_LIVE_BUDGET`
-//! says so, so it placed 7.35 GiB there anyway. cubecl's device thread
+//! most of it. The planner of that release read free VRAM only when
+//! `MUMMU_VRAM_LIVE_BUDGET` said so, so it placed 7.35 GiB there anyway (the
+//! planner now always measures the card — see `placement`). cubecl's device thread
 //! `DSD-0-0` panicked thirty times during the load (counted in `docker logs`,
 //! 15:55:52 to 15:55:58 UTC) with `failed to reserve 22020096 bytes of device
 //! memory: out of device memory allocating 261319680 bytes`; the load

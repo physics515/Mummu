@@ -1901,6 +1901,98 @@ pub fn load_from_pack_layered(
     })
 }
 
+/// Move whole layers of a resident [`load_from_pack_layered`] model to
+/// `device`, re-reading each of their tensors from the pack at the precision
+/// `choose` names. Returns the bytes read off the pack.
+///
+/// This is how a placement changes without a reload: a layer is ~220 MiB of
+/// the 27B, so moving a few costs seconds where reloading the model costs
+/// minutes of disk. Tensors are re-read rather than converted from their
+/// current home because the two homes keep different precisions (the host
+/// runs Q4 for its bandwidth, the card whatever its mix chose), and a
+/// requantized copy compounds two roundings where the pack's blob has one —
+/// measured 0.0997 vs 0.1090 for Q8-then-requantize on the ladder probe.
+///
+/// Every tensor of a moved layer lands on `device` before the old copy is
+/// released (it is replaced in place), so the peak is the old layer plus the
+/// new one, never the whole model twice. The forward pass follows each
+/// layer's own device (see `Qwen35::forward`), so a model placed as any mix
+/// of layers runs unchanged. Caches are per generation, so the caller must
+/// hold the model exclusively (no generation in flight) — `&mut` says so.
+///
+/// # Errors
+/// A pack that cannot be read, or a tensor it does not store.
+pub fn relocate_layers(
+    loaded: &mut LoadedQwen35,
+    dir: &Path,
+    layers: &[usize],
+    device: &Device,
+    choose: &dyn Fn(&crate::pack::TensorEntry) -> crate::pack::Precision,
+) -> Result<u64, ImportError> {
+    use crate::pack::{Pack, Role};
+    let parse = |reason: String| ImportError::Parse {
+        file: dir.to_path_buf(),
+        reason,
+    };
+    if layers.is_empty() {
+        return Ok(0);
+    }
+    let pack = Pack::open(dir).map_err(parse)?;
+    let trunk = loaded.config.num_layers;
+    if let Some(&bad) = layers.iter().find(|&&l| l >= trunk) {
+        return Err(parse(format!("layer {bad} is past the trunk ({trunk})")));
+    }
+    let mut moved = 0usize;
+    for entry in &pack.manifest.tensors {
+        let Some(path) = pack_param_path(&entry.name, trunk) else {
+            continue;
+        };
+        if !layer_of_path(&path).is_some_and(|l| layers.contains(&l)) {
+            continue;
+        }
+        let precision = {
+            let p = choose(entry);
+            if entry.precisions.contains_key(&p) {
+                p
+            } else {
+                *entry
+                    .precisions
+                    .keys()
+                    .max()
+                    .ok_or_else(|| parse(format!("'{}' has no stored precision", entry.name)))?
+            }
+        };
+        let src = match entry.role {
+            Role::Linear | Role::Expert { .. } | Role::Embedding => ParamSrc::Ready2(Box::new(
+                pack.tensor::<2>(entry, precision, device).map_err(parse)?,
+            )),
+            Role::Vector | Role::Conv => ParamSrc::F32 {
+                values: pack.read_f32(entry).map_err(parse)?,
+                shape: entry.shape.clone(),
+            },
+        };
+        assign_param(&mut loaded.model, &path, src, QuantPolicy::Off, device).map_err(parse)?;
+        moved += 1;
+    }
+    if moved == 0 {
+        return Err(parse(format!(
+            "the pack holds no tensors for layers {layers:?}"
+        )));
+    }
+    Ok(pack.bytes_read())
+}
+
+/// The device a layer of a resident model lives on (its input norm's, which
+/// is where `forward` moves the activations for it).
+#[must_use]
+pub fn layer_device(loaded: &LoadedQwen35, layer: usize) -> Option<Device> {
+    loaded
+        .model
+        .layers
+        .get(layer)
+        .map(|l| l.input_norm.gamma.val().device())
+}
+
 /// The layer index a parameter path belongs to, if any
 /// (`model.layers.7.mlp.gate_proj.weight` -> 7).
 fn layer_of_path(path: &str) -> Option<usize> {
