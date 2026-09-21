@@ -270,19 +270,25 @@ fn horizon_tokens() -> f64 {
 
 /// Measured pack read rate, seconds per byte (prior: this array's quiet
 /// 150 MB/s until a load or a move measures it).
-static DISK_S_PER_BYTE: Mutex<f64> = Mutex::new(1.0 / 150e6);
+static DISK_S_PER_BYTE: Mutex<Option<f64>> = Mutex::new(None);
+const DISK_PRIOR_S_PER_BYTE: f64 = 1.0 / 150e6;
 
 pub(super) fn note_disk(bytes: u64, secs: f64) {
     if bytes < (64 << 20) || secs <= 0.0 {
         return;
     }
+    let seen = secs / bytes as f64;
     let mut d = DISK_S_PER_BYTE.lock().unwrap_or_else(|e| e.into_inner());
-    // EWMA: one slow read under a co-tenant should not define the disk.
-    *d = 0.7 * *d + 0.3 * (secs / bytes as f64);
+    // The first measurement replaces the prior outright; after that an
+    // EWMA, so one slow read under a co-tenant does not define the disk.
+    *d = Some(d.map_or(seen, |prev| 0.7 * prev + 0.3 * seen));
 }
 
 fn disk_s_per_byte() -> f64 {
-    *DISK_S_PER_BYTE.lock().unwrap_or_else(|e| e.into_inner())
+    DISK_S_PER_BYTE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or(DISK_PRIOR_S_PER_BYTE)
 }
 
 /// What the current request needs beyond the weights: its context and
@@ -967,6 +973,45 @@ fn apply(
     Ok(order.len())
 }
 
+/// Say once why a better placement is not being taken — the move-cost gate
+/// (4) or nothing better existing is otherwise indistinguishable from a
+/// watch that stopped working.
+fn explain_hold(live: &Live, pb: &joint::Problem) {
+    static SAID: Mutex<Option<(usize, usize)>> = Mutex::new(None);
+    let target = joint::solve(pb);
+    let now_t = joint::time_of(pb, &live.assignment);
+    let key = (
+        live.layers_on_card(),
+        target
+            .assignment
+            .layers
+            .iter()
+            .filter(|c| c.device == 1)
+            .count(),
+    );
+    if !target.feasible || target.time_s >= now_t * 0.99 {
+        return;
+    }
+    let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+    if *said == Some(key) {
+        return;
+    }
+    *said = Some(key);
+    let reread = joint::changed_bytes(pb, &live.assignment, &target.assignment);
+    eprintln!(
+        "[mummu-serve] placement hold: {} -> {} layers on {} would save {:.1} ms/token, {:.1}s over the {:.0}-token horizon — less than re-reading {:.2} GiB ({:.1}s at {:.0} MB/s)",
+        key.0,
+        key.1,
+        label_of(live.backend),
+        (now_t - target.time_s) * 1e3,
+        (now_t - target.time_s) * pb.horizon_tokens,
+        pb.horizon_tokens,
+        reread as f64 / f64::from(1u32 << 30),
+        reread as f64 * pb.disk_s_per_byte,
+        1.0 / pb.disk_s_per_byte / 1e6,
+    );
+}
+
 /// What a re-plan decided, for the log.
 fn verdict_word(v: joint::Verdict) -> &'static str {
     match v {
@@ -997,6 +1042,9 @@ fn replan_and_apply(
     let limit = match verdict {
         joint::Verdict::Hold => {
             live.improve_wanted = 0;
+            if idle {
+                explain_hold(live, &pb);
+            }
             return Ok(());
         }
         joint::Verdict::Repair => None,
