@@ -255,6 +255,43 @@ fn fastest_choice(
     Some(Choice { device, levels })
 }
 
+/// Every level combination `layer` can take on `dev`: each part at a level
+/// the pack stores, the device runs, and the floor allows. A layer has at
+/// most a few parts and a pack a few levels, so this stays small (<= 16 on
+/// qwen35).
+fn choices(layer: &Layer, device: usize, dev: &Device, floor: QuantPolicy) -> Vec<Choice> {
+    let per_part: Vec<Vec<QuantPolicy>> = layer
+        .parts
+        .iter()
+        .map(|p| {
+            p.levels
+                .iter()
+                .map(|&(q, _)| q)
+                .filter(|&q| level_ok(q, floor) && dev.rate_of(q).is_some())
+                .collect()
+        })
+        .collect();
+    if per_part.iter().any(Vec::is_empty) {
+        return Vec::new();
+    }
+    let mut out = vec![Vec::new()];
+    for levels in &per_part {
+        out = out
+            .into_iter()
+            .flat_map(|prefix: Vec<QuantPolicy>| {
+                levels.iter().map(move |&q| {
+                    let mut v = prefix.clone();
+                    v.push(q);
+                    v
+                })
+            })
+            .collect();
+    }
+    out.into_iter()
+        .map(|levels| Choice { device, levels })
+        .collect()
+}
+
 fn layer_bytes(pb: &Problem, layer: &Layer, c: &Choice) -> u64 {
     let dev = &pb.devices[c.device];
     layer
@@ -382,56 +419,72 @@ pub fn solve(pb: &Problem) -> Outcome {
     };
     let mut a = Assignment { layers: start };
 
-    // 2. Place: the move that saves the most time per destination byte.
-    loop {
-        let used = used_of(pb, &a);
-        let base = time_of(pb, &a);
-        let mut best: Option<(f64, usize, Choice)> = None;
-        for l in 0..n {
-            for d in 1..pb.devices.len() {
-                if a.layers[l].device == d {
-                    continue;
-                }
-                let Some(c) = fastest_choice(&pb.layers[l], d, &pb.devices[d], pb.floor) else {
-                    continue;
-                };
-                let add = layer_bytes(pb, &pb.layers[l], &c)
-                    + if used_of_device_hosts(&a, d) {
-                        0
-                    } else {
-                        pb.devices[d].fixed
-                    };
-                if used[d] + add > pb.devices[d].capacity {
-                    continue;
-                }
-                let mut trial = a.clone();
-                trial.layers[l] = c.clone();
-                let saved = base - time_of(pb, &trial);
-                if saved <= 0.0 {
-                    continue;
-                }
-                let ratio = saved / add.max(1) as f64;
-                // Ties go to the lower layer: a prefix keeps crossings at one.
-                if best.as_ref().is_none_or(|(r, bl, _)| {
-                    ratio > *r * (1.0 + 1e-9) || (ratio >= *r * (1.0 - 1e-9) && l < *bl)
-                }) {
-                    best = Some((ratio, l, c));
+    // 2. Place: the change that saves the most time per byte it adds. A
+    //    change is any (device, levels) for one layer — a move at ANY level
+    //    the destination runs, not just its fastest per byte: a level that is
+    //    slower per byte but half the size can put twice the layers on a
+    //    card, and a card with room left can then trade a layer up to its
+    //    faster level in place. Each step strictly lowers T, so this ends.
+    //    Moves first, in-place level changes after: a greedy that mixes them
+    //    spends the room a whole layer needed on making a resident one a
+    //    little faster.
+    for in_place in [false, true] {
+        loop {
+            let used = used_of(pb, &a);
+            let base = time_of(pb, &a);
+            let mut best: Option<(f64, usize, Choice)> = None;
+            for l in 0..n {
+                for d in 0..pb.devices.len() {
+                    if in_place != (a.layers[l].device == d) {
+                        continue;
+                    }
+                    for c in choices(&pb.layers[l], d, &pb.devices[d], pb.floor) {
+                        if c == a.layers[l] {
+                            continue;
+                        }
+                        let mut trial = a.clone();
+                        trial.layers[l] = c.clone();
+                        let after = used_of(pb, &trial);
+                        if after
+                            .iter()
+                            .zip(&pb.devices)
+                            .zip(&used)
+                            .any(|((&u, dev), &before)| u > dev.capacity && u > before)
+                        {
+                            continue;
+                        }
+                        let saved = base - time_of(pb, &trial);
+                        if saved <= 0.0 {
+                            continue;
+                        }
+                        // The device's working set is charged once, by the
+                        // capacity check above; counting it in the ratio would
+                        // make the first layer's biggest level look cheapest.
+                        let newly = !a.layers.iter().any(|x| x.device == d);
+                        let add = after[d]
+                            .saturating_sub(used[d])
+                            .saturating_sub(if newly { pb.devices[d].fixed } else { 0 })
+                            .max(1);
+                        let ratio = saved / add as f64;
+                        // Ties go to the lower layer: a prefix keeps crossings at one.
+                        if best.as_ref().is_none_or(|(r, bl, _)| {
+                            ratio > *r * (1.0 + 1e-9) || (ratio >= *r * (1.0 - 1e-9) && l < *bl)
+                        }) {
+                            best = Some((ratio, l, c));
+                        }
+                    }
                 }
             }
-        }
-        match best {
-            Some((_, l, c)) => a.layers[l] = c,
-            None => break,
+            match best {
+                Some((_, l, c)) => a.layers[l] = c,
+                None => break,
+            }
         }
     }
 
     // 3. Spend: leftover capacity on precision, within the time tolerance.
     spend(pb, &mut a);
     outcome(pb, a)
-}
-
-fn used_of_device_hosts(a: &Assignment, d: usize) -> bool {
-    a.layers.iter().any(|c| c.device == d)
 }
 
 /// Precision upgrades with what no layer move could use: most error removed
@@ -753,10 +806,52 @@ mod tests {
         let cap = (64 << 20) + 6 * per;
         assert_eq!(on_card(&solve(&problem(12, cap)).assignment), 6);
         let mut pb = problem(12, cap);
+        pb.devices[1].rate = vec![(Q4, 7.7e-12)];
         pb.devices[1].resident = vec![(Q4, 3.0)];
         let o = solve(&pb);
         assert_eq!(on_card(&o.assignment), 2, "{:?}", o.used);
         assert!(o.used[1] <= cap);
+        // Offered Q8 too, the card takes it: fewer bits on disk, but fewer
+        // bytes where it counts — resident.
+        pb.devices[1].rate.push((Q8, 7.7e-12));
+        let o = solve(&pb);
+        assert_eq!(on_card(&o.assignment), 3, "{:?}", o.assignment);
+        assert!(
+            o.assignment.layers[..3]
+                .iter()
+                .all(|c| c.levels == vec![Q8, Q8])
+        );
+        assert!(o.used[1] <= cap);
+    }
+
+    /// A card that streams Q8 faster per byte than Q4 (measured that way on
+    /// CUDA) still takes Q4 when capacity is short: twice the layers off the
+    /// host beats faster bytes on the card. With room to spare it trades up
+    /// to Q8 in place, because that is faster there.
+    #[test]
+    fn a_smaller_slower_level_wins_when_it_fits_more_layers() {
+        let q4 = bytes_at(8 * M, Q4) + bytes_at(2 * M, Q4) + 4096 + (1 << 20);
+        let fast_q8 = |cap: u64| {
+            let mut pb = problem(8, cap);
+            pb.devices[1].rate = vec![(Q4, 6.0 * 7.7e-12), (Q8, 7.7e-12)];
+            pb
+        };
+        let tight = solve(&fast_q8((64 << 20) + 4 * q4));
+        assert_eq!(on_card(&tight.assignment), 4, "{:?}", tight.assignment);
+        assert!(
+            tight.assignment.layers[..4]
+                .iter()
+                .all(|c| c.levels == vec![Q4, Q4])
+        );
+        let roomy = solve(&fast_q8(u64::MAX / 4));
+        assert_eq!(on_card(&roomy.assignment), 8);
+        assert!(
+            roomy
+                .assignment
+                .layers
+                .iter()
+                .all(|c| c.levels == vec![Q8, Q8])
+        );
     }
 
     /// A layer whose part the card cannot execute (no rate at any stored
@@ -851,5 +946,74 @@ mod tests {
                 .flat_map(|c| &c.levels)
                 .all(|&q| q != Q2)
         );
+    }
+}
+
+#[cfg(test)]
+mod timing {
+    use super::*;
+    use crate::bytes_at;
+    use QuantPolicy::{F16, Q4, Q8};
+
+    /// Solving the 27B's shape (64 layers, three levels per part on each of
+    /// two devices) is well inside one idle tick.
+    #[test]
+    #[ignore = "timing; run in release"]
+    fn a_64_layer_solve_is_cheap() {
+        let lv = |p: usize| {
+            vec![
+                (F16, bytes_at(p, F16) * 2),
+                (Q8, bytes_at(p, Q8)),
+                (Q4, bytes_at(p, Q4)),
+            ]
+        };
+        let layer = Layer {
+            parts: vec![
+                Part {
+                    params: 73 << 20,
+                    kind: Kind::Attention,
+                    levels: lv(73 << 20),
+                },
+                Part {
+                    params: 267 << 20,
+                    kind: Kind::Ffn,
+                    levels: lv(267 << 20),
+                },
+            ],
+            fixed_bytes: 1 << 20,
+            state_bytes: 8 << 20,
+        };
+        let rates = vec![(F16, 1e-10), (Q8, 7e-11), (Q4, 3e-11)];
+        let pb = Problem {
+            layers: vec![layer; 64],
+            devices: vec![
+                Device {
+                    capacity: u64::MAX / 4,
+                    fixed: 0,
+                    rate: rates.clone(),
+                    resident: vec![(Q4, 3.0)],
+                },
+                Device {
+                    capacity: 9 << 30,
+                    fixed: 2 << 30,
+                    rate: vec![(F16, 9e-12), (Q8, 2e-12), (Q4, 1.3e-11)],
+                    resident: Vec::new(),
+                },
+            ],
+            crossing_s: 1.7e-4,
+            disk_s_per_byte: 1.0 / 150e6,
+            horizon_tokens: 1000.0,
+            tolerance: 0.01,
+            floor: Q4,
+        };
+        let t = std::time::Instant::now();
+        let o = solve(&pb);
+        let (v, _) = replan(&pb, &o.assignment);
+        eprintln!(
+            "64-layer solve + replan: {:?}, {} on card, {v:?}",
+            t.elapsed(),
+            o.assignment.layers.iter().filter(|c| c.device == 1).count()
+        );
+        assert!(t.elapsed() < std::time::Duration::from_secs(2));
     }
 }
