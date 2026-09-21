@@ -849,14 +849,27 @@ fn render_prompt_with_tools(
 /// Lift the calls out of a finished answer to a request that offered tools,
 /// in the convention its prompt was rendered with. Markup that does not
 /// parse stays in the text, where the client can at least read it.
+///
+/// Calls are read from the answer, never from a `<think>` block that drafts
+/// one — present when the request asked to see the thinking. A request that
+/// did not ask never has it here (`generate_on` strips it), and ollama's own
+/// parsers only look for calls once the thinking is over. The block is put
+/// back in front of the prose, in the `</think>\n\n` shape Qwen writes.
 fn lift_tool_calls(arch: Architecture, r: &mut ChatResult) {
     let Some(syntax) = tool_calls(arch) else {
         return;
     };
-    if let Ok((calls, prose)) = (syntax.read)(&r.text)
+    let mut reasoning = crate::think::Filter::default();
+    let mut answer = reasoning.push(&r.text);
+    answer.push_str(&reasoning.finish());
+    if let Ok((calls, prose)) = (syntax.read)(&answer)
         && !calls.is_empty()
     {
-        r.text = prose;
+        r.text = match reasoning.withheld() {
+            "" => prose,
+            block if prose.is_empty() => block.to_owned(),
+            block => format!("{block}\n\n{prose}"),
+        };
         r.tool_calls = calls;
     }
 }
@@ -5417,5 +5430,33 @@ mod template_tests {
         // A family whose tags are not these keeps nothing extra.
         assert!(preserved_tokens(&tok, Architecture::Qwen3).is_empty());
         assert!(preserved_tokens(&tok, Architecture::Olmoe).is_empty());
+    }
+
+    /// A request that asked to see the thinking gets it in `text`, and a
+    /// call the model only drafted there is not one it made: only the answer
+    /// after `</think>` is read, and the block goes back in front of the
+    /// prose, whole.
+    #[test]
+    fn a_call_drafted_in_the_thinking_is_not_lifted() {
+        let drafted = "<think>\nMaybe <tool_call>{\"name\": \"get_weather\", \"arguments\": \
+                       {\"city\": \"Rome\"}}</tool_call>? No, Paris.\n</think>\n\n";
+        let mut r = answered(&format!(
+            "{drafted}Checking.\n<tool_call>\n{{\"name\": \"get_weather\", \"arguments\": \
+             {{\"city\": \"Paris\"}}}}\n</tool_call>"
+        ));
+        lift_tool_calls(Architecture::Qwen3, &mut r);
+        assert_eq!(r.tool_calls.len(), 1, "only the answer's call");
+        assert_eq!(
+            r.tool_calls[0].arguments,
+            serde_json::json!({"city": "Paris"})
+        );
+        assert_eq!(r.text, format!("{}\n\nChecking.", drafted.trim_end()));
+
+        // Drafted and never made: nothing is lifted and the text is untouched.
+        let only = format!("{drafted}I'd need a city.");
+        let mut r = answered(&only);
+        lift_tool_calls(Architecture::Qwen3, &mut r);
+        assert!(r.tool_calls.is_empty());
+        assert_eq!(r.text, only);
     }
 }

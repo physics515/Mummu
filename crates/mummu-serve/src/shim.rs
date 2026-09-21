@@ -10,11 +10,14 @@
 //! (both stream and non-stream), `POST /api/pull`, `DELETE /api/delete`.
 //! `/api/chat` takes `tools` for the families whose calls mummu reads back,
 //! and `/api/show` reports each model's capabilities from the same source.
+//! A request that sets `think: true` gets a reasoning model's thinking in
+//! ollama's own field, `message.thinking` (`thinking` on /api/generate),
+//! with `content` holding only the answer; `think` absent is off, which is
+//! where mummu parts from ollama (see [`OllamaChatRequest::think`]).
 //! Embeddings/create/copy/push answer with an explicit error rather than
 //! pretending. Model names are mummu's catalog names; a trailing `:latest`
 //! (which ollama CLIs append) is accepted and stripped.
 
-use std::borrow::Cow;
 use std::convert::Infallible;
 use std::ops::ControlFlow;
 use std::path::Path;
@@ -36,7 +39,7 @@ use tokio::sync::mpsc;
 
 use crate::engine::CallSyntax;
 use crate::recovery::{self, ChatError, InFlight};
-use crate::think::Filter;
+use crate::think::{Filter, Split};
 use crate::{
     ChatMessage, DEFAULT_MAX_TOKENS, FinalFrame, MAX_BODY_BYTES, MAX_MAX_TOKENS, OutputFormat,
     blocking, engine, json_response, models_root, parse_json, to_turns,
@@ -540,9 +543,18 @@ struct OllamaChatRequest {
     stream: Option<bool>,
     #[serde(default)]
     format: Option<OllamaFormat>,
-    /// Ollama's opt-in for reasoning output. Absent means off: a client
-    /// that did not ask for thinking should not have its token budget
-    /// spent on it (see `crate::think`).
+    /// Show a reasoning model's thinking, in `message.thinking`. `true` for
+    /// a model that does not think is ollama's 400 (see [`allow_thinking`]).
+    ///
+    /// Absent means off. Real ollama turns it on for a thinking model, and
+    /// mummu does not, on purpose: the model reasons either way — mummu does
+    /// not render Qwen's no-think prompt — so the flag only decides what the
+    /// client is shown, and a client that never asked is shown the answer
+    /// alone. When a reply is all reasoning because the token cap cut it
+    /// off, that client gets an error that says so (see `crate::think`)
+    /// instead of an empty `content` it has no reason to look behind. The
+    /// ollama CLI sends `true` to any model `/api/show` says thinks, so it
+    /// gets the split either way.
     #[serde(default)]
     think: Option<bool>,
     /// Functions the model may call. Before these were read, serde dropped
@@ -564,6 +576,7 @@ struct OllamaGenerateRequest {
     stream: Option<bool>,
     #[serde(default)]
     format: Option<OllamaFormat>,
+    /// As on /api/chat, with the thinking in `thinking`.
     #[serde(default)]
     think: Option<bool>,
 }
@@ -618,6 +631,17 @@ pub(crate) fn offer_tools(
     Ok(())
 }
 
+/// Refuse a request to see the thinking of a model that does not think —
+/// ollama's 400, in its words. `/api/show` reports "thinking" from the same
+/// [`engine::thinks`], so a client that read it first is never refused.
+/// Asking NOT to see it is never refused, as in ollama.
+fn allow_thinking(p: &RunPlan, model: &str) -> Result<(), String> {
+    if p.think && !engine::thinks(p.spec.architecture) {
+        return Err(format!("{model:?} does not support thinking"));
+    }
+    Ok(())
+}
+
 /// Everything a chat/generate run needs after validation.
 pub(crate) struct RunPlan {
     pub(crate) spec: ModelSpec,
@@ -627,7 +651,9 @@ pub(crate) struct RunPlan {
     pub(crate) max_tokens: usize,
     pub(crate) format: Option<OutputFormat>,
     pub(crate) images: Vec<mummu::vision::Patches>,
-    /// Pass a reasoning model's `<think>` block through to the client.
+    /// Let the client see a reasoning model's thinking: the engine passes the
+    /// `<think>` block through, and the surface decides where it goes —
+    /// inline on OpenAI's, ollama's `thinking` field on the shim's.
     pub(crate) think: bool,
     /// Tool definitions to advertise to the model (see [`offer_tools`]).
     pub(crate) tools: Vec<ToolSpec>,
@@ -753,9 +779,37 @@ fn done_value(model: &str, r: &engine::ChatResult, started: Instant) -> serde_js
     })
 }
 
-/// An assistant message in ollama's shape, with the calls it made.
-fn assistant_message(content: &str, calls: &[ToolCall]) -> serde_json::Value {
-    let mut message = json!({"role": "assistant", "content": content});
+/// Text on its way to an ollama client, a delta of it or the whole: the
+/// answer, and the thinking — empty unless the request asked to see it.
+#[derive(Clone, Copy, Default)]
+struct Said<'a> {
+    content: &'a str,
+    thinking: &'a str,
+}
+
+/// Turns a piece of the answer into the endpoint's streamed frame:
+/// `message` for /api/chat, `response` for /api/generate.
+type Wrap = fn(&str, Said<'_>) -> serde_json::Value;
+
+/// The endpoint's last line — the whole answer, when buffered.
+type Finish = fn(&str, Said<'_>, &engine::ChatResult, Instant) -> serde_json::Value;
+
+/// Ollama's `thinking`, beside `content` or `response`. Ollama omits it when
+/// empty, and so does this: a client that never asked sees no new field.
+fn with_thinking(mut v: serde_json::Value, thinking: &str) -> serde_json::Value {
+    if !thinking.is_empty() {
+        v["thinking"] = json!(thinking);
+    }
+    v
+}
+
+/// An assistant message in ollama's shape, with its thinking and the calls
+/// it made.
+fn assistant_message(said: Said<'_>, calls: &[ToolCall]) -> serde_json::Value {
+    let mut message = with_thinking(
+        json!({"role": "assistant", "content": said.content}),
+        said.thinking,
+    );
     if !calls.is_empty() {
         message["tool_calls"] = calls
             .iter()
@@ -767,14 +821,10 @@ fn assistant_message(content: &str, calls: &[ToolCall]) -> serde_json::Value {
 }
 
 /// Run one completion for the shim: streamed (one NDJSON frame per delta)
-/// or buffered, with `wrap` turning a text delta into the endpoint's frame
-/// shape (`message.content` for /api/chat, `response` for /api/generate).
-async fn run(
-    p: RunPlan,
-    stream: bool,
-    wrap: fn(&str, &str) -> serde_json::Value,
-    finish: fn(&str, &str, &engine::ChatResult, Instant) -> serde_json::Value,
-) -> Response {
+/// or buffered, with `wrap` turning a piece of the answer into the
+/// endpoint's frame shape (`message` for /api/chat, `response` and
+/// `thinking` for /api/generate).
+async fn run(p: RunPlan, stream: bool, wrap: Wrap, finish: Finish) -> Response {
     // One line per accepted request, before any engine work: a request that
     // queues behind a cold model load produces nothing for its whole wait,
     // and a surface that logs nothing while that happens reads as wedged
@@ -830,35 +880,187 @@ async fn run(
     } else {
         engine::tool_calls(p.spec.architecture)
     };
-    respond(model, stream, calls, wrap, finish, move |sink| async move {
-        let r = engine::run_chat(
-            &p.spec,
-            &p.root,
-            &p.turns,
-            &p.opts,
-            p.max_tokens,
-            p.format,
-            p.think,
-            p.images,
-            p.tools,
-            |delta| sink.delta(delta),
-        )
-        .await;
-        // Padded exactly when a buffered answer outlived the keep-alive
-        // grace — the condition `keepalive_json` pads on.
-        let padded = !stream && begin.started.elapsed() >= crate::KEEPALIVE_GRACE;
-        match &r {
-            Ok(res) => begin.finish(res.device, res.timings.clone(), padded, Ok(())),
-            Err(e) => begin.finish(
-                "",
-                crate::trace::Timings::default(),
-                padded,
-                Err(&e.message),
-            ),
-        }
-        r
-    })
+    let think = p.think;
+    respond(
+        model,
+        stream,
+        think,
+        calls,
+        wrap,
+        finish,
+        move |sink| async move {
+            let r = engine::run_chat(
+                &p.spec,
+                &p.root,
+                &p.turns,
+                &p.opts,
+                p.max_tokens,
+                p.format,
+                p.think,
+                p.images,
+                p.tools,
+                |delta| sink.delta(delta),
+            )
+            .await;
+            // Padded exactly when a buffered answer outlived the keep-alive
+            // grace — the condition `keepalive_json` pads on.
+            let padded = !stream && begin.started.elapsed() >= crate::KEEPALIVE_GRACE;
+            match &r {
+                Ok(res) => begin.finish(res.device, res.timings.clone(), padded, Ok(())),
+                Err(e) => begin.finish(
+                    "",
+                    crate::trace::Timings::default(),
+                    padded,
+                    Err(&e.message),
+                ),
+            }
+            r
+        },
+    )
     .await
+}
+
+/// Splits an answer that was allowed to think into ollama's `thinking` and
+/// `content`, the way ollama's own parser does (`thinking/parser.go`): the
+/// whitespace between `<think>` and the reasoning, and between `</think>`
+/// and the answer, belongs to neither — so `content` does not open on the
+/// blank line Qwen writes after `</think>`. The trailing whitespace of the
+/// reasoning is kept, as there. A streamed answer and a buffered one go
+/// through the same splitter, so the two cannot disagree.
+#[derive(Default)]
+struct Reasoning {
+    filter: Filter,
+    /// Some thinking has been shown: its whitespace is its own from here on.
+    thinking: bool,
+    /// Some answer has been shown, likewise.
+    answering: bool,
+    /// Whitespace the answer opened with, held until it is known whether it
+    /// was the gap around a think block (dropped) or the answer's own (kept).
+    gap: String,
+}
+
+impl Reasoning {
+    /// One whole answer, split.
+    fn split(text: &str) -> Split {
+        let mut r = Self::default();
+        let mut whole = r.push(text);
+        let tail = r.finish();
+        whole.visible.push_str(&tail.visible);
+        whole.thought.push_str(&tail.thought);
+        whole
+    }
+
+    fn push(&mut self, delta: &str) -> Split {
+        let split = self.filter.push_split(delta);
+        self.shape(split)
+    }
+
+    /// Whatever is still held at the end. A block the token cap cut off is
+    /// thinking all the same, and goes out as `thinking`.
+    fn finish(&mut self) -> Split {
+        let split = self.filter.finish_split();
+        let mut out = self.shape(split);
+        if !self.answering && !self.opened() {
+            // No block, and an answer of nothing but whitespace: that was
+            // the answer.
+            out.visible.insert_str(0, &std::mem::take(&mut self.gap));
+        }
+        out
+    }
+
+    /// Has a think block opened?
+    fn opened(&self) -> bool {
+        !self.filter.withheld().is_empty()
+    }
+
+    fn shape(&mut self, split: Split) -> Split {
+        let Split {
+            mut visible,
+            mut thought,
+        } = split;
+        if !self.thinking {
+            thought = thought.trim_start().to_owned();
+            self.thinking = !thought.is_empty();
+        }
+        if !self.answering {
+            let body = visible.trim_start();
+            if body.is_empty() {
+                self.gap.push_str(&visible);
+                visible.clear();
+            } else {
+                self.answering = true;
+                let gap = std::mem::take(&mut self.gap);
+                visible = if self.opened() {
+                    body.to_owned()
+                } else {
+                    gap + &visible
+                };
+            }
+        }
+        Split { visible, thought }
+    }
+}
+
+/// What a streamed answer holds back between deltas, and why.
+struct Held {
+    /// The request asked to see the thinking: it is split out of the answer
+    /// into ollama's `thinking` field.
+    reasoning: Option<Reasoning>,
+    /// The request offered tools: the family's call markup is held back from
+    /// the answer. The calls go out structured, and whole, once the answer
+    /// is — see [`tool_tail`]. Only the answer is looked in: markup inside
+    /// the thinking is thinking, which is also all the engine reads calls
+    /// from (`engine::lift_tool_calls`).
+    calls: Option<Filter>,
+}
+
+impl Held {
+    /// One delta, as the client may see it now.
+    fn push(&mut self, delta: &str) -> Split {
+        let Split { visible, thought } = match &mut self.reasoning {
+            Some(r) => r.push(delta),
+            None => Split {
+                visible: delta.to_owned(),
+                thought: String::new(),
+            },
+        };
+        let visible = match &mut self.calls {
+            Some(f) => f.push(&visible),
+            None => visible,
+        };
+        Split { visible, thought }
+    }
+
+    /// What the client is still owed once the model is done, before the
+    /// final line: the thinking and answer text still held, then the calls.
+    fn tail(
+        &mut self,
+        model: &str,
+        wrap: Wrap,
+        r: &mut engine::ChatResult,
+    ) -> Vec<serde_json::Value> {
+        let mut frames = Vec::new();
+        if let Some(reasoning) = &mut self.reasoning {
+            let Split { visible, thought } = reasoning.finish();
+            let content = match &mut self.calls {
+                Some(f) => f.push(&visible),
+                None => visible,
+            };
+            if !content.is_empty() || !thought.is_empty() {
+                frames.push(wrap(
+                    model,
+                    Said {
+                        content: &content,
+                        thinking: &thought,
+                    },
+                ));
+            }
+        }
+        if let Some(calls) = &mut self.calls {
+            frames.extend(tool_tail(model, wrap, calls, r));
+        }
+        frames
+    }
 }
 
 /// Where a shim generation's text goes: one NDJSON line per piece when
@@ -866,11 +1068,10 @@ async fn run(
 struct ShimSink {
     tx: Option<mpsc::UnboundedSender<serde_json::Value>>,
     model: String,
-    wrap: fn(&str, &str) -> serde_json::Value,
-    /// For a request that offered tools: holds the family's call markup
-    /// back from the stream. The calls go out structured, and whole, once
-    /// the answer is — see [`tool_tail`].
-    held: Option<Arc<Mutex<Filter>>>,
+    wrap: Wrap,
+    /// What the answer holds back between deltas; `None` when the request
+    /// neither asked to see the thinking nor offered tools.
+    held: Option<Arc<Mutex<Held>>>,
 }
 
 impl ShimSink {
@@ -878,14 +1079,21 @@ impl ShimSink {
         let Some(tx) = &self.tx else {
             return ControlFlow::Continue(());
         };
-        let visible = match &self.held {
-            Some(f) => Cow::Owned(f.lock().unwrap_or_else(|e| e.into_inner()).push(text)),
-            None => Cow::Borrowed(text),
+        let split = match &self.held {
+            Some(h) => h.lock().unwrap_or_else(|e| e.into_inner()).push(text),
+            None => Split {
+                visible: text.to_owned(),
+                thought: String::new(),
+            },
         };
-        if visible.is_empty() {
+        if split.visible.is_empty() && split.thought.is_empty() {
             return ControlFlow::Continue(());
         }
-        match tx.send((self.wrap)(&self.model, &visible)) {
+        let said = Said {
+            content: &split.visible,
+            thinking: &split.thought,
+        };
+        match tx.send((self.wrap)(&self.model, said)) {
             Ok(()) => ControlFlow::Continue(()),
             Err(_) => ControlFlow::Break(()),
         }
@@ -900,20 +1108,26 @@ impl ShimSink {
 /// nothing the model wrote goes missing.
 fn tool_tail(
     model: &str,
-    wrap: fn(&str, &str) -> serde_json::Value,
+    wrap: Wrap,
     held: &mut Filter,
     r: &mut engine::ChatResult,
 ) -> Vec<serde_json::Value> {
     let text = held.settle(!r.tool_calls.is_empty());
     let mut frames = Vec::new();
     if !text.is_empty() {
-        frames.push(wrap(model, &text));
+        frames.push(wrap(
+            model,
+            Said {
+                content: &text,
+                thinking: "",
+            },
+        ));
     }
     if !r.tool_calls.is_empty() {
         frames.push(json!({
             "model": model,
             "created_at": now_rfc3339(),
-            "message": assistant_message("", &std::mem::take(&mut r.tool_calls)),
+            "message": assistant_message(Said::default(), &std::mem::take(&mut r.tool_calls)),
             "done": false,
         }));
     }
@@ -929,15 +1143,19 @@ fn tool_tail(
 /// `done: true`, or ollama's `{"error": "…"}` — and a buffered one on a
 /// non-2xx with `{"error": "…"}`: 503 for the GPU, 500 for anything else.
 /// `run` is the generation; production passes `engine::run_chat`, a test one
-/// that fails the way production did. `calls` is the family's tool-call
-/// convention when the request offered tools: a streamed answer holds that
-/// markup back and sends the calls structured instead (see [`tool_tail`]).
+/// that fails the way production did. `think` is the request's: the engine
+/// then passes the `<think>` block through, and it is split out of the
+/// answer here, into ollama's `thinking` (see [`Reasoning`]). `calls` is the
+/// family's tool-call convention when the request offered tools: a streamed
+/// answer holds that markup back and sends the calls structured instead
+/// (see [`tool_tail`]).
 async fn respond<F, Fut>(
     model: String,
     stream: bool,
+    think: bool,
     calls: Option<CallSyntax>,
-    wrap: fn(&str, &str) -> serde_json::Value,
-    finish: fn(&str, &str, &engine::ChatResult, Instant) -> serde_json::Value,
+    wrap: Wrap,
+    finish: Finish,
     run: F,
 ) -> Response
 where
@@ -950,7 +1168,12 @@ where
         let inflight = InFlight::enter();
         tokio::spawn(async move {
             let last = FinalFrame::new(tx.clone(), ended_without_result());
-            let held = calls.map(|c| Arc::new(Mutex::new(Filter::spans(c.open, c.close))));
+            let held = (think || calls.is_some()).then(|| {
+                Arc::new(Mutex::new(Held {
+                    reasoning: think.then(Reasoning::default),
+                    calls: calls.map(|c| Filter::spans(c.open, c.close)),
+                }))
+            });
             let sink = ShimSink {
                 tx: Some(tx.clone()),
                 model: model.clone(),
@@ -961,11 +1184,11 @@ where
                 Ok(mut r) => {
                     if let Some(held) = held {
                         let mut held = held.lock().unwrap_or_else(|e| e.into_inner());
-                        for frame in tool_tail(&model, wrap, &mut held, &mut r) {
+                        for frame in held.tail(&model, wrap, &mut r) {
                             let _ = tx.send(frame);
                         }
                     }
-                    finish(&model, "", &r, started)
+                    finish(&model, Said::default(), &r, started)
                 }
                 Err(e) => {
                     eprintln!("[mummu-serve] shim chat {model}: {e}");
@@ -989,8 +1212,19 @@ where
         };
         match recovery::contain(&model, run(sink)).await {
             Ok(r) => {
-                let text = r.text.clone();
-                (200, finish(&model, &text, &r, started))
+                let whole = if think {
+                    Reasoning::split(&r.text)
+                } else {
+                    Split {
+                        visible: r.text.clone(),
+                        thought: String::new(),
+                    }
+                };
+                let said = Said {
+                    content: &whole.visible,
+                    thinking: &whole.thought,
+                };
+                (200, finish(&model, said, &r, started))
             }
             Err(e) => {
                 eprintln!("[mummu-serve] shim chat {model}: {e}");
@@ -1016,6 +1250,9 @@ pub(crate) async fn chat(body: Bytes) -> Response {
         Ok(p) => p,
         Err(response) => return *response,
     };
+    if let Err(e) = allow_thinking(&p, &parsed.model) {
+        return json_response(400, json!({"error": e}));
+    }
     let tools = tool_specs(parsed.tools.as_deref().unwrap_or_default());
     if let Err(e) = offer_tools(&mut p, &parsed.model, tools) {
         return json_response(400, json!({"error": e}));
@@ -1024,11 +1261,11 @@ pub(crate) async fn chat(body: Bytes) -> Response {
 }
 
 /// One streamed piece of an `/api/chat` answer.
-fn chat_delta(model: &str, delta: &str) -> serde_json::Value {
+fn chat_delta(model: &str, said: Said<'_>) -> serde_json::Value {
     json!({
         "model": model,
         "created_at": now_rfc3339(),
-        "message": {"role": "assistant", "content": delta},
+        "message": assistant_message(said, &[]),
         "done": false,
     })
 }
@@ -1036,12 +1273,12 @@ fn chat_delta(model: &str, delta: &str) -> serde_json::Value {
 /// The last line of an `/api/chat` answer — the whole answer, when buffered.
 fn chat_done(
     model: &str,
-    text: &str,
+    said: Said<'_>,
     r: &engine::ChatResult,
     started: Instant,
 ) -> serde_json::Value {
     let mut v = done_value(model, r, started);
-    v["message"] = assistant_message(text, &r.tool_calls);
+    v["message"] = assistant_message(said, &r.tool_calls);
     v
 }
 
@@ -1077,24 +1314,42 @@ async fn generate(body: Bytes) -> Response {
         Ok(p) => p,
         Err(response) => return *response,
     };
+    if let Err(e) = allow_thinking(&p, &parsed.model) {
+        return json_response(400, json!({"error": e}));
+    }
     run(
         p,
         parsed.stream.unwrap_or(true),
-        |model, delta| {
-            json!({
-                "model": model,
-                "created_at": now_rfc3339(),
-                "response": delta,
-                "done": false,
-            })
-        },
-        |model, text, r, started| {
-            let mut v = done_value(model, r, started);
-            v["response"] = json!(text);
-            v
-        },
+        generate_delta,
+        generate_done,
     )
     .await
+}
+
+/// One streamed piece of an `/api/generate` answer.
+fn generate_delta(model: &str, said: Said<'_>) -> serde_json::Value {
+    with_thinking(
+        json!({
+            "model": model,
+            "created_at": now_rfc3339(),
+            "response": said.content,
+            "done": false,
+        }),
+        said.thinking,
+    )
+}
+
+/// The last line of an `/api/generate` answer — the whole answer, when
+/// buffered.
+fn generate_done(
+    model: &str,
+    said: Said<'_>,
+    r: &engine::ChatResult,
+    started: Instant,
+) -> serde_json::Value {
+    let mut v = done_value(model, r, started);
+    v["response"] = json!(said.content);
+    with_thinking(v, said.thinking)
 }
 
 // ---------------------------------------------------------------------------
@@ -1192,18 +1447,18 @@ mod tests {
         panic!("called `Option::unwrap()` on a `None` value")
     }
 
-    fn wrap(model: &str, delta: &str) -> serde_json::Value {
-        json!({"model": model, "response": delta, "done": false})
+    fn wrap(model: &str, said: Said<'_>) -> serde_json::Value {
+        json!({"model": model, "response": said.content, "done": false})
     }
 
     fn finish(
         model: &str,
-        text: &str,
+        said: Said<'_>,
         r: &engine::ChatResult,
         started: Instant,
     ) -> serde_json::Value {
         let mut v = done_value(model, r, started);
-        v["response"] = json!(text);
+        v["response"] = json!(said.content);
         v
     }
 
@@ -1224,7 +1479,7 @@ mod tests {
         recovery::reset_for_tests();
         recovery::install_panic_hook();
 
-        let response = respond("m".into(), true, None, wrap, finish, |_| {
+        let response = respond("m".into(), true, false, None, wrap, finish, |_| {
             fails_like_production()
         })
         .await;
@@ -1253,7 +1508,7 @@ mod tests {
         recovery::reset_for_tests();
         recovery::install_panic_hook();
 
-        let response = respond("m".into(), false, None, wrap, finish, |_| {
+        let response = respond("m".into(), false, false, None, wrap, finish, |_| {
             fails_like_production()
         })
         .await;
@@ -1268,7 +1523,7 @@ mod tests {
         );
 
         recovery::reset_for_tests();
-        let response = respond("m".into(), false, None, wrap, finish, |_| {
+        let response = respond("m".into(), false, false, None, wrap, finish, |_| {
             fails_with_an_ordinary_bug()
         })
         .await;
@@ -1585,6 +1840,7 @@ mod tests {
         let response = respond(
             "m".into(),
             true,
+            false,
             hermes,
             chat_delta,
             chat_done,
@@ -1629,6 +1885,7 @@ mod tests {
         let response = respond(
             "m".into(),
             true,
+            false,
             hermes,
             chat_delta,
             chat_done,
@@ -1664,6 +1921,7 @@ mod tests {
         let response = respond(
             "m".into(),
             false,
+            false,
             hermes,
             chat_delta,
             chat_done,
@@ -1679,6 +1937,364 @@ mod tests {
             body["message"]["tool_calls"][0]["function"]["name"],
             json!("get_weather")
         );
+    }
+
+    // -- thinking -------------------------------------------------------------
+
+    /// A Qwen3 answer as the engine streams it to a request that asked to see
+    /// the thinking: the block passes through, a token-shaped piece at a
+    /// time, both tags split across pieces.
+    const THOUGHT_DELTAS: [&str; 8] = [
+        "<th",
+        "ink>",
+        "\nThe user",
+        " said hi.",
+        "\n</th",
+        "ink>",
+        "\n\n",
+        "Hello!",
+    ];
+    /// The same answer whole, as the engine hands it back.
+    const THOUGHT: &str = "<think>\nThe user said hi.\n</think>\n\nHello!";
+
+    /// One field of every frame, joined in order.
+    fn joined(
+        lines: &[serde_json::Value],
+        pick: impl Fn(&serde_json::Value) -> Option<&str>,
+    ) -> String {
+        lines.iter().filter_map(pick).collect()
+    }
+
+    /// Streamed, in ollama's shape: the reasoning in `message.thinking` as it
+    /// arrives, the answer in `message.content`, no tag in either, and not
+    /// the blank line Qwen writes after `</think>` — what ollama's own
+    /// parser makes of the same tokens.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serializes tests; nothing else waits on it
+    async fn a_streamed_answer_that_thinks_splits_into_thinking_and_content() {
+        let _serial = crate::progress_serial();
+        let response = respond(
+            "m".into(),
+            true,
+            true,
+            None,
+            chat_delta,
+            chat_done,
+            |sink| async move {
+                for d in THOUGHT_DELTAS {
+                    let _ = sink.delta(d);
+                }
+                Ok(answered(THOUGHT, Vec::new()))
+            },
+        )
+        .await;
+        let lines = ndjson(&body_text(response).await);
+        let (last, pieces) = lines.split_last().expect("lines");
+        assert_eq!(
+            joined(pieces, |l| l["message"]["thinking"].as_str()),
+            "The user said hi.\n"
+        );
+        assert_eq!(
+            joined(pieces, |l| l["message"]["content"].as_str()),
+            "Hello!"
+        );
+        assert!(
+            pieces
+                .iter()
+                .filter(|l| l["message"].get("thinking").is_some())
+                .count()
+                > 1,
+            "the thinking streams as it comes, not in one piece at the end: {lines:?}"
+        );
+        for l in pieces {
+            assert_eq!(l["done"], json!(false));
+            assert!(!l.to_string().contains("think>"), "a tag leaked: {l}");
+            assert!(
+                l["message"]["thinking"]
+                    .as_str()
+                    .is_none_or(|t| !t.is_empty()),
+                "an empty `thinking` is omitted, as ollama omits it: {l}"
+            );
+        }
+        assert_eq!(last["done"], json!(true));
+        assert_eq!(last["message"]["content"], json!(""));
+        assert!(last["message"].get("thinking").is_none(), "{last}");
+    }
+
+    /// Buffered, the one object carries both fields.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serializes tests; nothing else waits on it
+    async fn a_buffered_answer_that_thinks_carries_both_fields() {
+        let _serial = crate::progress_serial();
+        let response = respond(
+            "m".into(),
+            false,
+            true,
+            None,
+            chat_delta,
+            chat_done,
+            |_| async { Ok(answered(THOUGHT, Vec::new())) },
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value =
+            serde_json::from_str(&body_text(response).await).expect("JSON");
+        assert_eq!(body["message"]["thinking"], json!("The user said hi.\n"));
+        assert_eq!(body["message"]["content"], json!("Hello!"));
+    }
+
+    /// /api/generate is the same split in its own fields: `thinking` beside
+    /// `response`, streamed and buffered.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serializes tests; nothing else waits on it
+    async fn generate_puts_the_thinking_beside_the_response() {
+        let _serial = crate::progress_serial();
+        let response = respond(
+            "m".into(),
+            true,
+            true,
+            None,
+            generate_delta,
+            generate_done,
+            |sink| async move {
+                for d in THOUGHT_DELTAS {
+                    let _ = sink.delta(d);
+                }
+                Ok(answered(THOUGHT, Vec::new()))
+            },
+        )
+        .await;
+        let lines = ndjson(&body_text(response).await);
+        assert_eq!(
+            joined(&lines, |l| l["thinking"].as_str()),
+            "The user said hi.\n"
+        );
+        assert_eq!(joined(&lines, |l| l["response"].as_str()), "Hello!");
+        assert!(
+            lines.iter().all(|l| l.get("message").is_none()),
+            "{lines:?}"
+        );
+
+        let response = respond(
+            "m".into(),
+            false,
+            true,
+            None,
+            generate_delta,
+            generate_done,
+            |_| async { Ok(answered(THOUGHT, Vec::new())) },
+        )
+        .await;
+        let body: serde_json::Value =
+            serde_json::from_str(&body_text(response).await).expect("JSON");
+        assert_eq!(body["thinking"], json!("The user said hi.\n"));
+        assert_eq!(body["response"], json!("Hello!"));
+    }
+
+    /// A request that did not ask gets what the engine hands it, untouched —
+    /// no `thinking` field, and none of the whitespace the split eats.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serializes tests; nothing else waits on it
+    async fn an_answer_that_did_not_ask_is_passed_through_as_it_was() {
+        let _serial = crate::progress_serial();
+        let response = respond(
+            "m".into(),
+            true,
+            false,
+            None,
+            chat_delta,
+            chat_done,
+            |sink| async move {
+                let _ = sink.delta("\n\n");
+                let _ = sink.delta("Hello!");
+                Ok(answered("\n\nHello!", Vec::new()))
+            },
+        )
+        .await;
+        let lines = ndjson(&body_text(response).await);
+        assert_eq!(
+            joined(&lines, |l| l["message"]["content"].as_str()),
+            "\n\nHello!"
+        );
+        assert!(
+            lines.iter().all(|l| l["message"].get("thinking").is_none()),
+            "{lines:?}"
+        );
+    }
+
+    /// A block the token cap cut off is reasoning all the same: it goes out
+    /// as `thinking`, to the model's last byte, with an empty `content` —
+    /// what ollama answers. (A request that did not ask gets the engine's
+    /// error instead, which says to raise the cap; see `crate::think`.)
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serializes tests; nothing else waits on it
+    async fn thinking_cut_off_by_the_token_cap_is_still_thinking() {
+        let _serial = crate::progress_serial();
+        let cut = "<think>\nStep one, step two</thi";
+        let response = respond(
+            "m".into(),
+            true,
+            true,
+            None,
+            chat_delta,
+            chat_done,
+            move |sink| async move {
+                for d in ["<think>\nStep one", ", step tw", "o</thi"] {
+                    let _ = sink.delta(d);
+                }
+                Ok(answered(cut, Vec::new()))
+            },
+        )
+        .await;
+        let lines = ndjson(&body_text(response).await);
+        assert_eq!(
+            joined(&lines, |l| l["message"]["thinking"].as_str()),
+            "Step one, step two</thi"
+        );
+        assert_eq!(joined(&lines, |l| l["message"]["content"].as_str()), "");
+
+        let response = respond(
+            "m".into(),
+            false,
+            true,
+            None,
+            chat_delta,
+            chat_done,
+            move |_| async move { Ok(answered(cut, Vec::new())) },
+        )
+        .await;
+        let body: serde_json::Value =
+            serde_json::from_str(&body_text(response).await).expect("JSON");
+        assert_eq!(
+            body["message"]["thinking"],
+            json!("Step one, step two</thi")
+        );
+        assert_eq!(body["message"]["content"], json!(""));
+    }
+
+    /// Thinking and tools together. The thinking is split out first and only
+    /// the answer is looked in for calls, so a call the model drafted while
+    /// thinking stays in `thinking`, verbatim, and is not one it made — the
+    /// engine reads calls from the same place (`engine::lift_tool_calls`).
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serializes tests; nothing else waits on it
+    async fn a_call_drafted_while_thinking_stays_in_the_thinking() {
+        let _serial = crate::progress_serial();
+        let hermes = engine::tool_calls(Architecture::Qwen3);
+        let block = "<think>\nMaybe <tool_call>{\"name\": \"x\"}</tool_call>?\n</think>";
+        let response = respond(
+            "m".into(),
+            true,
+            true,
+            hermes,
+            chat_delta,
+            chat_done,
+            move |sink| async move {
+                let _ = sink.delta(&format!("{block}\n\n"));
+                let _ = sink.delta("Checking. <tool");
+                let _ = sink.delta(
+                    "_call>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}</tool_call>",
+                );
+                Ok(answered(
+                    &format!("{block}\n\nChecking."),
+                    vec![weather_call()],
+                ))
+            },
+        )
+        .await;
+        let lines = ndjson(&body_text(response).await);
+        assert_eq!(
+            joined(&lines, |l| l["message"]["thinking"].as_str()),
+            "Maybe <tool_call>{\"name\": \"x\"}</tool_call>?\n"
+        );
+        assert_eq!(
+            joined(&lines, |l| l["message"]["content"].as_str()),
+            "Checking. "
+        );
+        let calls: Vec<_> = lines
+            .iter()
+            .filter_map(|l| l["message"].get("tool_calls"))
+            .collect();
+        assert_eq!(
+            calls,
+            [
+                &json!([{"function": {"index": 0, "name": "get_weather", "arguments": {"city": "Paris"}}}])
+            ],
+            "{lines:?}"
+        );
+        assert_eq!(lines.last().expect("lines")["done"], json!(true));
+    }
+
+    /// The splitter eats what ollama's parser eats — the whitespace around
+    /// the block — and nothing else; and a stream split anywhere, down to a
+    /// character at a time, comes out the same as the whole.
+    #[test]
+    fn the_split_is_ollamas_and_does_not_depend_on_where_the_deltas_fall() {
+        // (model output, thinking, content)
+        let cases = [
+            (THOUGHT, "The user said hi.\n", "Hello!"),
+            (
+                "\n<think>\n\nwhy\n</think>\n\nAnswer.\n",
+                "why\n",
+                "Answer.\n",
+            ),
+            ("<think></think>\n\nAnswer.", "", "Answer."),
+            ("  no block, indented", "", "  no block, indented"),
+            ("\n", "", "\n"),
+            ("5 < 7 and 8 > 2", "", "5 < 7 and 8 > 2"),
+            ("café <think>☕</think> ok", "☕", "café  ok"),
+        ];
+        for (text, thinking, content) in cases {
+            let whole = Reasoning::split(text);
+            assert_eq!(
+                (whole.thought.as_str(), whole.visible.as_str()),
+                (thinking, content),
+                "{text:?}"
+            );
+            let mut r = Reasoning::default();
+            let mut streamed = Split::default();
+            let mut take = |piece: Split| {
+                streamed.visible.push_str(&piece.visible);
+                streamed.thought.push_str(&piece.thought);
+            };
+            for (i, c) in text.char_indices() {
+                take(r.push(&text[i..i + c.len_utf8()]));
+            }
+            take(r.finish());
+            assert_eq!(streamed, whole, "{text:?}, a character at a time");
+        }
+    }
+
+    /// `think: true` is refused exactly where `/api/show` does not report
+    /// "thinking" — both read `engine::thinks` — and in ollama's words.
+    /// Asking not to see it is never refused.
+    #[test]
+    fn thinking_is_advertised_exactly_where_a_request_may_ask_to_see_it() {
+        let root = scratch_root("think");
+        let (mut accepted, mut refused) = (0, 0);
+        for spec in mummu::registry::catalog() {
+            if spec.architecture == Architecture::MiniLm {
+                continue; // not chat-servable: `plan` never gets this far
+            }
+            let name = spec.name.clone();
+            let advertised = capabilities(&spec, &root).contains(&"thinking");
+            let mut p = a_plan_for(spec, &root);
+            assert!(allow_thinking(&p, &name).is_ok(), "{name}");
+            p.think = true;
+            match allow_thinking(&p, &name) {
+                Ok(()) => {
+                    assert!(advertised, "{name} took think /api/show does not advertise");
+                    accepted += 1;
+                }
+                Err(e) => {
+                    assert!(!advertised, "{name} refused think /api/show advertises");
+                    assert_eq!(e, format!("{name:?} does not support thinking"));
+                    refused += 1;
+                }
+            }
+        }
+        assert!(accepted > 0 && refused > 0, "{accepted} / {refused}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A pull ends on its own `status` line: only a chat stream is held to
@@ -1697,7 +2313,11 @@ mod tests {
         );
 
         let (tx, rx) = mpsc::unbounded_channel();
-        tx.send(wrap("m", "half")).expect("open");
+        let half = Said {
+            content: "half",
+            thinking: "",
+        };
+        tx.send(wrap("m", half)).expect("open");
         drop(tx);
         let text = body_text(ndjson_response(rx, Some(InFlight::enter()))).await;
         let last: serde_json::Value =

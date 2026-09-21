@@ -9,7 +9,10 @@
 //! was written for caps replies at 600.
 //!
 //! So thinking is suppressed unless a request opts in (ollama's `think`,
-//! OpenAI's `reasoning_effort`). Opting in passes it through unchanged.
+//! OpenAI's `reasoning_effort`). Opting in passes it through unchanged, and
+//! the surface decides what to do with it: OpenAI's gets it inline, and the
+//! ollama shim splits it into the `thinking` field ollama clients read
+//! ([`Filter::push_split`]).
 //!
 //! The filter is streaming, because the deltas it sees are token-shaped and
 //! a tag can be split across any number of them — `<`, `th`, `ink>` is three
@@ -48,6 +51,14 @@ impl Default for Filter {
     }
 }
 
+/// One piece of an answer, split: what may be shown as the answer, and what
+/// was inside a span.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Split {
+    pub(crate) visible: String,
+    pub(crate) thought: String,
+}
+
 /// The longest proper prefix of `tag` that `s` ends with — the part that
 /// might still become a tag once more text arrives.
 fn dangling(s: &str, tag: &str) -> usize {
@@ -73,6 +84,14 @@ impl Filter {
 
     /// Feed one delta; returns the part that may be shown now.
     pub(crate) fn push(&mut self, delta: &str) -> String {
+        self.push_split(delta).visible
+    }
+
+    /// Feed one delta; returns the part that may be shown now AND the part
+    /// of the span it completed — for a caller that shows the thinking
+    /// somewhere else instead of dropping it.
+    pub(crate) fn push_split(&mut self, delta: &str) -> Split {
+        let before = self.thought.len();
         self.pending.push_str(delta);
         let mut out = String::new();
         loop {
@@ -106,7 +125,10 @@ impl Filter {
                 self.inside = true;
             }
         }
-        out
+        Split {
+            visible: out,
+            thought: self.thought[before..].to_owned(),
+        }
     }
 
     /// Whatever is still held back at the end of a generation.
@@ -116,19 +138,39 @@ impl Filter {
     /// half-tag — but an unterminated *partial tag* outside a block was
     /// ordinary text all along and is released.
     pub(crate) fn finish(&mut self) -> String {
+        self.finish_split().visible
+    }
+
+    /// [`Self::finish`], with the unclosed span's tail as `thought`: the
+    /// reasoning a token cap cut off is still reasoning.
+    pub(crate) fn finish_split(&mut self) -> Split {
+        let tail = std::mem::take(&mut self.pending);
         if self.inside {
-            let tail = std::mem::take(&mut self.pending);
             self.thought.push_str(&tail);
             self.withheld.push_str(&tail);
-            String::new()
+            Split {
+                visible: String::new(),
+                thought: tail,
+            }
         } else {
-            std::mem::take(&mut self.pending)
+            Split {
+                visible: tail,
+                thought: String::new(),
+            }
         }
     }
 
     /// Did the model open a block that never closed?
     pub(crate) fn truncated(&self) -> bool {
         self.inside
+    }
+
+    /// Every span held back so far, verbatim — tags included, and an
+    /// unclosed one's tail once [`Self::finish`] has run. For a caller that
+    /// puts a think block back where it was (`engine::lift_tool_calls`), or
+    /// asks whether one has opened yet (`crate::shim`).
+    pub(crate) fn withheld(&self) -> &str {
+        &self.withheld
     }
 
     /// End a stream that held spans back to use them: the text still owed.
@@ -254,6 +296,46 @@ mod tests {
             unused.settle(false),
             "<tool_call>{\"name\": \"x\"}</tool_call><tool_"
         );
+    }
+
+    fn split(visible: &str, thought: &str) -> Split {
+        Split {
+            visible: visible.into(),
+            thought: thought.into(),
+        }
+    }
+
+    /// The ollama shim shows the thinking instead of dropping it, so each
+    /// push hands back the thought it completed — and holds a maybe-tag on
+    /// either side exactly as `push` does.
+    #[test]
+    fn push_split_hands_back_the_thought_as_it_arrives() {
+        let mut f = Filter::default();
+        assert_eq!(f.push_split("<th"), split("", ""), "a maybe-open is held");
+        assert_eq!(f.push_split("ink>step "), split("", "step "));
+        assert_eq!(
+            f.push_split("one</th"),
+            split("", "one"),
+            "a maybe-close is held"
+        );
+        assert_eq!(f.push_split("ink>Answer"), split("Answer", ""));
+        assert_eq!(f.finish_split(), split("", ""));
+        assert_eq!(f.thought, "step one");
+    }
+
+    /// A block the token cap cut off ends as thought, half-tag and all;
+    /// a half-tag outside a block ends as text, as [`Filter::finish`] has it.
+    #[test]
+    fn finish_split_hands_back_a_cut_off_block_as_thought() {
+        let mut f = Filter::default();
+        assert_eq!(f.push_split("<think>still go").thought, "still go");
+        assert_eq!(f.push_split("ing</thi").thought, "ing");
+        assert_eq!(f.finish_split(), split("", "</thi"));
+        assert!(f.truncated());
+
+        let mut f = Filter::default();
+        assert_eq!(f.push_split("x <thi"), split("x ", ""));
+        assert_eq!(f.finish_split(), split("<thi", ""));
     }
 
     #[test]
