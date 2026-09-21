@@ -828,7 +828,7 @@ impl SlotStage for TensorStage {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicIsize;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     fn close(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-9
@@ -1158,65 +1158,170 @@ mod tests {
         )
     }
 
-    /// (a) tx <= compute: transfers hide, wall ~= sum of compute. Margins
-    /// are deliberately coarse (sleep-based, CI-safe): the bound sits well
-    /// under the no-overlap serial time (~1080 ms) while allowing ~120 ms
-    /// of scheduler noise.
-    #[test]
-    fn transfers_hide_under_compute_with_two_slots() {
-        let order = vec![0usize, 1, 2];
-        let (stage, peak) = fake(40);
-        let ring = Ring::new(stage, 2, order.clone());
-        let compute = Duration::from_millis(80);
-        let t = Instant::now();
-        for _token in 0..3 {
-            for &l in &order {
-                let g = ring.acquire(l);
-                assert_eq!(g.layer(), l);
-                std::thread::sleep(compute);
-            }
-        }
-        let wall = t.elapsed().as_secs_f64() * 1e3;
-        let sum_compute = 9.0 * 80.0;
-        assert!(
-            wall >= sum_compute - 20.0,
-            "compute alone is {sum_compute} ms: {wall}"
-        );
-        assert!(
-            wall < sum_compute + 2.0 * 40.0 + 120.0,
-            "transfers must hide under compute (serial would be ~1080 ms): {wall}"
-        );
-        assert!(
-            peak.load(Ordering::SeqCst) <= 2,
-            "at most `slots` payloads may be alive at once"
-        );
+    // The ring's timing claims run on a simulated clock, not wall time. Real
+    // sleeps wake late while other work holds the cores, the lateness piles
+    // up along the link's serial chain of uploads, and no margin absorbs it
+    // while still telling overlap from serial. Nothing below sleeps: uploads
+    // and computes cost simulated milliseconds. The ring's real threads
+    // still decide the order of events, and two checks hold that order to
+    // the one the clock assumes. No upload starts before the slot it fills
+    // is released, and the ring keeps uploading ahead while the consumer
+    // holds a slot.
+
+    /// A serial link on a simulated clock. The upload at schedule position
+    /// `pos` starts once the link is free and the slot it fills is released
+    /// (the guard `slots` positions back), and lands `tx_ms` later.
+    struct SimLink {
+        tx_ms: u64,
+        slots: usize,
+        clock: Arc<SimClock>,
     }
 
-    /// (b) tx > compute: the link paces the ring, wall ~= sum of tx.
-    #[test]
-    fn a_transfer_bound_ring_paces_at_the_link() {
-        let order = vec![0usize, 1, 2];
-        let (stage, _) = fake(60);
-        let ring = Ring::new(stage, 2, order.clone());
-        let compute = Duration::from_millis(25);
-        let t = Instant::now();
-        for _token in 0..2 {
-            for &l in &order {
-                let g = ring.acquire(l);
-                assert_eq!(g.layer(), l);
-                std::thread::sleep(compute);
+    #[derive(Default)]
+    struct SimClock {
+        state: Mutex<SimState>,
+        cv: Condvar,
+    }
+
+    #[derive(Default)]
+    struct SimState {
+        /// Uploads started so far, which is also the next upload's position.
+        started: usize,
+        /// When the link finishes its latest upload.
+        link_free_ms: u64,
+        /// When the consumer released each position's slot, in order.
+        released_ms: Vec<u64>,
+        /// Uploads that started before the slot they fill was released.
+        early_starts: usize,
+        /// Payloads alive now, and the most ever alive at once.
+        live: usize,
+        peak: usize,
+    }
+
+    impl SimClock {
+        fn lock(&self) -> std::sync::MutexGuard<'_, SimState> {
+            self.state.lock().unwrap_or_else(|e| e.into_inner())
+        }
+    }
+
+    struct SimPayload {
+        layer: usize,
+        landed_ms: u64,
+        clock: Arc<SimClock>,
+    }
+
+    impl Drop for SimPayload {
+        fn drop(&mut self) {
+            self.clock.lock().live -= 1;
+        }
+    }
+
+    impl SlotStage for SimLink {
+        type Payload = SimPayload;
+        fn upload(&self, layer: usize) -> SimPayload {
+            let mut st = self.clock.lock();
+            let pos = st.started;
+            let slot_free_ms = match pos.checked_sub(self.slots) {
+                None => 0,
+                Some(p) if p < st.released_ms.len() => st.released_ms[p],
+                Some(_) => {
+                    st.early_starts += 1;
+                    0
+                }
+            };
+            let start_ms = st.link_free_ms.max(slot_free_ms);
+            st.link_free_ms = start_ms + self.tx_ms;
+            st.started += 1;
+            st.live += 1;
+            st.peak = st.peak.max(st.live);
+            self.clock.cv.notify_all();
+            SimPayload {
+                layer,
+                landed_ms: st.link_free_ms,
+                clock: Arc::clone(&self.clock),
             }
         }
-        let wall = t.elapsed().as_secs_f64() * 1e3;
-        let sum_tx = 6.0 * 60.0;
-        assert!(
-            wall >= sum_tx - 20.0,
-            "uploads are serial on one link: {wall}"
+    }
+
+    /// Stream `tokens` passes of `order` through a `slots`-slot ring over a
+    /// [`SimLink`], computing each layer for `compute_ms` of simulated time.
+    /// Returns the simulated wall time.
+    fn simulate_ring(
+        tx_ms: u64,
+        compute_ms: u64,
+        slots: usize,
+        order: &[usize],
+        tokens: usize,
+    ) -> u64 {
+        let clock = Arc::new(SimClock::default());
+        let link = SimLink {
+            tx_ms,
+            slots,
+            clock: Arc::clone(&clock),
+        };
+        let ring = Ring::new(link, slots, order.to_vec());
+        let mut now_ms = 0;
+        let mut pos = 0;
+        for _token in 0..tokens {
+            for &l in order {
+                let g = ring.acquire(l);
+                assert_eq!(g.layer(), l);
+                assert_eq!((*g).layer, l, "payload must belong to the acquired layer");
+                now_ms = now_ms.max(g.landed_ms) + compute_ms;
+                // Overlap, on the real threads: while this slot is held the
+                // ring must start the next `slots - 1` uploads. A ring that
+                // waited for this guard to drop never would.
+                let (mut st, wait) = clock
+                    .cv
+                    .wait_timeout_while(clock.lock(), Duration::from_secs(20), |s| {
+                        s.started < pos + slots
+                    })
+                    .unwrap_or_else(|e| e.into_inner());
+                assert!(
+                    !wait.timed_out(),
+                    "position {pos} is held, but the ring never started position {}",
+                    pos + slots - 1
+                );
+                // Recorded before the guard drops, so the upload this
+                // release admits always finds it.
+                st.released_ms.push(now_ms);
+                drop(st);
+                drop(g);
+                pos += 1;
+            }
+        }
+        drop(ring);
+        let st = clock.lock();
+        assert_eq!(
+            st.early_starts, 0,
+            "an upload started before the slot it fills was released"
         );
         assert!(
-            wall < sum_tx + 100.0,
-            "transfer-bound wall must track sum-of-tx (~{sum_tx} ms), \
-             not sum of tx + compute (~510 ms): {wall}"
+            st.peak <= slots,
+            "at most `slots` payloads may be alive at once: {}",
+            st.peak
+        );
+        now_ms
+    }
+
+    /// (a) tx <= compute: transfers hide under compute. Only the first
+    /// upload is exposed; serial would be 9 x (40 + 80) = 1080 ms.
+    #[test]
+    fn transfers_hide_under_compute_with_two_slots() {
+        let wall = simulate_ring(40, 80, 2, &[0, 1, 2], 3);
+        assert_eq!(wall, 40 + 9 * 80, "transfers must hide under compute");
+    }
+
+    /// (b) tx > compute: the link paces the ring. Uploads run back to back
+    /// and only the last compute is exposed; serial would be
+    /// 6 x (60 + 25) = 510 ms.
+    #[test]
+    fn a_transfer_bound_ring_paces_at_the_link() {
+        let wall = simulate_ring(60, 25, 2, &[0, 1, 2], 2);
+        assert_eq!(
+            wall,
+            6 * 60 + 25,
+            "a transfer-bound ring must track the sum of tx, not tx + compute"
         );
     }
 
@@ -1263,11 +1368,13 @@ mod tests {
 
     /// The prefetch thread goes through `upload_blocks`, so a blocked stage
     /// sees its per-block callback — `upload` itself must never be called
-    /// once a stage overrides the blocked path.
+    /// once a stage overrides the blocked path. Blocks cross a serial link
+    /// on a simulated clock, `block_ms` each; `events` records every block
+    /// with the simulated time it landed.
     struct BlockedStage {
         blocks: usize,
-        per_block: Duration,
-        events: Arc<Mutex<Vec<Block>>>,
+        block_ms: u64,
+        events: Arc<Mutex<Vec<(Block, u64)>>>,
     }
 
     impl SlotStage for BlockedStage {
@@ -1277,16 +1384,16 @@ mod tests {
         }
         fn upload_blocks(&self, layer: usize, on_block: &mut dyn FnMut(Block)) -> usize {
             for index in 0..self.blocks {
-                std::thread::sleep(self.per_block);
                 let b = Block {
                     layer,
                     index,
                     of: self.blocks,
                 };
-                self.events
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(b);
+                {
+                    let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
+                    let landed_ms = events.last().map_or(0, |&(_, t)| t) + self.block_ms;
+                    events.push((b, landed_ms));
+                }
                 on_block(b);
             }
             layer
@@ -1298,7 +1405,7 @@ mod tests {
         let events = Arc::new(Mutex::new(Vec::new()));
         let stage = BlockedStage {
             blocks: 4,
-            per_block: Duration::from_millis(2),
+            block_ms: 2,
             events: Arc::clone(&events),
         };
         let ring = Ring::new(stage, 2, vec![0, 1]);
@@ -1312,45 +1419,53 @@ mod tests {
         let seen = events.lock().unwrap_or_else(|e| e.into_inner());
         for chunk in seen.chunks(4).take(4) {
             assert_eq!(chunk.len(), 4);
-            for (i, b) in chunk.iter().enumerate() {
+            for (i, (b, _)) in chunk.iter().enumerate() {
                 assert_eq!(b.index, i);
                 assert_eq!(b.of, 4);
-                assert_eq!(b.layer, chunk[0].layer);
+                assert_eq!(b.layer, chunk[0].0.layer);
             }
         }
     }
 
-    /// The floor-collapse measurement: consuming a blocked upload block by
-    /// block (transfer thread feeding a compute thread — the mechanism a
-    /// block-granular executor runs inside one slot) lands near
-    /// `pipelined_layer_ms`, far from the serial tx + compute.
+    /// The floor collapse: consuming a blocked upload block by block
+    /// (transfer thread feeding a compute thread — the mechanism a
+    /// block-granular executor runs inside one slot) lands on
+    /// `pipelined_layer_ms`, far from the serial tx + compute. The clock is
+    /// simulated (see the ring tests above): the consumer starts each block
+    /// at the later of its own clock and the block's landing, so the result
+    /// holds however the two real threads interleave.
     #[test]
     fn block_pipelining_approaches_the_predicted_floor() {
         let blocks = 8usize;
-        let stage = BlockedStage {
-            blocks,
-            per_block: Duration::from_millis(30), // tx total 240 ms
-            events: Arc::new(Mutex::new(Vec::new())),
-        };
-        let block_compute = Duration::from_millis(15); // compute total 120 ms
-        let (btx, brx) = std::sync::mpsc::channel::<Block>();
-        let t = Instant::now();
-        let producer = std::thread::spawn(move || {
-            let _ = stage.upload_blocks(0, &mut |b| btx.send(b).expect("consumer listens"));
-        });
-        for _ in 0..blocks {
-            let b = brx.recv().expect("producer sends every block");
-            assert_eq!(b.of, blocks);
-            std::thread::sleep(block_compute);
+        // (per-block transfer, per-block compute): transfer-bound, then the
+        // compute-bound mirror. Both are 240 + 120 = 360 ms serial.
+        for (block_ms, compute_ms) in [(30u64, 15u64), (15, 30)] {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let stage = BlockedStage {
+                blocks,
+                block_ms,
+                events: Arc::clone(&events),
+            };
+            let (btx, brx) = std::sync::mpsc::channel::<Block>();
+            let producer = std::thread::spawn(move || {
+                let _ = stage.upload_blocks(0, &mut |b| btx.send(b).expect("consumer listens"));
+            });
+            let mut now_ms = 0;
+            for _ in 0..blocks {
+                let b = brx.recv().expect("producer sends every block");
+                assert_eq!(b.of, blocks);
+                let landed_ms = events.lock().unwrap_or_else(|e| e.into_inner())[b.index].1;
+                now_ms = now_ms.max(landed_ms) + compute_ms;
+            }
+            producer.join().expect("producer exits cleanly");
+            let n = blocks as u64;
+            let predicted =
+                pipelined_layer_ms((n * block_ms) as f64, (n * compute_ms) as f64, blocks, 0.0);
+            assert!(
+                close(now_ms as f64, predicted),
+                "block pipelining must land on {predicted} ms (serial is 360 ms): {now_ms}"
+            );
         }
-        producer.join().expect("producer exits cleanly");
-        let wall = t.elapsed().as_secs_f64() * 1e3;
-        let predicted = pipelined_layer_ms(240.0, 120.0, blocks, 0.0); // 255 ms
-        assert!(wall >= 240.0 - 20.0, "the link is serial: {wall}");
-        assert!(
-            wall < predicted + 65.0,
-            "block pipelining must approach {predicted} ms (serial is 360 ms): {wall}"
-        );
     }
 
     /// TensorStage plumbing on the CPU device: the ring hands back the
