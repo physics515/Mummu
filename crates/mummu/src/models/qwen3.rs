@@ -474,6 +474,17 @@ mod tests {
         }
     }
 
+    /// [`toy_config`] with no EOS id, for tests that need a decode to run its
+    /// full `max_tokens`. The toy's weights are an unseeded random draw, and
+    /// about one draw in 600 makes EOS (2) one of the first four greedy
+    /// tokens, which stops the decode short of the bound.
+    fn toy_config_without_eos() -> Qwen3Config {
+        Qwen3Config {
+            eos_token_id: EosIds::None,
+            ..toy_config()
+        }
+    }
+
     #[test]
     fn config_parses_qwen3_4b_shape() {
         // The real Qwen3-4B config.json shape: head_dim is explicit and
@@ -725,7 +736,7 @@ mod tests {
     #[tokio::test]
     async fn greedy_generate_respects_max_tokens_bound() {
         let device = crate::backend::cpu_device();
-        let cfg = toy_config();
+        let cfg = toy_config_without_eos();
         let loaded = LoadedQwen3 {
             model: build(&cfg, &device),
             config: cfg,
@@ -735,6 +746,7 @@ mod tests {
             .greedy_generate(&[1, 2, 3], 4, &device)
             .await
             .unwrap();
-        assert!(out.len() <= 4);
+        // With no EOS to end the decode early, only the bound can stop it.
+        assert_eq!(out.len(), 4);
     }
 }
