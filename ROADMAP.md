@@ -1478,31 +1478,45 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
 
 ## Phases
 
-### Vision (qwen3-vl tower) — shipped, not yet correct
+### Vision (qwen3-vl tower) — shipped and answering; one measured gap left
 
-- [ ] **Instrument the image pipeline before touching it again.** *(2026-09-20)* The tower runs end to
+- [x] **Instrument the image pipeline before touching it again.** *(2026-09-20, done same day)*
+      `examples/vision-trace.rs` preprocesses images and prints grid, post-resize size and a
+      fingerprint (mean / sd / range / order-sensitive checksum), then optionally runs the tower and
+      reports **pairwise cosine similarity of the projected tokens** — no language model in the loop.
+      It found the bug in one iteration after four rebuild-and-ask-the-27B cycles had found nothing:
+      two images preprocessing to statistically identical tensors produced embeddings 12% apart, and
+      embedding similarity predicted answer agreement exactly. A correct encoder contracts
+      perturbation; that one amplified it ~12x.
+      **The bug:** the rotary table was built [h, h, w, w] with `rotate_half` pairing inside each
+      half, where the reference is `cat(h_freqs, w_freqs)` then `cat(freqs, freqs)` — [h, w, h, w]
+      with pairing i ↔ i + half. Both are self-consistent, so it compiled and answered fluently while
+      half of every head rotated on the wrong axis. Fixed: worst pair 0.8825 → 0.9526, control
+      (same photo re-encoded) 0.9978, and the behavioural gate went from 2/7 to 5/5 across
+      1500x1125, 1200x900, 900x675, 512x384 and a rotated portrait.
+      **Method note worth keeping:** the 1500x1125 image passed *reproducibly* while the encoder was
+      broken. Reproducible is not robust, and "it works" after one image was the worst claim made
+      during that run.
+
+- [ ] **Close the residual drift: 0.95, not 0.99.** *(2026-09-20)* The tower runs end to
       end — mmproj loads, the ViT encodes, the merger projects, the rows splice into the prefill — and
-      it describes the same photo differently depending on the file it arrived in. Two of seven test
-      images correct, both the same source: two hot dogs read correctly at 1500x1125, as "three
-      sunflowers" at 512x384, "three tacos" at 900x675, "a single, large, multi-layered crepe cake" at
-      1200x900, and "three hot dogs" at 3000x2250 (food right, count wrong).
-      **The reason this is an instrumentation item and not another fix:** 900x675 and 1500x1125 compute
-      to an *identical* 40x50 patch grid and are both resized to 800x640 before patchifying, so the
-      tensors entering the tower should be near-identical — and they disagree anyway. That contradicts
-      the model of the code, which means the code is not doing what the arithmetic says. Print the real
-      grid, the post-resize dimensions, and a checksum of the patch tensor per request; find where
-      reality diverges from `grid_for`. Guessing has already cost four rebuild/retest cycles.
-      **Fixed getting this far** (all real, all kept): `grid_for` converged toward a square and
-      destroyed the aspect ratio; the encoder had no 2-D RoPE at all, only the absolute position table
-      (Qwen3-VL uses both — the llama.cpp port computes both host-side and validates at ~0.999 cosine
-      similarity against the HF reference); and there was no floor on the patch grid.
-      **Disproved, so do not re-try blind:** switching `positions_for` to `align_corners=False` (which
-      is what `F.interpolate` does) changed the three-resolution results *not at all*; and JPEG
-      encoding is not the variable — re-encoding the working file at its own size still works.
+      The encoder answers correctly across resolutions now, but it still drifts: two resamplings of
+      one photo give projected tokens at cos 0.95, where the control (same photo, re-encoded) sits at
+      0.998. Roughly 5x amplification of a ~0.1% input change — better than the 12x the axis bug
+      caused, and not yet the contraction a correct encoder shows. Some of the gap is legitimate
+      (those really are different pixels); the rest is probably another small convention mismatch.
       **The real gate is numerical**, not behavioural: dump the projected image tokens for a fixed
-      input and compare against the HF reference (or llama.cpp's mtmd) by cosine similarity. Every
-      conclusion in this item rests on asking a 27B what it sees, which cannot distinguish "the
-      embeddings are subtly wrong" from "the model miscounted".
+      input and compare against the HF reference (or llama.cpp's mtmd) by cosine similarity — the
+      llama.cpp port reaches ~0.999. `examples/vision-trace.rs` already does the comparison; it needs
+      a reference vector to compare *against* instead of a sibling resampling. Everything concluded
+      behaviourally rests on asking a 27B what it sees, which cannot separate "the embeddings are
+      subtly wrong" from "the model miscounted".
+      **Disproved, so do not re-try blind:** `positions_for` with `align_corners=False` (what
+      `F.interpolate` does) changed the three-resolution results *not at all*; JPEG encoding is not
+      the variable; and neither is input resolution — identical grids gave opposite answers.
+      **Also fixed getting here, both real:** `grid_for` converged toward a square and destroyed the
+      aspect ratio, and there was no floor on the patch grid (kept — it makes prefill cost
+      predictable regardless of camera resolution).
 
 - [ ] **Load the vision tower at f16.** *(2026-09-20)* `VisionTower::load` reads through
       `read_tensor_f32`, so the F16 mmproj lands on the card as f32: 0.93 GB becomes ~1.85 GiB, and
