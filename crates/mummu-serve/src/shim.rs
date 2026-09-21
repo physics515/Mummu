@@ -622,6 +622,7 @@ fn with_placeholders(messages: &[ChatMessage], marks: &[String]) -> Vec<ChatMess
                 role: m.role.clone(),
                 content,
                 images: Vec::new(),
+                tool_calls: Vec::new(),
             }
         })
         .collect()
@@ -832,12 +833,14 @@ async fn generate(body: Bytes) -> Response {
             role: "system".into(),
             content: system.clone(),
             images: Vec::new(),
+            tool_calls: Vec::new(),
         });
     }
     messages.push(ChatMessage {
         role: "user".into(),
         content: parsed.prompt.clone(),
         images: Vec::new(),
+        tool_calls: Vec::new(),
     });
     let p = match plan(
         &parsed.model,

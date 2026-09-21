@@ -879,6 +879,11 @@ pub(crate) struct ChatMessage {
     /// them in `content` parts instead; both land here before planning.
     #[serde(default)]
     pub(crate) images: Vec<String>,
+    /// The calls an assistant turn made, when the client is replaying a
+    /// tool loop back to us. Dropping these leaves an EMPTY assistant turn
+    /// in the history followed by a tool result the model never asked for.
+    #[serde(default)]
+    pub(crate) tool_calls: Vec<mummu::chat::ToolCall>,
 }
 
 /// An output grammar the decoder must obey, asked for by a request.
@@ -950,6 +955,12 @@ pub(crate) fn to_turns(messages: &[ChatMessage]) -> Result<Vec<Turn>, String> {
         .map(|m| match m.role.as_str() {
             "system" => Ok(Turn::system(m.content.clone())),
             "user" => Ok(Turn::user(m.content.clone())),
+            // An assistant turn that made calls is re-rendered in the
+            // family's own wire format, so the model sees its own request
+            // and not a blank turn before the answer comes back.
+            "assistant" if !m.tool_calls.is_empty() => {
+                Ok(Turn::assistant_tool_calls(&m.tool_calls))
+            }
             "assistant" => Ok(Turn::assistant(m.content.clone())),
             // The second half of a tool loop: the client ran the function
             // and is handing back its result. The family renderer decides

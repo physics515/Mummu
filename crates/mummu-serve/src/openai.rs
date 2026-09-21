@@ -147,6 +147,24 @@ struct Message {
     role: String,
     #[serde(default)]
     content: Option<Content>,
+    /// Present when the client replays an assistant turn that made calls.
+    #[serde(default)]
+    tool_calls: Vec<ToolCallIn>,
+}
+
+/// OpenAI's wire shape for a call the assistant already made.
+#[derive(Deserialize)]
+struct ToolCallIn {
+    #[serde(default)]
+    function: Option<FunctionCallIn>,
+}
+
+#[derive(Deserialize)]
+struct FunctionCallIn {
+    name: String,
+    /// A JSON *string*, per the protocol — not an object.
+    #[serde(default)]
+    arguments: String,
 }
 
 /// OpenAI's `response_format`. `json_schema` is recognised and refused by
@@ -228,10 +246,25 @@ impl ChatCompletionRequest {
                     Some(c) => c.split()?,
                     None => (String::new(), Vec::new()),
                 };
+                let tool_calls = m
+                    .tool_calls
+                    .iter()
+                    .filter_map(|c| c.function.as_ref())
+                    .map(|f| mummu::chat::ToolCall {
+                        name: f.name.clone(),
+                        // Arguments arrive JSON-encoded in a string; a call
+                        // whose arguments do not parse is kept with an empty
+                        // object rather than dropped, so the turn still shows
+                        // the model what it asked for.
+                        arguments: serde_json::from_str(&f.arguments)
+                            .unwrap_or_else(|_| serde_json::json!({})),
+                    })
+                    .collect();
                 Ok(ChatMessage {
                     role: m.role.clone(),
                     content,
                     images,
+                    tool_calls,
                 })
             })
             .collect::<Result<Vec<_>, String>>()
