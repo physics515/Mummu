@@ -16,8 +16,8 @@
 //! - **Gated DeltaNet** (the rest): one projection mixes q/k/v, a second
 //!   emits the gate `z`; the mix runs through a depthwise causal conv
 //!   (kernel `conv_kernel`, rolling state) + SiLU; q/k are L2-normalized
-//!   per head (`x / max(‖x‖, ε)` here, `x / sqrt(‖x‖² + ε)` for qwen4exp:
-//!   [`Qwen35Config::gdn_l2`]) and tiled from `n_k_heads` to
+//!   per head (`x / sqrt(‖x‖² + ε)`, [`Qwen35Config::gdn_l2`]) and tiled
+//!   from `n_k_heads` to
 //!   `n_v_heads`; the recurrence per head with state `S ∈ R^{d_k×d_v}`:
 //!   `S ← S·exp(g);  v̂ = Sᵀk;  S += k(β(v − v̂))ᵀ;  o = Sᵀ(q/√d_k)` with
 //!   `β = σ(x·Wβ)` and `g = softplus(x·Wα + dt_bias)·a` (`a` holds
@@ -87,8 +87,8 @@ pub struct Qwen35Config {
     /// qwen35, [`GdnGate::Sigmoid`] when qwen4exp drives these blocks.
     pub gdn_gate: GdnGate,
     /// Where `rms_norm_eps` enters the DeltaNet's q/k L2 norms. Not in the
-    /// header either: [`GdnL2::ClampNorm`] for qwen35 (the form its parity
-    /// fixtures were recorded against), [`GdnL2::AddEps`] for qwen4exp.
+    /// header either: [`GdnL2::AddEps`] for both qwen35 and qwen4exp, the
+    /// form the checkpoints were trained with.
     pub gdn_l2: GdnL2,
     pub eos_token_id: EosIds,
 }
@@ -180,11 +180,15 @@ impl Qwen35Config {
             n_v_heads: meta_usize("qwen35.ssm.time_step_rank")?,
             // llama.cpp qwen35.cpp build_norm_gated: ggml_silu(z).
             gdn_gate: GdnGate::Silu,
-            // Unchanged from the parity-checked port. transformers and
-            // llama.cpp master both use GdnL2::AddEps for this family too;
-            // switching needs the qwen35 parity legs rerun, which the
-            // qwen4exp change (found by its teacher-forced dump) did not do.
-            gdn_l2: GdnL2::ClampNorm,
+            // The training-time form (FLA/transformers l2norm) and llama.cpp's
+            // since PR #28068 (b10991 has it; ollama 0.34.0's b10760 does
+            // not). On this family's real weights the choice is below noise —
+            // Qwen3.8-27B's smallest key norm over six prompts is 1.4e-2, and
+            // switching moved its logprobs by <= 6.4e-4 with top-5 and greedy
+            // ids unchanged; the 2B parity legs pass or fail identically
+            // under both forms against both llama.cpp builds — so the tie goes
+            // to the form that stays right when keys are tiny (see GdnL2).
+            gdn_l2: GdnL2::AddEps,
             eos_token_id: EosIds::One(u32::try_from(eos).map_err(|_| "EOS out of u32")?),
         };
         cfg.validate()?;
@@ -586,6 +590,9 @@ impl GatedDeltaNet {
             }
         });
         let conv_out = activation::silu(conv_out.swap_dims(1, 2)); // [b, t, conv_dim]
+        if gdn_l2_probe::enabled() {
+            gdn_l2_probe::record(&conv_out, cfg);
+        }
         drop(_s_conv);
         let _s_split = crate::prof::scope("delta.split");
 
@@ -798,6 +805,83 @@ fn gdn_chunk() -> Option<usize> {
             }
         }
     })
+}
+
+/// Diagnostic tap on the per-head ‖q‖ and ‖k‖ entering the DeltaNet's L2
+/// normalization — the numbers that decide whether the [`GdnL2`] form
+/// matters on a checkpoint: the two forms differ by `1 − ‖x‖/sqrt(‖x‖²+ε)`
+/// relative, which is 29% at ‖x‖ = 1e-3 and 5e-5 at 0.1 for ε = 1e-6.
+/// Off by default; while on, every tensor-path DeltaNet forward reads its
+/// conv output back to the host. The fused host decode step is not tapped,
+/// so probe prefills (or decode with `MUMMU_FUSED_GDN=0`).
+pub mod gdn_l2_probe {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::Qwen35Config;
+    use burn::tensor::Tensor;
+
+    static ON: AtomicBool = AtomicBool::new(false);
+    static SINK: Mutex<Vec<Record>> = Mutex::new(Vec::new());
+
+    /// One tensor-path DeltaNet forward, in call order: a prefill visits
+    /// the DeltaNet layers in model order, so the `i`-th record of a single
+    /// forward is the `i`-th DeltaNet layer.
+    #[derive(Debug, Clone)]
+    pub struct Record {
+        /// Positions in the forward (`b · t`).
+        pub tokens: usize,
+        /// `n_k_heads`.
+        pub heads: usize,
+        /// Pre-normalization head norms, `[tokens · heads]` token-major.
+        pub q: Vec<f32>,
+        pub k: Vec<f32>,
+    }
+
+    /// Turn the tap on or off (process-wide).
+    pub fn set_enabled(on: bool) {
+        ON.store(on, Ordering::Relaxed);
+    }
+
+    pub(super) fn enabled() -> bool {
+        ON.load(Ordering::Relaxed)
+    }
+
+    /// Drain everything recorded since the last call.
+    pub fn take() -> Vec<Record> {
+        std::mem::take(&mut *SINK.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Read back `conv_out` `[b, t, conv_dim]` (after conv + SiLU) and keep
+    /// the q and k head norms, summed in f64.
+    pub(super) fn record(conv_out: &Tensor<3>, cfg: &Qwen35Config) {
+        let [b, t, _] = conv_out.dims();
+        let (heads, ds, key_dim) = (cfg.n_k_heads, cfg.d_state, cfg.key_dim());
+        let host = conv_out
+            .clone()
+            .narrow(2, 0, 2 * key_dim)
+            .into_data()
+            .convert::<f32>()
+            .try_to_vec::<f32>()
+            .expect("conv output reads back as f32");
+        let tokens = b * t;
+        let (mut q, mut k) = (
+            Vec::with_capacity(tokens * heads),
+            Vec::with_capacity(tokens * heads),
+        );
+        for row in host.chunks_exact(2 * key_dim) {
+            let (qs, ks) = row.split_at(key_dim);
+            let norm = |x: &[f32]| x.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>().sqrt();
+            q.extend(qs.chunks_exact(ds).map(|h| norm(h) as f32));
+            k.extend(ks.chunks_exact(ds).map(|h| norm(h) as f32));
+        }
+        SINK.lock().unwrap_or_else(|e| e.into_inner()).push(Record {
+            tokens,
+            heads,
+            q,
+            k,
+        });
+    }
 }
 
 /// Longest span the sequential recurrence still evaluates when chunking is

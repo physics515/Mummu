@@ -51,6 +51,17 @@ const TOP_K: usize = 5;
 /// past LFM2's 5e-2, consistent with this family's wider heads (256) and
 /// 24-layer recurrence accumulating more of the reference's per-dot bf16
 /// rounding. 7.5e-2 is ~1.5x headroom on the measurement.
+///
+/// The result depends on WHICH llama.cpp serves the reference — name the
+/// build next to any number from this gate. Re-measured 2026-09-16 (same
+/// GPU, default features) when qwen35 moved to `GdnL2::AddEps`: against
+/// ollama 0.34.0's bundled llama-server (b10760, still `ggml_l2_norm`) both
+/// legs pass at 5.0281e-2 (5.0230e-2 under the old ClampNorm); against
+/// llama.cpp b10991 (`build_gdn_l2_norm`, PR #28068) leg 1 fails on a rank
+/// 4/5 swap of ids 248069/760 at 5.2879e-2 (5.2929e-2 under ClampNorm) and
+/// leg 2 passes. The swap is not the L2 form: the two llama.cpp builds put
+/// id 760 0.125 apart, while the form moves our logprobs by <= 1.5e-4 and
+/// our 248069/760 gap is 0.032.
 const LOGPROB_ABS_TOLERANCE: f64 = 7.5e-2;
 
 fn reference_gguf() -> PathBuf {
