@@ -46,6 +46,11 @@ pub(crate) fn router() -> Router {
         .route("/chat/completions", post(chat_completions))
         .route("/v1/models", get(models))
         .route("/models", get(models))
+        // Per-request visibility (see `crate::trace`). Served here as well as
+        // on the native API because this is the listener the public
+        // hostname reaches.
+        .route("/api/requests", get(requests))
+        .route("/api/stats", get(stats))
 }
 
 // ---------------------------------------------------------------------------
@@ -414,6 +419,7 @@ fn chunk(id: &str, model: &str, created: u64, delta: serde_json::Value) -> serde
 }
 
 async fn chat_completions(body: Bytes) -> Response {
+    let started = std::time::Instant::now();
     let parsed: ChatCompletionRequest = match parse_json(&body) {
         Ok(p) => p,
         Err(response) => return reshape(*response),
@@ -428,6 +434,26 @@ async fn chat_completions(body: Bytes) -> Response {
         Ok(p) => p,
         Err(response) => {
             eprintln!("[mummu-serve] openai chat {model}: rejected before the engine");
+            let status = response.status();
+            crate::trace::Begin {
+                surface: "openai",
+                model: model.clone(),
+                stream,
+                think: false,
+                json_mode: false,
+                tools: parsed.tools.as_ref().map_or(0, Vec::len),
+                images: 0,
+                started,
+            }
+            .finish(
+                "",
+                crate::trace::Timings::default(),
+                false,
+                Err(&format!(
+                    "rejected before the engine: HTTP {}",
+                    status.as_u16()
+                )),
+            );
             return response;
         }
     };
@@ -463,11 +489,21 @@ async fn chat_completions(body: Bytes) -> Response {
             ),
         );
     }
-    respond(model, p, stream).await
+    let begin = crate::trace::Begin {
+        surface: "openai",
+        model: model.clone(),
+        stream,
+        think: p.think,
+        json_mode: p.format.is_some(),
+        tools: p.tools.len(),
+        images: p.images.len(),
+        started,
+    };
+    respond(model, p, stream, begin).await
 }
 
 /// Turn one generation into an OpenAI response, streamed as SSE or buffered.
-async fn respond(model: String, p: RunPlan, stream: bool) -> Response {
+async fn respond(model: String, p: RunPlan, stream: bool, begin: crate::trace::Begin) -> Response {
     let id = completion_id();
     let created = created_now();
 
@@ -489,8 +525,13 @@ async fn respond(model: String, p: RunPlan, stream: bool) -> Response {
                 p.tools,
                 |_| ControlFlow::Continue(()),
             );
-            match recovery::contain(&model, run).await {
+            let outcome = recovery::contain(&model, run).await;
+            // Padded exactly when the answer outlived the keep-alive grace:
+            // that is the condition `keepalive_json` pads on.
+            let padded = begin.started.elapsed() >= crate::KEEPALIVE_GRACE;
+            match outcome {
                 Ok(r) => {
+                    begin.finish(r.device, r.timings.clone(), padded, Ok(()));
                     // The model answers a tool request as `<tool_call>{…}</tool_call>`
                     // in its text; OpenAI clients expect them lifted into a
                     // structured field, with `finish_reason` saying so — a client
@@ -530,18 +571,22 @@ async fn respond(model: String, p: RunPlan, stream: bool) -> Response {
                                 "message": message,
                                 "finish_reason": finish,
                             }],
-                            // `prompt_tokens` is not counted here; reporting 0 rather
-                            // than a guess keeps a client's arithmetic honest.
                             "usage": {
-                                "prompt_tokens": 0,
+                                "prompt_tokens": r.timings.prompt_tokens,
                                 "completion_tokens": r.tokens,
-                                "total_tokens": r.tokens,
+                                "total_tokens": r.timings.prompt_tokens + r.tokens,
                             },
                         }),
                     )
                 }
                 Err(e) => {
                     eprintln!("[mummu-serve] openai chat {model}: {}", e.message);
+                    begin.finish(
+                        "",
+                        crate::trace::Timings::default(),
+                        padded,
+                        Err(&e.message),
+                    );
                     (
                         e.http_status(),
                         error_body(&e.message, "server_error", "generation_failed"),
@@ -598,13 +643,16 @@ async fn respond(model: String, p: RunPlan, stream: bool) -> Response {
             },
         );
         let tail = match recovery::contain(&model, run).await {
-            Ok(_) => {
+            Ok(r) => {
+                // Streaming is never padded: its first chunk is the keep-alive.
+                begin.finish(r.device, r.timings, false, Ok(()));
                 let mut stop = chunk(&id, &model, created, json!({}));
                 stop["choices"][0]["finish_reason"] = json!("stop");
                 format!("{}{}", sse(&stop), "data: [DONE]\n\n")
             }
             Err(e) => {
                 eprintln!("[mummu-serve] openai chat {model}: {}", e.message);
+                begin.finish("", crate::trace::Timings::default(), false, Err(&e.message));
                 format!(
                     "{}{}",
                     sse(&error_body(&e.message, "server_error", "generation_failed")),
@@ -677,4 +725,21 @@ fn sse_response(mut rx: mpsc::UnboundedReceiver<String>, inflight: InFlight) -> 
         Body::from_stream(stream),
     )
         .into_response()
+}
+
+/// `GET /api/requests?limit=N` — the most recent traces, newest first.
+async fn requests(
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let limit = q
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(50)
+        .clamp(1, 256);
+    json_response(200, crate::trace::recent_json(limit))
+}
+
+/// `GET /api/stats` — latency and throughput percentiles, warm vs cold.
+async fn stats() -> Response {
+    json_response(200, crate::trace::stats_json())
 }

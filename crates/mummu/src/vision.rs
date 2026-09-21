@@ -205,10 +205,23 @@ fn vector(f: &GgufFile, name: &str, n: usize, device: &Device) -> Result<Tensor<
     )))
 }
 
+/// Widen a stored weight to the compute width, at the point of use.
+///
+/// Weights are *stored* at the checkpoint's own precision to keep the
+/// tower's resident footprint small (see [`half_precision`]); activations
+/// stay f32. burn does not multiply mixed dtypes — the CPU backend asserts
+/// `matmul: dtype mismatch`, and that assertion is exactly what the first
+/// f16 build hit, because it cast the weights and never the operations.
+/// Widening per use keeps compute numerically identical to an all-f32 tower
+/// while only ever holding one weight wide at a time.
+fn wide<const D: usize>(t: &Tensor<D>) -> Tensor<D> {
+    t.clone().cast(burn::tensor::FloatDType::F32)
+}
+
 /// `y = x · Wᵀ + b` for `[tokens, in] · [out, in]ᵀ`.
 fn linear(x: Tensor<2>, w: &Tensor<2>, b: &Tensor<1>) -> Tensor<2> {
     let out = w.dims()[0];
-    x.matmul(w.clone().swap_dims(0, 1)) + b.clone().reshape([1, out])
+    x.matmul(wide(w).swap_dims(0, 1)) + wide(b).reshape([1, out])
 }
 
 /// Layer norm with learned scale and shift, over the last dimension.
@@ -218,7 +231,7 @@ fn layer_norm(x: Tensor<2>, w: &Tensor<1>, b: &Tensor<1>, eps: f64) -> Tensor<2>
     let centered = x - mean.clone();
     let var = centered.clone().powf_scalar(2.0).mean_dim(1);
     let normed = centered / var.add_scalar(eps).sqrt();
-    normed * w.clone().reshape([1, d]) + b.clone().reshape([1, d])
+    normed * wide(w).reshape([1, d]) + wide(b).reshape([1, d])
 }
 
 /// The exact GELU (erf form), which is what `clip.use_gelu` selects.
@@ -304,6 +317,67 @@ fn apply_rope(x: Tensor<3>, cos: &Tensor<2>, sin: &Tensor<2>) -> Tensor<3> {
     let c = cos.clone().reshape([1, n, d]).repeat_dim(0, heads);
     let s = sin.clone().reshape([1, n, d]).repeat_dim(0, heads);
     x.clone() * c + rotate_half(x) * s
+}
+
+/// One stage's activation, read back to the host by
+/// [`VisionTower::forward_staged`].
+pub struct Stage {
+    pub name: String,
+    pub values: Vec<f32>,
+}
+
+impl Stage {
+    fn capture(name: String, t: &Tensor<2>) -> Self {
+        // A readback failure is reported, not turned into an empty stage: an
+        // empty stage makes every cosine `None`, which prints as "n/a" and
+        // reads like "not comparable" rather than "broken".
+        let values = t
+            .clone()
+            .into_data()
+            .convert::<f32>()
+            .try_into_vec::<f32>()
+            .unwrap_or_else(|e| panic!("vision stage {name}: readback failed: {e:?}"));
+        Self { name, values }
+    }
+
+    /// Mean, standard deviation, L2 norm and largest magnitude.
+    #[must_use]
+    pub fn summary(&self) -> (f64, f64, f64, f32) {
+        let n = self.values.len().max(1) as f64;
+        let mean = self.values.iter().map(|&v| f64::from(v)).sum::<f64>() / n;
+        let var = self
+            .values
+            .iter()
+            .map(|&v| (f64::from(v) - mean).powi(2))
+            .sum::<f64>()
+            / n;
+        let l2 = self
+            .values
+            .iter()
+            .map(|&v| f64::from(v).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let maxabs = self.values.iter().fold(0f32, |m, &v| m.max(v.abs()));
+        (mean, var.sqrt(), l2, maxabs)
+    }
+
+    /// Cosine similarity with the same stage of another run, or `None` when
+    /// the shapes differ (a different grid is a different sequence length,
+    /// not a different answer).
+    #[must_use]
+    pub fn cosine(&self, other: &Self) -> Option<f64> {
+        if self.values.len() != other.values.len() || self.values.is_empty() {
+            return None;
+        }
+        let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+        for (&a, &b) in self.values.iter().zip(&other.values) {
+            let (a, b) = (f64::from(a), f64::from(b));
+            dot += a * b;
+            na += a * a;
+            nb += b * b;
+        }
+        Some(dot / (na.sqrt() * nb.sqrt()).max(1e-12))
+    }
 }
 
 struct Block {
@@ -411,7 +485,8 @@ impl VisionTower {
         let g = self.cfg.pos_grid();
         let h = self.cfg.hidden;
         if gh == g && gw == g {
-            return self.pos.clone();
+            // The stored table is f16; the activations it is added to are not.
+            return wide(&self.pos);
         }
         let table = self
             .pos
@@ -475,6 +550,44 @@ impl VisionTower {
         gw: usize,
         device: &Device,
     ) -> Result<Tensor<2>, String> {
+        self.forward_inner(patches, gh, gw, device, None)
+    }
+
+    /// [`Self::forward`], also returning the activation after every stage.
+    ///
+    /// The encoder's output drifts between near-identical inputs, and the
+    /// output alone cannot say *where* the drift enters: 27 blocks, a merge
+    /// and a projector are all suspects. Comparing two inputs stage by stage
+    /// finds the first stage where they separate, which turns "somewhere in
+    /// the tower" into one operation to inspect.
+    ///
+    /// Every stage is read back to the host, a full device sync each — so
+    /// this is a diagnostic path, never the serving one.
+    pub fn forward_staged(
+        &self,
+        patches: Tensor<2>,
+        gh: usize,
+        gw: usize,
+        device: &Device,
+    ) -> Result<(Tensor<2>, Vec<Stage>), String> {
+        let mut stages = Vec::new();
+        let out = self.forward_inner(patches, gh, gw, device, Some(&mut stages))?;
+        Ok((out, stages))
+    }
+
+    fn forward_inner(
+        &self,
+        patches: Tensor<2>,
+        gh: usize,
+        gw: usize,
+        device: &Device,
+        mut stages: Option<&mut Vec<Stage>>,
+    ) -> Result<Tensor<2>, String> {
+        let mut record = |name: String, t: &Tensor<2>| {
+            if let Some(s) = stages.as_deref_mut() {
+                s.push(Stage::capture(name, t));
+            }
+        };
         let m = self.cfg.merge;
         if gh % m != 0 || gw % m != 0 {
             return Err(format!(
@@ -484,13 +597,18 @@ impl VisionTower {
         let (n, heads, hd) = (gh * gw, self.cfg.heads, self.cfg.head_dim());
         let h = self.cfg.hidden;
 
-        let mut x =
-            linear(patches, &self.patch_w, &self.patch_b) + self.positions_for(gh, gw, device);
+        let embedded = linear(patches, &self.patch_w, &self.patch_b);
+        record("patch_embed".into(), &embedded);
+        let mut x = embedded + self.positions_for(gh, gw, device);
+        record("pos_add".into(), &x);
         let (cos, sin) = rope_2d(gh, gw, hd, device);
 
-        for b in &self.blocks {
-            // Attention: bidirectional, no mask, no RoPE — the position
-            // signal is the learned table added above.
+        for (bi, b) in self.blocks.iter().enumerate() {
+            // Attention: bidirectional, no mask. Position reaches it twice —
+            // the absolute table added above, and the 2-D rotation applied to
+            // queries and keys below. (Until 2026-09-20 this comment said "no
+            // RoPE", which was true only of the first version, and was wrong
+            // for as long as it survived the RoPE going in.)
             let normed = layer_norm(x.clone(), &b.ln1_w, &b.ln1_b, self.cfg.eps);
             let qkv = linear(normed, &b.qkv_w, &b.qkv_b);
             // `[n, 3h]` is laid out q|k|v along the feature axis, so the
@@ -513,9 +631,11 @@ impl VisionTower {
             let normed = layer_norm(x.clone(), &b.ln2_w, &b.ln2_b, self.cfg.eps);
             let up = gelu(linear(normed, &b.up_w, &b.up_b));
             x = x + linear(up, &b.down_w, &b.down_b);
+            record(format!("block_{bi:02}"), &x);
         }
 
         let x = layer_norm(x, &self.post_ln_w, &self.post_ln_b, self.cfg.eps);
+        record("post_ln".into(), &x);
 
         // Spatial merge: fold each m x m block of neighbouring patches into
         // one token by concatenating their features. Row-major patch order
@@ -525,12 +645,12 @@ impl VisionTower {
             .reshape([mh, m, mw, m, h])
             .swap_dims(1, 2)
             .reshape([mh * mw, m * m * h]);
+        record("merge".into(), &merged);
 
-        let projected = linear(
-            gelu(linear(merged, &self.mm0_w, &self.mm0_b)),
-            &self.mm2_w,
-            &self.mm2_b,
-        );
+        let hidden = gelu(linear(merged, &self.mm0_w, &self.mm0_b));
+        record("mm0_gelu".into(), &hidden);
+        let projected = linear(hidden, &self.mm2_w, &self.mm2_b);
+        record("mm2_out".into(), &projected);
         Ok(projected)
     }
 

@@ -78,6 +78,9 @@ fn main() {
     if std::env::var("MUMMU_VISION_EMBED").is_ok_and(|v| v != "0") {
         compare_embeddings(&cfg, &mmproj, &images);
     }
+    if std::env::var("MUMMU_VISION_STAGES").is_ok_and(|v| v != "0") && images.len() >= 2 {
+        compare_stages(&cfg, &mmproj, &images[0], &images[1]);
+    }
     if groups.len() == 1 {
         println!(
             "\nAll inputs preprocess IDENTICALLY. Any difference in what the model says \
@@ -160,6 +163,62 @@ fn compare_embeddings(cfg: &VisionConfig, mmproj: &str, images: &[String]) {
                 "  {:<22} vs {:<22}  cos {cos:.4}  {verdict}",
                 rows[i].0, rows[j].0
             );
+        }
+    }
+}
+
+/// Run two images through the tower and report, stage by stage, how far
+/// apart they are.
+///
+/// The final-output cosine says the tower drifts; this says where. The first
+/// stage whose similarity falls is where the divergence enters. Also
+/// prints each stage's own statistics for the first image, since a stage
+/// whose activations explode (a large `maxabs`, a growing `l2`) is a suspect
+/// on its own.
+fn compare_stages(cfg: &VisionConfig, mmproj: &str, a: &str, b: &str) {
+    let device = mummu::backend::cpu_device();
+    let tower = match mummu::vision::VisionTower::load(std::path::Path::new(mmproj), &device) {
+        Ok(t) => t,
+        Err(e) => {
+            println!("\ntower load failed: {e}");
+            return;
+        }
+    };
+    let run = |path: &str| -> Option<Vec<mummu::vision::Stage>> {
+        let bytes = std::fs::read(path).ok()?;
+        let p = cfg.preprocess(&bytes).ok()?;
+        let (_, stages) = tower
+            .forward_staged(p.to_tensor(&device), p.grid_h, p.grid_w, &device)
+            .ok()?;
+        Some(stages)
+    };
+    let (Some(sa), Some(sb)) = (run(a), run(b)) else {
+        println!("\nstage run failed");
+        return;
+    };
+
+    println!("\nstage-by-stage: {} vs {}", short(a), short(b));
+    println!(
+        "  {:<11} {:>9} {:>9} {:>11} {:>9}   {:>8}  {}",
+        "stage", "mean", "sd", "l2", "maxabs", "cos(a,b)", ""
+    );
+    let mut prev: Option<f64> = None;
+    for (x, y) in sa.iter().zip(&sb) {
+        let (mean, sd, l2, maxabs) = x.summary();
+        let cos = x.cosine(y);
+        // Mark the stage where agreement falls most sharply: that is where to
+        // look first.
+        let flag = match (prev, cos) {
+            (Some(p), Some(c)) if p - c > 0.01 => format!("  <- dropped {:.4}", p - c),
+            _ => String::new(),
+        };
+        println!(
+            "  {:<11} {mean:>+9.4} {sd:>9.4} {l2:>11.2} {maxabs:>9.3}   {:>8}{flag}",
+            x.name,
+            cos.map_or_else(|| "n/a".into(), |c| format!("{c:.4}")),
+        );
+        if cos.is_some() {
+            prev = cos;
         }
     }
 }

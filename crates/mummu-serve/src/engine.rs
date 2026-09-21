@@ -723,6 +723,8 @@ pub struct ChatResult {
     pub tokens: usize,
     pub device: &'static str,
     pub elapsed_ms: u128,
+    /// Where the time went, phase by phase (see `crate::trace`).
+    pub timings: crate::trace::Timings,
 }
 
 /// Run one chat completion, streaming decoded-text deltas through `on_delta`
@@ -765,12 +767,15 @@ pub async fn run_chat(
     // read pins the worker for its duration, so it declares itself blocking
     // the same way the model load in `mummu::cache` does (and with the same
     // current-thread-runtime escape hatch, where `block_in_place` panics).
+    let plan_started = Instant::now();
     let plan = match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
         Ok(tokio::runtime::RuntimeFlavor::MultiThread) => {
             tokio::task::block_in_place(|| plan_fit(spec, models_root))?
         }
         _ => plan_fit(spec, models_root)?,
     };
+    #[allow(clippy::cast_possible_truncation)]
+    let plan_ms = plan_started.elapsed().as_millis() as u64;
     eprintln!(
         "[mummu-serve] fit plan for {}: {:?} @ {:?}",
         spec.name, plan.backend, plan.policy
@@ -790,6 +795,10 @@ pub async fn run_chat(
         on_delta,
     )
     .await
+    .map(|mut r| {
+        r.timings.plan_ms = plan_ms;
+        r
+    })
 }
 
 /// The device a backend choice denotes (burn 0.22 selects at runtime).
@@ -3743,6 +3752,13 @@ async fn drive(
     // was found stale is recorded for the load's own log line.
     let stale = AtomicBool::new(false);
     let found_stale = &stale;
+    // `acquire_valid` both waits for the slot and, on a miss, loads into it.
+    // Timing the load closure separately is what splits "stuck behind
+    // another request" from "loading weights" — the two look identical from
+    // outside and have entirely different fixes.
+    let load_ms = std::sync::atomic::AtomicU64::new(0);
+    let load_ms_ref = &load_ms;
+    let acquire_started = Instant::now();
     let m = slot
         .acquire_valid(
             &key,
@@ -3754,17 +3770,25 @@ async fn drive(
                 valid
             },
             move |_| {
-                load_for_slot(
+                let t = Instant::now();
+                let r = load_for_slot(
                     spec,
                     models_root,
                     plan,
                     arming,
                     flag_key,
                     found_stale.load(SeqCst),
-                )
+                );
+                #[allow(clippy::cast_possible_truncation)]
+                load_ms_ref.store(t.elapsed().as_millis() as u64, SeqCst);
+                r
             },
         )
         .await?;
+    #[allow(clippy::cast_possible_truncation)]
+    let acquire_ms = acquire_started.elapsed().as_millis() as u64;
+    let load_ms = load_ms.load(SeqCst);
+    let queue_ms = acquire_ms.saturating_sub(load_ms);
     resident_note.loaded = true;
     // DECLARATION ORDER IS DROP ORDER HERE, reversed: the last binding
     // declared is the first one dropped. The progress guard must be declared
@@ -3834,7 +3858,11 @@ async fn drive(
     .catch_unwind()
     .await;
     let failure = match outcome {
-        Ok(Ok(result)) => return Ok(result),
+        Ok(Ok(mut result)) => {
+            result.timings.queue_ms = queue_ms;
+            result.timings.load_ms = load_ms;
+            return Ok(result);
+        }
         Ok(Err(e)) if e.needs_decision() => e.message,
         Ok(Err(e)) => return Err(e),
         Err(payload) => {
@@ -3959,6 +3987,7 @@ async fn generate_on(
     // runs the prompt reserved. Both halves refuse loudly on a mismatch —
     // a misaligned splice is not an error anywhere downstream, it is an
     // answer about a different picture.
+    let vision_started = Instant::now();
     let placed = if images.is_empty() {
         Vec::new()
     } else {
@@ -3983,6 +4012,21 @@ async fn generate_on(
         );
         mummu::vision::place(&prompt_ids, tokens.pad, rows)?
     };
+    #[allow(clippy::cast_possible_truncation)]
+    let vision_ms = if images.is_empty() {
+        0
+    } else {
+        vision_started.elapsed().as_millis() as u64
+    };
+    let image_tokens: usize = placed.iter().map(|p| p.rows.dims()[0]).sum();
+    // The first token is the boundary between prefill and decode; stamped
+    // from inside the token callback, where it is known exactly. A plain
+    // captured `Option`, like `ids` and `emitted` — NOT a `Cell`: the
+    // callback is held across the decode loop's awaits, and `&Cell` is not
+    // `Send` (`Cell` is not `Sync`), which fails every caller that spawns a
+    // generation with an error naming the whole future.
+    let mut first_token_at: Option<Instant> = None;
+    let generation_started = Instant::now();
 
     let out = if let (AnyLm::Qwen35(vlm), false) = (&m.lm, placed.is_empty()) {
         mummu::models::generate_multimodal(
@@ -4004,6 +4048,9 @@ async fn generate_on(
                     // `recovery::decide`). Only on them — a token on the host
                     // vouches for nothing on the card.
                     recovery::generation_succeeded(&m.devices);
+                }
+                if first_token_at.is_none() {
+                    first_token_at = Some(Instant::now());
                 }
                 ids.push(id);
                 // Incremental decode: re-decode the whole tail and emit the
@@ -4042,6 +4089,9 @@ async fn generate_on(
                 if ids.is_empty() {
                     progress.ready();
                     recovery::generation_succeeded(&m.devices);
+                }
+                if first_token_at.is_none() {
+                    first_token_at = Some(Instant::now());
                 }
                 ids.push(id);
                 let Ok(text) = m.tokenizer.decode(&ids, true) else {
@@ -4104,11 +4154,24 @@ async fn generate_on(
     if matches!(&m.lm, AnyLm::OlmoeQ(q) if q.pool.is_some()) {
         rebalance_tiers();
     }
+    let generation_done = Instant::now();
+    let first = first_token_at.unwrap_or(generation_done);
+    #[allow(clippy::cast_possible_truncation)]
+    let timings = crate::trace::Timings {
+        vision_ms,
+        prefill_ms: first.duration_since(generation_started).as_millis() as u64,
+        decode_ms: generation_done.duration_since(first).as_millis() as u64,
+        prompt_tokens: prompt_ids.len(),
+        image_tokens,
+        completion_tokens: out.len(),
+        ..crate::trace::Timings::default()
+    };
     Ok(ChatResult {
         text,
         tokens: out.len(),
         device: label,
         elapsed_ms,
+        timings,
     })
 }
 

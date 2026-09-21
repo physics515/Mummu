@@ -52,6 +52,7 @@ pub mod recovery;
 mod shim;
 pub mod status;
 mod think;
+pub mod trace;
 
 /// `mummu::progress` is process-wide state and `cargo test` runs this crate's
 /// tests in parallel threads of one process, so every test that WRITES it —
@@ -443,7 +444,7 @@ pub(crate) fn json_response(status: u16, body: serde_json::Value) -> Response {
 /// reassuring. Everything that fails fast — validation, an unknown model,
 /// the 503 while a model loads — settles far inside this, so those keep
 /// their real status code.
-const KEEPALIVE_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
+pub(crate) const KEEPALIVE_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Gap between keep-alive bytes once padding has started. Comfortably
 /// under every proxy timeout worth caring about.

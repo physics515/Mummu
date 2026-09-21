@@ -663,6 +663,16 @@ async fn run(
         "[mummu-serve] shim chat {}: request accepted (stream = {stream})",
         p.spec.name
     );
+    let begin = crate::trace::Begin {
+        surface: "ollama",
+        model: p.spec.name.clone(),
+        stream,
+        think: p.think,
+        json_mode: p.format.is_some(),
+        tools: p.tools.len(),
+        images: p.images.len(),
+        started: Instant::now(),
+    };
     // The process is exiting to restart the GPU backend (see `recovery`).
     if recovery::restarting() {
         return json_response(503, json!({"error": recovery::restarting_message()}));
@@ -679,6 +689,12 @@ async fn run(
             "[mummu-serve] shim chat {}: 503 — the {loading} load is in flight",
             p.spec.name
         );
+        begin.finish(
+            "",
+            crate::trace::Timings::default(),
+            false,
+            Err(&format!("503: the {loading} load is in flight")),
+        );
         return json_response(
             503,
             json!({"error": format!(
@@ -689,7 +705,7 @@ async fn run(
     }
     let model = p.spec.name.clone();
     respond(model, stream, wrap, finish, move |sink| async move {
-        engine::run_chat(
+        let r = engine::run_chat(
             &p.spec,
             &p.root,
             &p.turns,
@@ -701,7 +717,20 @@ async fn run(
             p.tools,
             |delta| sink.delta(delta),
         )
-        .await
+        .await;
+        // Padded exactly when a buffered answer outlived the keep-alive
+        // grace — the condition `keepalive_json` pads on.
+        let padded = !stream && begin.started.elapsed() >= crate::KEEPALIVE_GRACE;
+        match &r {
+            Ok(res) => begin.finish(res.device, res.timings.clone(), padded, Ok(())),
+            Err(e) => begin.finish(
+                "",
+                crate::trace::Timings::default(),
+                padded,
+                Err(&e.message),
+            ),
+        }
+        r
     })
     .await
 }
