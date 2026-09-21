@@ -1498,7 +1498,15 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       broken. Reproducible is not robust, and "it works" after one image was the worst claim made
       during that run.
 
-- [ ] **Close the residual drift: 0.95, not 0.99.** *(2026-09-20)* The tower runs end to
+- [ ] **Close the residual drift: 0.95, not 0.99.** *(2026-09-20; localized 2026-09-21)*
+      **Where it enters, measured** (`MUMMU_VISION_STAGES=1` in `examples/vision-trace.rs`, two
+      near-identical inputs): agreement is 0.9970 at `pos_add`, so the inputs enter the tower
+      essentially identical and the drift is amplification, *not* different pixels. It falls first at
+      blocks 1-2 (0.989 -> 0.938). Activations spike 52x at block 9 (maxabs 11 -> 585) and reach 6164
+      at block 26, which `post_ln` normalizes back to 18 — and `post_ln` is where agreement bottoms out
+      (0.81) before the projector recovers it to 0.95. SigLIP-family encoders are known to carry
+      massive activations in a few channels, so the spikes may be normal; blocks 1-2 are the
+      stronger lead. The tower runs end to
       end — mmproj loads, the ViT encodes, the merger projects, the rows splice into the prefill — and
       The encoder answers correctly across resolutions now, but it still drifts: two resamplings of
       one photo give projected tokens at cos 0.95, where the control (same photo, re-encoded) sits at
@@ -1518,15 +1526,29 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       aspect ratio, and there was no floor on the patch grid (kept — it makes prefill cost
       predictable regardless of camera resolution).
 
-- [ ] **Load the vision tower at f16.** *(2026-09-20)* `VisionTower::load` reads through
-      `read_tensor_f32`, so the F16 mmproj lands on the card as f32: 0.93 GB becomes ~1.85 GiB, and
-      `vision_reserve_bytes` has to reserve double to match. That reserve costs 10 of 64 layers on the
-      27B (33/64 -> 23/64 at a 9 GiB budget) and takes decode from ~0.83 to ~2.3 s/token — for *text*
-      requests too, because placement is decided once at load. Blocked on burn configuring a float
-      dtype per **device**, not per tensor (`backend::gpu_device_f16`), so an f16 tower means an f16
-      language model as well. Worth revisiting with the 0.22 migration, where dtype stops being a type
-      parameter. Alternative that needs no burn change: evict the tower when idle and take a ~6 s
-      reload on the next image.
+- [x] **Load the vision tower at f16.** *(2026-09-21, done)* Weights are stored at the checkpoint's
+      own precision and widened to f32 at each use, so the reserve is one mmproj file rather than two:
+      the 27B went from 23/64 to 27/64 GPU layers at a 9 GiB budget, and decode measured ~1.4 tok/s
+      where the f32 tower had it near 0.43 (not a same-session comparison — see the decode-drift note;
+      direction certain, magnitude indicative). Projected tokens are **bit-for-bit as accurate** as the
+      f32 tower: cos 0.9526 against a sibling image either way.
+      **Two corrections for the record.** This item was previously marked *blocked*, on the claim that
+      burn sets a float dtype per device so an f16 tower would force an f16 language model. That was
+      never checked and was false — `Tensor::cast(FloatDType::F16)` is per tensor. And the first f16
+      build cast the *weights* and not the *operations*: burn refuses mixed-dtype matmuls
+      (`matmul: dtype mismatch, left: F32, right: F16`), so it panicked on its first image. It had
+      been deployed after checking that it compiled and that the layer count rose — never with an
+      image, the one input it changes.
+
+- [ ] **Cut image-request prefill.** *(2026-09-21)* The per-request traces (`GET /api/requests`)
+      put a warm image request at ~36 s to first token, of which the vision tower is **0.4-1.0 s** and
+      **prefill is 31-35 s** — the language model reading ~500 image tokens at ~16 tok/s with 37 of 64
+      layers on the host. The tower was never the cost. Levers, cheapest first: fewer image tokens
+      (`MIN/MAX_IMAGE_TOKENS`, currently 480/512 — 256 would roughly halve prefill, at a detail cost
+      that needs measuring on real photos, since the budget was raised specifically to preserve the
+      shape that the "eggplant slices" misreading lost); more layers on the GPU; and a batched host
+      prefill path, which is compute-bound where decode is bandwidth-bound and so is a different
+      optimization problem.
 
 ### P0 — Workspace scaffold
 - [ ] **Prepare the burn 0.22 migration** — v0.22.0-pre.1 (2026-07-29) is a breaking release aimed right
