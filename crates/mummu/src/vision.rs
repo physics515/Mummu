@@ -233,13 +233,24 @@ fn rope_2d(gh: usize, gw: usize, head_dim: usize, device: &Device) -> (Tensor<2>
                 #[allow(clippy::cast_precision_loss)]
                 let inv = 1.0 / VISION_ROPE_THETA.powf(2.0 * i as f32 / half as f32);
                 #[allow(clippy::cast_precision_loss)]
-                let angles = [(0usize, y as f32 * inv), (half, x as f32 * inv)];
+                let angles = [(0usize, y as f32 * inv), (pairs, x as f32 * inv)];
+                // Layout is [h, w, h, w]: the reference builds
+                // `freqs = cat(h_freqs, w_freqs)` — `pairs` of each — and
+                // then `emb = cat(freqs, freqs)`, so the second copy sits a
+                // whole `half` away, not a `pairs` away.
+                //
+                // Writing each axis into its own contiguous half instead
+                // ([h, h, w, w]) is self-consistent and therefore compiles
+                // and answers fluently — while rotating dims 0..half by the
+                // ROW that the weights expect to carry the column. Measured
+                // 2026-09-20: that made the tower amplify a 0.1% input
+                // change into a 12% change in the projected tokens.
                 for (base, angle) in angles {
                     let (c, sn) = (angle.cos(), angle.sin());
                     cos[row + base + i] = c;
-                    cos[row + base + pairs + i] = c;
+                    cos[row + half + base + i] = c;
                     sin[row + base + i] = sn;
-                    sin[row + base + pairs + i] = sn;
+                    sin[row + half + base + i] = sn;
                 }
             }
         }
@@ -255,12 +266,13 @@ fn rope_2d(gh: usize, gw: usize, head_dim: usize, device: &Device) -> (Tensor<2>
 fn rotate_half(x: Tensor<3>) -> Tensor<3> {
     let [h, n, d] = x.dims();
     let half = d / 2;
-    let q = half / 2;
-    let lo_a = x.clone().slice([0..h, 0..n, 0..q]);
-    let lo_b = x.clone().slice([0..h, 0..n, q..half]);
-    let hi_a = x.clone().slice([0..h, 0..n, half..half + q]);
-    let hi_b = x.slice([0..h, 0..n, half + q..d]);
-    Tensor::cat(vec![-lo_b, lo_a, -hi_b, hi_a], 2)
+    // The plain GPT-NeoX rotation: the second half negated in front of the
+    // first. Pairing `i` with `i + half` is what the [h, w, h, w] table
+    // layout requires — each dimension meets its own duplicate, so the row
+    // and column rotations stay on the dimensions the weights expect.
+    let a = x.clone().slice([0..h, 0..n, 0..half]);
+    let b = x.slice([0..h, 0..n, half..d]);
+    Tensor::cat(vec![-b, a], 2)
 }
 
 /// Apply the rotation to `[heads, n, head_dim]`.
@@ -628,15 +640,67 @@ impl VisionConfig {
                 }
             }
         }
-        Ok(Patches {
+        let p = Patches {
             data,
             grid_h,
             grid_w,
-        })
+        };
+        // One line per image, because the arithmetic and the behaviour
+        // disagree: 900x675 and 1500x1125 compute to the same grid and the
+        // same post-resize size, and the model describes them differently.
+        // Printing what actually happened — rather than what `grid_for` is
+        // believed to do — is the only way to find where they diverge.
+        if std::env::var("MUMMU_VISION_TRACE").is_ok_and(|v| v != "0") {
+            eprintln!(
+                "[mummu] vision trace: in {w}x{h} -> grid {grid_h}x{grid_w} patches \
+                 ({} tokens) -> resized {px_w}x{px_h} -> {} floats, {}",
+                (grid_h / self.merge) * (grid_w / self.merge),
+                p.data.len(),
+                p.fingerprint(),
+            );
+        }
+        Ok(p)
     }
 }
 
 impl Patches {
+    /// A summary of the patch tensor: enough to tell two preprocessings
+    /// apart without printing a million floats.
+    ///
+    /// Deliberately more than a hash. A hash answers "are these the same",
+    /// which is the question already known to be interesting; the mean and
+    /// the extremes also answer "and if not, how" — a normalization or
+    /// channel-order mistake moves the mean, a resampling one moves the
+    /// range, and a reordering moves neither.
+    #[must_use]
+    pub fn fingerprint(&self) -> String {
+        let n = self.data.len().max(1) as f64;
+        let sum: f64 = self.data.iter().map(|&v| f64::from(v)).sum();
+        let mean = sum / n;
+        let var = self
+            .data
+            .iter()
+            .map(|&v| (f64::from(v) - mean).powi(2))
+            .sum::<f64>()
+            / n;
+        let (lo, hi) = self
+            .data
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(l, h), &v| (l.min(v), h.max(v)));
+        // Order-sensitive checksum: two tensors with identical contents in a
+        // different patch order must NOT look alike here, since a wrong
+        // ordering is one of the live suspects.
+        let mut ck: u64 = 0xcbf2_9ce4_8422_2325;
+        for (i, &v) in self.data.iter().enumerate() {
+            ck ^= u64::from(v.to_bits()).wrapping_mul(i as u64 | 1);
+            ck = ck.wrapping_mul(0x0100_0000_01b3);
+        }
+        format!(
+            "mean {mean:+.5} sd {:.5} range [{lo:+.3}, {hi:+.3}] ck {ck:016x}",
+            var.sqrt()
+        )
+    }
+
     /// Upload as `[grid_h * grid_w, 3 * patch * patch]`.
     #[must_use]
     pub fn to_tensor(&self, device: &Device) -> Tensor<2> {
