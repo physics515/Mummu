@@ -176,8 +176,10 @@ impl Turn {
 }
 
 /// Deepest literal nesting the Pythonic renderer/parser will follow — far
-/// past any real argument payload, and the recursion bound for both.
-const MAX_VALUE_DEPTH: usize = 8;
+/// past any real argument payload, and the recursion bound for both. Public
+/// so a caller rendering calls it did not write (a client's replayed tool
+/// loop) can refuse deeper ones instead of tripping the renderer's assert.
+pub const MAX_VALUE_DEPTH: usize = 8;
 
 /// Serialize a value the way Python's `json.dumps` does by default — `", "`
 /// between items, `": "` after keys. Prompt JSON renders this way

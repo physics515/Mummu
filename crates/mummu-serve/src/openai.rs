@@ -218,8 +218,9 @@ struct ChatCompletionRequest {
     #[serde(default)]
     response_format: Option<ResponseFormat>,
     /// OpenAI function definitions. Rendered into the prompt through the
-    /// family's own tool convention (Hermes `<tools>` for Qwen), and the
-    /// model's `<tool_call>` blocks are parsed back out of the answer.
+    /// family's own tool convention (Hermes `<tools>` for Qwen, a
+    /// `List of tools` line for LFM2), and the model's calls are parsed back
+    /// out of the answer in that same convention.
     #[serde(default)]
     tools: Option<Vec<ToolDef>>,
     #[serde(default)]

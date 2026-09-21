@@ -664,8 +664,8 @@ fn load_any(
 /// Lifts every call out of a whole answer, with the prose around them.
 pub type ReadCalls = fn(&str) -> Result<(Vec<ToolCall>, String), mummu::chat::ToolCallError>;
 
-/// How a family's answer carries tool calls, and how they are read back out
-/// of it.
+/// How a family's answer carries tool calls, how they are read back out of
+/// it, and how a call it made is written back into a replayed history.
 #[derive(Clone, Copy)]
 pub struct CallSyntax {
     /// The tag a call opens with, as it appears in the decoded answer.
@@ -673,6 +673,10 @@ pub struct CallSyntax {
     /// The tag that closes it.
     pub close: &'static str,
     pub read: ReadCalls,
+    /// The assistant turn a client's replayed calls become (`to_turns`
+    /// builds it) — what the model itself wrote, so it recognises its own
+    /// request.
+    pub replay: fn(&[ToolCall]) -> Turn,
 }
 
 /// Hermes: `<tool_call>{json}</tool_call>`. The tags are ordinary added
@@ -682,6 +686,19 @@ const HERMES: CallSyntax = CallSyntax {
     open: "<tool_call>",
     close: "</tool_call>",
     read: mummu::chat::parse_tool_calls,
+    replay: Turn::assistant_tool_calls,
+};
+
+/// LFM: a Pythonic call list, `<|tool_call_start|>[name(k=v), …]<|tool_call_end|>`.
+/// Each tag is one token, but the two LFM2.5 builds disagree on whether it
+/// is special: the safetensors `tokenizer.json` says no, the GGUF types it
+/// CONTROL and so it is a special added token there. The decoder keeps it
+/// either way — see [`preserved_tokens`].
+const LFM: CallSyntax = CallSyntax {
+    open: "<|tool_call_start|>",
+    close: "<|tool_call_end|>",
+    read: mummu::chat::parse_tool_calls_lfm,
+    replay: Turn::assistant_tool_calls_lfm,
 };
 
 /// A family's prompt template, and what it lets a request do.
@@ -715,12 +732,7 @@ fn template(arch: Architecture) -> Result<Template, String> {
         // qwen35's imported chat template is ChatML with Qwen3's think
         // conventions (its vision macros never fire on text-only turns).
         Architecture::Qwen35 => chatml(ChatMl::qwen3(), Some(HERMES), true),
-        // The renderer speaks LFM's Pythonic tool convention, but nothing
-        // reads `<|tool_call_start|>[…]<|tool_call_end|>` back out of an
-        // answer yet: `mummu::chat::parse_tool_calls_lfm` is not wired in,
-        // and the GGUF build's tokenizer marks those tags CONTROL, so the
-        // decoder's skip-specials pass drops them before any parser looks.
-        Architecture::Lfm2 => chatml(ChatMl::lfm2(), None, false),
+        Architecture::Lfm2 => chatml(ChatMl::lfm2(), Some(LFM), false),
         Architecture::Olmoe => Template {
             chatml: None,
             calls: None,
@@ -746,6 +758,48 @@ pub fn supports_tools(arch: Architecture) -> bool {
 /// Does this family reason in a `<think>` block before it answers?
 pub fn thinks(arch: Architecture) -> bool {
     template(arch).is_ok_and(|t| t.thinks)
+}
+
+/// The special tokens an answer is decoded WITH: the family's call tags,
+/// where this tokenizer marks them special. Every other special — the end
+/// of turn, BOS, padding — the decoder still skips.
+///
+/// llama.cpp calls these preserved tokens. A build is free to type a call
+/// tag CONTROL (the LFM2.5 GGUF does), and skipping specials would then turn
+/// `<|tool_call_start|>[f()]<|tool_call_end|>` into a bare `[f()]` that no
+/// reader recognises as a call — and that the client gets as prose.
+fn preserved_tokens(tok: &Tokenizer, arch: Architecture) -> Vec<u32> {
+    let Some(calls) = tool_calls(arch) else {
+        return Vec::new();
+    };
+    let added = tok.get_added_vocabulary();
+    [calls.open, calls.close]
+        .into_iter()
+        .filter(|tag| added.is_special_token(tag))
+        .filter_map(|tag| tok.token_to_id(tag))
+        .collect()
+}
+
+/// `tok.decode(ids, true)`, except that the `keep` ids (see
+/// [`preserved_tokens`]) come through. The same filter-then-decode the
+/// tokenizer runs, with one more thing let past it.
+fn decode_answer(tok: &Tokenizer, ids: &[u32], keep: &[u32]) -> tokenizers::Result<String> {
+    use tokenizers::Decoder as _;
+    if keep.is_empty() {
+        return tok.decode(ids, true);
+    }
+    let added = tok.get_added_vocabulary();
+    let tokens: Vec<String> = ids
+        .iter()
+        .filter_map(|&id| {
+            let token = tok.id_to_token(id)?;
+            (keep.contains(&id) || !added.is_special_token(&token)).then_some(token)
+        })
+        .collect();
+    match tok.get_decoder() {
+        Some(decoder) => decoder.decode(tokens),
+        None => Ok(tokens.join(" ")),
+    }
 }
 
 /// Render `turns` into the family's prompt string. The ChatML families are
@@ -4059,6 +4113,8 @@ async fn generate_on(
     let start = Instant::now();
     let mut ids: Vec<u32> = Vec::new();
     let mut emitted = String::new();
+    // The family's call tags, which this build may type special.
+    let keep = preserved_tokens(&m.tokenizer, spec.architecture);
     // A reasoning model opens with `<think>…</think>`. Unless the request
     // asked for it, that is suppressed here — between the decoder and the
     // client — so it never reaches a sink and never counts against what the
@@ -4156,7 +4212,7 @@ async fn generate_on(
                 // suffix beyond what was already streamed. A trailing U+FFFD
                 // means we're mid-way through a multi-byte char — hold the
                 // delta until the next token completes it.
-                let Ok(text) = m.tokenizer.decode(&ids, true) else {
+                let Ok(text) = decode_answer(&m.tokenizer, &ids, &keep) else {
                     return ControlFlow::Continue(());
                 };
                 if text.ends_with('\u{FFFD}') || text.len() <= emitted.len() {
@@ -4193,7 +4249,7 @@ async fn generate_on(
                     first_token_at = Some(Instant::now());
                 }
                 ids.push(id);
-                let Ok(text) = m.tokenizer.decode(&ids, true) else {
+                let Ok(text) = decode_answer(&m.tokenizer, &ids, &keep) else {
                     return ControlFlow::Continue(());
                 };
                 if text.ends_with('\u{FFFD}') || text.len() <= emitted.len() {
@@ -4217,10 +4273,7 @@ async fn generate_on(
         .await?
     };
 
-    let mut text = m
-        .tokenizer
-        .decode(&out, true)
-        .map_err(|e| format!("decode: {e}"))?;
+    let mut text = decode_answer(&m.tokenizer, &out, &keep).map_err(|e| format!("decode: {e}"))?;
     if !think {
         // The buffered path never went through the streaming filter, so it
         // is filtered whole here. A block the token cap cut short leaves no
@@ -5258,7 +5311,111 @@ mod template_tests {
 
         // A family with no reader is never lifted, whatever the text says.
         let mut r = answered("<tool_call>{\"name\": \"x\"}</tool_call>");
-        lift_tool_calls(Architecture::Lfm2, &mut r);
+        lift_tool_calls(Architecture::Olmoe, &mut r);
         assert!(r.tool_calls.is_empty());
+    }
+
+    const LFM_CALL: &str = "<|tool_call_start|>[get_weather(city=\"Paris\")]<|tool_call_end|>";
+
+    fn weather_call() -> ToolCall {
+        ToolCall {
+            name: "get_weather".into(),
+            arguments: serde_json::json!({"city": "Paris"}),
+        }
+    }
+
+    /// LFM2 answers in its own convention, and is read back in it — and
+    /// only in it: Hermes markup in an LFM answer is not a call it made.
+    #[test]
+    fn an_lfm_call_is_lifted_in_lfms_own_convention() {
+        let mut r = answered(&format!("Checking.\n{LFM_CALL}"));
+        lift_tool_calls(Architecture::Lfm2, &mut r);
+        assert_eq!(r.text, "Checking.");
+        assert_eq!(r.tool_calls, [weather_call()]);
+
+        let hermes = "<tool_call>{\"name\": \"get_weather\"}</tool_call>";
+        let mut r = answered(hermes);
+        lift_tool_calls(Architecture::Lfm2, &mut r);
+        assert_eq!((r.text.as_str(), r.tool_calls.len()), (hermes, 0));
+    }
+
+    /// A byte-level BPE with no merges — every byte a token of its own —
+    /// plus LFM2.5's end of turn and its call tags as added tokens: the tags
+    /// special as the GGUF types them (CONTROL), or not, as the safetensors
+    /// `tokenizer.json` does.
+    fn lfm_like_tokenizer(tags_special: bool) -> Tokenizer {
+        use tokenizers::AddedToken;
+        use tokenizers::models::bpe::{BPE, Vocab};
+        use tokenizers::pre_tokenizers::byte_level::ByteLevel;
+        let mut alphabet: Vec<char> = ByteLevel::alphabet().into_iter().collect();
+        alphabet.sort_unstable();
+        let mut vocab = Vocab::default();
+        for (id, c) in (0u32..).zip(alphabet) {
+            vocab.insert(c.to_string(), id);
+        }
+        let bpe = BPE::builder()
+            .vocab_and_merges(vocab, Vec::new())
+            .build()
+            .expect("BPE");
+        let mut tok = Tokenizer::new(bpe);
+        tok.with_pre_tokenizer(Some(ByteLevel::new(false, false, false)));
+        tok.with_decoder(Some(ByteLevel::new(false, false, false)));
+        tok.add_special_tokens([AddedToken::from("<|im_end|>", true)])
+            .expect("end of turn");
+        let tags = [LFM.open, LFM.close].map(|t| AddedToken::from(t, tags_special));
+        if tags_special {
+            tok.add_special_tokens(tags).expect("tags");
+        } else {
+            tok.add_tokens(tags).expect("tags");
+        }
+        tok
+    }
+
+    /// The GGUF build's tags are special, so skipping specials used to
+    /// decode its call as a bare `[get_weather(…)]` that nothing read back.
+    /// They come through now, as they do from the safetensors build, and
+    /// the end of turn is still skipped in both.
+    #[test]
+    fn call_tags_typed_special_survive_the_decoder_and_no_other_special_does() {
+        let answer = format!("Checking. {LFM_CALL}<|im_end|>");
+        let want = format!("Checking. {LFM_CALL}");
+        for tags_special in [true, false] {
+            let tok = lfm_like_tokenizer(tags_special);
+            let ids = tok
+                .encode(answer.as_str(), false)
+                .expect("encode")
+                .get_ids()
+                .to_vec();
+            let keep = preserved_tokens(&tok, Architecture::Lfm2);
+            assert_eq!(
+                keep.len(),
+                if tags_special { 2 } else { 0 },
+                "{tags_special}"
+            );
+            assert_eq!(decode_answer(&tok, &ids, &keep).expect("decode"), want);
+            // Streamed, every prefix decodes to a prefix of the answer, so
+            // the emitter's suffix-diff sees the tags arrive whole.
+            for n in 0..=ids.len() {
+                let so_far = decode_answer(&tok, &ids[..n], &keep).expect("decode");
+                assert!(want.starts_with(&so_far), "{n}: {so_far:?}");
+            }
+            let mut r = answered(&want);
+            lift_tool_calls(Architecture::Lfm2, &mut r);
+            assert_eq!(r.tool_calls, [weather_call()], "{tags_special}");
+        }
+        // What the plain skip-specials pass made of the GGUF build's answer.
+        let tok = lfm_like_tokenizer(true);
+        let ids = tok
+            .encode(answer.as_str(), false)
+            .expect("encode")
+            .get_ids()
+            .to_vec();
+        assert_eq!(
+            tok.decode(&ids, true).expect("decode"),
+            "Checking. [get_weather(city=\"Paris\")]"
+        );
+        // A family whose tags are not these keeps nothing extra.
+        assert!(preserved_tokens(&tok, Architecture::Qwen3).is_empty());
+        assert!(preserved_tokens(&tok, Architecture::Olmoe).is_empty());
     }
 }
