@@ -747,8 +747,61 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       Q8 at 490 GB/s against Q4 at 86 GB/s (the packed Q4 GEMV is the slow kernel there), so a roomy
       card now prefers Q8 — worth a kernel look; (3) the 2B all-host at Q4 (VNNI twins lazily
       repacked from the i8 slab, a second 4-bit rounding) ignores `think: false` and reasons at length.
-      Open: the head is placed once at load and never moves (it should be a part of the solve);
-      MoE tiers still budget through `free_for_new` rather than the joint solver.
+      Follow-ups are the open items below. **v0.4.0 OOMed on its first production load** (1 GiB
+      working-set prior; head and embedding at f32) and v0.4.1 fixed both — see the first item.
+- [ ] **Placement follow-ups from v0.4.0/v0.4.1** *(2026-09-21)* — what the live runs and the incident
+      left open, most consequential first.
+      - [ ] **Verify placement changes on the 27B, and make that a gate.** v0.4.0 passed every test and
+        a 2B end-to-end on the card, then OOMed on the 27B's first load: the 2B's working set is tiny
+        and its head outweighs its layers, so neither bug (the 1 GiB prior, the f32 head) could show.
+        Wants a scripted 27B cold-load check (placement line, residency, one coherent answer) run before
+        any placement change ships, and a rollback image kept per deploy (none of v0.3.3 existed).
+      - [ ] **The head is placed once, at load, and never moves.** It follows the last layer (reserved
+        in the solve when it goes to the card) but is not a part in `joint`, so re-plans cannot move it
+        and its time is not in the model. On the 27B it is 1.27 G params (~0.7 GiB at Q4); on the 2B it
+        is larger than every layer together.
+      - [ ] **The time model counts weight streaming only.** Predicted ms/token omits the head, fixed
+        per-token overhead (dispatch, sampling, attention/recurrence compute) and host contention between
+        probes: the 27B predicted 242.7 ms/token and ran ~550 (1.81 tok/s); the 2B's 10-layer move
+        predicted 21.2 -> 16.6 ms and measured no change. Decisions compare placements, so a constant
+        error mostly cancels, but the improve gate (4) multiplies the *predicted* saving by the horizon
+        and so over-credits moves. Calibrate the model against measured decode (per-request ms/token vs
+        predicted) and scale the saving by the ratio.
+      - [ ] **Card resident overhead is under-modelled.** The prior is 5% (11.28 vs 10.82 GiB on
+        v0.4.0's load); v0.4.1's first load planned 7.10 GiB and the card grew 8.94 (+26%, probe and
+        pool pages included). Calibrate the card's resident multiplier from `in_use` after each load and
+        move instead of a constant.
+      - [ ] **The working-set prior is a constant fraction** (card/4). It is what makes a cold load fit,
+        and it is replaced by the measurement — but it is still one number for every model. Derive a
+        prior from the model's shapes (the analytic act/KV terms plus a measured per-architecture pool
+        factor) and keep the persisted per-model value as the first source.
+      - [ ] **An idle server holds improvements.** The horizon `H` is tokens served in the last hour
+        (floor 256), so after a co-tenant leaves a quiet server keeps its degraded placement until
+        traffic returns (live: `30 -> 36 layers would save 33.5 ms/token, 8.6 s over the 256-token
+        horizon — less than re-reading 1.35 GiB (13.5 s at 107 MB/s)`). Right by (4) as written, but the
+        first request after the quiet pays it. Consider pricing idle re-reads only by the disk
+        contention they cause, not by request latency they do not add.
+      - [ ] **Card Q4 is the slow kernel.** The CUDA probe measured Q8 at 450-490 GB/s against Q4 at
+        86-290 GB/s, so the packed Q4 GEMV on the card is slower per byte than Q8; a roomy card now
+        prefers Q8, and a tight one pays for Q4's slowness. A kernel look (and a warm-cache re-probe:
+        the 86 GB/s runs had a cold autotune cache).
+      - [ ] **Host Q4 quality on small models.** The 2B entirely on the host at Q4 ignores
+        `think: false` and reasons at length; on the card at Q8 it answers directly. The host twins are
+        lazily repacked from the i8 slab (a second 4-bit rounding, logged at every load) — register them
+        from the float level at load, and give the solver a quality floor per model size rather than one
+        Q4 floor.
+      - [ ] **MoE tiers and the other planners still use `free_for_new`.** OLMoE's expert tiers, the fit
+        planner and the non-layered qwen35 path budget from the live card but are not joint-solved and do
+        not re-plan; the integrated GPU keeps its `MUMMU_IGPU_BUDGET_GB` default (8 GiB).
+      - [ ] **The card leg of `real_qwen35_relocate` has never run.** The host has no CUDA toolkit for
+        NVRTC (only the image does), so moves onto the card were verified only through the serve image's
+        end-to-end run, not the logit-equality test. Run it in the image, or install the toolkit.
+      - [ ] **Moves read the pack, never the host copy.** Promoting a host layer to the card re-reads
+        it from the array (~107 MB/s here) even when the same precision is already in host RAM; a
+        host->card copy at PCIe speed would make improvements ~50x cheaper and change what (4) admits.
+      - [ ] **A `placement` view on `/logs`/status.** Placement is only visible as log lines; the status
+        object should carry layers-per-device, the parts histogram, capacity/guard/residual, and the last
+        hold reason.
 - [ ] **What v0.3.1's review left open on `/logs`** *(2026-09-18)* — none blocked the deploy; each is
       a way the page can still lose or misstate history. (1) **A LOUD flood still evicts the load**: 404s
       stay loud by design, so one scanner sweep of more than 2000 paths on the public shim pushes the
