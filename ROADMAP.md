@@ -2029,6 +2029,21 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       `olmoe-tok`** — i.e. the MoE gates specifically. Also still absent and tracked separately: the
       qwen3.5-2b BF16 fixture `parity_qwen35` wants. Refetching the OLMoE pair costs ~18 GB against
       8.5 TB free, so it is bandwidth, not space, that gates it.
+      *(2026-09-23) **The MoE gates are back, and so is qwen3.5-2b.*** Fetched this run:
+      `olmoe-1b-7b-0125-instruct-q4km/OLMoE-1B-7B-0125-Instruct-Q4_K_M.gguf` (4,213,512,192 B, from
+      `allenai/OLMoE-1B-7B-0125-Instruct-GGUF`) and `olmoe-tok/` (`tokenizer.json` 3.57 MB plus
+      `tokenizer_config.json` and `config.json`, from the non-GGUF repo — the GGUF repo does not ship
+      them). Three gates that were unrunnable now pass on this host, run `--release`:
+      `real_olmoe_quant::olmoe_per_expert_q8_agrees_with_f32_and_answers` (362 s),
+      `real_olmoe::olmoe_gguf_tokenizer_matches_the_hf_tokenizer` (byte-identical on 8 prompts) and
+      `real_olmoe::olmoe_gguf_loads_and_decodes_on_cpu` (16 layers x 64 experts loaded in 117.1 s,
+      6 tokens in 6.5 s = 1.09 s/token, "2 + 2 equals 4."). `qwen3.5-2b` is present too
+      (`Qwen3.5-2B-BF16.gguf`, 3,775,709,216 B) — the separately-tracked absence above is stale.
+      **Still missing: `qwen3-4b-q4km`, and OLMoE's 13.84 GB safetensors twin**
+      (`allenai/OLMoE-1B-7B-0125-Instruct`, which `load_from_dir` fuses into `[experts, out, in]`
+      banks) — the GGUF leg is what the three gates above needed, the safetensors leg is its own.
+      `budget_moe::olmoe_moe_cpu_decode_stays_inside_its_budget` was NOT run: it wants ~30 GB of
+      commit and the live `mummu-serve` deployment was holding 54-68 GB of this 124 GB box all run.
 - [ ] **Linking is the memory peak of this build, and the linker is `rust-lld`, not `ld`.** Worth
       writing down because it cost this run three failed gates and two wrong diagnoses. `cc` execs
       GCC's `collect2` (a ~2.6 MB wrapper) which execs
