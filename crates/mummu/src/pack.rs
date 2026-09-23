@@ -446,12 +446,33 @@ pub fn import_gguf(
             }
         }
 
+        // A ternary-family source (Bonsai's PQ2_0/PTQ1_0/Q2_0/Q1_0, every
+        // value a scale times −1/0/+1) carries two bits per value, so the
+        // integer levels are all a projection stores (Q8 holds it to 0.3%,
+        // Q4 to 5% — the blocks run along the output axis, mixing rows with
+        // different scales; see `GgmlType::is_ternary_family`), and a
+        // float-only role (the embedding) keeps the narrowest float level
+        // asked for. Wider copies are bytes without information: for the
+        // 27B, f16+f32 of a 2-bit checkpoint would be 160 GB written and
+        // re-read for nothing.
+        let ternary = info.dtype.is_ternary_family();
+        let integer_requested = precisions
+            .iter()
+            .any(|p| matches!(p, Precision::Q4 | Precision::Q8));
+        let narrowest_float = float_levels
+            .iter()
+            .copied()
+            .min()
+            .expect("float_levels always holds at least f32");
         for (name, role, shape, data) in items {
             let quantizable = matches!(role, Role::Linear | Role::Expert { .. })
                 && QuantPolicy::Q8.eligible(&shape);
             let mut per: BTreeMap<Precision, Blob> = BTreeMap::new();
             for &p in &all_levels {
                 let stored = match p {
+                    Precision::F32 | Precision::F16 if ternary => {
+                        (!quantizable || !integer_requested) && p == narrowest_float
+                    }
                     Precision::F32 | Precision::F16 => {
                         float_levels.contains(&p) || !quantizable && p == Precision::F32
                     }
@@ -1068,6 +1089,101 @@ impl Pack {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A ternary source stores only what carries information: the integer
+    /// levels for a projection, the narrowest float level for the embedding
+    /// — while an ordinary float source keeps every level requested.
+    #[test]
+    fn ternary_sources_skip_the_float_levels_they_cannot_use() {
+        use crate::gguf::tests::TestGguf;
+        let _serial = crate::progress::test_serial();
+        // One PQ2_0 linear [256, 256] (65536 elements = 512 blocks of 34 B),
+        // one PQ2_0 embedding [16, 128] (16 blocks), one F32 linear [256, 256];
+        // every offset lands 32-aligned.
+        let d = half::f16::from_f32(0.5).to_bits().to_le_bytes();
+        let mut payload = Vec::new();
+        for _ in 0..512 {
+            payload.extend_from_slice(&d);
+            payload.extend(std::iter::repeat_n(0b1001_0110u8, 32));
+        }
+        let emb_off = payload.len() as u64; // 17408, 32-aligned
+        for _ in 0..16 {
+            payload.extend_from_slice(&d);
+            payload.extend(std::iter::repeat_n(0b0110_1001u8, 32));
+        }
+        let f32_off = payload.len() as u64; // 17952, 32-aligned
+        payload.extend((0..65536u32).flat_map(|i| ((i % 17) as f32 * 0.1 - 0.8).to_le_bytes()));
+        let bytes = TestGguf::new()
+            .kv_str("general.architecture", "test")
+            .tensor("blk.0.ffn_up.weight", &[256, 256], 142, 0)
+            .tensor("token_embd.weight", &[128, 16], 142, emb_off)
+            .tensor("blk.0.ffn_down.weight", &[256, 256], 0, f32_off)
+            .build_with_payload(&payload);
+        let root = std::env::temp_dir().join(format!("mummu-pack-ternary-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("root");
+        let gguf = root.join("t.gguf");
+        std::fs::write(&gguf, &bytes).expect("gguf");
+        let map = |info: &GgufTensorInfo| {
+            Some(if info.name == "token_embd.weight" {
+                ImportAction::Embedding
+            } else {
+                ImportAction::Linear
+            })
+        };
+        let manifest = import_gguf(
+            &gguf,
+            &root.join("pack"),
+            &Precision::ALL,
+            &map,
+            |_, _, _| {},
+        )
+        .expect("imports");
+        let levels = |name: &str| -> Vec<Precision> {
+            manifest
+                .tensors
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("{name} in manifest"))
+                .precisions
+                .keys()
+                .copied()
+                .collect()
+        };
+        assert_eq!(
+            levels("blk.0.ffn_up.weight"),
+            vec![Precision::Q4, Precision::Q8]
+        );
+        assert_eq!(levels("token_embd.weight"), vec![Precision::F16]);
+        assert_eq!(levels("blk.0.ffn_down.weight"), Precision::ALL.to_vec());
+        // With one scale for every block, the integer copy is exact: every
+        // stored value is ±d or 0 (real checkpoints mix scales across a
+        // block's 32 output rows and lose ~5% at Q4 — see the doc).
+        let pack = Pack::open(&root.join("pack")).expect("pack opens");
+        let entry = pack.entry("blk.0.ffn_up.weight").expect("entry");
+        let device = crate::backend::cpu_device();
+        let q4 = pack
+            .tensor::<2>(entry, Precision::Q4, &device)
+            .expect("q4 tensor")
+            .dequantize()
+            .into_data()
+            .try_to_vec::<f32>()
+            .expect("f32");
+        let want = crate::gguf::dequantize(crate::gguf::GgmlType::PQ2_0, &payload[..512 * 34])
+            .expect("dequant");
+        // Stored [in, out] = transposed; compare as a multiset per value class.
+        assert_eq!(q4.len(), want.len());
+        let mut a: Vec<i32> = q4.iter().map(|v| (v / 0.5).round() as i32).collect();
+        let mut b: Vec<i32> = want.iter().map(|v| (v / 0.5).round() as i32).collect();
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(a, b, "the Q4 level reproduces the ternary values exactly");
+        for (q, r) in q4.iter().zip(&a) {
+            let _ = r;
+            assert!((q.abs() - 0.5).abs() < 1e-6 || q.abs() < 1e-6, "{q}");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     /// A pack read must return the SAME bytes whether they came off the
     /// blob or out of the NVMe cache, and the second read of a range must

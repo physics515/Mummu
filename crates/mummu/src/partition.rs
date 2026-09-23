@@ -255,6 +255,14 @@ pub fn partition_pack(
     if pack.manifest.ffn_partition.is_some() {
         return Err("pack is already partitioned".into());
     }
+    if pack_is_hadamard_folded(pack)? {
+        return Err(
+            "a Hadamard-folded checkpoint cannot be partitioned: the down-projection's input \
+             transform is blockwise over the ORIGINAL intermediate order, and reordering the \
+             neurons would silently break it (measured: layer-0 FFN wrong, garbage output)"
+                .into(),
+        );
+    }
     // Crash safety: a layer's three entries are rewritten one after the
     // other, so a crash in between leaves gate permuted and down not — a
     // corrupt layer. The journal records, per layer, the permutation and a
@@ -346,6 +354,14 @@ struct LayerJournal {
     /// Fingerprints of gate / up / down f32 before the rewrite.
     before: [u64; 3],
     done: bool,
+}
+
+/// Does the pack's source declare Prism's folded Hadamard basis
+/// (`prism.hadamard.*`)? Such a pack must keep its FFN neuron order: the
+/// fold is blockwise over that order (see `crate::nn::hadamard`).
+pub fn pack_is_hadamard_folded(pack: &Pack) -> Result<bool, String> {
+    let header = pack.header()?;
+    Ok(crate::nn::hadamard::HadamardSpec::from_gguf(&header)?.is_some())
 }
 
 /// FNV-1a over the first 4096 values (enough to tell permuted from not).
@@ -494,6 +510,51 @@ mod tests {
         let mut counts = [0; 4];
         a.iter().for_each(|&c| counts[c] += 1);
         assert_eq!(counts, [8; 4]);
+    }
+
+    /// A folded checkpoint's pack keeps its neuron order: partitioning is
+    /// refused by name, and the loaders' skip predicate agrees.
+    #[test]
+    fn a_hadamard_folded_pack_is_never_partitioned() {
+        use crate::gguf::tests::TestGguf;
+        let _serial = crate::progress::test_serial();
+        let payload: Vec<u8> = (0..256u32 * 256)
+            .flat_map(|i| ((i % 7) as f32 * 0.1).to_le_bytes())
+            .collect();
+        let bytes = TestGguf::new()
+            .kv_str("general.architecture", "qwen35")
+            .kv_u32("prism.hadamard.version", 1)
+            .kv_u32("prism.hadamard.block_size", 8)
+            .kv_str(
+                "prism.hadamard.transform",
+                "normalized-sylvester-walsh-hadamard",
+            )
+            .kv_str("prism.hadamard.axis", "input-last-dimension")
+            .kv_str("prism.hadamard.sign_mode", "identity")
+            .kv_str_array("prism.hadamard.weight_names", &["blk.0.ffn_up.weight"])
+            .tensor("blk.0.ffn_up.weight", &[256, 256], 0, 0)
+            .build_with_payload(&payload);
+        let root = std::env::temp_dir().join(format!("mummu-part-folded-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("root");
+        let gguf = root.join("t.gguf");
+        std::fs::write(&gguf, &bytes).expect("gguf");
+        let out = root.join("pack");
+        crate::pack::import_gguf(
+            &gguf,
+            &out,
+            &[Precision::Q4],
+            &|_| Some(crate::pack::ImportAction::Linear),
+            |_, _, _| {},
+        )
+        .expect("imports");
+        let mut pack = Pack::open(&out).expect("opens");
+        assert!(pack_is_hadamard_folded(&pack).expect("header parses"));
+        let err = partition_pack(&mut pack, &ffn_names(1), DEFAULT_CLUSTERS, |_, _| {})
+            .expect_err("refused");
+        assert!(err.contains("Hadamard"), "{err}");
+        assert!(pack.manifest.ffn_partition.is_none());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

@@ -209,6 +209,7 @@ impl Qwen4expConfig {
             // keys by up to 2.8e-2 on real prompts (see GdnL2).
             gdn_l2: GdnL2::AddEps,
             eos_token_id: EosIds::One(self.eos_token_id),
+            hadamard: None,
         }
     }
 

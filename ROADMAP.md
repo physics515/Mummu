@@ -2444,6 +2444,73 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       `qwen3.8-27b-ud-q4ks` (loud-size-error until P9). Toy cache-equivalence tests green;
       the llama.cpp parity gate is `tests/parity_qwen35.rs` (`MUMMU_QWEN35_GGUF` +
       `MUMMU_LLAMA_SERVER`; the local Ollama 0.32.15's bundled llama-server speaks qwen35).
+      *(2026-09-22)* **Ternary-Bonsai 2 27B (Prism ML) serves through this port.** The checkpoint is
+      Qwen3.8-27B with end-to-end ternary g128 weights — every value one f16 scale per 128 times
+      −1/0/+1 — shipped as `PQ2_0` (Prism-private ggml id 142, 2-bit slots, 7.21 GB) or `PTQ1_0`
+      (id 143, five base-3 trits per byte, 5.95 GB), and stored in a **blockwise Hadamard basis**: each
+      linear's input axis was rotated offline by `R = H·S` (a fixed ±1 sign per position, then the
+      normalized 1024-block Sylvester Walsh–Hadamard), so the runtime must feed every folded weight
+      `R x` and un-rotate the token table's rows after the gather. Stock llama.cpp loads the
+      `Q2_0` variant of these files and produces garbage for exactly that reason. Shipped: (1)
+      `gguf.rs` decodes `Q1_0`/`Q2_0` (upstream 41/42), `PQ2_0`/`PTQ1_0` — the PTQ1_0 decoder is pinned
+      by a verbatim port of the fork's reference encoder round-tripping every trit position — plus a
+      tensor-table **overlap check** (Prism's legacy `*-Q2_0.gguf` stores group-128 blocks under the
+      group-64 id; the fork refuses it and now so do we, instead of reading a neighbour's bytes as
+      weights); (2) `nn::hadamard` parses and validates the `prism.hadamard.*` v1 contract (block,
+      transform, axis, explicit/identity sign mode, sign vectors cut by width, weight names, inverse
+      tables, `gdn_v_grouped`) — anything else is a load error naming the field — and holds the
+      per-device constants (one 4 MiB block matrix per device, sign vectors on first use); (3)
+      `Qwen35Config.hadamard` resolves the contract onto this forward per projection (q/k/v/o,
+      qkv/z/out, gate/up/down, head, table), and every path applies it: the tensor blocks, the fused
+      host DeltaNet decode step (host FWHT, O(n log n)), the lookahead scratch forward, the head, and
+      `embed()`; the DeltaNet out-projection's input is permuted from this port's tiled value-head
+      order to HF's grouped order first, the order the fold was computed in (the fork's
+      `perm_hd/nk/rep`); the partitioned-FFN and expert-pool paths refuse a folded checkpoint (the
+      down-projection transform spans the whole intermediate axis). Pinned by
+      `hadamard_folded_weights_reproduce_the_unfolded_logits`: a toy model, its weights folded the way
+      Prism's converter folds them (`w'_o = R·P·w_o`, table rows `R·e_v`), declared and compared —
+      prefill and fused decode steps match the unfolded model to 1e-4 relative, and the folded weights
+      run WITHOUT the contract are wrong by construction. (4) The pack import stores, for a
+      ternary-family source, only the integer levels for the projections and the narrowest float
+      level for the table; f16/f32 copies of a 2-bit 27B would have been 160 GB written and re-read
+      for nothing. **Neither integer level is exact, and that was the first false belief of this
+      work**: a pack stores linears transposed with 32-wide scale blocks along the OUTPUT axis, so
+      one block mixes rows with different ternary scales — measured on the real `blk.0.attn_qkv`:
+      Q4 5.0% mean / 33% max per-value error (95% of values wrong), Q8 0.27% mean / 1.9% max; along
+      the input axis both would be exact (max abs error 2e-9). (5) A folded pack is never
+      FFN-partitioned: the partition permutes gate/up columns and down rows in place, and the
+      down-projection's blockwise input transform runs over the original neuron order — found the
+      hard way (layer-0 DeltaNet output matched the reference to three digits, the FFN did not,
+      the answer was `::::::`). `partition_pack` refuses, `ensure_partition` and `pack-import`
+      skip, and the loader refuses the partitioned/pool paths anyway. Catalog entry
+      `ternary-bonsai-2-27b-pq2_0`. **Parity, measured 2026-09-22 on the real 27B** (`examples/bonsai-probe`
+      on the CPU against the fork's `llama-eval-callback` dump, same 14 prompt ids, greedy/first token):
+      at the pack's Q8 level the embedding row after the inverse, every layer-0 DeltaNet stage
+      (qkv, z, gated→permute→signs→H, out-projection) and the layer-0 FFN agree to three digits, the
+      residual sums after layers 0/3/63 are within 0.05% / 0.04% / 0.3% (166.83 vs 166.76, 374.56 vs
+      374.41, 5609.6 vs 5628.2), and the first-token top-5 is the same set in the same order with
+      logprobs within 0.05 (`<think>` −0.0001, `\n` −9.94 vs −9.99, `<|im_end|>` −10.00, `2` −13.33,
+      `<|im_start|>` −14.41 vs −14.45). At Q4 (5% weight error, see above) the order still holds with
+      logprobs within 0.3 and the final residual sum within 1.8%. The GGUF's own template renders a
+      "Reasoning effort is set to xhigh…" system turn plus a `<think>\n` prefix that mummu's ChatML
+      renderer does not, and mummu tokenizes the trailing "assistant\n" as two ids (74455, 198) where
+      llama.cpp emits one — neither changes the answer, both matter when comparing. Reference for
+      parity: the Prism llama.cpp fork
+      (`PrismML-Eng/llama.cpp` branch `prism`, commit bdc23b5), CPU build — note `GGML_CPU_REPACK`
+      must be OFF on this host (the repacked PQ2_0 path segfaults at load on the 7950X3D, NULL call in
+      `libggml-cpu`); the plain vec_dot build loads and decodes at ~370 ms/token on 8 threads.
+      **Left open, in order of value:** (a) the real win is a **native ternary rung** — burn's `Q2S`
+      value (`QuantPolicy::Q2` exists in the ladder, `Precision` in the pack does not) represents
+      −1/0/+1 exactly ONLY with scales along the input axis (per-128 source groups), so it needs a
+      block layout the pack does not have today; done right, the 24.35B backbone is ~7.6 GB and fits
+      the 16 GB card entire instead of streaming half its layers from the host at Q4 (~14 GB), and it
+      also removes the 5% Q4 error above. Needs a `Q2` pack level, the planner floor lifted for
+      exact-at-Q2 sources, and the Q2S matmul kernels measured on CUDA/wgpu/flex; (b) `PTQ1_0` in the catalog is one entry (the decoder is in); (c)
+      Ternary-Bonsai-8B (`prism-ml/Ternary-Bonsai-8B-gguf`, plain Qwen3 + PQ2_0, no Hadamard) is
+      blocked only by YaRN rope scaling (factor 4, original 16384), which `attn_config` still refuses;
+      (d) the host-side transform on flex layers goes through the 1024×1024 matmul like every device —
+      an FWHT op would cut it to O(n log n) (~30 blocks per DeltaNet layer per token); (e) the
+      vision `mmproj-Q8_0` sidecar is untested with this checkpoint.
 - [ ] **RoPE scaling + sliding-window attention** *(mistral.rs parity)* — the shared blocks compute plain
       RoPE and a full causal mask; there is no `rope_scaling` handling (YaRN / linear / dynamic-NTK /
       `rope_type: llama3`) and no sliding-window mask anywhere in `nn` (grep across `src` is clean).

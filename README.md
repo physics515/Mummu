@@ -220,7 +220,19 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
   Works for the **LFM2.5 hybrid** as well (`lfm2::load_from_gguf`: layer kinds from the per-layer
   kv-head array, conv kernels un-squeezed bit-exactly): the official LiquidAI Q4_K_M greedy-decodes
   "2 + 2 equals 4." with top-1 identical to bf16 (logit cosine 0.991). Next: keep-quantized VRAM
-  (tracked in P9).
+  (tracked in P9). *(2026-09-22)* **Ternary checkpoints in a folded Hadamard basis** — the Prism ML
+  ternary family (`Q1_0`/`Q2_0` upstream ids 41/42, Prism-private `PQ2_0`/`PTQ1_0` ids 142/143: every
+  value a per-128 f16 scale times −1/0/+1) dequantizes, and `nn::hadamard` implements the
+  `prism.hadamard.*` contract Ternary-Bonsai 2 declares — signs then a normalized blockwise
+  Sylvester–Walsh–Hadamard transform on every folded projection's input, the inverse after the token
+  gather, the tiled→grouped value-head permutation for the DeltaNet out-projection — so
+  `ternary-bonsai-2-27b-pq2_0` (Qwen3.8-27B at 2.13 bits/weight, 7.2 GB) is a catalog entry that serves
+  through the same qwen35 path as the UD-Q4 27B. A checkpoint whose contract this runtime cannot honour
+  is refused by name, never run unrotated; a table whose declared dtypes overlap (Prism's legacy
+  group-128 file stored under the group-64 id) is refused at parse; and a folded pack is never FFN-
+  partitioned (the down-projection transform is blockwise over the original neuron order). Verified
+  against the Prism llama.cpp fork on the real 27B: the layer-0 DeltaNet block agrees to three digits
+  at the pack's Q8 level.
 - **SentencePiece `tokenizer.model` import, both proto types** — `tokenizer_from_spm` builds the HF
   pipeline straight from the SPM proto the Llama/Gemma/T5 families ship (a bounded hand-rolled
   protobuf reader, zero new dependencies). **Unigram** protos (T5/ALBERT/Gemma) get the `Precompiled`

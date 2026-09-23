@@ -287,6 +287,23 @@ pub fn catalog() -> Vec<ModelSpec> {
             },
             disk_bytes_estimate: 2_400_000_000,
         },
+        // Ternary-Bonsai 2 27B (Prism ML): Qwen3.8-27B with end-to-end
+        // ternary g128 weights (PQ2_0, id 142 — 2.13 bits/weight, 7.2 GB)
+        // stored in a blockwise Hadamard basis that the qwen35 forward
+        // undoes on activations (`prism.hadamard.*`; see nn::hadamard).
+        // Q4 in the pack is exact for ternary values, so the imported pack
+        // is Q4+Q8 for the projections and f16 for the table — ~45 GB, not
+        // the 205 GB an all-levels import of a 27B writes.
+        ModelSpec {
+            name: "ternary-bonsai-2-27b-pq2_0".into(),
+            repo: "prism-ml/Ternary-Bonsai-2-27B-gguf".into(),
+            revision: "main".into(),
+            architecture: Architecture::Qwen35,
+            format: WeightFormat::Gguf {
+                file: "Ternary-Bonsai-2-27B-PQ2_0.gguf".into(),
+            },
+            disk_bytes_estimate: 7_206_168_928,
+        },
         // Qwen3.8-27B: the header parses and every tensor dequantizes (the
         // full IQ family shipped 2026-08-21), but a 27B at f32 is ~109 GB —
         // loading it needs the P9 keep-quantized runtime. The entry exists

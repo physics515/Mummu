@@ -818,10 +818,10 @@ impl LoadedQwen4exp {
             let inject = teacher::teach(&format!("hc_inject-{li}"), 0, inject);
             let out = match (&layer.self_attn, &layer.linear_attn, &mut cache.layers[li]) {
                 (Some(attn), None, Qwen35Kv::Attn(kv)) => {
-                    attn.forward(m.clone(), &self.blocks, &cos, &sin, mask.as_ref(), kv)
+                    attn.forward(m.clone(), &self.blocks, &cos, &sin, mask.as_ref(), kv, None)
                 }
                 (None, Some(delta), Qwen35Kv::Delta(state)) => {
-                    delta.forward(m.clone(), &self.blocks, state)
+                    delta.forward(m.clone(), &self.blocks, state, None)
                 }
                 _ => unreachable!("qwen4exp forward: layer/cache kind mismatch at {li}"),
             };
