@@ -417,6 +417,31 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       target (Nanna's Tauri build): a *good* tune shipped deliberately, rather than whatever the user's
       first busy minute produced. — https://github.com/tracel-ai/cubecl/pull/1423 ·
       https://github.com/tracel-ai/cubecl
+      *(2026-09-23 research) **cubecl pre.4 closes two cache-poisoning routes, and one of them
+      contradicts "warm every probe".**
+      (i) https://github.com/tracel-ai/cubecl/pull/1621 adds `TunableSet::with_eviction`, a cache
+      eviction the tuner runs **before every measured sample**, because a warm operand that fits in
+      LLC is served from cache from the second launch on: a memory-bound kernel then reads at several
+      times bus bandwidth, hits the set's throughput bound on the first candidate, and the round ends
+      with a winner chosen on a read no real call ever gets. Measured upstream on a Radeon 8060S — a
+      21 MB weight streaming at 124 GB/s cold was **tuned at over 400 GB/s warm, with only two rows
+      ever compiled.** This is the exact inverse of the warm-probe rule we run every perf probe by,
+      and both are right in their own place: warm for *measuring a decode we will really serve*, cold
+      for *choosing between kernels*. Worth stating that distinction wherever the warm rule is
+      written down.
+      (ii) https://github.com/tracel-ai/cubecl/pull/1659: a throughput probe that failed to allocate
+      used to fail **invisibly** — `initialize_memory` panicked on the device thread while
+      `check`/`sync_buffers`/`sync` all answered `Ok`, the probe timed an empty pass, and
+      `measure_peak_throughput` **cached that timing as the device's peak**. Probes now allocate in a
+      persistent window outside the workload budget, failed reservations fail `check`, and errors are
+      not cached. Since we install custom pools, this is a failure mode we were exposed to.
+      Consequence for us either way: **a cache written by pre.3 should be distrusted and
+      re-measured** after the port, not carried over. Also in pre.4, cubecl #1677 swaps `rusqlite`
+      for Turso in the tune-cache persistence layer (pure Rust, no libsqlite3-sys, no `links`
+      conflict) — with the caveat from its own issue that Turso is WAL-only, so `journal_mode =
+      DELETE` silently does nothing and a shipped bundle keeps a WAL-mode header even after
+      `wal_checkpoint(TRUNCATE)`. That matters precisely for the "ship a warm cache with the binary"
+      route above.*
 
 - [ ] **The 27B decode gap is still unexplained — but it is NOT a broken quantized matmul.**
       *(2026-08-23)* Measured against native Windows ollama on the same box and checkpoint: ollama
@@ -756,6 +781,19 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       repacked from the i8 slab, a second 4-bit rounding) ignores `think: false` and reasons at length.
       Follow-ups are the open items below. **v0.4.0 OOMed on its first production load** (1 GiB
       working-set prior; head and embedding at f32) and v0.4.1 fixed both — see the first item.
+- [ ] **The pre.4 upload fix is for integrated adapters — this box does not get it, and that is the
+      point of writing it down.** *(2026-09-23 research)* https://github.com/tracel-ai/cubecl/pull/1651
+      makes Vulkan uploads write **straight into mapped storage** instead of going through a staging
+      buffer and a queue submit: measured upstream at 256 MiB on an Iris Xe, 85.3 ms -> 31.7 ms
+      (~2.7 -> ~7.5 GiB/s). Reading only the headline, it looks like the answer to the upload path
+      this section has measured at ~4.2-4.4 GB/s. It is not, on this hardware: the direct copy is
+      taken only where host memory *is* device memory, discrete GPUs keep `DEVICE_LOCAL` and the queue
+      path unchanged, and it additionally needs an already-idle queue (non-blocking poll, never a
+      stall). An RTX 4070 Ti SUPER is discrete, so the expected delta here is **zero** — do not spend
+      a run A/B'ing it after the pre.4 port, and do not read a post-port upload change as caused by
+      it. It DOES matter for consumers: a Nanna or laurelane build on an integrated Vulkan adapter is
+      exactly the case it helps, so it belongs in the consumer-hardware story rather than in this
+      box's numbers.
 - [ ] **Placement follow-ups from v0.4.0/v0.4.1** *(2026-09-21)* — what the live runs and the incident
       left open, most consequential first.
       - [ ] **Verify placement changes on the 27B, and make that a gate.** v0.4.0 passed every test and
@@ -1716,6 +1754,47 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       (c) **wgpu 30 arrived with the bump**, as this item predicted — no separate action, and no second
       wgpu in the graph. Still open here: the dtype-pinning / alias story (the `Gpu`/`GpuF16` seam) and
       the graph-capture measurement, which pre-3 now makes possible — see the new item below.*
+      *(2026-09-23 research) **pre.4 is out (2026-09-22) and is NOT a version bump — budget a port.**
+      Read before touching it: https://github.com/tracel-ai/burn/compare/v0.22.0-pre.3...v0.22.0-pre.4
+      and the migration guide that is itself new in pre.4,
+      https://github.com/tracel-ai/burn/blob/v0.22.0-pre.4/burn-book/src/migrating-to-0.22.md (a
+      migration guide appearing IS release prep — 0.21 went pre.5 to stable in two days, 0.20 pre.6 to
+      stable in four weeks; there is still no milestone and no maintainer date, so do not plan around
+      one). The bump is all-or-nothing: pre.4 pins `cubecl = "=0.11.0-pre.4"` and `cubek =
+      "=0.3.0-pre.4"`, so every `=`-pinned crate in our manifest moves together or none do. What lands
+      on us, worst first:
+      - **CubeCL runtime erasure** (cubecl #1590/#1603/#1604): `CubeTensor<R>` becomes `CubeTensor`,
+        the `CubeRuntime` trait is gone, `ComputeClient`->`Client`, `empty_device::<R, E>` ->
+        `empty_device::<E>`, `R::client(device)` -> `device.client()`. Every file naming a CubeCL
+        runtime type is touched — mechanical, but wide, and the packed Q4 GEMV lives right in it.
+      - **`#[backend_extension(Wgpu, ...)]` no longer compiles.** The selector catalog is now
+        `Cube, Flex, NdArray, LibTorch, Remote, Capture`; `Cube` covers every CubeCL runtime and
+        `Wgpu`/`Cuda` are not selectors. No deprecation path. Upside: a new `Fusion` selector
+        (burn #5673) generates the `Fusion<B>` impl we hand-wrote — but read its caveat first, it
+        returns the metadata callback's non-tensor fields WITHOUT waiting for execution and discards
+        the backend's, unchecked even in debug.
+      - **`CubeTensor` shape/rank now go through `logical_shape()`/`logical_rank()`** because of
+        storage tiling (a tiled tensor's physical dims split each matrix dim in two), and
+        `From<CubeTensor> for TensorHandle` must use `from_metadata` or the tiling is lost. Anything
+        of ours that rebuilds a handle from shape+strides is wrong after the bump.
+      - **No implicit backend fallback** (burn #5722): `Device::default()` panics unless a backend
+        feature is named. Our feature list must become explicit.
+      - `burn_store::nested` -> `burn_store::pytorch_reader::nested` (the reader is its own
+        burn-free crate now, #5656), `Tensor::into_primitive` -> `try_into_primitive::<B>()`,
+        `TensorData::to_vec`/`into_vec` -> `try_to_vec`/`try_into_vec`, `AutodiffModule` merged into
+        `Module` (#5721), quant scheme `with_level`/`with_param` -> `per_tensor`/`per_block`.
+      - Unchanged and therefore cheap: `Device::flex()`, `into_data_async`, `CustomOpIr`'s fields,
+        the memory-pool API (`memory_pool_usage` and friends), and `burn-capture` is byte-identical,
+        so the graph-capture item below does not move.
+      Two reasons to want it anyway, both measured upstream rather than promised: cubecl #1659 and
+      #1621 are **autotune-cache poisoning fixes** (a failed probe allocation used to be cached as the
+      device's peak throughput; and warm-cache tuning measured a 21 MB weight at >400 GB/s when its
+      cold rate was 124 GB/s, picking a winner on a read no real call gets) — which means a cache
+      written by pre.3 should be distrusted and re-measured, and it cuts against "warm every perf
+      probe" for autotune specifically. And cubecl #1672 adds `MemoryDeviceProperties::max_memory`,
+      the card's total capacity from the runtime — a number the live-placement item has been deriving
+      from NVML. Also relevant: burn #5678 fixes cross-device tensor moves that silently never wrote
+      the destination on wgpu/ROCm/Metal, and left the scales behind on a quantized same-runtime move.*
 - [ ] **Measure burn 0.22's graph capture on the decode step — the named lever for dispatch-bound
       decode.** 0.22.0-pre.3 ships a **graph-capture backend producing `GraphIr`** (plus a fix to
       preserve initializers across capture scopes), and it is now in the tree rather than a
@@ -3697,6 +3776,27 @@ that fits the model AND uses every device to the fullest.
       device boundary between stages, KV-cache per shard, and a micro-batch/pipeline schedule so the GPUs
       overlap rather than idle. *(Tensor-parallel within a layer is the stretch goal; layer/pipeline split is
       the tractable first cut.)*
+      *(2026-09-23 research) **Burn is building this upstream, in the open, and it is worth reading
+      before we build our own:** https://github.com/tracel-ai/burn/pull/5702 — "pipeline trait to
+      split a model by layers across devices", opened 2026-09-16, still open, not a draft. A
+      `Pipeline` trait (`forward_input` -> `forward_block` per block -> `forward_output`) plus a
+      `PipelineLayout` naming each segment's submodules (because a module tree does not say what
+      order forward runs in), a `PipelinePlacement` assigning a device per segment, and `place`
+      forking each parameter onto its segment's device. The stated point is ours exactly — "the model
+      never exists whole on one device", each stage loads straight onto its own device so an
+      oversized model can load at all — and it is tested on a four-GPU box with `--features
+      cuda,vulkan`. What it explicitly does NOT do, which is why it does not replace this item: no
+      scheduling at all (capacity, not speed — overlap needs microbatching), no tensor parallelism,
+      and **KV-cached generation does not work** because `forward_block` takes `&self` while cached
+      attention wants `&mut MhaCache`. Bare tensors do not follow a module either, so tables like
+      `RotaryEncoding` stay put. Decide deliberately: adopt the trait and keep our scheduling, or
+      keep ours whole. Two things that DID merge and are usable the moment we are on pre.4:
+      `Device::enumerate_physical() -> Vec<PhysicalGpu>` (burn #5688 — one entry per card, so a card
+      reachable by both CUDA and Vulkan is listed once rather than twice; see the Device inventory
+      item) and burn #5678, which fixes `CubeTensor::to_client` silently never writing the
+      destination on wgpu/ROCm/Metal (it always took the collective send/recv path, which only CUDA
+      implements) and leaving the scales behind on a quantized same-runtime move. That second one is
+      a correctness bug in exactly the operation this item is made of.*
 - [ ] **The 27B pack load is NOT I/O-bound — fix the LOADER, not the disk.** Measured 2026-09-15
       A/B'ing `mummu::diskcache` against the 193 GB qwen3.8-27b pack on the spinning array, and the
       result kills the premise the cache was reached for here:
@@ -4193,6 +4293,26 @@ The VRAM lever the P6 planner pulls to make the largest useful model fit the use
       the kernel substrate a Q4-weights × f16-activations decode path would ride (vs hand-writing a
       dequant-fused kernel); gate any adoption on the parity harness + `bench/BASELINE.md` —
       https://github.com/tracel-ai/cubecl/releases · https://burn.dev/blog/release-0.21.0/
+      *(2026-09-23 research) The kernels moved OUT of cubecl into `tracel-ai/cubek` (burn pins
+      `cubek = "=0.3.0-pre.4"`), and the design doc there —
+      https://github.com/tracel-ai/cubek/blob/main/QUANT_PLAN.md — describes almost exactly the shape
+      our packed path wants, so re-read this item against it rather than against the cubecl notes.
+      The premise is "scales are an operand, folding them in is a verb": instead of a quantization
+      *scheme* attached to a tensor, you bind values and scales as separate tiles and call
+      `c.mm_scaled(&w, &x, &s, Semiring::SUM_PROD)`. Landed per the doc: coarse scale operands by
+      rational projection (`PhysicalAxisMap::of(K).over(block)` is literally block-wise scaling,
+      proven at block-equal, finer and coarser cuts), f16 scales on either operand with the side
+      inferred from the scales' own axes, and `TileSpec::packed(field)` — packed values with NO
+      scheme, served through `PackedView` — with the note that "the q4 kernel the plan was blocked on
+      now runs end to end" via `w.tile_packed()` + a scales tensor + `mm_scaled`. Caveat that decides
+      whether it is usable here: **Q4S/Q2S need a device whose vector width reaches the packing
+      factor; Q8S runs everywhere.** Also in cubecl pre.4: a **`dp4a` intrinsic** (packed int8x4
+      dot-and-accumulate — CUDA `__dp4a`, Vulkan/SPIR-V `OpSDot`+add, polyfill elsewhere), added
+      explicitly for Q8 MMVQ, which is the same shape as our VNNI host kernel but on the card.
+      Sourcing caveat: most cubek PRs have empty bodies and QUANT_PLAN.md is an in-repo design doc,
+      not a release note — treat it as intent, and one of its sections is already marked superseded.
+      All of this is gated behind the pre.4 port (see the P0 migration item); none of it is reachable
+      on pre.3.*
 - [ ] **KV-cache quantization (FP8/e4m3)** — quantize the KV cache (and optionally the QK/ScoreV attention
       matmuls) to 8-bit, halving per-token cache footprint — the *other* VRAM lever besides weights, and the
       one that grows with context length. vLLM shipped exactly this (April 2026) and published the lessons
