@@ -2775,6 +2775,27 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       GGUF), and IQ1/IQ2 ids on the critical path.
       **Estimate: ~60-80 engineer-days to the parity-band deliverable** — carried over from the
       assessment, unrevised. *(2026-09-14, folding in the 2026-09-11/12 assessment.)*
+- [ ] **Live placement overcommits the card and recovery-loops (observed 2026-09-23, both 27Bs).**
+      In a fresh CUDA container on the reference box (desktop ambient 3.1–3.3 GiB) the joint planner
+      placed 32–37 of 64 layers (7.5–8.8 GiB planned, 9.7–11.1 GiB resident — the pool's slack over
+      the plan is a steady +1.7 to +2.4 GiB), the request completed with the RIGHT answer, and then
+      `DSD-0-0` panicked with `failed to reserve 536870912 bytes … out of device memory allocating
+      ~2.0 GB` 13–50 s after residency; recovery dropped the model and reloaded with 0/64 layers on
+      the card ("nothing fits everywhere"), which then repeated. Identical on `qwen3.8-27b-ud-q4ks`
+      and `ternary-bonsai-2-27b-pq2_0`, so it is the placement/pool accounting, not a model. Seeding
+      a 5 GiB working-set residual (28 layers, 4.7 GiB free at residency) did NOT prevent it — so the
+      residual prior is not the lever; something grows the sliced pool by ~2 GB after the first
+      forward (the `allocating N` figure in the message walks 1.5→2.0 GB run to run, the shape of a
+      pool total rather than one tensor). Three things to pin: (1) what the ~2 GB is (autotune on
+      the first shapes? the head's dequantize-first fallback?) via a cubecl memory trace on the
+      first request; (2) whether the guard should be `ambient + measured pool slack + working set`
+      rather than a fixed 3.6–3.8 GiB; (3) the recovery must not re-plan against the dropped
+      model's own still-resident bytes (ambient read 12.1 GiB right after a drop → 0/64 on the
+      card). The v0.4.1 production placement (30/64, 8.94 GiB resident, ambient 2.7) sat just under
+      the line, which is why this only surfaced now — and it IS live: the first production chat on
+      `ternary-bonsai-2-27b-pq2_0` (fe70feb, 32/64 layers, 7.52 planned / 9.52 resident) answered
+      byte-identically to the reference and then hit the same panic 13 s after residency. *(2026-09-23,
+      Ternary-Bonsai bring-up.)*
 - [ ] **Llama-family decoder port (`llama`)** *(mistral.rs parity)* — the loader that multiplies
       checkpoint coverage most per unit of new surface: Llama 2/3.x and the wide Mistral/TinyLlama-style
       fine-tune space share one architecture shape, and it is strictly a subset of blocks Mummu already
