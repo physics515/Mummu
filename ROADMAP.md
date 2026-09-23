@@ -2107,7 +2107,7 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       anywhere (auto-discovery only), no `include!`/`#[path]` reference from outside the tree, and
       `cargo metadata` reports the **same 30 example targets before and after**, none named `src`.
       40 files, 25,984 deletions. *(2026-09-07)*
-- [ ] **Pin `-j` for this workspace in `.cargo/config.toml`.** Following from the linker note above:
+- [x] **Pin `-j` for this workspace in `.cargo/config.toml`.** Following from the linker note above:
       add a `[build] jobs = 6` (or a documented host-specific override) so the default parallelism
       cannot spawn ~16 concurrent `rust-lld` at ~4.5 GB each and swap the box. Needs a check that it
       does not throttle the *compile* phase unacceptably — compiles are ~0.5 GB each and happily run
@@ -2122,6 +2122,24 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       DWARF that makes a 5 GiB linker), so re-measure the link peak on top of it before choosing a
       `jobs` value — a cap picked against the old 4.5-5.7 GiB peak will throttle compiles for
       nothing. Whatever is chosen, record it as host-specific: 16 cores and 124 GiB is this box.
+      *(2026-09-23, same run, after the `line-tables-only` change) **Decided: NO blanket cap, and
+      here is the evidence.** Re-measured on top of it, sampling `rust-lld` once a second through a
+      full `--all-targets` relink: **max 5 concurrent, 11.8 GiB combined, 4.19 GiB the largest single
+      linker** (that one is `mummu-app`, which keeps full DWARF because it is ours). Against the
+      2026-09-13 datum of 4.5-5.7 GiB each, and against the ~25 GiB combined measured earlier in this
+      same run before the debuginfo change, the link phase now peaks at under half what it did — on a
+      124 GiB box. There is nothing left for a `jobs` cap to defend against that the debuginfo change
+      has not already defended, and a blanket cap in `.cargo/config.toml` would throttle the compile
+      phase of every build, for every consumer and any CI, to buy that nothing. **Guidance instead of
+      a pin: pass `-j 6` from the nightly routine's own commands** (it does), which is where the
+      host-specific knowledge belongs, and revisit only if a link peak is measured above ~20 GiB.
+      **Read this before trusting any concurrency number from this box:** the first measurement this
+      run said "19 concurrent linkers under `-j 6`", which would have been a spectacular finding and
+      was entirely false — the extra 14 belonged to other routines linking into
+      `.claude/worktrees/*/target/agent-N`. `-j` bounds cargo's units and it does so correctly. Any
+      `ps`-based count here MUST filter `rust-lld` by the target directory it is writing into, or it
+      measures the whole box. Same trap as the `pkill` rule: this machine runs many routines in one
+      cgroup.*
 - [ ] **Put the build's target directory on NVMe, not the HDD array.** Following from the iowait
       finding above: `/mnt/deepmem` is four spinning disks shared with the household server stack, and
       the link phase starves on it (50+ min/link at 2-3% CPU), while the same build on
