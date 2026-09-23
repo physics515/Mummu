@@ -228,6 +228,19 @@ pub enum GgmlType {
     /// IQ3_S: 3.4375 bpw — the 512-entry grid, high index bits in `qh`.
     IQ3_S,
     BF16,
+    /// Q1_0: binary `{−d, +d}`, one bit per weight (LSB first) with an f16
+    /// scale per 128 (upstream ggml id 41 — Prism's Bonsai 1-bit line).
+    Q1_0,
+    /// Q2_0: 2-bit code slots, four per byte low bits first, decoding as
+    /// `(code − 1)·d` — `{−d, 0, +d, +2d}`, the last reserved — with an f16
+    /// scale per 64 (upstream ggml id 42, the group-64 ternary format).
+    Q2_0,
+    /// PQ2_0: Q2_0's codec with the scale per 128 (Prism-private id 142 —
+    /// what Ternary-Bonsai ships as `*-PQ2_0.gguf`).
+    PQ2_0,
+    /// PTQ1_0: five base-3 trits per byte, scale per 128 (Prism-private id
+    /// 143, 1.75 bits/weight — TQ1_0's packing at group 128, not 256).
+    PTQ1_0,
 }
 
 impl GgmlType {
@@ -255,6 +268,10 @@ impl GgmlType {
             22 => Self::IQ2_S,
             23 => Self::IQ4_XS,
             30 => Self::BF16,
+            41 => Self::Q1_0,
+            42 => Self::Q2_0,
+            142 => Self::PQ2_0,
+            143 => Self::PTQ1_0,
             _ => return None,
         };
         Some(ty)
@@ -272,6 +289,8 @@ impl GgmlType {
             | Self::Q8_0
             | Self::Q8_1
             | Self::IQ4_NL => 32,
+            Self::Q2_0 => 64,
+            Self::Q1_0 | Self::PQ2_0 | Self::PTQ1_0 => 128,
             Self::Q2_K
             | Self::Q3_K
             | Self::Q4_K
@@ -310,7 +329,25 @@ impl GgmlType {
             Self::IQ2_S => 82,   // f16 d + 64 B qs(idx lo + signs) + 8 B qh + 8 B scales
             Self::IQ3_XXS => 98, // f16 d + 64 B idx + 32 B (scale|signs) words
             Self::IQ3_S => 110,  // f16 d + 64 B qs + 8 B qh + 32 B signs + 4 B scales
+            Self::Q1_0 => 18,    // f16 d + 16 B of bits
+            Self::Q2_0 => 18,    // f16 d + 16 B of 2-bit slots
+            Self::PQ2_0 => 34,   // f16 d + 32 B of 2-bit slots
+            Self::PTQ1_0 => 28,  // 24 B qs (5 trits/byte) + 2 B qh (4 trits/byte) + f16 d
         }
+    }
+
+    /// Does every value of this dtype decode to a scale times one of
+    /// `{−1, 0, +1}` — the ternary (and binary) family Prism's Bonsai models
+    /// ship in? Two bits of information per value: a pack storing f16/f32
+    /// copies of such a tensor holds bytes without information, and its
+    /// integer levels are as good as their block layout allows (exact with
+    /// scale blocks along the source's own axis, 5% mean at Q4 / 0.3% at Q8
+    /// with the pack's blocks along the output axis — measured on the real
+    /// 27B). Q2_0's reserved `+2` code is never emitted by a shipped
+    /// checkpoint (histogrammed: zero occurrences).
+    #[must_use]
+    pub fn is_ternary_family(self) -> bool {
+        matches!(self, Self::Q1_0 | Self::Q2_0 | Self::PQ2_0 | Self::PTQ1_0)
     }
 }
 
@@ -1185,6 +1222,32 @@ impl Reader {
                 offset,
             });
         }
+        // Payloads must not overlap: a table whose declared dtype is not the
+        // file's real packing (Prism's legacy `*-Q2_0.gguf` stores group-128
+        // blocks under the group-64 id 42) sizes every tensor wrong and would
+        // otherwise read the neighbour's bytes as weights, silently.
+        let mut by_offset: Vec<usize> = (0..tensors.len()).collect();
+        by_offset.sort_by_key(|&i| tensors[i].offset);
+        for pair in by_offset.windows(2) {
+            let (a, b) = (&tensors[pair[0]], &tensors[pair[1]]);
+            let end = a.offset.saturating_add(a.byte_len());
+            if end > b.offset {
+                return Err(GgufError::BadTensor {
+                    path: self.path.clone(),
+                    index: pair[1],
+                    reason: format!(
+                        "'{}' at offset {} overlaps '{}' ({:?}, {} bytes ending at {end}) — \
+                         the table's dtypes do not match the file's packing (a legacy \
+                         group-128 Q2_0 stored under id 42?)",
+                        b.name,
+                        b.offset,
+                        a.name,
+                        a.dtype,
+                        a.byte_len()
+                    ),
+                });
+            }
+        }
         Ok(tensors)
     }
 }
@@ -1250,6 +1313,10 @@ pub fn dequantize(dtype: GgmlType, bytes: &[u8]) -> Result<Vec<f32>, String> {
             GgmlType::IQ2_S => dequant_iq2_s(block, &mut out),
             GgmlType::IQ3_XXS => dequant_iq3_xxs(block, &mut out),
             GgmlType::IQ3_S => dequant_iq3_s(block, &mut out),
+            GgmlType::Q1_0 => dequant_q1_0(block, &mut out),
+            GgmlType::Q2_0 => dequant_q2_slots(block, 64, &mut out),
+            GgmlType::PQ2_0 => dequant_q2_slots(block, 128, &mut out),
+            GgmlType::PTQ1_0 => dequant_ptq1_0(block, &mut out),
             other => return Err(format!("dequant for {other:?} is not implemented yet")),
         }
     }
@@ -1261,6 +1328,72 @@ pub fn dequantize(dtype: GgmlType, bytes: &[u8]) -> Result<Vec<f32>, String> {
 /// tests against the `half` crate the workspace already carries).
 fn f16_to_f32(bits: u16) -> f32 {
     f32::from(half::f16::from_bits(bits))
+}
+
+/// Q1_0: f16 scale + 128 bits, LSB first; `x = bit ? d : −d`.
+fn dequant_q1_0(block: &[u8], out: &mut Vec<f32>) {
+    assert_eq!(block.len(), 18, "Q1_0 block is 18 bytes");
+    let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+    for &byte in &block[2..18] {
+        for bit in 0..8 {
+            out.push(if (byte >> bit) & 1 == 1 { d } else { -d });
+        }
+    }
+}
+
+/// Q2_0 (64 elements) and PQ2_0 (128): f16 scale + 2-bit code slots, four
+/// per byte with element `j` at bits `2·(j % 4)`; `x = (code − 1)·d`, so
+/// `00 → −d`, `01 → 0`, `10 → +d`, `11 → +2d` (reserved — the Prism fork's
+/// `dequantize_row_q2_0`/`_pq2_0`).
+fn dequant_q2_slots(block: &[u8], elems: usize, out: &mut Vec<f32>) {
+    assert_eq!(block.len(), 2 + elems / 4, "Q2_0-family block size");
+    let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+    for &byte in &block[2..] {
+        for shift in [0u8, 2, 4, 6] {
+            let code = i32::from((byte >> shift) & 0x3);
+            #[allow(clippy::cast_precision_loss)] // −1..=2
+            out.push((code - 1) as f32 * d);
+        }
+    }
+}
+
+/// PTQ1_0: 128 ternary values as base-3 trits — 24 bytes holding five
+/// trits each (120 values) in two stages of 16 then 8 bytes, 2 bytes holding
+/// four each (8 values), then the f16 scale. A trit is read by multiplying
+/// the byte by `3^n` (mod 256) and taking `(q·3) >> 8`, the encoder having
+/// stored `ceil(q_base3 · 256 / 243)` — the Prism fork's
+/// `dequantize_row_ptq1_0` (TQ1_0's scheme at group 128).
+fn dequant_ptq1_0(block: &[u8], out: &mut Vec<f32>) {
+    assert_eq!(block.len(), 28, "PTQ1_0 block is 28 bytes");
+    const POW3: [u8; 6] = [1, 3, 9, 27, 81, 243];
+    const STAGES: [usize; 3] = [32, 16, 8];
+    let qs = &block[0..24];
+    let qh = &block[24..26];
+    let d = f16_to_f32(u16::from_le_bytes([block[26], block[27]]));
+    let trit = |byte: u8, n: usize| -> f32 {
+        let q = byte.wrapping_mul(POW3[n]);
+        let xi = i32::from((u16::from(q) * 3) >> 8);
+        #[allow(clippy::cast_precision_loss)] // −1..=1
+        {
+            (xi - 1) as f32 * d
+        }
+    };
+    let mut j = 0usize;
+    for &c in &STAGES {
+        while j + c <= qs.len() {
+            for n in 0..5 {
+                for m in 0..c {
+                    out.push(trit(qs[j + m], n));
+                }
+            }
+            j += c;
+        }
+    }
+    for n in 0..4 {
+        for &h in qh {
+            out.push(trit(h, n));
+        }
+    }
 }
 
 /// Q8_0: f16 scale + 32 signed bytes; `x = d * q`.
@@ -1657,12 +1790,12 @@ fn dequant_iq3_s(block: &[u8], out: &mut Vec<f32>) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::Write;
 
     /// Minimal in-memory GGUF builder for tests.
-    struct TestGguf {
+    pub(crate) struct TestGguf {
         buf: Vec<u8>,
         tensor_count: u64,
         kv_count: u64,
@@ -1671,7 +1804,7 @@ mod tests {
     }
 
     impl TestGguf {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self {
                 buf: Vec::new(),
                 tensor_count: 0,
@@ -1686,7 +1819,7 @@ mod tests {
             out.extend_from_slice(s.as_bytes());
         }
 
-        fn kv_str(mut self, key: &str, value: &str) -> Self {
+        pub(crate) fn kv_str(mut self, key: &str, value: &str) -> Self {
             Self::push_str(&mut self.kvs, key);
             self.kvs.extend_from_slice(&8u32.to_le_bytes());
             Self::push_str(&mut self.kvs, value);
@@ -1694,7 +1827,7 @@ mod tests {
             self
         }
 
-        fn kv_u32(mut self, key: &str, value: u32) -> Self {
+        pub(crate) fn kv_u32(mut self, key: &str, value: u32) -> Self {
             Self::push_str(&mut self.kvs, key);
             self.kvs.extend_from_slice(&4u32.to_le_bytes());
             self.kvs.extend_from_slice(&value.to_le_bytes());
@@ -1702,7 +1835,7 @@ mod tests {
             self
         }
 
-        fn kv_str_array(mut self, key: &str, values: &[&str]) -> Self {
+        pub(crate) fn kv_str_array(mut self, key: &str, values: &[&str]) -> Self {
             Self::push_str(&mut self.kvs, key);
             self.kvs.extend_from_slice(&9u32.to_le_bytes());
             self.kvs.extend_from_slice(&8u32.to_le_bytes());
@@ -1715,7 +1848,26 @@ mod tests {
             self
         }
 
-        fn tensor(mut self, name: &str, dims: &[u64], type_id: u32, offset: u64) -> Self {
+        pub(crate) fn kv_i32_array(mut self, key: &str, values: &[i32]) -> Self {
+            Self::push_str(&mut self.kvs, key);
+            self.kvs.extend_from_slice(&9u32.to_le_bytes());
+            self.kvs.extend_from_slice(&5u32.to_le_bytes());
+            self.kvs
+                .extend_from_slice(&(values.len() as u64).to_le_bytes());
+            for v in values {
+                self.kvs.extend_from_slice(&v.to_le_bytes());
+            }
+            self.kv_count += 1;
+            self
+        }
+
+        pub(crate) fn tensor(
+            mut self,
+            name: &str,
+            dims: &[u64],
+            type_id: u32,
+            offset: u64,
+        ) -> Self {
             Self::push_str(&mut self.tensors, name);
             self.tensors
                 .extend_from_slice(&(dims.len() as u32).to_le_bytes());
@@ -1728,7 +1880,7 @@ mod tests {
             self
         }
 
-        fn build(mut self) -> Vec<u8> {
+        pub(crate) fn build(mut self) -> Vec<u8> {
             self.buf.extend_from_slice(&MAGIC);
             self.buf.extend_from_slice(&3u32.to_le_bytes());
             self.buf.extend_from_slice(&self.tensor_count.to_le_bytes());
@@ -1740,7 +1892,7 @@ mod tests {
 
         /// Header + alignment padding + tensor payload bytes (offsets in the
         /// tensor table are relative to the padded data start).
-        fn build_with_payload(self, payload: &[u8]) -> Vec<u8> {
+        pub(crate) fn build_with_payload(self, payload: &[u8]) -> Vec<u8> {
             let mut buf = self.build();
             let data_offset = (buf.len() as u64).div_ceil(DEFAULT_ALIGNMENT) * DEFAULT_ALIGNMENT;
             buf.resize(usize::try_from(data_offset).expect("small test file"), 0);
@@ -1916,7 +2068,10 @@ mod tests {
 
     /// Write `bytes` to a fresh temp file and run `f` on the parse result
     /// while the file still exists (payload reads re-open the path).
-    fn with_gguf_bytes<R>(bytes: &[u8], f: impl FnOnce(Result<GgufFile, GgufError>) -> R) -> R {
+    pub(crate) fn with_gguf_bytes<R>(
+        bytes: &[u8],
+        f: impl FnOnce(Result<GgufFile, GgufError>) -> R,
+    ) -> R {
         use std::sync::atomic::{AtomicU64, Ordering};
         // Parallel tests in one process must never share a temp file.
         static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -2334,6 +2489,162 @@ mod tests {
         assert!(dequantize(GgmlType::Q8_0, &[]).is_err());
         // Q8_K is an activation format, never tensor storage.
         assert!(dequantize(GgmlType::Q8_K, &[0u8; 292]).is_err());
+    }
+
+    /// The ternary family's ids, block widths and byte sizes, straight from
+    /// the Prism fork's `ggml.h` / `ggml-common.h` (upstream carries 41/42).
+    #[test]
+    fn ternary_family_ids_and_layouts_match_the_fork() {
+        for (id, ty, block, bytes) in [
+            (41, GgmlType::Q1_0, 128, 18),
+            (42, GgmlType::Q2_0, 64, 18),
+            (142, GgmlType::PQ2_0, 128, 34),
+            (143, GgmlType::PTQ1_0, 128, 28),
+        ] {
+            assert_eq!(GgmlType::from_id(id), Some(ty));
+            assert_eq!(ty.block_size(), block, "{ty:?}");
+            assert_eq!(ty.bytes_per_block(), bytes, "{ty:?}");
+            assert!(ty.is_ternary_family());
+        }
+        assert!(!GgmlType::Q4_0.is_ternary_family());
+        assert!(!GgmlType::IQ2_XS.is_ternary_family());
+    }
+
+    /// Q2_0/PQ2_0: element `j` is the 2-bit slot at bits `2·(j % 4)` of byte
+    /// `j / 4`, decoding `(code − 1)·d` — the fork's `dequantize_row_q2_0`.
+    #[test]
+    fn q2_slots_decode_low_bits_first_as_code_minus_one() {
+        let d = half::f16::from_f32(1.5).to_bits().to_le_bytes();
+        // Byte 0b11_10_01_00 holds codes 0,1,2,3 in element order.
+        let mut pq = vec![d[0], d[1]];
+        pq.extend(std::iter::repeat_n(0b1110_0100u8, 32));
+        let out = dequantize(GgmlType::PQ2_0, &pq).unwrap();
+        assert_eq!(out.len(), 128);
+        assert_eq!(&out[..4], &[-1.5, 0.0, 1.5, 3.0]);
+        assert_eq!(&out[124..], &[-1.5, 0.0, 1.5, 3.0]);
+        // Q2_0 is the same codec at 64 elements / 16 bytes.
+        let mut q = vec![d[0], d[1]];
+        q.extend(std::iter::repeat_n(0b0110_1001u8, 16)); // codes 1,2,2,1
+        let out = dequantize(GgmlType::Q2_0, &q).unwrap();
+        assert_eq!(out.len(), 64);
+        assert_eq!(&out[..4], &[0.0, 1.5, 1.5, 0.0]);
+        // A block of code-1 slots is all zeros whatever the scale says.
+        let mut z = vec![d[0], d[1]];
+        z.extend(std::iter::repeat_n(0b0101_0101u8, 32));
+        assert!(
+            dequantize(GgmlType::PQ2_0, &z)
+                .unwrap()
+                .iter()
+                .all(|&v| v == 0.0)
+        );
+    }
+
+    /// Q1_0: bit `j % 8` of byte `j / 8`, LSB first, `1 → +d`, `0 → −d`.
+    #[test]
+    fn q1_0_reads_bits_lsb_first() {
+        let d = half::f16::from_f32(0.25).to_bits().to_le_bytes();
+        let mut b = vec![d[0], d[1]];
+        b.push(0b0000_0001); // element 0 set, 1..8 clear
+        b.extend(std::iter::repeat_n(0xFFu8, 15));
+        let out = dequantize(GgmlType::Q1_0, &b).unwrap();
+        assert_eq!(out.len(), 128);
+        assert_eq!(out[0], 0.25);
+        assert!(out[1..8].iter().all(|&v| v == -0.25));
+        assert!(out[8..].iter().all(|&v| v == 0.25));
+    }
+
+    /// The fork's `quantize_row_ptq1_0_ref`, ported verbatim: the encoder
+    /// side of the trit packing, so the decoder is pinned by a round trip of
+    /// every trit position rather than by one hand-built byte.
+    fn encode_ptq1_0(x: &[f32]) -> Vec<u8> {
+        assert_eq!(x.len(), 128);
+        let amax = x.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let id = if amax > 0.0 { 1.0 / amax } else { 0.0 };
+        let mut qs = [0u8; 24];
+        let mut qh = [0u8; 2];
+        let mut x = x;
+        let mut j = 0usize;
+        for &c in &[32usize, 16, 8] {
+            while j + c <= qs.len() {
+                for m in 0..c {
+                    let mut q: u8 = 0;
+                    for n in 0..5 {
+                        let xi = (x[m + n * c] * id).round() as i32 + 1;
+                        q = q.wrapping_mul(3).wrapping_add(u8::try_from(xi).unwrap());
+                    }
+                    qs[j + m] = u8::try_from((u16::from(q) * 256).div_ceil(243)).unwrap();
+                }
+                x = &x[5 * c..];
+                j += c;
+            }
+        }
+        for h in 0..2usize {
+            let mut q: u8 = 0;
+            for m in 0..4 {
+                let xi = (x[h + m * 2] * id).round() as i32 + 1;
+                q = q.wrapping_mul(3).wrapping_add(u8::try_from(xi).unwrap());
+            }
+            q = q.wrapping_mul(3);
+            qh[h] = u8::try_from((u16::from(q) * 256).div_ceil(243)).unwrap();
+        }
+        let mut out = qs.to_vec();
+        out.extend_from_slice(&qh);
+        out.extend_from_slice(&half::f16::from_f32(amax).to_bits().to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn ptq1_0_round_trips_the_forks_reference_encoder() {
+        // A deterministic ternary pattern that puts every trit value at
+        // every position of every stage (16-byte, 8-byte, and the qh tail).
+        let d = 0.75f32;
+        let vals: Vec<f32> = (0..128)
+            .map(|i: i32| d * ((i * 7 + i / 5) % 3 - 1) as f32)
+            .collect();
+        let block = encode_ptq1_0(&vals);
+        assert_eq!(block.len(), 28);
+        let out = dequantize(GgmlType::PTQ1_0, &block).unwrap();
+        assert_eq!(
+            out, vals,
+            "every trit position must decode to what was encoded"
+        );
+        // Whole-row: two blocks decode independently, in order.
+        let mut two = block.clone();
+        let neg: Vec<f32> = vals.iter().map(|v| -v).collect();
+        two.extend(encode_ptq1_0(&neg));
+        let out = dequantize(GgmlType::PTQ1_0, &two).unwrap();
+        assert_eq!(&out[..128], &vals[..]);
+        assert_eq!(&out[128..], &neg[..]);
+    }
+
+    /// A table whose declared dtypes size the payloads past each other is
+    /// refused: reading it would take one tensor's bytes for another's.
+    #[test]
+    fn overlapping_tensor_payloads_are_rejected() {
+        // A 32-element Q8_0 tensor is 34 bytes; a second tensor at the next
+        // 32-aligned offset lands inside it.
+        let bytes = TestGguf::new()
+            .kv_str("general.architecture", "qwen2")
+            .tensor("a.weight", &[32], 8, 0)
+            .tensor("b.weight", &[8], 0, 32)
+            .build();
+        with_gguf_bytes(&bytes, |f| {
+            let err = f.expect_err("overlap must be refused").to_string();
+            assert!(err.contains("overlaps"), "{err}");
+            assert!(
+                err.contains("b.weight") && err.contains("a.weight"),
+                "{err}"
+            );
+        });
+        // The same table with the second tensor past the first is fine.
+        let bytes = TestGguf::new()
+            .kv_str("general.architecture", "qwen2")
+            .tensor("a.weight", &[32], 8, 0)
+            .tensor("b.weight", &[8], 0, 64)
+            .build();
+        with_gguf_bytes(&bytes, |f| {
+            f.expect("non-overlapping table parses");
+        });
     }
 
     #[test]

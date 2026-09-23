@@ -91,7 +91,18 @@ fn main() {
             std::process::exit(1);
         });
     }
-    if arch == "qwen35" {
+    let folded = Pack::open(&out)
+        .and_then(|p| mummu::partition::pack_is_hadamard_folded(&p))
+        .unwrap_or_else(|e| {
+            eprintln!("reopen pack: {e}");
+            std::process::exit(1);
+        });
+    if folded {
+        eprintln!(
+            "  Hadamard-folded checkpoint: FFNs stay in their original neuron order (not partitioned)"
+        );
+    }
+    if arch == "qwen35" && !folded {
         // P9 stage 3(c): partition the dense FFNs in place (exact; enables tiering).
         let mut pack = Pack::open(&out).unwrap_or_else(|e| {
             eprintln!("reopen pack: {e}");

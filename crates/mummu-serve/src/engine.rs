@@ -598,16 +598,25 @@ fn load_any(
                 Architecture::Qwen35 => {
                     if let Some(pack_dir) = ensure_pack(&dir, &path, spec)? {
                         let level = precision_for(policy);
-                        let partitioned = mummu::pack::Pack::open(&pack_dir)
-                            .ok()
-                            .is_some_and(|p| p.manifest.ffn_partition.is_some());
+                        let (partitioned, folded) =
+                            mummu::pack::Pack::open(&pack_dir)
+                                .ok()
+                                .map_or((false, false), |p| {
+                                    (
+                                        p.manifest.ffn_partition.is_some(),
+                                        mummu::partition::pack_is_hadamard_folded(&p)
+                                            .unwrap_or(false),
+                                    )
+                                });
                         match tiers_mode() {
                             // qwen35 is DENSE: every FFN cluster runs on every
                             // token, so splitting a layer across devices buys
                             // nothing and costs a crossing. Place whole layers
                             // instead (`MUMMU_TIERS=clusters` restores the
-                            // cluster-granular path for experimenting).
-                            Some(_) if partitioned && !cluster_granular() => {
+                            // cluster-granular path for experimenting). A
+                            // Hadamard-folded pack is never partitioned and
+                            // takes the whole-layer path unconditionally.
+                            Some(_) if (partitioned && !cluster_granular()) || folded => {
                                 clear_tiers();
                                 AnyLm::Qwen35(build_layered_qwen35(&pack_dir, backend, policy)?)
                             }
@@ -2782,6 +2791,12 @@ fn ensure_partition(pack_dir: &Path, spec: &ModelSpec) -> Result<(), String> {
     if pack.manifest.ffn_partition.is_some() {
         return Ok(());
     }
+    // A folded checkpoint keeps its neuron order: the down-projection's
+    // blockwise input transform runs over the original axis, so this pack
+    // is never partitioned and always loads whole-layer (see `partition_pack`).
+    if mummu::partition::pack_is_hadamard_folded(&pack)? {
+        return Ok(());
+    }
     // Trunk depth from the GGUF header, which every architecture records the
     // same way; the FFN names are the standard triple for all of them.
     let header = pack.header()?;
@@ -3209,6 +3224,9 @@ fn plan_fresh(spec: &ModelSpec, models_root: &Path) -> Result<FitPlan, String> {
                     .tensors
                     .iter()
                     .any(|t| matches!(t.role, mummu::pack::Role::Expert { .. }))
+                // A folded pack is never partitioned but places whole layers
+                // exactly like a partitioned dense pack does.
+                || mummu::partition::pack_is_hadamard_folded(p).unwrap_or(false)
         })
     } else {
         None
@@ -4120,6 +4138,7 @@ fn cfg_27b_for_tests() -> qwen35::Qwen35Config {
         gdn_gate: qwen35::GdnGate::Silu,
         gdn_l2: qwen35::GdnL2::AddEps,
         eos_token_id: mummu::models::qwen2::EosIds::One(0),
+        hadamard: None,
     }
 }
 

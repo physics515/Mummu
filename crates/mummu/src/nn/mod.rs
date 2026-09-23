@@ -17,6 +17,7 @@ pub use attention::{
 };
 pub use conv::{ConvState, ShortConv, ShortConvConfig};
 pub use mlp::{SwiGluMlp, SwiGluMlpConfig};
+pub mod hadamard;
 pub mod packed_gemv;
 pub mod refarith;
 pub use moe::{

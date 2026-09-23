@@ -44,6 +44,7 @@ use crate::gguf::{GgufFile, GgufMap, GgufTensorInfo, GgufValue};
 use crate::import::ImportError;
 use crate::models::CausalLm;
 use crate::models::qwen2::EosIds;
+use crate::nn::hadamard::{DeviceConsts, HadamardRuntime, HadamardSpec};
 use crate::nn::{LayerKv, SwiGluMlp, SwiGluMlpConfig, causal_mask, repeat_kv, rope_tables};
 use crate::quant::QuantPolicy;
 
@@ -91,6 +92,12 @@ pub struct Qwen35Config {
     /// form the checkpoints were trained with.
     pub gdn_l2: GdnL2,
     pub eos_token_id: EosIds,
+    /// Prism's folded Hadamard basis (`prism.hadamard.*` in the header —
+    /// Ternary-Bonsai 2): which projections take a transformed input,
+    /// whether the token table is stored rotated, and the per-device
+    /// constants. `None` for an ordinary checkpoint. See
+    /// [`crate::nn::hadamard`].
+    pub hadamard: Option<std::sync::Arc<Qwen35Hadamard>>,
 }
 
 impl Qwen35Config {
@@ -158,7 +165,7 @@ impl Qwen35Config {
             .and_then(GgufValue::as_u64)
             .ok_or("GGUF metadata missing tokenizer.ggml.eos_token_id")?;
 
-        let cfg = Self {
+        let mut cfg = Self {
             vocab_size,
             hidden_size: meta_usize("qwen35.embedding_length")?,
             num_layers: block_count - nextn,
@@ -190,8 +197,21 @@ impl Qwen35Config {
             // to the form that stays right when keys are tiny (see GdnL2).
             gdn_l2: GdnL2::AddEps,
             eos_token_id: EosIds::One(u32::try_from(eos).map_err(|_| "EOS out of u32")?),
+            hadamard: None,
         };
         cfg.validate()?;
+        // The folded-basis contract, checked against THIS model's tensors:
+        // an unknown fold target is a load error, never an unrotated matmul.
+        let untied = f.tensor("output.weight").is_some();
+        let width_of = |name: &str| {
+            f.tensor(name)
+                .and_then(|t| t.dims.first().copied())
+                .map(|w| usize::try_from(w).expect("width fits usize"))
+        };
+        cfg.hadamard = HadamardSpec::from_gguf(f)?
+            .map(|spec| Qwen35Hadamard::from_spec(spec, &cfg, untied, &width_of))
+            .transpose()?
+            .map(std::sync::Arc::new);
         Ok(cfg)
     }
 
@@ -220,6 +240,158 @@ impl Qwen35Config {
             return Err("degenerate full_attention_interval or conv_kernel".into());
         }
         Ok(())
+    }
+}
+
+/// Which of one layer's projections are Hadamard-folded — each takes the
+/// transformed input (`DeviceConsts::forward` of what it would otherwise
+/// multiply). Per projection, because the contract lists weights one by one
+/// and the fork transforms per weight; a layer's untouched projections keep
+/// reading the plain activation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LayerFolds {
+    pub q: bool,
+    pub k: bool,
+    pub v: bool,
+    pub o: bool,
+    pub qkv: bool,
+    pub z: bool,
+    pub out: bool,
+    pub gate: bool,
+    pub up: bool,
+    pub down: bool,
+}
+
+impl LayerFolds {
+    /// Does any projection reading the block INPUT take the transform?
+    fn any_input(self) -> bool {
+        self.q || self.k || self.v || self.qkv || self.z
+    }
+}
+
+/// The folded-basis contract resolved onto this architecture's forward:
+/// per-layer fold flags, the head, the token table, and the runtime that
+/// owns the per-device constants.
+#[derive(Debug)]
+pub struct Qwen35Hadamard {
+    pub runtime: HadamardRuntime,
+    /// One entry per trunk layer.
+    pub layers: Vec<LayerFolds>,
+    /// The head's input is transformed: a folded `output.weight`, or a
+    /// tied head reading the rotated table (`logits = E'·R h = E·h`).
+    pub head: bool,
+    /// `token_embd.weight` holds rotated rows: inverse after the gather.
+    pub embed_inverse: bool,
+}
+
+impl Qwen35Hadamard {
+    /// Resolve `spec` against `cfg`. Every folded name must be a projection
+    /// this forward transforms the input of (a load error otherwise — the
+    /// fork refuses the same way), its input width must cut into whole
+    /// blocks and, in explicit sign mode, carry a sign vector; the only
+    /// rotated lookup table this forward restores is the token embedding.
+    /// `width_of` gives a tensor's input width (ggml's first dim).
+    pub fn from_spec(
+        spec: HadamardSpec,
+        cfg: &Qwen35Config,
+        untied: bool,
+        width_of: &dyn Fn(&str) -> Option<usize>,
+    ) -> Result<Self, String> {
+        let check_width = |name: &str, width: usize| -> Result<(), String> {
+            if !width.is_multiple_of(spec.block) {
+                return Err(format!(
+                    "prism.hadamard block {} does not divide the input width {width} of '{name}'",
+                    spec.block
+                ));
+            }
+            spec.signs_for(width).map(|_| ())
+        };
+        let not_verified = |name: &str| {
+            format!("prism.hadamard folds '{name}', which is not on a path this forward transforms")
+        };
+        let mut layers = vec![LayerFolds::default(); cfg.num_layers];
+        let mut head = false;
+        for name in &spec.weights {
+            let width = width_of(name).ok_or_else(|| {
+                format!("prism.hadamard folds '{name}', which the file does not carry")
+            })?;
+            check_width(name, width)?;
+            if name == "output.weight" {
+                head = true;
+                continue;
+            }
+            let Some((layer, field)) = name.strip_prefix("blk.").and_then(|r| r.split_once('.'))
+            else {
+                return Err(not_verified(name));
+            };
+            let layer: usize = layer
+                .parse()
+                .map_err(|_| format!("bad layer index in '{name}'"))?;
+            if layer >= cfg.num_layers {
+                continue; // the NextN draft block: never run here
+            }
+            let attn = cfg.is_attention(layer);
+            let folds = &mut layers[layer];
+            match (field, attn) {
+                ("attn_q.weight", true) => folds.q = true,
+                ("attn_k.weight", true) => folds.k = true,
+                ("attn_v.weight", true) => folds.v = true,
+                ("attn_output.weight", true) => folds.o = true,
+                ("attn_qkv.weight", false) => folds.qkv = true,
+                ("attn_gate.weight", false) => folds.z = true,
+                ("ssm_out.weight", false) => folds.out = true,
+                ("ffn_gate.weight", _) => folds.gate = true,
+                ("ffn_up.weight", _) => folds.up = true,
+                ("ffn_down.weight", _) => folds.down = true,
+                _ => return Err(not_verified(name)),
+            }
+        }
+        let mut embed_inverse = false;
+        for name in &spec.inverses {
+            if name != "token_embd.weight" {
+                return Err(format!(
+                    "prism.hadamard names '{name}' as a rotated lookup table; token_embd.weight is the only one this forward restores"
+                ));
+            }
+            check_width(name, cfg.hidden_size)?;
+            embed_inverse = true;
+        }
+        // A tied head multiplies by the rotated table itself, so its input
+        // takes the forward transform: E'·(R h) = (R E)·(R h) = E·h.
+        if !untied && embed_inverse {
+            head = true;
+        }
+        Ok(Self {
+            runtime: HadamardRuntime::new(spec),
+            layers,
+            head,
+            embed_inverse,
+        })
+    }
+}
+
+/// One layer's fold flags with the constants on that layer's device — what
+/// the block forwards take.
+pub struct LayerHadamard {
+    pub consts: std::sync::Arc<DeviceConsts>,
+    pub folds: LayerFolds,
+}
+
+impl LayerHadamard {
+    /// The block input `x`, transformed once when any of the projections
+    /// reading it is folded; `pick(on)` then hands each projection the
+    /// version it was folded for.
+    fn input_pair(&self, x: &Tensor<3>) -> Option<Tensor<3>> {
+        self.folds
+            .any_input()
+            .then(|| self.consts.forward(x.clone()))
+    }
+}
+
+fn pick(on: bool, transformed: Option<&Tensor<3>>, plain: &Tensor<3>) -> Tensor<3> {
+    match transformed {
+        Some(t) if on => t.clone(),
+        _ => plain.clone(),
     }
 }
 
@@ -328,6 +500,7 @@ impl GatedAttention {
         sin: &Tensor<4>,
         mask: Option<&Tensor<4>>,
         kv: &mut LayerKv,
+        had: Option<&LayerHadamard>,
     ) -> Tensor<3> {
         let [b, t, _] = x.dims();
         let (nh, nkv, hd) = (
@@ -335,18 +508,28 @@ impl GatedAttention {
             cfg.num_key_value_heads,
             cfg.head_dim,
         );
+        // Folded projections read the transformed input (once per block).
+        let xr = had.and_then(|h| h.input_pair(&x));
+        let folds = had.map_or(LayerFolds::default(), |h| h.folds);
+        let (xq, xk, xv) = (
+            pick(folds.q, xr.as_ref(), &x),
+            pick(folds.k, xr.as_ref(), &x),
+            pick(folds.v, xr.as_ref(), &x),
+        );
+        drop(xr);
+        drop(x);
 
         // Split the joint projection into q and gate: per head the layout is
         // [q (hd) | gate (hd)], so a [b, t, nh, 2, hd] view separates them.
         let _s_qkv = crate::prof::scope("fa.qkv");
-        let qg = qlinear(&self.q_proj, x.clone()).reshape([b, t, nh, 2, hd]);
+        let qg = qlinear(&self.q_proj, xq).reshape([b, t, nh, 2, hd]);
         let q = qg.clone().narrow(3, 0, 1).reshape([b, t, nh, hd]);
         let gate = qg.narrow(3, 1, 1).reshape([b, t, nh, hd]);
 
         let q = self.q_norm.forward(q).swap_dims(1, 2); // [b, nh, t, hd]
-        let k_new = qlinear(&self.k_proj, x.clone()).reshape([b, t, nkv, hd]);
+        let k_new = qlinear(&self.k_proj, xk).reshape([b, t, nkv, hd]);
         let k_new = self.k_norm.forward(k_new).swap_dims(1, 2);
-        let v_new = qlinear(&self.v_proj, x)
+        let v_new = qlinear(&self.v_proj, xv)
             .reshape([b, t, nkv, hd])
             .swap_dims(1, 2);
 
@@ -403,6 +586,10 @@ impl GatedAttention {
             .swap_dims(1, 2) // [b, t, nh, hd]
             .mul(activation::sigmoid(gate))
             .reshape([b, t, nh * hd]);
+        let gated = match had {
+            Some(h) if h.folds.o => h.consts.forward(gated),
+            _ => gated,
+        };
         qlinear(&self.o_proj, gated)
     }
 }
@@ -500,6 +687,7 @@ impl GatedDeltaNet {
         x: Tensor<3>,
         cfg: &Qwen35Config,
         cache: &mut DeltaState,
+        had: Option<&LayerHadamard>,
     ) -> Tensor<3> {
         let [b, t, _] = x.dims();
         let (hk, hv, ds) = (cfg.n_k_heads, cfg.n_v_heads, cfg.d_state);
@@ -513,7 +701,7 @@ impl GatedDeltaNet {
         // as plain host memory across tokens. Flex only, batch 1, t == 1;
         // MUMMU_FUSED_GDN=0 (or the force switch) restores the path below.
         if t == 1 && b == 1 && crate::flex::gdn::enabled() && crate::backend::is_flex(&device) {
-            return self.forward_fused_decode(x, cfg, cache, &device);
+            return self.forward_fused_decode(x, cfg, cache, &device, had);
         }
         // Entering the tensor path with host-resident state (a prefill
         // after fused decode steps — the multi-turn shape): materialize
@@ -534,8 +722,20 @@ impl GatedDeltaNet {
         }
 
         let _s_proj = crate::prof::scope("delta.proj");
-        let mixed = qlinear(&self.qkv_proj, x.clone()); // [b, t, conv_dim]
-        let z = qlinear(&self.z_proj, x.clone()); // [b, t, d_inner]
+        // The mix and the gate may be folded; β/α stay in the plain basis
+        // (the fork keeps the recurrent-state path at full precision,
+        // unrotated).
+        let xr = had.and_then(|h| h.input_pair(&x));
+        let folds = had.map_or(LayerFolds::default(), |h| h.folds);
+        if let Some(r) = &xr {
+            trace_tensor("gdn.x_rot", r);
+        }
+        trace_tensor("gdn.x", &x);
+        let mixed = qlinear(&self.qkv_proj, pick(folds.qkv, xr.as_ref(), &x)); // [b, t, conv_dim]
+        let z = qlinear(&self.z_proj, pick(folds.z, xr.as_ref(), &x)); // [b, t, d_inner]
+        drop(xr);
+        trace_tensor("gdn.qkv", &mixed);
+        trace_tensor("gdn.z", &z);
         let beta = activation::sigmoid(qlinear(&self.beta_proj, x.clone())); // [b, t, hv]
         // g = softplus(α + dt_bias) · a, with a = -exp(A_log) < 0.
         let alpha = qlinear(&self.alpha_proj, x).add(self.dt_bias.val().reshape([1, 1, hv]));
@@ -590,6 +790,7 @@ impl GatedDeltaNet {
             }
         });
         let conv_out = activation::silu(conv_out.swap_dims(1, 2)); // [b, t, conv_dim]
+        trace_tensor("gdn.conv_silu", &conv_out);
         if gdn_l2_probe::enabled() {
             gdn_l2_probe::record(&conv_out, cfg);
         }
@@ -674,7 +875,26 @@ impl GatedDeltaNet {
             GdnGate::Sigmoid => activation::sigmoid(z),
         };
         let gated = o.mul(gate).reshape([b, t, cfg.d_inner]);
-        qlinear(&self.out_proj, gated)
+        trace_tensor("gdn.gated", &gated);
+        // A folded out-projection was rotated over HF's grouped value
+        // heads; this port's tiled order is permuted to match first.
+        let gated = match had {
+            Some(h) if h.folds.out => {
+                let g = if h.consts.spec().gdn_v_grouped {
+                    crate::nn::hadamard::tiled_to_grouped(gated, hk, hv, ds)
+                } else {
+                    gated
+                };
+                trace_tensor("gdn.gated_grouped", &g);
+                let r = h.consts.forward(g);
+                trace_tensor("gdn.gated_rot", &r);
+                r
+            }
+            _ => gated,
+        };
+        let out = qlinear(&self.out_proj, gated);
+        trace_tensor("gdn.out", &out);
+        out
     }
 
     /// The fused decode step (SPEC P3): projections stay tensor ops (they
@@ -687,10 +907,28 @@ impl GatedDeltaNet {
         cfg: &Qwen35Config,
         cache: &mut DeltaState,
         device: &Device,
+        had: Option<&LayerHadamard>,
     ) -> Tensor<3> {
         let _s_proj = crate::prof::scope("delta.proj");
-        let mixed_t = qlinear(&self.qkv_proj, x.clone()); // [1, 1, conv_dim]
-        let z_t = qlinear(&self.z_proj, x.clone()); // [1, 1, d_inner]
+        // The transform on the host (O(n log n) butterflies): this path is
+        // flex-only by construction, and the tensor matmul against the
+        // block matrix would cost more than the step it decorates.
+        let folds = had.map_or(LayerFolds::default(), |h| h.folds);
+        let xr = had.filter(|_| folds.any_input()).map(|h| {
+            let mut v = x
+                .clone()
+                .into_data()
+                .try_to_vec::<f32>()
+                .expect("flex activations are f32");
+            h.consts
+                .spec()
+                .forward_host(&mut v)
+                .expect("folded widths were checked at load");
+            Tensor::<3>::from_data(TensorData::new(v, [1, 1, cfg.hidden_size]), device)
+        });
+        let mixed_t = qlinear(&self.qkv_proj, pick(folds.qkv, xr.as_ref(), &x)); // [1, 1, conv_dim]
+        let z_t = qlinear(&self.z_proj, pick(folds.z, xr.as_ref(), &x)); // [1, 1, d_inner]
+        drop(xr);
         let beta_t = qlinear(&self.beta_proj, x.clone()); // [1, 1, hv]
         let alpha_t = qlinear(&self.alpha_proj, x); // [1, 1, hv]
         drop(_s_proj);
@@ -743,6 +981,26 @@ impl GatedDeltaNet {
         drop(_s);
 
         let _s_out = crate::prof::scope("delta.out");
+        let gated = match had {
+            Some(h) if h.folds.out => {
+                let mut g = if h.consts.spec().gdn_v_grouped {
+                    crate::nn::hadamard::tiled_to_grouped_host(
+                        &gated,
+                        cfg.n_k_heads,
+                        cfg.n_v_heads,
+                        cfg.d_state,
+                    )
+                } else {
+                    gated
+                };
+                h.consts
+                    .spec()
+                    .forward_host(&mut g)
+                    .expect("folded widths were checked at load");
+                g
+            }
+            _ => gated,
+        };
         let gated_t = Tensor::<3>::from_data(TensorData::new(gated, [1, 1, cfg.d_inner]), device);
         qlinear(&self.out_proj, gated_t)
     }
@@ -1674,6 +1932,33 @@ fn lookahead_verify() -> bool {
     })
 }
 
+/// Debug: print a tensor's row-0 head under `MUMMU_LAYER_TRACE`.
+pub(crate) fn trace_tensor<const D: usize>(name: &str, t: &Tensor<D>) {
+    if !layer_trace() {
+        return;
+    }
+    let dims = t.dims();
+    let v = t
+        .clone()
+        .into_data()
+        .convert::<f32>()
+        .try_to_vec::<f32>()
+        .unwrap_or_default();
+    let sum: f64 = v.iter().map(|&a| f64::from(a)).sum();
+    let last = dims[D - 1];
+    eprintln!(
+        "[layer-trace] {name}: dims={dims:?} sum={sum:.6} row0={:?} row0_tail={:?}",
+        &v[..v.len().min(4)],
+        &v[last.saturating_sub(3).min(v.len())..last.min(v.len())]
+    );
+}
+
+/// Per-layer residual dump (`MUMMU_LAYER_TRACE=1`) — debug only.
+fn layer_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MUMMU_LAYER_TRACE").is_ok())
+}
+
 /// Residual-geometry probe on? (`MUMMU_RESIDUAL_PROBE=1`).
 fn residual_probe() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -2061,6 +2346,10 @@ impl LoadedQwen35 {
             self.config.num_layers,
             "FFN pool must have one row per layer"
         );
+        assert!(
+            self.config.hadamard.is_none(),
+            "a Hadamard-folded checkpoint cannot run with remote FFN clusters"
+        );
         self.ffn_pool = Some(pool);
         self
     }
@@ -2101,6 +2390,15 @@ fn load_from_pack_inner(
     let untied = pack.entry("output.weight").is_some();
     let trunk = config.num_layers;
     let mut model = build(&config, device, untied);
+
+    // The FFN down-projection's input transform spans the whole intermediate
+    // axis; splitting that axis into clusters (partitioned load, remote
+    // pools) would transform each piece alone. Refuse rather than run wrong.
+    if local.is_some() && config.hadamard.is_some() {
+        return Err(parse(
+            "a Hadamard-folded checkpoint cannot be loaded partitioned (the down-projection transform spans the whole FFN axis)".into(),
+        ));
+    }
 
     // Partitioned FFN entries → (layer, proj index) for the local-cluster path.
     let ffn_index: std::collections::HashMap<&str, (usize, usize)> =
@@ -2297,7 +2595,14 @@ impl LoadedQwen35 {
         )
         .reshape([1, t]);
         let _s = crate::prof::scope("embed");
-        self.model.embed_tokens.forward(input).to_device(device)
+        let e = self.model.embed_tokens.forward(input);
+        // A rotated table stores `R e`: restore the primal basis right after
+        // the gather, on the table's own device (the constants live there).
+        let e = match &self.config.hadamard {
+            Some(h) if h.embed_inverse => h.runtime.on(&embed_device).inverse(e),
+            _ => e,
+        };
+        e.to_device(device)
     }
 
     fn forward_impl(
@@ -2393,17 +2698,34 @@ impl LoadedQwen35 {
             });
             drop(_s_glue_rope);
             let kv = &mut cache[li];
+            // The folded basis's constants on this layer's device (built
+            // once per device, shared by every layer there).
+            let lh = self.config.hadamard.as_ref().map(|h| LayerHadamard {
+                consts: h.runtime.on(&layer_device),
+                folds: h.layers[li],
+            });
             let h = match (&layer.self_attn, &layer.linear_attn, kv) {
                 (Some(attn), None, Qwen35Kv::Attn(kv_state)) => {
                     let _s = crate::prof::scope("attn.full");
-                    attn.forward(h, cfg, &cos_l, &sin_l, mask_l.as_ref(), kv_state)
+                    attn.forward(
+                        h,
+                        cfg,
+                        &cos_l,
+                        &sin_l,
+                        mask_l.as_ref(),
+                        kv_state,
+                        lh.as_ref(),
+                    )
                 }
                 (None, Some(delta), Qwen35Kv::Delta(state)) => {
                     let _s = crate::prof::scope("attn.delta");
-                    delta.forward(h, cfg, state)
+                    delta.forward(h, cfg, state, lh.as_ref())
                 }
                 _ => unreachable!("qwen35 forward: layer/cache kind mismatch"),
             };
+            if layer_trace() {
+                trace_tensor(&format!("block_out-{li}"), &h);
+            }
             {
                 let _s = crate::prof::scope("glue.resid1");
                 x = x.add(h);
@@ -2471,17 +2793,31 @@ impl LoadedQwen35 {
             // Three separate scopes: gate/up multiply [1,h]x[h,inter] while
             // down multiplies [1,inter]x[inter,h] — if one shape hits a slow
             // kernel path, the graph should say which.
+            let folds = lh.as_ref().map_or(LayerFolds::default(), |h| h.folds);
+            let h2r = lh
+                .as_ref()
+                .filter(|_| folds.gate || folds.up)
+                .map(|h| h.consts.forward(h2.clone()));
             let gate = {
                 let _s = crate::prof::scope("mlp.gate");
-                activation::silu(qlinear(&layer.mlp.gate_proj, h2.clone()))
+                activation::silu(qlinear(
+                    &layer.mlp.gate_proj,
+                    pick(folds.gate, h2r.as_ref(), &h2),
+                ))
             };
             let up = {
                 let _s = crate::prof::scope("mlp.up");
-                qlinear(&layer.mlp.up_proj, h2.clone())
+                qlinear(&layer.mlp.up_proj, pick(folds.up, h2r.as_ref(), &h2))
             };
+            drop(h2r);
             let mut ffn = {
                 let _s = crate::prof::scope("mlp.down");
-                qlinear(&layer.mlp.down_proj, gate.clone().mul(up))
+                let act = gate.clone().mul(up);
+                let act = match &lh {
+                    Some(h) if folds.down => h.consts.forward(act),
+                    _ => act,
+                };
+                qlinear(&layer.mlp.down_proj, act)
             };
             // RADIAL LOOKAHEAD (MUMMU_LOOKAHEAD=verify): the dGPU is still
             // draining this layer's remote FFN on its worker; the main
@@ -2499,12 +2835,16 @@ impl LoadedQwen35 {
                     let nxt = &self.model.layers[li + 1];
                     let mut scratch = snapshot_kv(&cache[li + 1]);
                     let sh = nxt.input_norm.forward(a3.clone());
+                    let lh_next = self.config.hadamard.as_ref().map(|h| LayerHadamard {
+                        consts: h.runtime.on(&sh.device()),
+                        folds: h.layers[li + 1],
+                    });
                     let sh = match (&nxt.self_attn, &nxt.linear_attn, &mut scratch) {
                         (Some(attn), None, Qwen35Kv::Attn(kv_state)) => {
-                            attn.forward(sh, cfg, &cos, &sin, None, kv_state)
+                            attn.forward(sh, cfg, &cos, &sin, None, kv_state, lh_next.as_ref())
                         }
                         (None, Some(delta), Qwen35Kv::Delta(state)) => {
-                            delta.forward(sh, cfg, state)
+                            delta.forward(sh, cfg, state, lh_next.as_ref())
                         }
                         _ => unreachable!("qwen35 lookahead: layer/cache kind mismatch"),
                     };
@@ -2615,9 +2955,25 @@ impl LoadedQwen35 {
                     ffn = ffn.add(remote.reshape([b, tt, hd]));
                 }
             }
+            if layer_trace() {
+                trace_tensor(&format!("ffn_out-{li}"), &ffn);
+            }
             {
                 let _s = crate::prof::scope("glue.resid2");
                 x = x.add(ffn);
+            }
+            if layer_trace() {
+                let v = x
+                    .clone()
+                    .into_data()
+                    .convert::<f32>()
+                    .try_to_vec::<f32>()
+                    .unwrap_or_default();
+                let sum: f64 = v.iter().map(|&a| f64::from(a)).sum();
+                eprintln!(
+                    "[layer-trace] l_out-{li}: sum={sum:.6} first={:?}",
+                    &v[..v.len().min(4)]
+                );
             }
         }
         if la_n > 0 {
@@ -2649,6 +3005,12 @@ impl LoadedQwen35 {
 
         // Last position only → logits [1, vocab].
         let last = x.narrow(1, t - 1, 1).reshape([1, cfg.hidden_size]);
+        // A folded head (or a tied head over the rotated table) reads the
+        // transformed hidden state.
+        let last = match &self.config.hadamard {
+            Some(h) if h.head => h.runtime.on(&head_device).forward(last),
+            _ => last,
+        };
         // Suspect number one for unattributed time: the tied head is a
         // [1, 5120] x [5120, 248320] f32 matmul, and it runs on whichever
         // device holds the embedding table — the HOST, for a split model.
@@ -2708,6 +3070,7 @@ mod tests {
             gdn_gate: GdnGate::Silu,
             gdn_l2: GdnL2::ClampNorm,
             eos_token_id: EosIds::One(0),
+            hadamard: None,
         }
     }
 
@@ -2783,6 +3146,216 @@ mod tests {
             .map(|(x, y)| (x - y).abs())
             .fold(0.0f32, f32::max);
         assert!(max_diff > 1e-6, "different prefixes must change the logits");
+    }
+
+    /// Fold a `[in, out]` linear weight the way Prism's converter folds it:
+    /// every output column `w_o` becomes `R w_o` (through the grouped-head
+    /// permutation first when `grouped`), so that `⟨w'_o, R x⟩ = ⟨w_o, x⟩`.
+    fn fold_linear(lin: &mut Linear, spec: &HadamardSpec, grouped: Option<(usize, usize, usize)>) {
+        let w = lin.weight.val();
+        let device = w.device();
+        let [inp, out] = w.dims();
+        let mut v = w.into_data().try_to_vec::<f32>().expect("f32 weights");
+        for o in 0..out {
+            let mut col: Vec<f32> = (0..inp).map(|i| v[i * out + o]).collect();
+            if let Some((nk, nv, hd)) = grouped {
+                col = crate::nn::hadamard::tiled_to_grouped_host(&col, nk, nv, hd);
+            }
+            spec.forward_host(&mut col).expect("width cuts into blocks");
+            for (i, c) in col.into_iter().enumerate() {
+                v[i * out + o] = c;
+            }
+        }
+        lin.weight = Param::from_tensor(Tensor::from_data(TensorData::new(v, [inp, out]), &device));
+    }
+
+    /// A checkpoint folded the way Prism's converter folds it must give the
+    /// unfolded model's logits: every folded weight's input axis rotated by
+    /// `R = H·S` per block (signs, then the transform), `ssm_out` through
+    /// the grouped-head permutation, the token table stored as `R e_v`, the
+    /// head folded — then the contract declared and the two compared. This
+    /// pins the sign order, the inverse-after-gather, the head, and the
+    /// tiled→grouped permutation, on the tensor path AND the fused host
+    /// decode step (single tokens on flex take it). Two projections are
+    /// deliberately left unfolded: the contract is per weight.
+    #[test]
+    fn hadamard_folded_weights_reproduce_the_unfolded_logits() {
+        use std::collections::{BTreeMap, BTreeSet};
+        let _serial = FUSED_TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let device = crate::backend::cpu_device();
+        // Two key heads tiled over six value heads, so the permutation moves
+        // something; block 4 divides every folded width (16, 24, 16).
+        let cfg = Qwen35Config {
+            d_inner: 24,
+            n_k_heads: 3,
+            n_v_heads: 6,
+            ..toy_config()
+        };
+        cfg.validate().expect("toy config validates");
+        let plain = LoadedQwen35 {
+            model: build(&cfg, &device, true),
+            config: cfg.clone(),
+            tokenizer_config: None,
+            ffn_pool: None,
+            ffn_skip_tau: 0.0,
+            ffn_plan: None,
+        };
+
+        let block = 4;
+        let mut signs = BTreeMap::new();
+        for w in [cfg.hidden_size, cfg.d_inner, cfg.intermediate_size] {
+            signs.insert(w, mummu_mix::hadamard::sign_diagonal(w as u64 * 11 + 3, w));
+        }
+        let unfolded = ["blk.1.attn_k.weight", "blk.2.attn_gate.weight"];
+        let mut weights = BTreeSet::new();
+        weights.insert("output.weight".to_string());
+        for l in 0..cfg.num_layers {
+            let fields: Vec<&str> = if cfg.is_attention(l) {
+                vec!["attn_q", "attn_k", "attn_v", "attn_output"]
+            } else {
+                vec!["attn_qkv", "attn_gate", "ssm_out"]
+            };
+            for f in fields.into_iter().chain(["ffn_gate", "ffn_up", "ffn_down"]) {
+                let name = format!("blk.{l}.{f}.weight");
+                if !unfolded.contains(&name.as_str()) {
+                    weights.insert(name);
+                }
+            }
+        }
+        let spec = HadamardSpec {
+            block,
+            signs,
+            weights,
+            inverses: ["token_embd.weight".to_string()].into_iter().collect(),
+            gdn_v_grouped: true,
+        };
+
+        // Fold a copy of the weights.
+        let mut model = plain.model.clone();
+        let grouped = Some((cfg.n_k_heads, cfg.n_v_heads, cfg.d_state));
+        for (l, layer) in model.layers.iter_mut().enumerate() {
+            let on = |f: &str| spec.folds(&format!("blk.{l}.{f}.weight"));
+            if let Some(a) = layer.self_attn.as_mut() {
+                for (f, lin) in [
+                    ("attn_q", &mut a.q_proj),
+                    ("attn_k", &mut a.k_proj),
+                    ("attn_v", &mut a.v_proj),
+                    ("attn_output", &mut a.o_proj),
+                ] {
+                    if on(f) {
+                        fold_linear(lin, &spec, None);
+                    }
+                }
+            }
+            if let Some(d) = layer.linear_attn.as_mut() {
+                if on("attn_qkv") {
+                    fold_linear(&mut d.qkv_proj, &spec, None);
+                }
+                if on("attn_gate") {
+                    fold_linear(&mut d.z_proj, &spec, None);
+                }
+                if on("ssm_out") {
+                    fold_linear(&mut d.out_proj, &spec, grouped);
+                }
+            }
+            for (f, lin) in [
+                ("ffn_gate", &mut layer.mlp.gate_proj),
+                ("ffn_up", &mut layer.mlp.up_proj),
+                ("ffn_down", &mut layer.mlp.down_proj),
+            ] {
+                if on(f) {
+                    fold_linear(lin, &spec, None);
+                }
+            }
+        }
+        fold_linear(model.lm_head.as_mut().expect("untied head"), &spec, None);
+        {
+            let e = model.embed_tokens.weight.val();
+            let [vocab, hidden] = e.dims();
+            let mut v = e.into_data().try_to_vec::<f32>().expect("f32 table");
+            for row in v.chunks_mut(hidden) {
+                spec.forward_host(row).expect("hidden cuts into blocks");
+            }
+            model.embed_tokens.weight = Param::from_tensor(Tensor::from_data(
+                TensorData::new(v, [vocab, hidden]),
+                &device,
+            ));
+        }
+        let width_of = |name: &str| -> Option<usize> {
+            Some(match name.rsplit('.').nth(1)? {
+                "ssm_out" => cfg.d_inner,
+                "ffn_down" => cfg.intermediate_size,
+                "attn_output" => cfg.num_attention_heads * cfg.head_dim,
+                _ => cfg.hidden_size,
+            })
+        };
+        let mut cfg_folded = cfg.clone();
+        cfg_folded.hadamard = Some(std::sync::Arc::new(
+            Qwen35Hadamard::from_spec(spec, &cfg, true, &width_of).expect("contract resolves"),
+        ));
+        let had = cfg_folded.hadamard.as_ref().unwrap();
+        assert!(had.head && had.embed_inverse);
+        assert!(had.layers[1].q && !had.layers[1].k && had.layers[1].v);
+        assert!(had.layers[2].qkv && !had.layers[2].z && had.layers[2].out);
+        let folded = LoadedQwen35 {
+            model,
+            config: cfg_folded,
+            tokenizer_config: None,
+            ffn_pool: None,
+            ffn_skip_tau: 0.0,
+            ffn_plan: None,
+        };
+
+        let ids: Vec<u32> = vec![3, 17, 42, 9, 60, 11];
+        let logits = |m: &LoadedQwen35| -> Vec<Vec<f32>> {
+            let mut cache = m.new_cache();
+            let mut out = vec![
+                m.forward(&ids[..4], 0, &mut cache, &device)
+                    .into_data()
+                    .try_to_vec::<f32>()
+                    .unwrap(),
+            ];
+            // Single tokens on flex take the fused host decode step.
+            for (i, &id) in ids.iter().enumerate().skip(4) {
+                out.push(
+                    m.forward(&[id], i, &mut cache, &device)
+                        .into_data()
+                        .try_to_vec::<f32>()
+                        .unwrap(),
+                );
+            }
+            out
+        };
+        let (a, b) = (logits(&plain), logits(&folded));
+        for (step, (pa, pb)) in a.iter().zip(&b).enumerate() {
+            let worst = pa
+                .iter()
+                .zip(pb)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max);
+            let scale = pa.iter().fold(0f32, |m, v| m.max(v.abs())).max(1.0);
+            assert!(
+                worst / scale < 1e-4,
+                "step {step}: folded logits differ from plain by {worst} (scale {scale})"
+            );
+        }
+        // And the fold is not a no-op: the folded weights run WITHOUT the
+        // contract would be wrong.
+        let bare = LoadedQwen35 {
+            model: folded.model.clone(),
+            config: cfg,
+            tokenizer_config: None,
+            ffn_pool: None,
+            ffn_skip_tau: 0.0,
+            ffn_plan: None,
+        };
+        let c = logits(&bare);
+        let worst = a[0]
+            .iter()
+            .zip(&c[0])
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max);
+        assert!(worst > 1e-3, "the rotation must matter: {worst}");
     }
 
     /// Max |a − b| across two same-shape tensors, read back on the host.
