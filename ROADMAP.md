@@ -2019,6 +2019,15 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       does not throttle the *compile* phase unacceptably — compiles are ~0.5 GB each and happily run
       at full width, so the honest fix may be per-phase rather than a blanket cap, in which case
       record why a blanket cap was chosen anyway. *(2026-09-13)*
+      *(2026-09-23) Measured, and `-j` alone does not bound it.* A `cargo build --workspace
+      --all-targets -j 6` on this box still had **five concurrent `rust-lld` at 4.3-5.7 GiB RSS**
+      (~25 GiB) at the tail of the build, because cargo's `-j` counts *units* and at the tail every
+      remaining unit is a link — `-j 6` is a cap of six linkers, not of one. That ran while
+      `mummu-serve` held 54 GiB of the 124 GiB box, i.e. inside ~5 GiB of the commit-charge limit.
+      The `line-tables-only` change in the item below is the bigger lever on the same number (it is
+      DWARF that makes a 5 GiB linker), so re-measure the link peak on top of it before choosing a
+      `jobs` value — a cap picked against the old 4.5-5.7 GiB peak will throttle compiles for
+      nothing. Whatever is chosen, record it as host-specific: 16 cores and 124 GiB is this box.
 - [ ] **Put the build's target directory on NVMe, not the HDD array.** Following from the iowait
       finding above: `/mnt/deepmem` is four spinning disks shared with the household server stack, and
       the link phase starves on it (50+ min/link at 2-3% CPU), while the same build on
@@ -2028,6 +2037,23 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       filesystem. Note the tradeoff this trades INTO: a target dir off the worktree is shared state
       again, so if it is made global it re-creates the concurrent-routine collision the per-worktree
       layout was chosen to avoid; per-worktree-under-NVMe keeps both properties. *(2026-09-13)*
+      *(2026-09-23) **33 GB was an underestimate by 4x, and that is the finding.** A cold
+      `cargo build --workspace --all-targets` on NVMe reached **147 GiB** and took this box's 1.1 TB
+      root from 84% to 98% before it was stopped — not 33 GB. The shape: ~70 test and bench binaries
+      under `debug/build/<pkg>/<hash>/out/` at **2.0-2.2 GiB each**, which is the whole burn / wgpu /
+      tauri graph statically linked into every one of them at `-C debuginfo=2`. Our own five crates
+      are a rounding error beside it. So the target dir is not a placement problem first; it is a
+      *size* problem, and moving 147 GiB to a faster disk only moves it. Shipped this run:
+      `debug = "line-tables-only"` on `[profile.dev.package."*"]` — **147 GiB -> 74 GiB** measured on
+      the same build, per binary 2.0-2.2 -> 0.87-1.1 GiB, with file and line still in every panic and
+      backtrace (only our own crates keep full DWARF, and they are the ones actually stepped
+      through). Release is untouched, so bench/BASELINE.md is unaffected by construction. What is
+      still open: 74 GiB per worktree is *still* too much to keep several of on a 160 GB-free root,
+      so the durable form is undecided — the honest candidates now are (a) per-worktree on NVMe plus
+      a hard rule that the routine removes it with the worktree, (b) `--all-targets` only when a
+      run actually needs every test binary, or (c) one shared `build-dir` (nightly cargo's
+      `build.build-dir`, which splits intermediates from the final artifacts) so ~70 binaries stop
+      being ~70 copies. Measure (c) before choosing it.
 
 ### P1 — Backends & device *(ex-laurelane)*
 - [x] Backend abstraction generic over `B: Backend`; one binary compiling BOTH `Wgpu` (Vulkan/DX12/Metal,
