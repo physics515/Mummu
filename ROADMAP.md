@@ -6,9 +6,16 @@
 > README (perf claims link a benchmark artifact); everything not-done / discovered / next is a `[ ]`
 > here; git history + PRs are the record. Edit surgically; never rewrite wholesale.
 
-**Stack:** Rust 2024 · **Burn 0.21** (`wgpu` 29 + `burn-flex` CPU, `fusion` + `autotune`, multi-device) ·
-`burn-store` · HF `tokenizers` · runs on **any hardware** — CPU, one GPU, or several (multi-GPU + CPU
-offload). Reference dev machine: Ryzen 9 7950X3D · 128 GB · RTX 4070 Ti SUPER 16 GB.
+**Stack:** Rust 2024 · **Burn 0.22.0-pre.3** (`wgpu` 30 + `burn-flex` CPU, `fusion` + `autotune`,
+multi-device) · `burn-store` · HF `tokenizers` · runs on **any hardware** — CPU, one GPU, or several
+(multi-GPU + CPU offload). Reference dev machine: Ryzen 9 7950X3D · 128 GB · RTX 4070 Ti SUPER 16 GB.
+*(2026-09-23) Pin watch: `cargo update` brought 30 transitive deps current (793 lib tests green);
+**`pliron` is held at 0.17.0 and `pliron-derive` with it**, because `pliron-llvm 0.17.0` asks for
+`pliron = "^0"` and the update floated it to 0.18.0, whose `=0.18.0` derive pin then got compiled
+against the `pliron 0.17.0` that `cubecl-core 0.11.0-pre.3` actually uses — 40+ `cannot find `ident`
+in `pliron`` errors out of `pliron_attr`. Nothing of ours to fix; it unsticks when cubecl moves.
+**`burn 0.22.0-pre.4` (2026-09-22) is NOT taken** — see the P0 migration item; it is a wide breaking
+change, not a version bump. Still no stable 0.22.*
 *(2026-08-21) Pin watch: **burn 0.21.0 is still the latest STABLE release** (crates.io, checked
 2026-08-21) — the workspace is already on the newest burn there is; a `cargo update` pass brought
 transitive deps current (7 patch/minor bumps, 243 lib tests green). 0.22 exists only as pre-releases
