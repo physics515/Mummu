@@ -190,10 +190,122 @@ fn guard(ambient: u64) -> u64 {
     wm.guard_bytes().max(ambient)
 }
 
+/// Bytes our own pool handed back that the driver may not have returned to
+/// the card yet, and the ambient reading from just before it handed them
+/// back. See [`ambient`].
+#[derive(Debug, Clone, Copy)]
+struct InFlight {
+    bytes: u64,
+    ambient_before: u64,
+    since: Instant,
+}
+
+/// The previous reading's `reserved`, and the ambient it produced.
+static LAST_READING: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+
+/// Bytes released but possibly not yet reclaimed by the driver.
+static IN_FLIGHT: Mutex<Option<InFlight>> = Mutex::new(None);
+
+/// How long the driver may hold pages our pool released. A reading still
+/// high after this is a co-tenant, not us, and is believed in full.
+const RELEASE_SETTLE: Duration = Duration::from_secs(30);
+
+/// The smallest drop in `reserved` worth correcting for. Below it the
+/// correction is inside the noise of an NVML sample and only costs guard.
+const RELEASE_FLOOR: u64 = 256 << 20;
+
+/// `A = used − reserved`, corrected for bytes we just gave back.
+///
+/// The raw subtraction is right only while our pool and the driver agree
+/// about what we hold. They disagree for seconds after a drop: the pool
+/// reports `reserved` down immediately, the driver keeps the pages
+/// attributed to this process until it reclaims them, and every one of those
+/// bytes then reads as somebody else's. Measured 2026-09-23 on both 27Bs —
+/// ambient read 12.1 GiB directly after a model drop on a box whose desktop
+/// ambient is 3.1-3.3 GiB. That reading is not merely wrong once: the guard
+/// is an envelope with a 120-sample window, so ONE post-drop sample holds the
+/// guard above 12 GiB for ten minutes, the reload that follows fits nothing
+/// on the card ("nothing fits everywhere", 0/64 layers), and the next drop
+/// re-feeds it. That is the recovery loop, and this is where it starts.
+///
+/// So a fall in `reserved` is treated as ours-in-flight rather than as
+/// somebody else's arrival: for [`RELEASE_SETTLE`] the reading is credited
+/// back by at most what we released, and never below the ambient observed
+/// before we released it. Growth beyond `ambient_before + released` is still
+/// believed immediately — the guard's "up at once" property survives, it is
+/// only the bytes we can account for as our own that stop counting twice.
+fn ambient(c: &Card) -> u64 {
+    let mut last = LAST_READING.lock().unwrap_or_else(|e| e.into_inner());
+    let mut flight = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+    correct_ambient(c, &mut last, &mut flight, Instant::now())
+}
+
+/// [`ambient`] with its state passed in: the whole rule, no globals, so the
+/// sequences that matter (a drop, a slow reclaim, a co-tenant arriving during
+/// one) can be written down as tests.
+///
+/// `last` is `(reserved, ambient)` from the previous reading; `flight` is the
+/// open credit window, if any. Both are updated in place.
+fn correct_ambient(
+    c: &Card,
+    last: &mut Option<(u64, u64)>,
+    flight: &mut Option<InFlight>,
+    now: Instant,
+) -> u64 {
+    let raw = c.used.saturating_sub(c.reserved);
+
+    // A pool that shrank by a real amount: open (or refresh) the window.
+    if let Some((prev_reserved, prev_ambient)) = *last
+        && prev_reserved >= c.reserved.saturating_add(RELEASE_FLOOR)
+    {
+        let released = prev_reserved - c.reserved;
+        let carried = flight
+            .filter(|f| now.duration_since(f.since) < RELEASE_SETTLE)
+            .map_or(0, |f| f.bytes);
+        *flight = Some(InFlight {
+            bytes: released.saturating_add(carried),
+            ambient_before: prev_ambient,
+            since: now,
+        });
+    }
+
+    let corrected = match *flight {
+        Some(f) if now.duration_since(f.since) < RELEASE_SETTLE => {
+            // What the driver has NOT given back yet: never more than we
+            // released, and never so much that the reading falls below the
+            // ambient we trusted before releasing.
+            let outstanding = raw.saturating_sub(f.ambient_before).min(f.bytes);
+            if outstanding == 0 {
+                // Settled early: the card is back where it was.
+                *flight = None;
+            } else {
+                // Shrink the credit as pages come back, so a co-tenant that
+                // arrives mid-window is not hidden by a stale entitlement.
+                *flight = Some(InFlight {
+                    bytes: outstanding,
+                    ..f
+                });
+            }
+            raw - outstanding
+        }
+        _ => {
+            *flight = None;
+            raw
+        }
+    };
+
+    assert!(corrected <= raw, "the correction only ever credits back");
+    debug_assert!(
+        flight.is_none_or(|f| corrected >= f.ambient_before.min(raw)),
+        "the correction never reads below the last trusted ambient"
+    );
+    *last = Some((c.reserved, corrected));
+    corrected
+}
+
 /// `K = total − G`: what this process may occupy on the card.
 pub(super) fn capacity(c: &Card) -> u64 {
-    let ambient = c.used.saturating_sub(c.reserved);
-    c.total.saturating_sub(guard(ambient))
+    c.total.saturating_sub(guard(ambient(c)))
 }
 
 /// Free for a NEW placement on `backend` — what every planner that has no
@@ -242,12 +354,37 @@ fn residual_prior(card_total: Option<u64>) -> u64 {
     card_total.map_or(1 << 30, |t| (t / 4).max(1 << 30))
 }
 
+/// The most ε̂ may ever claim: half the card.
+///
+/// [`note_device_failure`] doubles ε̂ on every out-of-memory, and doubling is
+/// unbounded — from the 4 GiB prior on this 16 GiB card it reaches 8, then 16,
+/// and at 16 the working set alone exceeds the card, so nothing fits anywhere
+/// and the load reports "nothing fits everywhere" with 0/64 layers. Worse, the
+/// value is remembered ([`remember_residual`]), so the next process starts
+/// there too: a single bad night is written to disk and every restart after it
+/// serves entirely from the host. That is a ratchet, not an estimate.
+///
+/// Half the card allows exactly the one doubling that carries information —
+/// "the working set was bigger than measured, reserve more" — and refuses the
+/// one that cannot: if a run still runs out with half the card held back, the
+/// answer is not another doubling, it is that this working set does not fit
+/// beside this model, and [`note_device_failure`] says so instead of writing a
+/// larger number. The clamp is applied on READ as well as on write, so a file
+/// left by an older build (or a hand-seeded value) cannot carry a dead card
+/// into a fresh process.
+fn residual_ceiling(card_total: Option<u64>) -> u64 {
+    card_total.map_or(u64::MAX, |t| (t / 2).max(residual_prior(Some(t))))
+}
+
 fn residual_for(card_total: Option<u64>) -> u64 {
     RESIDUAL
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .max()
-        .unwrap_or_else(|| residual_prior(card_total))
+        .map_or_else(
+            || residual_prior(card_total),
+            |v| v.min(residual_ceiling(card_total)),
+        )
 }
 
 fn inventory_vram() -> Option<u64> {
@@ -299,11 +436,23 @@ fn recall_residual(pack_dir: &Path) {
     else {
         return;
     };
-    env.push(v);
+    // Clamped on the way in: a file written before the ceiling existed — or
+    // seeded by hand during an incident — must not start this process with a
+    // working set the card cannot hold.
+    let ceiling = residual_ceiling(inventory_vram());
+    env.push(v.min(ceiling));
     eprintln!(
-        "[mummu-serve] placement: working-set residual {:.2} GiB, remembered from {}",
-        v as f64 / f64::from(1u32 << 30),
-        path.display()
+        "[mummu-serve] placement: working-set residual {:.2} GiB, remembered from {}{}",
+        v.min(ceiling) as f64 / f64::from(1u32 << 30),
+        path.display(),
+        if v > ceiling {
+            format!(
+                " (clamped from {:.2} GiB)",
+                v as f64 / f64::from(1u32 << 30)
+            )
+        } else {
+            String::new()
+        },
     );
 }
 
@@ -332,13 +481,25 @@ fn remember_residual() {
 /// working set was bigger than ε̂ said. Double it (and let the guard count a
 /// breach), so the reload that follows plans smaller instead of repeating
 /// the failure — and remember it, so a restart does too.
+///
+/// Bounded by [`residual_ceiling`]: at the ceiling the doubling stops, and
+/// says so rather than writing a number that guarantees an empty card.
 pub(super) fn note_device_failure(cause: &str) {
     if !cause.contains("out of device memory") {
         return;
     }
     super::ALLOC_FAILED.store(true, std::sync::atomic::Ordering::SeqCst);
-    let before = residual_for(inventory_vram());
-    let after = before.saturating_mul(2);
+    let card = inventory_vram();
+    let before = residual_for(card);
+    let after = escalate_residual(before, card);
+    if after == before {
+        eprintln!(
+            "[mummu-serve] placement: out of device memory with the working-set estimate already at its ceiling ({:.2} GiB of a {:.2} GiB card) — holding it there; this model's working set does not fit beside its own weights on this device",
+            before as f64 / f64::from(1u32 << 30),
+            card.unwrap_or(0) as f64 / f64::from(1u32 << 30),
+        );
+        return;
+    }
     RESIDUAL
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -349,6 +510,16 @@ pub(super) fn note_device_failure(cause: &str) {
         before as f64 / f64::from(1u32 << 30),
         after as f64 / f64::from(1u32 << 30),
     );
+}
+
+/// One escalation step: double, but never past [`residual_ceiling`].
+fn escalate_residual(before: u64, card_total: Option<u64>) -> u64 {
+    let ceiling = residual_ceiling(card_total);
+    debug_assert!(before <= ceiling, "ε̂ is clamped on every read");
+    let after = before.saturating_mul(2).min(ceiling);
+    debug_assert!(after >= before, "evidence of an OOM never lowers ε̂");
+    debug_assert!(after <= ceiling, "and never raises it past the ceiling");
+    after
 }
 
 /// Contexts (prompt + budget) of recent requests.
@@ -1038,10 +1209,25 @@ pub(super) fn plan_load(pack_dir: &Path, backend: BackendChoice) -> Result<Live,
     }
     live.assignment = out.assignment;
     if let Some(c) = reading {
+        // The corrected ambient is what the guard was built from; when it
+        // differs from the raw subtraction, say by how much, because that
+        // gap IS the post-drop window and an incident is read from here.
+        let raw = c.used.saturating_sub(c.reserved);
+        let a = ambient(&c);
+        let credited = if a == raw {
+            String::new()
+        } else {
+            format!(
+                " ({:.1} raw, {:.1} of it ours in flight)",
+                raw as f64 / f64::from(1u32 << 30),
+                (raw - a) as f64 / f64::from(1u32 << 30),
+            )
+        };
         eprintln!(
-            "[mummu-serve] placement: card {:.1} GiB, ambient {:.1}, guard {:.1}, capacity {:.1} GiB for a {ctx}-token context{}",
+            "[mummu-serve] placement: card {:.1} GiB, ambient {:.1}{}, guard {:.1}, capacity {:.1} GiB for a {ctx}-token context{}",
             c.total as f64 / f64::from(1u32 << 30),
-            c.used.saturating_sub(c.reserved) as f64 / f64::from(1u32 << 30),
+            a as f64 / f64::from(1u32 << 30),
+            credited,
             c.total.saturating_sub(capacity(&c)) as f64 / f64::from(1u32 << 30),
             pb.devices.get(1).map_or(0, |d| d.capacity) as f64 / f64::from(1u32 << 30),
             if tower { " + vision tower" } else { "" },
@@ -1467,5 +1653,144 @@ mod tests {
             e.push(1);
         }
         assert_eq!(e.max(), Some(1));
+    }
+
+    // -----------------------------------------------------------------
+    // The post-release ambient window. Numbers are the 2026-09-23 incident:
+    // a 16 GiB card, 3.1 GiB of desktop ambient, a 27B holding a 9.5 GiB
+    // pool, dropped — and the driver still reporting all of it as used.
+    // -----------------------------------------------------------------
+
+    const MIB: u64 = 1 << 20;
+
+    /// A reading of the incident card: `used` and `reserved` in MiB.
+    fn reading(used: u64, reserved: u64) -> Card {
+        Card {
+            total: 16 * 1024 * MIB,
+            used: used * MIB,
+            reserved: reserved * MIB,
+            in_use: reserved * MIB,
+        }
+    }
+
+    /// A fresh, empty state for the correction.
+    fn fresh() -> (Option<(u64, u64)>, Option<InFlight>) {
+        (None, None)
+    }
+
+    /// The incident itself: the model is dropped, our pool reports zero, the
+    /// driver still attributes 9.5 GiB to us — and that must NOT read as a
+    /// co-tenant that just took three quarters of the card.
+    #[test]
+    fn a_model_drop_is_not_a_co_tenant_arriving() {
+        let (mut last, mut flight) = fresh();
+        let t = Instant::now();
+
+        let resident = correct_ambient(&reading(12_600, 9_500), &mut last, &mut flight, t);
+        assert_eq!(resident, 3_100 * MIB, "3.1 GiB of desktop, ours excluded");
+
+        let dropped = correct_ambient(&reading(12_600, 0), &mut last, &mut flight, t);
+        assert_eq!(
+            dropped,
+            3_100 * MIB,
+            "the 9.5 GiB the driver has not reclaimed is still ours"
+        );
+        assert!(flight.is_some(), "the window is open");
+    }
+
+    /// The driver gives the pages back a few at a time; the credit shrinks
+    /// with them and the window closes by itself once the card is level.
+    #[test]
+    fn the_credit_shrinks_as_the_driver_returns_pages() {
+        let (mut last, mut flight) = fresh();
+        let t = Instant::now();
+        correct_ambient(&reading(12_600, 9_500), &mut last, &mut flight, t);
+        correct_ambient(&reading(12_600, 0), &mut last, &mut flight, t);
+
+        let half_back = correct_ambient(&reading(7_000, 0), &mut last, &mut flight, t);
+        assert_eq!(half_back, 3_100 * MIB, "still ours, just less of it");
+        assert_eq!(flight.map(|f| f.bytes), Some(3_900 * MIB));
+
+        let level = correct_ambient(&reading(3_100, 0), &mut last, &mut flight, t);
+        assert_eq!(level, 3_100 * MIB);
+        assert!(flight.is_none(), "settled: nothing left to credit back");
+    }
+
+    /// The window credits back what WE released and not one byte more: a
+    /// co-tenant that arrives while it is open still moves ambient, so the
+    /// guard's "up at once" property survives the correction.
+    #[test]
+    fn a_co_tenant_arriving_during_the_window_is_still_believed() {
+        let (mut last, mut flight) = fresh();
+        let t = Instant::now();
+        correct_ambient(&reading(12_600, 9_500), &mut last, &mut flight, t);
+        correct_ambient(&reading(12_600, 0), &mut last, &mut flight, t);
+
+        // +2 GiB on top of the bytes we have not been given back.
+        let intruder = correct_ambient(&reading(14_600, 0), &mut last, &mut flight, t);
+        assert_eq!(intruder, 5_100 * MIB, "3.1 desktop + 2.0 of somebody else");
+    }
+
+    /// The credit is a settling window, not an entitlement: a reading still
+    /// high after it expires is believed in full, because by then it is not
+    /// ours.
+    #[test]
+    fn the_window_expires_and_the_raw_reading_is_believed() {
+        let (mut last, mut flight) = fresh();
+        let t = Instant::now();
+        correct_ambient(&reading(12_600, 9_500), &mut last, &mut flight, t);
+        correct_ambient(&reading(12_600, 0), &mut last, &mut flight, t);
+
+        let later = t + RELEASE_SETTLE + Duration::from_secs(1);
+        let raw = correct_ambient(&reading(12_600, 0), &mut last, &mut flight, later);
+        assert_eq!(raw, 12_600 * MIB, "no longer explainable as ours");
+        assert!(flight.is_none());
+    }
+
+    /// The escalation converges. Doubling from the prior on the reference
+    /// card reaches the ceiling in one step and stays there however many
+    /// failures follow — the ratchet that emptied the card is bounded.
+    #[test]
+    fn the_working_set_estimate_stops_doubling_at_half_the_card() {
+        let total = 16 * 1024 * MIB;
+        let card = Some(total);
+        let ceiling = residual_ceiling(card);
+        assert_eq!(ceiling, 8 * 1024 * MIB);
+
+        let mut e = residual_prior(card);
+        assert_eq!(e, 4 * 1024 * MIB);
+        e = escalate_residual(e, card);
+        assert_eq!(e, ceiling, "the one doubling that carries information");
+        for _ in 0..8 {
+            e = escalate_residual(e, card);
+            assert_eq!(e, ceiling, "and no more");
+        }
+        assert!(e < total, "a working set the card can still hold");
+    }
+
+    /// The ceiling is never below the prior, or the very first load would
+    /// start out clamped.
+    #[test]
+    fn the_ceiling_leaves_room_for_the_prior_on_a_small_card() {
+        for gib in [1u64, 2, 4, 8, 16, 24, 48] {
+            let card = Some(gib * 1024 * MIB);
+            assert!(
+                residual_ceiling(card) >= residual_prior(card),
+                "{gib} GiB card: ceiling below its own prior"
+            );
+        }
+    }
+
+    /// Pool jitter is not a release. A window opened on every small wobble
+    /// would sit open forever and hide a real arrival.
+    #[test]
+    fn a_small_pool_fluctuation_opens_no_window() {
+        let (mut last, mut flight) = fresh();
+        let t = Instant::now();
+        correct_ambient(&reading(12_600, 9_500), &mut last, &mut flight, t);
+
+        let jitter = correct_ambient(&reading(12_500, 9_400), &mut last, &mut flight, t);
+        assert_eq!(jitter, 3_100 * MIB);
+        assert!(flight.is_none(), "100 MiB is under the release floor");
     }
 }

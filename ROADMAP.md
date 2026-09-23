@@ -2829,6 +2829,34 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       `ternary-bonsai-2-27b-pq2_0` (fe70feb, 32/64 layers, 7.52 planned / 9.52 resident) answered
       byte-identically to the reference and then hit the same panic 13 s after residency. *(2026-09-23,
       Ternary-Bonsai bring-up.)*
+      *(2026-09-23, nightly) **(3) is shipped, and it was two ratchets, not one.*** The re-plan after
+      a drop is what turns one OOM into a loop, and both mechanisms that did it are now bounded.
+      **(a) The post-drop ambient reading.** `A = used − reserved` is right only while our pool and
+      the driver agree about what we hold, and for seconds after a drop they do not: the pool reports
+      `reserved` down at once, the driver keeps the pages attributed to this process, and every one
+      of those bytes then reads as somebody else's — the 12.1 GiB reading on a box whose desktop
+      ambient is 3.1. That sample is not merely wrong once: the guard is an envelope over a
+      120-sample window, so ONE of them holds the guard above 12 GiB for ten minutes and every reload
+      inside that window fits nothing. A fall in `reserved` now opens a 30 s window in which the
+      reading is credited back by at most what we released and never below the ambient trusted before
+      it, with the credit shrinking as the driver returns pages. Growth beyond
+      `ambient_before + released` is still believed immediately, so the watermark keeps its "up at
+      once" property, and the placement log line prints the raw reading beside the corrected one
+      whenever they differ — that gap IS the window, and an incident is read from there.
+      **(b) The working-set estimate had no ceiling.** `note_device_failure` doubled ε̂ on every
+      out-of-memory and *persisted* it: from the 4 GiB prior on this 16 GiB card that is 8, then 16,
+      and at 16 the working set alone exceeds the card — 0/64 layers, written to
+      `.mummu-serve/placement-<model>.json`, so every restart after it serves entirely from the host.
+      ε̂ is now clamped to half the card on write AND on read (so a file from an older build, or the
+      hand-seeded 5 GiB from this incident, cannot carry a dead card into a fresh process), and at
+      the ceiling the escalation stops and says so instead of writing a bigger number.
+      Seven tests in `mummu-serve::engine::placement`; the correction is a pure function over its
+      state, so the sequences that matter — a drop, a slow reclaim, a co-tenant arriving during one —
+      are testable without a card. **Still open: (1) and (2).** What the ~2 GB actually is has NOT
+      been identified; this run bounds the *recovery*, it does not stop the first OOM. And the guard
+      is still `Watermark(ambient)` rather than `ambient + measured pool slack + working set`. Both
+      want the cubecl memory trace on a first request. Not yet verified on a live 27B — see the
+      placement gate item above.
 - [ ] **Llama-family decoder port (`llama`)** *(mistral.rs parity)* — the loader that multiplies
       checkpoint coverage most per unit of new surface: Llama 2/3.x and the wide Mistral/TinyLlama-style
       fine-tune space share one architecture shape, and it is strictly a subset of blocks Mummu already
