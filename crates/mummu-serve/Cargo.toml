@@ -42,7 +42,6 @@ tokio = { workspace = true }
 axum = { workspace = true }
 futures = { workspace = true }
 async-stream = { workspace = true }
-tokio-stream = { workspace = true }
 # `Body::size_hint`, so the request log can say how many bytes a buffered
 # response actually carried (axum sets no content-length header of its own).
 http-body = { workspace = true }

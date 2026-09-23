@@ -1212,6 +1212,8 @@ pub(super) fn plan_load(pack_dir: &Path, backend: BackendChoice) -> Result<Live,
         // The corrected ambient is what the guard was built from; when it
         // differs from the raw subtraction, say by how much, because that
         // gap IS the post-drop window and an incident is read from here.
+        // One `ambient` call, not two: it advances the release window, and
+        // reporting a line must not age the state the next plan reads.
         let raw = c.used.saturating_sub(c.reserved);
         let a = ambient(&c);
         let credited = if a == raw {
@@ -1228,7 +1230,7 @@ pub(super) fn plan_load(pack_dir: &Path, backend: BackendChoice) -> Result<Live,
             c.total as f64 / f64::from(1u32 << 30),
             a as f64 / f64::from(1u32 << 30),
             credited,
-            c.total.saturating_sub(capacity(&c)) as f64 / f64::from(1u32 << 30),
+            guard(a) as f64 / f64::from(1u32 << 30),
             pb.devices.get(1).map_or(0, |d| d.capacity) as f64 / f64::from(1u32 << 30),
             if tower { " + vision tower" } else { "" },
         );
