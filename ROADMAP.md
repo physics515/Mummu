@@ -9,7 +9,13 @@
 **Stack:** Rust 2024 · **Burn 0.22.0-pre.3** (`wgpu` 30 + `burn-flex` CPU, `fusion` + `autotune`,
 multi-device) · `burn-store` · HF `tokenizers` · runs on **any hardware** — CPU, one GPU, or several
 (multi-GPU + CPU offload). Reference dev machine: Ryzen 9 7950X3D · 128 GB · RTX 4070 Ti SUPER 16 GB.
-*(2026-09-23) Pin watch: `cargo update` brought 30 transitive deps current (793 lib tests green);
+*(2026-09-23) Pin watch: `cargo update` brought 30 transitive deps current (793 lib tests green,
+and **numerically inert against both reference gates that can run on this host**: `parity_qwen2`'s
+Candle leg top-5 ids exact with max |Δlogit| 7.43866e-5, and `parity_qwen4exp` reproducing its
+recorded llama.cpp deltas to the digit — primes 0.8791688539675455 (the 0.879 FAIL this roadmap
+already records, unmoved), moon 4.9252595444553826e-1 PASS, greedy text byte-identical on both.
+The qwen2 *ollama* leg fails with `curl exit Some(7)` — connection refused, there is no ollama on
+this Linux host; that is the separate open item in P7, not a regression.);
 **`pliron` is held at 0.17.0 and `pliron-derive` with it**, because `pliron-llvm 0.17.0` asks for
 `pliron = "^0"` and the update floated it to 0.18.0, whose `=0.18.0` derive pin then got compiled
 against the `pliron 0.17.0` that `cubecl-core 0.11.0-pre.3` actually uses — 40+ `cannot find `ident`
