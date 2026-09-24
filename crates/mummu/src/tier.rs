@@ -1,4 +1,4 @@
-//! **Tier planning** — P9 stage 3(b): which device runs which MoE expert at
+//! **Tier planning** — P9 stage 3(b): which device runs which `MoE` expert at
 //! which stored precision, all at once.
 //!
 //! A `.mummu` pack holds every expert at every level ([`crate::pack`]), so
@@ -26,6 +26,8 @@
 
 use std::collections::BTreeMap;
 
+use mummu_num::f64_from_u64;
+
 pub use crate::pack::Precision;
 
 /// What kind of device a tier lives on — the planner's speed ordering
@@ -40,7 +42,7 @@ pub enum DeviceClass {
 }
 
 /// One device the planner may place experts on.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TierDevice {
     pub name: String,
     pub class: DeviceClass,
@@ -88,7 +90,7 @@ impl TierPlan {
     /// Experts whose tier differs between `self` (live) and `next`: the
     /// swap list, in expert order.
     #[must_use]
-    pub fn diff(&self, next: &TierPlan) -> Vec<(usize, Tier)> {
+    pub fn diff(&self, next: &Self) -> Vec<(usize, Tier)> {
         self.tiers
             .iter()
             .zip(&next.tiers)
@@ -109,62 +111,43 @@ impl TierPlan {
     }
 }
 
-/// Plan tiers for `costs.len()` experts over `devices`, hottest-first.
-/// `hotness` is per expert (any non-negative scale; empty = uniform).
+/// Resident bytes of expert `e` at `tier`, or `None` when the pack stores no
+/// such level.
 ///
-/// Errors when some expert fits nowhere even at its cheapest level — the
-/// message names the expert and the shortfall, never a silent drop.
-pub fn plan_tiers(
+/// Host residency differs from stored size for Q4: flex unpacks nibbles to
+/// one i8 per element at load (`q_from_data`), so a Q4 blob occupies
+/// 1.125 B/elem resident against 0.625 stored — exactly 9/5. Without this
+/// the planner overpacks the host by 1.8x and the commit charge, not the
+/// budget, becomes the limit.
+fn cost_of(devices: &[TierDevice], costs: &[ExpertCost], tier: Tier, e: usize) -> Option<u64> {
+    let stored = costs[e].bytes.get(&tier.precision).copied()?;
+    let host_q4 = devices[tier.device].class == DeviceClass::Cpu && tier.precision == Precision::Q4;
+    Some(if host_q4 { stored * 9 / 5 } else { stored })
+}
+
+/// The mutable state the promotion phases work on: one tier per expert
+/// (planner input order), bytes promised per device, experts held per device.
+struct Placement {
+    tiers: Vec<Tier>,
+    used: Vec<u64>,
+    held: Vec<usize>,
+}
+
+/// 1. Admission: every expert at its cheapest available slot. `slots` is in
+///    desirability order, so the walk runs it backwards — cheapest bytes on
+///    the slowest device first.
+fn admit(
     devices: &[TierDevice],
     costs: &[ExpertCost],
-    hotness: &[f64],
-) -> Result<TierPlan, String> {
-    if devices.is_empty() {
-        return Err("tier plan: no devices".into());
-    }
-    if !hotness.is_empty() && hotness.len() != costs.len() {
-        return Err(format!(
-            "tier plan: {} hotness values for {} experts",
-            hotness.len(),
-            costs.len()
-        ));
-    }
-    // Device visiting order: fastest first (stable on ties).
-    let mut by_speed: Vec<usize> = (0..devices.len()).collect();
-    by_speed.sort_by(|&a, &b| devices[b].speed.cmp(&devices[a].speed));
-
-    // Desirability order of every (device, precision) slot: faster device
-    // first, then that device's ladder best-first.
-    let slots: Vec<Tier> = by_speed
-        .iter()
-        .flat_map(|&d| {
-            devices[d].ladder.iter().map(move |&p| Tier {
-                device: d,
-                precision: p,
-            })
-        })
-        .collect();
-    // The admission order is the reverse: cheapest bytes on the slowest device.
-    // Host residency differs from stored size for Q4: flex unpacks nibbles
-    // to one i8 per element at load (`q_from_data`), so a Q4 blob occupies
-    // 1.125 B/elem resident against 0.625 stored — exactly 9/5. Without
-    // this the planner overpacks the host by 1.8x and the commit charge,
-    // not the budget, becomes the limit.
-    let cost_of = |tier: Tier, e: usize| -> Option<u64> {
-        let stored = costs[e].bytes.get(&tier.precision).copied()?;
-        let host_q4 =
-            devices[tier.device].class == DeviceClass::Cpu && tier.precision == Precision::Q4;
-        Some(if host_q4 { stored * 9 / 5 } else { stored })
-    };
-
+    slots: &[Tier],
+) -> Result<Placement, String> {
     let mut used = vec![0u64; devices.len()];
+    let mut held = vec![0usize; devices.len()];
     let mut tiers: Vec<Tier> = Vec::with_capacity(costs.len());
-
-    // 1. Admission: every expert at its cheapest available slot.
     for (e, cost) in costs.iter().enumerate() {
         let mut best: Option<(u64, Tier)> = None;
         for &slot in slots.iter().rev() {
-            let Some(bytes) = cost_of(slot, e) else {
+            let Some(bytes) = cost_of(devices, costs, slot, e) else {
                 continue;
             };
             if used[slot.device] + bytes <= devices[slot.device].budget_bytes
@@ -187,65 +170,66 @@ pub fn plan_tiers(
             ));
         };
         used[slot.device] += bytes;
+        held[slot.device] += 1;
         tiers.push(slot);
     }
+    Ok(Placement { tiers, used, held })
+}
 
-    // 2a. Scheduler A: how many experts each device SHOULD hold.
-    //
-    // Admission below put everything on the slowest device and promotion
-    // pulls it up, fastest-slot-first — which fills the quick device and
-    // dumps the remainder on the slow ones. That is the right shape when
-    // devices run one after another, and the wrong one now that they run
-    // concurrently: the layer then costs the slowest device's share, so the
-    // objective is for every device to FINISH TOGETHER, not for the fast one
-    // to be busiest. Measured, fill-first put 996 experts on a device that
-    // takes 1.59 ms each and 1052 on devices taking ~14 ms — the slow side
-    // ran ~9x longer and decided the layer.
-    //
-    // `schedule::divide` gives the makespan-minimizing split; promotion
-    // treats it as a quota rather than a target, so a device is never filled
-    // past its share while a slower one still has work it could have taken.
-    let quota = {
-        let sched: Vec<crate::schedule::Device> = devices
-            .iter()
-            .map(|dev| {
-                // Cheapest an expert can be on this device, over the whole
-                // set — what its budget divides into.
-                let cheapest = costs
-                    .iter()
-                    .filter_map(|c| {
-                        dev.ladder
-                            .iter()
-                            .filter_map(|p| c.bytes.get(p).copied())
-                            .min()
-                    })
-                    .max()
-                    .unwrap_or(u64::MAX);
-                crate::schedule::Device {
-                    name: dev.name.clone(),
-                    throughput: f64::from(dev.speed),
-                    capacity_units: if cheapest == 0 || cheapest == u64::MAX {
-                        0
-                    } else {
-                        (dev.budget_bytes / cheapest) as usize
-                    },
-                    // Work this device already owes every token, in cluster
-                    // equivalents — the trunk, for whichever device holds it.
-                    // Counting it is what stops a host that is already
-                    // saturated from being handed a "fair share" on top.
-                    preload_units: dev.preload_units,
-                }
-            })
-            .collect();
-        crate::schedule::divide(&sched, costs.len()).units
-    };
-    let mut held = vec![0usize; devices.len()];
-    for t in &tiers {
-        held[t.device] += 1;
-    }
+/// 2a. Scheduler A: how many experts each device SHOULD hold.
+///
+/// Admission put everything on the slowest device and promotion pulls it
+/// up, fastest-slot-first — which fills the quick device and dumps the
+/// remainder on the slow ones. That is the right shape when devices run one
+/// after another, and the wrong one now that they run concurrently: the
+/// layer then costs the slowest device's share, so the objective is for
+/// every device to FINISH TOGETHER, not for the fast one to be busiest.
+/// Measured, fill-first put 996 experts on a device that takes 1.59 ms each
+/// and 1052 on devices taking ~14 ms — the slow side ran ~9x longer and
+/// decided the layer.
+///
+/// `schedule::divide` gives the makespan-minimizing split; promotion treats
+/// it as a quota rather than a target, so a device is never filled past its
+/// share while a slower one still has work it could have taken.
+fn device_quota(devices: &[TierDevice], costs: &[ExpertCost]) -> Vec<usize> {
+    let sched: Vec<crate::schedule::Device> = devices
+        .iter()
+        .map(|dev| {
+            // Cheapest an expert can be on this device, over the whole
+            // set — what its budget divides into.
+            let cheapest = costs
+                .iter()
+                .filter_map(|c| {
+                    dev.ladder
+                        .iter()
+                        .filter_map(|p| c.bytes.get(p).copied())
+                        .min()
+                })
+                .max()
+                .unwrap_or(u64::MAX);
+            crate::schedule::Device {
+                name: dev.name.clone(),
+                throughput: f64::from(dev.speed),
+                capacity_units: if cheapest == 0 || cheapest == u64::MAX {
+                    0
+                } else {
+                    usize::try_from(dev.budget_bytes / cheapest).unwrap_or(usize::MAX)
+                },
+                // Work this device already owes every token, in cluster
+                // equivalents — the trunk, for whichever device holds it.
+                // Counting it is what stops a host that is already
+                // saturated from being handed a "fair share" on top.
+                preload_units: dev.preload_units,
+            }
+        })
+        .collect();
+    crate::schedule::divide(&sched, costs.len()).units
+}
 
-    // 2b. Promotion, hottest first.
-    let mut order: Vec<usize> = (0..costs.len()).collect();
+/// 2b. Promotion order: hottest first, ties by expert index (empty hotness
+/// = expert order).
+fn promotion_order(hotness: &[f64], experts: usize) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..experts).collect();
     if !hotness.is_empty() {
         order.sort_by(|&a, &b| {
             hotness[b]
@@ -254,25 +238,24 @@ pub fn plan_tiers(
                 .then(a.cmp(&b))
         });
     }
-    // Two phases, because placement and precision optimize different things
-    // and one pass let the wrong one win.
-    //
-    // Moving an expert from a 14.15 ms device to a 1.59 ms one saves 12.6 ms
-    // EVERY token. Upgrading the precision of an expert already on the fast
-    // device saves nothing — for a quantized checkpoint the extra bytes buy
-    // no accuracy at all (measured 0.0000 relative error for f16 against a
-    // 4.55 bits/param source) — and those bytes are capacity another expert
-    // could have used. Interleaved, precision won: the fast device ended up
-    // holding 610 experts at mixed rungs while the slow one held 1374.
-    //
-    // So: fill the fast devices first, at their CHEAPEST rung, and only then
-    // spend whatever is left over on precision.
+    order
+}
 
-    // Phase 1 — placement. Hottest first, onto the fastest device with room.
-    for &e in &order {
+/// Phase 1 — placement. Hottest first, onto the fastest device with room,
+/// at that device's CHEAPEST rung (capacity beats precision).
+fn place_hottest_first(
+    devices: &[TierDevice],
+    costs: &[ExpertCost],
+    by_speed: &[usize],
+    quota: &[usize],
+    order: &[usize],
+    placement: &mut Placement,
+) {
+    let Placement { tiers, used, held } = placement;
+    for &e in order {
         let cur = tiers[e];
-        let cur_bytes = cost_of(cur, e).expect("admitted tier has a cost");
-        for &d in &by_speed {
+        let cur_bytes = cost_of(devices, costs, cur, e).expect("admitted tier has a cost");
+        for &d in by_speed {
             if d == cur.device {
                 continue;
             }
@@ -304,7 +287,7 @@ pub fn plan_tiers(
                         device: d,
                         precision: p,
                     };
-                    cost_of(slot, e).map(|b| (b, slot))
+                    cost_of(devices, costs, slot, e).map(|b| (b, slot))
                 })
                 .min_by_key(|&(b, _)| b)
             else {
@@ -320,11 +303,19 @@ pub fn plan_tiers(
             }
         }
     }
+}
 
-    // Phase 2 — precision, with what is left, and without moving anything.
-    for &e in &order {
+/// Phase 2 — precision, with what is left, and without moving anything.
+fn refine_precision(
+    devices: &[TierDevice],
+    costs: &[ExpertCost],
+    order: &[usize],
+    placement: &mut Placement,
+) {
+    let Placement { tiers, used, .. } = placement;
+    for &e in order {
         let cur = tiers[e];
-        let cur_bytes = cost_of(cur, e).expect("admitted tier has a cost");
+        let cur_bytes = cost_of(devices, costs, cur, e).expect("admitted tier has a cost");
         for &p in &devices[cur.device].ladder {
             let slot = Tier {
                 device: cur.device,
@@ -333,7 +324,7 @@ pub fn plan_tiers(
             if slot == cur {
                 break; // the ladder is best-first: nothing finer remains
             }
-            let Some(bytes) = cost_of(slot, e) else {
+            let Some(bytes) = cost_of(devices, costs, slot, e) else {
                 continue;
             };
             if used[cur.device] - cur_bytes + bytes <= devices[cur.device].budget_bytes {
@@ -343,10 +334,80 @@ pub fn plan_tiers(
             }
         }
     }
+}
+
+/// Plan tiers for `costs.len()` experts over `devices`, hottest-first.
+/// `hotness` is per expert (any non-negative scale; empty = uniform).
+///
+/// # Errors
+///
+/// When `devices` is empty, when `hotness` is non-empty but not one value
+/// per expert, or when some expert fits nowhere even at its cheapest level
+/// — the message names the expert and the shortfall, never a silent drop.
+///
+/// # Panics
+///
+/// Only on an internal invariant that cannot fail: the promotion phases
+/// re-price each expert's current tier with the same cost table that
+/// admitted it, so that lookup always succeeds.
+pub fn plan_tiers(
+    devices: &[TierDevice],
+    costs: &[ExpertCost],
+    hotness: &[f64],
+) -> Result<TierPlan, String> {
+    if devices.is_empty() {
+        return Err("tier plan: no devices".into());
+    }
+    if !hotness.is_empty() && hotness.len() != costs.len() {
+        return Err(format!(
+            "tier plan: {} hotness values for {} experts",
+            hotness.len(),
+            costs.len()
+        ));
+    }
+    // Device visiting order: fastest first (stable on ties).
+    let mut by_speed: Vec<usize> = (0..devices.len()).collect();
+    by_speed.sort_by(|&a, &b| devices[b].speed.cmp(&devices[a].speed));
+
+    // Desirability order of every (device, precision) slot: faster device
+    // first, then that device's ladder best-first.
+    let slots: Vec<Tier> = by_speed
+        .iter()
+        .flat_map(|&d| {
+            devices[d].ladder.iter().map(move |&p| Tier {
+                device: d,
+                precision: p,
+            })
+        })
+        .collect();
+
+    // 1. Admission: every expert at its cheapest available slot.
+    let mut placement = admit(devices, costs, &slots)?;
+
+    // 2a. Scheduler A: how many experts each device SHOULD hold.
+    let quota = device_quota(devices, costs);
+
+    // 2b. Promotion, hottest first — in two phases, because placement and
+    // precision optimize different things and one pass let the wrong one
+    // win.
+    //
+    // Moving an expert from a 14.15 ms device to a 1.59 ms one saves 12.6 ms
+    // EVERY token. Upgrading the precision of an expert already on the fast
+    // device saves nothing — for a quantized checkpoint the extra bytes buy
+    // no accuracy at all (measured 0.0000 relative error for f16 against a
+    // 4.55 bits/param source) — and those bytes are capacity another expert
+    // could have used. Interleaved, precision won: the fast device ended up
+    // holding 610 experts at mixed rungs while the slow one held 1374.
+    //
+    // So: fill the fast devices first, at their CHEAPEST rung, and only then
+    // spend whatever is left over on precision.
+    let order = promotion_order(hotness, costs.len());
+    place_hottest_first(devices, costs, &by_speed, &quota, &order, &mut placement);
+    refine_precision(devices, costs, &order, &mut placement);
 
     Ok(TierPlan {
-        tiers,
-        used_bytes: used,
+        tiers: placement.tiers,
+        used_bytes: placement.used,
     })
 }
 
@@ -361,9 +422,12 @@ pub fn smooth_hotness(prev: &mut Vec<f64>, hits: &[u64], alpha: f64) {
     if total == 0 {
         return;
     }
-    let inv = 1.0 / total as f64;
+    let inv = 1.0 / f64_from_u64(total);
     for (p, &h) in prev.iter_mut().zip(hits) {
-        *p = (1.0 - alpha) * *p + alpha * (h as f64 * inv);
+        // Two roundings on purpose: the test pins these averages exactly.
+        let kept = (1.0 - alpha) * *p;
+        let fresh = alpha * (f64_from_u64(h) * inv);
+        *p = kept + fresh;
     }
 }
 

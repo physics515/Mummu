@@ -14,7 +14,9 @@
 //!   cargo test -p mummu --release --test parity_qwen35 -- --ignored --nocapture
 //! ```
 
-mod llama_ref;
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
+use mummu_testkit::llama_ref;
 
 use std::path::PathBuf;
 
@@ -23,8 +25,8 @@ use mummu::models::CausalLm;
 use mummu::models::qwen35::{self, LoadedQwen35};
 use tokenizers::Tokenizer;
 
-/// One model for both legs (the real_inference pattern): a 2B at f32 is
-/// ~7.5 GB and CubeCL retains freed pool memory per device, so two
+/// One model for both legs (the `real_inference` pattern): a 2B at f32 is
+/// ~7.5 GB and `CubeCL` retains freed pool memory per device, so two
 /// independent loads in one sequential run exceed the 16 GB reference card.
 static QWEN35_SLOT: mummu::cache::ModelSlot<LoadedQwen35> = mummu::cache::ModelSlot::new();
 
@@ -56,9 +58,9 @@ const TOP_K: usize = 5;
 /// build next to any number from this gate. Re-measured 2026-09-16 (same
 /// GPU, default features) when qwen35 moved to `GdnL2::AddEps`: against
 /// ollama 0.34.0's bundled llama-server (b10760, still `ggml_l2_norm`) both
-/// legs pass at 5.0281e-2 (5.0230e-2 under the old ClampNorm); against
+/// legs pass at 5.0281e-2 (5.0230e-2 under the old `ClampNorm`); against
 /// llama.cpp b10991 (`build_gdn_l2_norm`, PR #28068) leg 1 fails on a rank
-/// 4/5 swap of ids 248069/760 at 5.2879e-2 (5.2929e-2 under ClampNorm) and
+/// 4/5 swap of ids 248069/760 at 5.2879e-2 (5.2929e-2 under `ClampNorm`) and
 /// leg 2 passes. The swap is not the L2 form: the two llama.cpp builds put
 /// id 760 0.125 apart, while the form moves our logprobs by <= 1.5e-4 and
 /// our 248069/760 gap is 0.032.
@@ -68,19 +70,23 @@ fn reference_gguf() -> PathBuf {
     let p = std::env::var_os("MUMMU_QWEN35_GGUF")
         .map(PathBuf::from)
         .expect("set MUMMU_QWEN35_GGUF to a qwen35 BF16 GGUF");
-    assert!(p.is_file(), "MUMMU_QWEN35_GGUF is not a file: {p:?}");
+    assert!(
+        p.is_file(),
+        "MUMMU_QWEN35_GGUF is not a file: {}",
+        p.display()
+    );
     p
 }
 
 fn server(gguf: &std::path::Path) -> LlamaServer {
+    static NEXT_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(18491);
     let exe =
         llama_ref::server_exe().expect("set MUMMU_LLAMA_SERVER to a llama.cpp llama-server binary");
-    static NEXT_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(18491);
     let port = NEXT_PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     LlamaServer::start(&exe, gguf, port).expect("llama-server starts")
 }
 
-/// ChatML with Qwen3's think conventions — what this family's imported
+/// `ChatML` with Qwen3's think conventions — what this family's imported
 /// template renders for a plain text turn.
 fn prompt_ids(gguf: &std::path::Path) -> (Tokenizer, Vec<u32>) {
     let f = mummu::gguf::GgufFile::open(gguf).expect("gguf opens");
@@ -128,7 +134,10 @@ async fn qwen35_first_forward_topk_matches_llama_cpp() {
 
     let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
     indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
-    let our_ids: Vec<u32> = indexed[..TOP_K].iter().map(|&(id, _)| id as u32).collect();
+    let our_ids: Vec<u32> = indexed[..TOP_K]
+        .iter()
+        .map(|&(id, _)| u32::try_from(id).expect("vocab index fits u32"))
+        .collect();
     let ref_ids: Vec<u32> = ref_top.iter().map(|&(id, _)| id).collect();
 
     let ours_lp = logprobs_at(&logits, &our_ids);

@@ -11,8 +11,12 @@
 //! is saved. This runs the real planner over the real pack's cluster costs and
 //! counts maximal runs — no weights loaded, no GPU needed, so it answers the
 //! question in seconds instead of an eight-minute model load.
+
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use mummu::pack::{Pack, Precision};
 use mummu::tier::{DeviceClass, TierDevice, plan_tiers};
+use mummu_num::f64_from_usize;
 use std::path::PathBuf;
 
 fn main() {
@@ -92,7 +96,7 @@ fn main() {
     println!("  coalesced (one per run)      {after}");
     println!(
         "  reduction                    {:.1}x\n",
-        before as f64 / after as f64
+        f64_from_usize(before) / f64_from_usize(after)
     );
 
     println!("runs per layer (how fragmented each layer's assignment is):");

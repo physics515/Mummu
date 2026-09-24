@@ -1,4 +1,4 @@
-//! Real-weights PyTorch state-dict import proof: fetch MiniLM's original
+//! Real-weights `PyTorch` state-dict import proof: fetch `MiniLM`'s original
 //! `pytorch_model.bin` from the Hub, load it through `PytorchStore`, and
 //! prove the embedding matches the safetensors-loaded model on the SAME
 //! sentence — identical weights through two formats must agree. Ignored by
@@ -8,10 +8,13 @@
 //! MUMMU_HUB_DEST=some/tmp/dir cargo test -p mummu --release --test real_pytorch -- --ignored --nocapture
 //! ```
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use std::path::PathBuf;
 
 use mummu::hub;
 use mummu::models::minilm;
+use mummu_num::f32_from_u32;
 use tokenizers::Tokenizer;
 
 const REPO: &str = "sentence-transformers/all-MiniLM-L6-v2";
@@ -22,7 +25,11 @@ fn embed_from(dir: &std::path::Path) -> Vec<f32> {
     let loaded = minilm::load_from_dir(dir, &device).expect("checked load");
     let tok = Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer loads");
     let enc = tok.encode(SENTENCE, true).expect("encodes");
-    let mask: Vec<f32> = enc.get_attention_mask().iter().map(|&m| m as f32).collect();
+    let mask: Vec<f32> = enc
+        .get_attention_mask()
+        .iter()
+        .map(|&m| f32_from_u32(m))
+        .collect();
     loaded
         .embed_ids(enc.get_ids(), &mask, &device)
         .expect("embeds")

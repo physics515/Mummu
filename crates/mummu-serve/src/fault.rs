@@ -186,13 +186,17 @@ pub fn loads() -> u64 {
 /// The most recent load's plan.
 #[must_use]
 pub fn last_load() -> Option<LoadInfo> {
-    *LAST_LOAD.lock().unwrap_or_else(|e| e.into_inner())
+    *LAST_LOAD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Called by the slot's load closure as a load starts, with its plan.
-pub(crate) fn loading(info: LoadInfo) {
+pub fn loading(info: LoadInfo) {
     LOADS.fetch_add(1, SeqCst);
-    *LAST_LOAD.lock().unwrap_or_else(|e| e.into_inner()) = Some(info);
+    *LAST_LOAD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(info);
 }
 
 /// A panic exactly as cubecl raises and swallows it: on a thread named like
@@ -212,7 +216,7 @@ fn raise_on_device_thread(message: &'static str) {
 
 /// Called inside the load, after the loader returned: raise cubecl's
 /// device-thread OOM the way cubecl does, so the loader never hears of it.
-pub(crate) fn during_load() {
+pub fn during_load() {
     if take(&LOAD_OOM) {
         eprintln!(
             "[mummu-serve] fault injection: raising cubecl's device-thread OOM panic on DSD-0-0, \
@@ -238,7 +242,7 @@ fn catch_and_retry_window(device_message: &'static str) {
 /// Called before the first forward: the read that finds the device server in
 /// an invalid state, as every chat after the incident's load did — or one of
 /// the other ways around it the module header lists.
-pub(crate) async fn before_first_read() -> Result<(), String> {
+pub async fn before_first_read() -> Result<(), String> {
     let stall = STALL_MS.swap(0, SeqCst);
     if stall > 0 {
         tokio::time::sleep(std::time::Duration::from_millis(stall)).await;
@@ -264,7 +268,7 @@ pub(crate) async fn before_first_read() -> Result<(), String> {
 }
 
 /// Called by the exit right before it calls `exit`: hang there if armed.
-pub(crate) fn before_exit() {
+pub fn before_exit() {
     if EXIT_STALL.swap(false, SeqCst) {
         eprintln!(
             "[mummu-serve] fault injection: the exit hangs here, as driver teardown can — only \
@@ -311,19 +315,19 @@ pub fn report() -> Value {
 }
 
 /// `POST /api/fault {…}` — replaces what is armed and answers with the state.
-pub(crate) async fn endpoint(body: Bytes) -> Response {
+pub async fn endpoint(body: Bytes) -> Response {
     let a: Arm = match parse_json(&body) {
         Ok(a) => a,
         Err(response) => return *response,
     };
     eprintln!("[mummu-serve] fault injection: armed {a:?}");
     arm(a);
-    json_response(200, report())
+    json_response(200, &report())
 }
 
 /// `GET /api/fault` — the state, unchanged.
-pub(crate) async fn state() -> Response {
-    json_response(200, report())
+pub async fn state() -> Response {
+    json_response(200, &report())
 }
 
 #[cfg(test)]
@@ -336,9 +340,8 @@ mod tests {
     /// Each armed fault fires once per count and then never again — a demo
     /// that arms one failure must get exactly one.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // serializes tests; nothing else waits on it
     async fn armed_faults_are_consumed_one_per_use() {
-        let _serial = crate::progress_serial();
+        let _serial = crate::progress_serial().await;
         crate::recovery::reset_for_tests();
         crate::recovery::install_panic_hook();
         arm(Arm {

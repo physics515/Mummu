@@ -1,8 +1,10 @@
 //! The model registry: declarative [`ModelSpec`]s and a small built-in
-//! catalog of known-good models. Adding a model to Mummu is a manifest entry
-//! here (or an app-supplied spec), not new code — the spec names the source
-//! repo, the architecture that loads it, and the files it needs; `fetch`
-//! hands it to the P3 downloader.
+//! catalog of known-good models.
+//!
+//! Adding a model to Mummu is a manifest entry here (or an app-supplied
+//! spec), not new code — the spec names the source repo, the architecture
+//! that loads it, and the files it needs; `fetch` hands it to the P3
+//! downloader.
 
 use std::path::{Path, PathBuf};
 
@@ -14,17 +16,17 @@ pub enum Architecture {
     /// `models::qwen2` — Qwen2 / Qwen2.5 decoder tiers.
     Qwen2,
     /// `models::qwen3` — Qwen3 dense decoder (per-head q/k norm, no qkv bias,
-    /// decoupled head_dim); the function-calling tier (4B / 9B).
+    /// decoupled `head_dim`); the function-calling tier (4B / 9B).
     Qwen3,
     /// `models::lfm2` — LFM2 / LFM2.5 hybrid conv+attention.
     Lfm2,
     /// `models::minilm` — all-MiniLM BERT sentence embedder.
     MiniLm,
-    /// `models::olmoe` — OLMoE sparse mixture-of-experts decoder (the zoo's
-    /// first MoE). Imports from GGUF (experts pre-fused) or from HF
+    /// `models::olmoe` — `OLMoE` sparse mixture-of-experts decoder (the zoo's
+    /// first `MoE`). Imports from GGUF (experts pre-fused) or from HF
     /// safetensors (experts fused on import).
     Olmoe,
-    /// `models::qwen35` — Qwen3.5/3.8 hybrid: Gated DeltaNet linear
+    /// `models::qwen35` — Qwen3.5/3.8 hybrid: Gated `DeltaNet` linear
     /// attention + gated full attention every 4th layer. GGUF import only.
     Qwen35,
 }
@@ -51,7 +53,7 @@ pub enum WeightFormat {
 pub struct ModelSpec {
     /// Short cache-dir-safe name, e.g. `qwen2.5-1.5b-instruct`.
     pub name: String,
-    /// HuggingFace repo id (`owner/name`).
+    /// `HuggingFace` repo id (`owner/name`).
     pub repo: String,
     /// Git revision (tag, branch, or commit) — pin for reproducibility.
     pub revision: String,
@@ -65,6 +67,13 @@ pub struct ModelSpec {
 
 impl ModelSpec {
     /// Sanity for manifest entries (also the deserialization gate).
+    ///
+    /// # Errors
+    ///
+    /// A message when the name is empty or has characters outside
+    /// `[A-Za-z0-9._-]`, the repo is not `owner/name`, the revision is
+    /// empty, or a GGUF file name is empty, absolute, contains `..`, or does
+    /// not end in `.gguf`.
     pub fn validate(&self) -> Result<(), String> {
         if self.name.is_empty()
             || !self
@@ -81,10 +90,12 @@ impl ModelSpec {
             return Err("revision must be non-empty (pin something)".into());
         }
         if let WeightFormat::Gguf { file } = &self.format {
+            // Case-sensitive on purpose: the name is spliced verbatim into
+            // the Hub URL, and `.GGUF` is not the same file there.
             let safe = !file.is_empty()
                 && !file.contains("..")
                 && !file.starts_with('/')
-                && file.ends_with(".gguf");
+                && file.strip_suffix(".gguf").is_some();
             if !safe {
                 return Err(format!("bad gguf file name {file:?}"));
             }
@@ -110,6 +121,17 @@ impl ModelSpec {
     /// Download this model into `models_root` (resumable, cache-first; see
     /// [`hub::fetch_model`] / [`hub::fetch_file`]) and return its directory,
     /// ready for the architecture's `load_from_dir` / `load_from_gguf`.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`hub::fetch_model`] (safetensors) or [`hub::fetch_file`]
+    /// (GGUF) returns — transport, I/O, a short or corrupt stream, a bad
+    /// shard index — plus [`HubError::Io`] when the model directory cannot
+    /// be created for a GGUF download.
+    ///
+    /// # Panics
+    ///
+    /// When the spec does not pass [`Self::validate`].
     pub fn fetch(
         &self,
         models_root: &Path,
@@ -138,7 +160,25 @@ impl ModelSpec {
 /// is actively gating — see the ROADMAP P2 checklist for each one's status).
 #[must_use]
 pub fn catalog() -> Vec<ModelSpec> {
-    let entries = vec![
+    let entries: Vec<ModelSpec> = [
+        dense_safetensors_entries(),
+        gguf_variant_entries(),
+        qwen3_entries(),
+        olmoe_entries(),
+        qwen35_entries(),
+    ]
+    .concat();
+    debug_assert!(
+        entries.iter().all(|s| s.validate().is_ok()),
+        "built-in catalog must validate"
+    );
+    entries
+}
+
+/// The safetensors tiers the zoo opened with: Qwen2.5, LFM2.5 and the
+/// `MiniLM` sentence embedder.
+fn dense_safetensors_entries() -> Vec<ModelSpec> {
+    vec![
         ModelSpec {
             name: "qwen2.5-1.5b-instruct".into(),
             repo: "Qwen/Qwen2.5-1.5B-Instruct".into(),
@@ -179,8 +219,13 @@ pub fn catalog() -> Vec<ModelSpec> {
             format: WeightFormat::Safetensors,
             disk_bytes_estimate: 91_000_000,
         },
-        // Single-file GGUF variants — quarter the download, same model
-        // (proven vs the bf16 safetensors builds in tests/real_gguf.rs).
+    ]
+}
+
+/// Single-file GGUF variants — quarter the download, same model (proven vs
+/// the bf16 safetensors builds in `tests/real_gguf.rs`).
+fn gguf_variant_entries() -> Vec<ModelSpec> {
+    vec![
         ModelSpec {
             name: "qwen2.5-1.5b-instruct-q4km".into(),
             repo: "Qwen/Qwen2.5-1.5B-Instruct-GGUF".into(),
@@ -201,8 +246,13 @@ pub fn catalog() -> Vec<ModelSpec> {
             },
             disk_bytes_estimate: 731_000_000,
         },
-        // Qwen3 dense — the local function-calling tier. 0.6B is the fast
-        // parity-validation / CPU tier; 4B is the BFCL sweet spot.
+    ]
+}
+
+/// Qwen3 dense — the local function-calling tier. 0.6B is the fast
+/// parity-validation / CPU tier; 4B is the BFCL sweet spot.
+fn qwen3_entries() -> Vec<ModelSpec> {
+    vec![
         ModelSpec {
             name: "qwen3-0.6b".into(),
             repo: "Qwen/Qwen3-0.6B".into(),
@@ -239,9 +289,14 @@ pub fn catalog() -> Vec<ModelSpec> {
             },
             disk_bytes_estimate: 2_500_000_000,
         },
-        // The zoo's first MoE: 64 experts, 8 active per token (1B active /
-        // 7B total). Resident-everything first cut — ~28 GB dequantized to
-        // f32, sized for the CPU backend (128 GB reference machine).
+    ]
+}
+
+/// The zoo's first `MoE`: 64 experts, 8 active per token (1B active / 7B
+/// total). Resident-everything first cut — ~28 GB dequantized to f32, sized
+/// for the CPU backend (128 GB reference machine).
+fn olmoe_entries() -> Vec<ModelSpec> {
+    vec![
         ModelSpec {
             name: "olmoe-1b-7b-0125-instruct-q4km".into(),
             repo: "allenai/OLMoE-1B-7B-0125-Instruct-GGUF".into(),
@@ -263,10 +318,16 @@ pub fn catalog() -> Vec<ModelSpec> {
             format: WeightFormat::Safetensors,
             disk_bytes_estimate: 13_800_000_000,
         },
-        // Qwen3.5 hybrid (Gated DeltaNet + interval attention) — the zoo's
-        // first linear-attention family. BF16 is the parity-reference build;
-        // Q8_0 is the practical download (identical f32 footprint once
-        // dequantized — mummu has no keep-quantized runtime yet, see P9).
+    ]
+}
+
+/// Qwen3.5 hybrid (Gated `DeltaNet` + interval attention) — the zoo's first
+/// linear-attention family. BF16 is the parity-reference build; `Q8_0` is the
+/// practical download (identical f32 footprint once dequantized — mummu has
+/// no keep-quantized runtime yet, see P9). The 27Bs are the same
+/// architecture at scale.
+fn qwen35_entries() -> Vec<ModelSpec> {
+    vec![
         ModelSpec {
             name: "qwen3.5-2b".into(),
             repo: "unsloth/Qwen3.5-2B-GGUF".into(),
@@ -319,12 +380,7 @@ pub fn catalog() -> Vec<ModelSpec> {
             },
             disk_bytes_estimate: 16_400_000_000,
         },
-    ];
-    debug_assert!(
-        entries.iter().all(|s| s.validate().is_ok()),
-        "built-in catalog must validate"
-    );
-    entries
+    ]
 }
 
 #[cfg(test)]

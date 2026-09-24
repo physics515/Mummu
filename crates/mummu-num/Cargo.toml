@@ -1,0 +1,11 @@
+[package]
+name = "mummu-num"
+description = "Exact, `as`-free integer/float conversions shared by every mummu crate."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Dependency-free on purpose: the two schedulers (`mummu-mix`, `mummu-schedule`)
+# are dependency-free by design and this is the one crate they both pull.
+[dependencies]

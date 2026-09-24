@@ -13,23 +13,27 @@
 
 use once_cell::sync::OnceCell;
 
-/// The default GPU device (wgpu: Vulkan / DX12 / Metal). burn 0.22 selects
-/// backends at runtime through [`burn::tensor::Device`]; with the workspace
-/// `fusion` feature, fusion applies to supporting devices automatically.
+/// The default GPU device (wgpu: Vulkan / DX12 / Metal).
+///
+/// burn 0.22 selects backends at runtime through [`burn::tensor::Device`];
+/// with the workspace `fusion` feature, fusion applies to supporting devices
+/// automatically.
 #[must_use]
 pub fn gpu_device() -> burn::tensor::Device {
-    burn::tensor::Device::wgpu(Default::default())
+    burn::tensor::Device::wgpu(burn::tensor::DeviceKind::default())
 }
 
 /// Raise every cubecl device-server thread ("DSD-*") above the compute
-/// pools. Those threads encode command buffers, submit to the driver, and
+/// pools.
+///
+/// Those threads encode command buffers, submit to the driver, and
 /// signal readback-map completions — microseconds of CPU each — but at
 /// normal priority they starve behind the trunk's spinning gemm workers:
 /// measured, a remote FFN group whose kernels total well under 1 ms still
 /// held its caller ~26 ms at the fence, and the wait tracked scheduler
 /// quanta, not GPU time. Call after model load (the servers spawn on first
 /// device use); repeat calls are cheap and idempotent.
-pub fn boost_device_server_threads() {
+pub const fn boost_device_server_threads() {
     #[cfg(windows)]
     unsafe {
         #[link(name = "kernel32.dll", kind = "raw-dylib", modifiers = "+verbatim")]
@@ -229,6 +233,11 @@ pub fn int_dtype(device: &burn::tensor::Device) -> burn::tensor::DType {
 /// `AlreadyInitialized` when the device has already computed something, and an
 /// unsupported-dtype error when the adapter cannot do f16 at all (check
 /// [`DeviceInventory::any_shader_f16`] first).
+///
+/// # Panics
+///
+/// Only on an internal invariant that cannot fail: the device handed back
+/// is asserted to be f16, and both branches above return early otherwise.
 pub fn gpu_device_f16() -> Result<burn::tensor::Device, burn::tensor::DeviceError> {
     let mut device = gpu_device();
     match device.configure((burn::tensor::FloatDType::F16, burn::tensor::IntDType::I32)) {
@@ -313,7 +322,7 @@ pub struct DeviceInventory {
 impl DeviceInventory {
     /// Is at least one hardware GPU present (on any API)?
     #[must_use]
-    pub fn has_gpu(&self) -> bool {
+    pub const fn has_gpu(&self) -> bool {
         !self.gpus.is_empty()
     }
 
@@ -573,7 +582,7 @@ fn vram_by_adapter_name() -> Vec<(String, u64)> {
 }
 
 #[cfg(not(windows))]
-fn vram_by_adapter_name() -> Vec<(String, u64)> {
+const fn vram_by_adapter_name() -> Vec<(String, u64)> {
     Vec::new() // Linux (Vulkan memory heaps) and macOS are P6 follow-ups.
 }
 
@@ -600,7 +609,7 @@ impl VideoMemory {
     /// usage legitimately exceeds budget when the OS has just cut it, and that
     /// means *zero* headroom, not a huge negative one.
     #[must_use]
-    pub fn headroom(self) -> u64 {
+    pub const fn headroom(self) -> u64 {
         self.budget.saturating_sub(self.current_usage)
     }
 }
@@ -702,7 +711,7 @@ pub fn video_memory() -> Option<VideoMemory> {
 /// `VK_EXT_memory_budget` is the equivalent and a P6 follow-up.
 #[cfg(not(windows))]
 #[must_use]
-pub fn video_memory() -> Option<VideoMemory> {
+pub const fn video_memory() -> Option<VideoMemory> {
     None
 }
 
@@ -748,9 +757,7 @@ fn total_ram_bytes() -> Option<u64> {
 
 /// The host CPU: logical cores + total RAM.
 fn cpu_info() -> CpuInfo {
-    let logical_cores = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(1);
+    let logical_cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let total_ram_bytes = total_ram_bytes();
     assert!(
         logical_cores >= 1,
@@ -795,7 +802,7 @@ pub fn inventory() -> &'static DeviceInventory {
 pub fn use_gpu() -> bool {
     let gpu = inventory().has_gpu();
     // Negative space: the decision must agree with the inventory it came from.
-    debug_assert!(gpu == !inventory().gpus.is_empty());
+    debug_assert_eq!(gpu, !inventory().gpus.is_empty());
     gpu
 }
 
@@ -928,11 +935,14 @@ mod tests {
                 gpu.name,
                 gpu.device_type,
                 gpu.shader_f16,
-                gpu.max_buffer_bytes as f64 / f64::from(1u32 << 30),
-                gpu.vram_bytes.map_or("unknown".into(), |b| format!(
-                    "{:.1} GiB",
-                    b as f64 / f64::from(1u32 << 30)
-                )),
+                mummu_num::f64_from_u64(gpu.max_buffer_bytes) / f64::from(1u32 << 30),
+                gpu.vram_bytes.map_or_else(
+                    || "unknown".into(),
+                    |b| format!(
+                        "{:.1} GiB",
+                        mummu_num::f64_from_u64(b) / f64::from(1u32 << 30)
+                    )
+                ),
             );
         }
         let cpu = &inventory().cpu;

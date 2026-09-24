@@ -22,15 +22,17 @@
 //! clean before it measures anything.
 //! ```
 //!
-//! Point the directory at an NVMe copy: the routed experts and PLE rows are
+//! Point the directory at an `NVMe` copy: the routed experts and PLE rows are
 //! read on demand from the shards, and random reads from spinning disks are
 //! ~1000x slower. The f32 trunk is ~20 GB of RAM. A missing directory SKIPS
 //! with a message. `MUMMU_QWEN4EXP_TRACE=1` with the `trace_*` test prints
 //! the per-layer intermediates to walk a failure to its first divergent op.
 
-mod gguf_compare;
-mod llama_ref;
-mod qwen4exp_fixture;
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
+use mummu_testkit::gguf_compare;
+use mummu_testkit::llama_ref;
+use mummu_testkit::qwen4exp_fixture;
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -39,6 +41,7 @@ use llama_ref::logprobs_at;
 use mummu::gguf::GgufFile;
 use mummu::models::CausalLm;
 use mummu::models::qwen4exp::{self, LoadedQwen4exp};
+use mummu_num::{f64_from_usize, narrow};
 use qwen4exp_fixture::{FIRST_SHARD, Fixture, compare_leg};
 
 fn first_shard() -> Option<PathBuf> {
@@ -87,7 +90,10 @@ fn readback(t: burn::tensor::Tensor<2>) -> Vec<f32> {
 fn top(logits: &[f32], k: usize) -> Vec<(u32, f64)> {
     let mut idx: Vec<usize> = (0..logits.len()).collect();
     idx.sort_by(|&a, &b| logits[b].total_cmp(&logits[a]));
-    let ids: Vec<u32> = idx[..k].iter().map(|&i| i as u32).collect();
+    let ids: Vec<u32> = idx[..k]
+        .iter()
+        .map(|&i| u32::try_from(i).expect("vocab index fits u32"))
+        .collect();
     ids.iter().copied().zip(logprobs_at(logits, &ids)).collect()
 }
 
@@ -135,9 +141,9 @@ fn qwen4exp_cpu_matches_the_recorded_llama_cpp_reference() {
              RSS {rss} MiB, peak {hwm} MiB",
             leg.name,
             leg.prompt_ids.len(),
-            prefill / leg.prompt_ids.len() as f64,
+            prefill / f64_from_usize(leg.prompt_ids.len()),
             greedy.len(),
-            (generate - prefill).max(0.0) / steps as f64,
+            (generate - prefill).max(0.0) / f64_from_usize(steps),
         );
         eprintln!(
             "[parity/qwen4exp/{}] ours top-5 {:?}",
@@ -210,10 +216,10 @@ fn trace_the_primes_prefill() {
 ///
 /// Measured 2026-09-16 on the primes leg, emulated and forced (median /
 /// max relative error over layers): HC mix 1.1e-7 / 1.7e-4, router 1.8e-7,
-/// shared expert 3.4e-7, routed experts 3.5e-5 / 2.4e-4, DeltaNet
+/// shared expert 3.4e-7, routed experts 3.5e-5 / 2.4e-4, `DeltaNet`
 /// 3.9e-5 / 2.9e-4, attention 1.1e-3 / 4.4e-3 (f16 flash attention, not
-/// exactly emulated), head 2.3e-7. This check found the DeltaNet L2 form
-/// (1.5e-2 on layer 28 before `GdnL2::AddEps`) and the missing Q8_1 `s`
+/// exactly emulated), head 2.3e-7. This check found the `DeltaNet` L2 form
+/// (1.5e-2 on layer 28 before `GdnL2::AddEps`) and the missing `Q8_1` `s`
 /// rounding (5e-4 on Q5_1-down experts). On the exact path the same ops
 /// sit at 0.7-2.2e-2, which is llama.cpp's activation-quantization noise.
 /// Free-running with the emulation on, `l_last` still drifts from 2.8e-3
@@ -261,8 +267,8 @@ fn teacher_forced_ops_against_a_llama_cpp_dump() {
 /// realizations. Measured 2026-09-16 with 11 emulated realizations per run
 /// (seeds None and 1..=10), llama.cpp's 4 distinct realizations for
 /// comparison:
-/// - primes `<|im_end|>`: -14.91 (sd 0.53) after the DeltaNet L2 fix, then
-///   -15.52 (sd 0.56) once the Q8_1 `s` rounding was emulated. llama.cpp:
+/// - primes `<|im_end|>`: -14.91 (sd 0.53) after the `DeltaNet` L2 fix, then
+///   -15.52 (sd 0.56) once the `Q8_1` `s` rounding was emulated. llama.cpp:
 ///   -15.06 (sd 0.33).
 /// - moon: -12.35 (sd 0.28), then -12.32 (sd 0.20). llama.cpp: -12.22
 ///   (sd 0.30).
@@ -274,6 +280,18 @@ fn teacher_forced_ops_against_a_llama_cpp_dump() {
 /// 6e-6 move on the exact path. The emulated forward is as chaotic as the
 /// reference. `NOISE_SEEDS` (default 8) and `NOISE_EPS` (default 1e-5) tune
 /// the sampling.
+/// Restores the process-global emulation state however the noise sweep
+/// exits, so nothing that runs after it in the same process measures a
+/// perturbed or emulated forward by accident.
+struct Restore(bool);
+
+impl Drop for Restore {
+    fn drop(&mut self) {
+        mummu::nn::refarith::set_enabled(self.0);
+        mummu::nn::refarith::set_perturbation(None, 0.0);
+    }
+}
+
 #[test]
 #[ignore = "diagnostic: needs MUMMU_QWEN4EXP_DIR and ~25 GB RAM"]
 fn noise_realizations_of_the_first_forward() {
@@ -292,16 +310,6 @@ fn noise_realizations_of_the_first_forward() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1e-5);
-    // Restore the process-global emulation state however this test exits,
-    // so nothing that runs after it in the same process measures a
-    // perturbed or emulated forward by accident.
-    struct Restore(bool);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            mummu::nn::refarith::set_enabled(self.0);
-            mummu::nn::refarith::set_perturbation(None, 0.0);
-        }
-    }
     let _restore = Restore(mummu::nn::refarith::enabled());
     for (mode, on, n) in [("exact", false, 3usize), ("emulated", true, seeds)] {
         mummu::nn::refarith::set_enabled(on);
@@ -443,7 +451,7 @@ struct VariantTop {
 /// The measurement the qwen4exp tolerance has to be judged against: replay
 /// each recorded llama.cpp realization, AS THE CANDIDATE, through the
 /// unchanged first-forward verdict against the fixture. Settings that only
-/// change kernels whose math is identical (`--no-repack` changes the Q4_K
+/// change kernels whose math is identical (`--no-repack` changes the `Q4_K`
 /// expert dot's float summation order; `-fa off` the attention kernel) fail
 /// the gate against llama.cpp's own recording, because activation
 /// quantization makes the 48-layer forward chaotic in float rounding. The
@@ -468,12 +476,14 @@ fn the_gate_is_tighter_than_llama_cpps_own_spread_on_this_model() {
             let top = &v.first_forward_top[&leg.name];
             let mut logits = vec![-1.0e4_f32; vocab];
             for e in top {
-                logits[e.id as usize] = e.logprob as f32;
+                logits[e.id as usize] = narrow(e.logprob);
             }
+            // "Identical" means the recorded double is the same value bit
+            // for bit, not merely within some tolerance.
             let bit_identical = top
                 .iter()
                 .zip(&leg.steps[0].top)
-                .all(|(a, b)| a.id == b.id && a.logprob == b.logprob);
+                .all(|(a, b)| a.id == b.id && a.logprob.to_bits() == b.logprob.to_bits());
             let pass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 gguf_compare::assert_matches_reference(
                     &format!("variant/{}/{}", v.tag, leg.name),
@@ -569,9 +579,9 @@ fn long_prompt_greedy_matches_the_recorded_llama_cpp_reference() {
          [long/qwen4exp] ours top-5 {ours_top:?}\n[long/qwen4exp] ref  top-5 {ref_top:?}\n\
          [long/qwen4exp] ours greedy {greedy:?} {:?}\n[long/qwen4exp] ref  greedy {:?} {:?}",
         leg.prompt_ids.len(),
-        prefill / leg.prompt_ids.len() as f64,
+        prefill / f64_from_usize(leg.prompt_ids.len()),
         greedy.len(),
-        (generate - prefill).max(0.0) / greedy.len().saturating_sub(1).max(1) as f64,
+        (generate - prefill).max(0.0) / f64_from_usize(greedy.len().saturating_sub(1).max(1)),
         tok.decode(&greedy, true).unwrap_or_default(),
         leg.greedy_ids,
         leg.content,

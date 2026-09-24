@@ -17,6 +17,8 @@
 //! `--nocapture` and checks the child's exit status; the child is the
 //! `#[ignore]`d half below.
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use std::process::Command;
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};

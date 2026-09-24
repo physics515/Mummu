@@ -12,6 +12,8 @@
 //! whole file stays within a single model's VRAM even with parallel test
 //! threads (two concurrent 6 GB loads would blow the 16 GB reference card).
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use std::path::PathBuf;
 
 use mummu::backend::use_gpu;
@@ -42,7 +44,7 @@ async fn gpu_model(dir: &std::path::Path) -> mummu::cache::SlotGuard<'static, Lo
         .expect("weights load checked")
 }
 
-/// ChatML prompt for the Qwen2.5 instruct checkpoints.
+/// `ChatML` prompt for the Qwen2.5 instruct checkpoints.
 fn chatml(system: &str, user: &str) -> String {
     format!(
         "<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n"
@@ -174,6 +176,7 @@ async fn qwen2_sampled_streaming_is_seeded_deterministic_and_cancellable() {
             })
             .await
             .expect("replay decode");
+        drop(loaded);
         (cancelled, streamed, replay)
     };
 

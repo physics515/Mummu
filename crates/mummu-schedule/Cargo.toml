@@ -11,3 +11,4 @@ repository.workspace = true
 # burn out means this compiles and tests in a second and can be reasoned
 # about (and fuzzed, and reused) without a GPU anywhere in sight.
 [dependencies]
+mummu-num = { workspace = true }

@@ -3,6 +3,8 @@
 //! gate for new dequant formats:
 //! `cargo run --release -p mummu --example gguf-verify -- <path.gguf>`.
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use std::collections::BTreeMap;
 
 use mummu::gguf::GgufFile;

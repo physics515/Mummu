@@ -33,8 +33,8 @@
 //! Streaming wins in exactly two situations, and the policy is built around
 //! them:
 //!
-//! 1. **Selectivity.** A routed MoE touches `top_k` of `E` experts per token,
-//!    so it stages a `k/E` fraction. This is why the MoE conversion matters
+//! 1. **Selectivity.** A routed `MoE` touches `top_k` of `E` experts per token,
+//!    so it stages a `k/E` fraction. This is why the `MoE` conversion matters
 //!    beyond fit: it turns "move everything" into "move what was routed".
 //! 2. **Overlap.** Staging that happens *while the previous layer computes*
 //!    costs nothing on the critical path until it exceeds compute time.
@@ -46,7 +46,9 @@
 
 use std::collections::HashMap;
 
-/// A unit of placement: one MoE expert, or one FFN neuron cluster.
+use mummu_num::{f64_from_u64, f64_from_usize, trunc_usize};
+
+/// A unit of placement: one `MoE` expert, or one FFN neuron cluster.
 pub type UnitId = usize;
 
 /// Where a unit's compute happened — what the scheduler reports back so a
@@ -118,11 +120,11 @@ impl Budget {
         if self.unit_bytes == 0 || self.stage_bytes_per_sec <= 0.0 {
             return 0;
         }
-        let per_unit_secs = self.unit_bytes as f64 / self.stage_bytes_per_sec;
+        let per_unit_secs = f64_from_u64(self.unit_bytes) / self.stage_bytes_per_sec;
         if per_unit_secs <= 0.0 {
             return usize::MAX;
         }
-        (self.layer_compute_secs / per_unit_secs).floor().max(0.0) as usize
+        trunc_usize((self.layer_compute_secs / per_unit_secs).floor().max(0.0))
     }
 }
 
@@ -158,7 +160,7 @@ impl Plan {
 /// The policy, in order:
 ///
 /// 1. **Pin the hot core.** Units used in every layer (a dense model's local
-///    slab, an MoE's always-hot experts) never leave the device: streaming
+///    slab, an `MoE`'s always-hot experts) never leave the device: streaming
 ///    something needed every layer is pure overhead. Pinning is capped so
 ///    the stream always has room to work.
 /// 2. **Prefetch ahead.** While layer `L` computes, issue staging for the
@@ -169,6 +171,7 @@ impl Plan {
 /// 4. **Overflow to the host.** Anything not resident and not stageable in
 ///    time is computed on the host. Never stall: the host already has the
 ///    bytes, so waiting is strictly worse than computing.
+#[must_use]
 pub fn schedule(demands: &[LayerDemand], budget: &Budget) -> Plan {
     let capacity = budget.capacity();
     let per_layer_stage = budget.stageable_per_layer();
@@ -273,7 +276,7 @@ pub fn schedule(demands: &[LayerDemand], budget: &Budget) -> Plan {
     let hit_rate = if total == 0 {
         0.0
     } else {
-        hits as f64 / total as f64
+        f64_from_usize(hits) / f64_from_usize(total)
     };
     Plan {
         layers,
@@ -306,7 +309,7 @@ mod tests {
         Budget {
             device_bytes: unit * capacity_units as u64,
             unit_bytes: unit,
-            stage_bytes_per_sec: (unit as f64) * stage_per_layer as f64 / 0.010,
+            stage_bytes_per_sec: f64_from_u64(unit) * f64_from_usize(stage_per_layer) / 0.010,
             layer_compute_secs: 0.010,
         }
     }
@@ -359,7 +362,7 @@ mod tests {
         assert_eq!(plan.layers[0].prefetch, vec![2, 3], "{:?}", plan.layers[0]);
         // And layer 1 then finds them resident — the point of the pipeline.
         assert_eq!(plan.layers[1].on_device, vec![2, 3]);
-        assert!(plan.layers[1].overflow.is_empty());
+        assert_eq!(plan.layers[1].overflow, [] as [usize; 0]);
     }
 
     #[test]

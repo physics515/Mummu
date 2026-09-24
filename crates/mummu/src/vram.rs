@@ -37,7 +37,7 @@ impl Memory {
     /// Saturating on purpose: when the card is already fuller than the
     /// reserve, the answer is zero, not a wrapped enormous number.
     #[must_use]
-    pub fn headroom(self, reserve: u64) -> u64 {
+    pub const fn headroom(self, reserve: u64) -> u64 {
         self.free.saturating_sub(reserve)
     }
 }
@@ -295,11 +295,11 @@ mod nvml {
             let mut device: *mut c_void = core::ptr::null_mut();
             // Device 0: the primary GPU. Multi-GPU placement picks its own
             // devices and is a separate concern from this global reading.
-            if (api.handle_by_index)(0, &mut device) != 0 || device.is_null() {
+            if (api.handle_by_index)(0, &raw mut device) != 0 || device.is_null() {
                 return None;
             }
             let mut mem = NvmlMemory::default();
-            if (api.get_memory_info)(device, &mut mem) != 0 {
+            if (api.get_memory_info)(device, &raw mut mem) != 0 {
                 return None;
             }
             Some(Memory {

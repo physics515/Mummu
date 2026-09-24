@@ -44,6 +44,8 @@
 
 use std::time::{Duration, Instant};
 
+use mummu_num::{f64_from_u64, trunc_u64};
+
 /// What the controller learned from one observation window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Adjust {
@@ -140,7 +142,7 @@ impl Controller {
 
     /// The device budget the placement planner should use right now.
     #[must_use]
-    pub fn budget(&self) -> u64 {
+    pub const fn budget(&self) -> u64 {
         self.budget
     }
 
@@ -152,12 +154,9 @@ impl Controller {
         //    ignoring dwell: staying here risks the next OOM.
         if sample.device_alloc_failed {
             let ceiling = sample.device_bytes_in_use.min(self.budget);
-            self.failed_at = Some(match self.failed_at {
-                Some(prev) => prev.min(ceiling),
-                None => ceiling,
-            });
-            let next =
-                ((ceiling as f64 * self.policy.shrink_factor) as u64).max(self.policy.floor_bytes);
+            self.failed_at = Some(self.failed_at.map_or(ceiling, |prev| prev.min(ceiling)));
+            let next = trunc_u64(f64_from_u64(ceiling) * self.policy.shrink_factor)
+                .max(self.policy.floor_bytes);
             self.last_change = now;
             self.best = None; // the old best was measured under a limit that no longer holds
             if next < self.budget {
@@ -220,7 +219,7 @@ impl Controller {
             .failed_at
             .map_or(self.policy.ceiling_bytes, |f| {
                 // Stay a decrease-step below the level that failed.
-                ((f as f64 * self.policy.shrink_factor) as u64).max(self.policy.floor_bytes)
+                trunc_u64(f64_from_u64(f) * self.policy.shrink_factor).max(self.policy.floor_bytes)
             })
             .min(self.policy.ceiling_bytes);
 

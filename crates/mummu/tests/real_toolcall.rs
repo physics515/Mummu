@@ -6,6 +6,8 @@
 //! MUMMU_QWEN2_DIR=path/to/qwen2.5-1.5b cargo test -p mummu --release --test real_toolcall -- --ignored --nocapture
 //! ```
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use std::path::PathBuf;
 
 use mummu::chat::{ChatMl, ToolSpec, Turn, parse_tool_calls};

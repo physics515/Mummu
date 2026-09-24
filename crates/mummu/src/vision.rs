@@ -1,4 +1,4 @@
-//! The Qwen3-VL vision tower: a ViT plus the `qwen3vl_merger` projector,
+//! The Qwen3-VL vision tower: a `ViT` plus the `qwen3vl_merger` projector,
 //! loaded from the companion `mmproj-*.gguf` and producing embeddings in the
 //! language model's hidden space.
 //!
@@ -18,10 +18,11 @@
 //! never in the photo. There is no downstream check that catches it.
 //!
 //! Qwen3.8-27B's tower, for orientation: 27 blocks, hidden 1152, 16 heads
-//! (head_dim 72), FFN 4304, patch 16, reference image 768 (a 48x48 patch
+//! (`head_dim` 72), FFN 4304, patch 16, reference image 768 (a 48x48 patch
 //! grid), 2x2 spatial merge, GELU, LN eps 1e-6, projecting to 5120.
 
 use burn::tensor::{Device, Tensor, TensorData};
+use mummu_num::{f32_from_usize, f64_from_usize, trunc_usize};
 
 use crate::gguf::GgufFile;
 
@@ -46,15 +47,24 @@ pub struct VisionConfig {
 
 impl VisionConfig {
     /// Patches per side in the position table.
-    fn pos_grid(&self) -> usize {
+    const fn pos_grid(&self) -> usize {
         self.image_size / self.patch
     }
 
-    fn head_dim(&self) -> usize {
+    const fn head_dim(&self) -> usize {
         self.hidden / self.heads
     }
 
     /// Read the geometry, refusing anything this module does not implement.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when `general.architecture` is not `"clip"`, the
+    /// projector is not `qwen3vl_merger`, the file has no vision encoder,
+    /// any `clip.vision.is_deepstack_layers` flag is set, a required
+    /// `clip.vision.*` size key is missing or does not fit a `usize`, the
+    /// hidden width is not a multiple of the head count (or a patch/head
+    /// count is zero), or `image_size` is not a multiple of `patch_size`.
     pub fn from_gguf(f: &GgufFile) -> Result<Self, String> {
         let arch = f.architecture().unwrap_or_default();
         if arch != "clip" {
@@ -94,15 +104,16 @@ impl VisionConfig {
         }
 
         let u = |k: &str| -> Result<usize, String> {
-            f.get(k)
+            let v = f
+                .get(k)
                 .and_then(crate::gguf::GgufValue::as_u64)
-                .map(|v| v as usize)
-                .ok_or_else(|| format!("mmproj is missing {k}"))
+                .ok_or_else(|| format!("mmproj is missing {k}"))?;
+            usize::try_from(v).map_err(|_| format!("mmproj {k} = {v} does not fit usize"))
         };
         let rgb = |k: &str| -> [f32; 3] {
             f.get(k)
                 .and_then(crate::gguf::GgufValue::as_array)
-                .map(|a| {
+                .map_or([0.5; 3], |a| {
                     let mut out = [0.5f32; 3];
                     for (slot, v) in out.iter_mut().zip(a) {
                         if let Some(x) = v.as_f32() {
@@ -111,7 +122,6 @@ impl VisionConfig {
                     }
                     out
                 })
-                .unwrap_or([0.5; 3])
         };
 
         let cfg = Self {
@@ -122,10 +132,11 @@ impl VisionConfig {
             blocks: u("clip.vision.block_count")?,
             heads: u("clip.vision.attention.head_count")?,
             merge: u("clip.vision.spatial_merge_size").unwrap_or(2),
-            eps: f
-                .get("clip.vision.attention.layer_norm_epsilon")
-                .and_then(crate::gguf::GgufValue::as_f32)
-                .unwrap_or(1e-6) as f64,
+            eps: f64::from(
+                f.get("clip.vision.attention.layer_norm_epsilon")
+                    .and_then(crate::gguf::GgufValue::as_f32)
+                    .unwrap_or(1e-6),
+            ),
             mean: rgb("clip.vision.image_mean"),
             std: rgb("clip.vision.image_std"),
             out_dim: u("clip.vision.projection_dim")?,
@@ -228,7 +239,7 @@ fn linear(x: Tensor<2>, w: &Tensor<2>, b: &Tensor<1>) -> Tensor<2> {
 fn layer_norm(x: Tensor<2>, w: &Tensor<1>, b: &Tensor<1>, eps: f64) -> Tensor<2> {
     let d = x.dims()[1];
     let mean = x.clone().mean_dim(1);
-    let centered = x - mean.clone();
+    let centered = x - mean;
     let var = centered.clone().powf_scalar(2.0).mean_dim(1);
     let normed = centered / var.add_scalar(eps).sqrt();
     normed * wide(w).reshape([1, d]) + wide(b).reshape([1, d])
@@ -239,8 +250,19 @@ fn gelu(x: Tensor<2>) -> Tensor<2> {
     burn::tensor::activation::gelu(x)
 }
 
+/// `from * (1 - w) + to * w`, as two products and a sum.
+///
+/// Two roundings on purpose: this is the arithmetic the reference bilinear
+/// resampler performs, and the position grid it produces was measured
+/// against that — a fused form would move the table by an ulp per cell.
+const fn lerp(from: f32, to: f32, w: f32) -> f32 {
+    let keep = from * (1.0 - w);
+    let take = to * w;
+    keep + take
+}
+
 /// Base for the vision tower's rotary frequencies. Not stored in the
-/// checkpoint (RoPE has no weights), so it is the architecture's constant.
+/// checkpoint (`RoPE` has no weights), so it is the architecture's constant.
 const VISION_ROPE_THETA: f32 = 10_000.0;
 
 /// 2-D rotary tables for a `gh x gw` patch grid: `[n, head_dim]` cos and
@@ -266,10 +288,12 @@ fn rope_2d(gh: usize, gw: usize, head_dim: usize, device: &Device) -> (Tensor<2>
         for x in 0..gw {
             let row = (y * gw + x) * head_dim;
             for i in 0..pairs {
-                #[allow(clippy::cast_precision_loss)]
-                let inv = 1.0 / VISION_ROPE_THETA.powf(2.0 * i as f32 / half as f32);
-                #[allow(clippy::cast_precision_loss)]
-                let angles = [(0usize, y as f32 * inv), (pairs, x as f32 * inv)];
+                let inv =
+                    1.0 / VISION_ROPE_THETA.powf(2.0 * f32_from_usize(i) / f32_from_usize(half));
+                let angles = [
+                    (0usize, f32_from_usize(y) * inv),
+                    (pairs, f32_from_usize(x) * inv),
+                ];
                 // Layout is [h, w, h, w]: the reference builds
                 // `freqs = cat(h_freqs, w_freqs)` — `pairs` of each — and
                 // then `emb = cat(freqs, freqs)`, so the second copy sits a
@@ -300,23 +324,23 @@ fn rope_2d(gh: usize, gw: usize, head_dim: usize, device: &Device) -> (Tensor<2>
 /// The `(a, b) -> (-b, a)` companion of [`rope_2d`]'s layout, applied within
 /// each half independently so the row and column rotations never mix.
 fn rotate_half(x: Tensor<3>) -> Tensor<3> {
-    let [h, n, d] = x.dims();
-    let half = d / 2;
+    let [heads, tokens, dim] = x.dims();
+    let half = dim / 2;
     // The plain GPT-NeoX rotation: the second half negated in front of the
     // first. Pairing `i` with `i + half` is what the [h, w, h, w] table
     // layout requires — each dimension meets its own duplicate, so the row
     // and column rotations stay on the dimensions the weights expect.
-    let a = x.clone().slice([0..h, 0..n, 0..half]);
-    let b = x.slice([0..h, 0..n, half..d]);
-    Tensor::cat(vec![-b, a], 2)
+    let first = x.clone().slice([0..heads, 0..tokens, 0..half]);
+    let second = x.slice([0..heads, 0..tokens, half..dim]);
+    Tensor::cat(vec![-second, first], 2)
 }
 
 /// Apply the rotation to `[heads, n, head_dim]`.
 fn apply_rope(x: Tensor<3>, cos: &Tensor<2>, sin: &Tensor<2>) -> Tensor<3> {
-    let [heads, n, d] = x.dims();
-    let c = cos.clone().reshape([1, n, d]).repeat_dim(0, heads);
-    let s = sin.clone().reshape([1, n, d]).repeat_dim(0, heads);
-    x.clone() * c + rotate_half(x) * s
+    let [heads, tokens, dim] = x.dims();
+    let cos_b = cos.clone().reshape([1, tokens, dim]).repeat_dim(0, heads);
+    let sin_b = sin.clone().reshape([1, tokens, dim]).repeat_dim(0, heads);
+    x.clone() * cos_b + rotate_half(x) * sin_b
 }
 
 /// One stage's activation, read back to the host by
@@ -343,7 +367,7 @@ impl Stage {
     /// Mean, standard deviation, L2 norm and largest magnitude.
     #[must_use]
     pub fn summary(&self) -> (f64, f64, f64, f32) {
-        let n = self.values.len().max(1) as f64;
+        let n = f64_from_usize(self.values.len().max(1));
         let mean = self.values.iter().map(|&v| f64::from(v)).sum::<f64>() / n;
         let var = self
             .values
@@ -372,9 +396,15 @@ impl Stage {
         let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
         for (&a, &b) in self.values.iter().zip(&other.values) {
             let (a, b) = (f64::from(a), f64::from(b));
-            dot += a * b;
-            na += a * a;
-            nb += b * b;
+            // Two roundings on purpose: the products are formed and then
+            // accumulated, so the figure stays comparable across runs that
+            // were logged before any fused form existed.
+            let ab = a * b;
+            dot += ab;
+            let aa = a * a;
+            na += aa;
+            let bb = b * b;
+            nb += bb;
         }
         Some(dot / (na.sqrt() * nb.sqrt()).max(1e-12))
     }
@@ -422,8 +452,18 @@ impl VisionTower {
     /// image is fed as both frames — that is what the reference
     /// implementations do — so the convolution reduces to `(W₀ + W₁) · patch`
     /// and the two kernels are summed once here rather than per image.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the file cannot be opened or parsed as GGUF,
+    /// when its geometry is refused (see [`VisionConfig::from_gguf`]), or
+    /// when any tower weight, bias, norm or projector tensor is missing,
+    /// unreadable, or holds a different number of values than the geometry
+    /// says it should. The second temporal patch kernel is the one tensor
+    /// allowed to be absent.
     pub fn load(path: &std::path::Path, device: &Device) -> Result<Self, String> {
-        let f = GgufFile::open(path).map_err(|e| format!("open mmproj {path:?}: {e:?}"))?;
+        let f =
+            GgufFile::open(path).map_err(|e| format!("open mmproj {}: {e:?}", path.display()))?;
         let cfg = VisionConfig::from_gguf(&f)?;
         let (h, p) = (cfg.hidden, cfg.patch);
         let patch_in = 3 * p * p;
@@ -480,11 +520,11 @@ impl VisionTower {
     /// The table is trained at one resolution (48x48 here) and images arrive
     /// at whatever the client sent, so every grid but the reference one needs
     /// this. Done on the host in f32: it is a few hundred KiB and once per
-    /// image, against a ViT that is about to run 27 blocks.
+    /// image, against a `ViT` that is about to run 27 blocks.
     fn positions_for(&self, gh: usize, gw: usize, device: &Device) -> Tensor<2> {
-        let g = self.cfg.pos_grid();
-        let h = self.cfg.hidden;
-        if gh == g && gw == g {
+        let grid = self.cfg.pos_grid();
+        let hidden = self.cfg.hidden;
+        if gh == grid && gw == grid {
             // The stored table is f16; the activations it is added to are not.
             return wide(&self.pos);
         }
@@ -495,7 +535,7 @@ impl VisionTower {
             .convert::<f32>()
             .try_into_vec::<f32>()
             .expect("position table readback");
-        let mut out = vec![0f32; gh * gw * h];
+        let mut out = vec![0f32; gh * gw * hidden];
         // `align_corners = False`, which is what `F.interpolate` does by
         // default and therefore what the reference resampler does: an output
         // cell maps to the CENTRE of its source footprint, `(i + 0.5) *
@@ -506,34 +546,37 @@ impl VisionTower {
         // 48x48 and drifts as the scale factor moves away — measured
         // 2026-09-20, the same photo read correctly at 40x50 patches and
         // came back as "three crepes" at 24x32 and "12 tacos" at 50x40.
-        #[allow(clippy::cast_precision_loss)]
         let scale = |i: usize, n: usize| -> f32 {
-            let src = (i as f32 + 0.5) * (g as f32 / n as f32) - 0.5;
-            src.clamp(0.0, (g - 1) as f32)
+            // Two roundings on purpose (scale, then shift): the reference
+            // resampler's arithmetic, kept unfused so the grid it picks is
+            // the grid that was measured working.
+            let centred = (f32_from_usize(i) + 0.5) * (f32_from_usize(grid) / f32_from_usize(n));
+            let src = centred - 0.5;
+            src.clamp(0.0, f32_from_usize(grid - 1))
         };
         for y in 0..gh {
             let fy = scale(y, gh);
-            let (y0, wy) = (fy.floor() as usize, fy - fy.floor());
-            let y1 = (y0 + 1).min(g - 1);
+            let (y0, wy) = (trunc_usize(fy.floor()), fy - fy.floor());
+            let y1 = (y0 + 1).min(grid - 1);
             for x in 0..gw {
                 let fx = scale(x, gw);
-                let (x0, wx) = (fx.floor() as usize, fx - fx.floor());
-                let x1 = (x0 + 1).min(g - 1);
-                let (a, b, c, d) = (
-                    (y0 * g + x0) * h,
-                    (y0 * g + x1) * h,
-                    (y1 * g + x0) * h,
-                    (y1 * g + x1) * h,
+                let (x0, wx) = (trunc_usize(fx.floor()), fx - fx.floor());
+                let x1 = (x0 + 1).min(grid - 1);
+                let (tl, tr, bl, br) = (
+                    (y0 * grid + x0) * hidden,
+                    (y0 * grid + x1) * hidden,
+                    (y1 * grid + x0) * hidden,
+                    (y1 * grid + x1) * hidden,
                 );
-                let dst = (y * gw + x) * h;
-                for k in 0..h {
-                    let top = table[a + k] * (1.0 - wx) + table[b + k] * wx;
-                    let bot = table[c + k] * (1.0 - wx) + table[d + k] * wx;
-                    out[dst + k] = top * (1.0 - wy) + bot * wy;
+                let dst = (y * gw + x) * hidden;
+                for k in 0..hidden {
+                    let top = lerp(table[tl + k], table[tr + k], wx);
+                    let bot = lerp(table[bl + k], table[br + k], wx);
+                    out[dst + k] = lerp(top, bot, wy);
                 }
             }
         }
-        Tensor::<2>::from_data(TensorData::new(out, [gh * gw, h]), device)
+        Tensor::<2>::from_data(TensorData::new(out, [gh * gw, hidden]), device)
     }
 
     /// Run the tower over one preprocessed image.
@@ -543,6 +586,12 @@ impl VisionTower {
     /// `(c, y, x)` — to match how the convolution kernel is stored.
     /// Returns `[gh/merge * gw/merge, out_dim]`: the tokens to splice into
     /// the language model's embedding sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when `gh` or `gw` is not a multiple of the
+    /// checkpoint's spatial merge size, since a partial merge block has no
+    /// meaning.
     pub fn forward(
         &self,
         patches: Tensor<2>,
@@ -563,6 +612,11 @@ impl VisionTower {
     ///
     /// Every stage is read back to the host, a full device sync each — so
     /// this is a diagnostic path, never the serving one.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::forward`]: the patch grid is not a multiple of
+    /// the spatial merge size.
     pub fn forward_staged(
         &self,
         patches: Tensor<2>,
@@ -588,14 +642,14 @@ impl VisionTower {
                 s.push(Stage::capture(name, t));
             }
         };
-        let m = self.cfg.merge;
-        if !gh.is_multiple_of(m) || !gw.is_multiple_of(m) {
+        let merge = self.cfg.merge;
+        if !gh.is_multiple_of(merge) || !gw.is_multiple_of(merge) {
             return Err(format!(
-                "patch grid {gh}x{gw} is not a multiple of the {m}x{m} spatial merge"
+                "patch grid {gh}x{gw} is not a multiple of the {merge}x{merge} spatial merge"
             ));
         }
         let (n, heads, hd) = (gh * gw, self.cfg.heads, self.cfg.head_dim());
-        let h = self.cfg.hidden;
+        let width = self.cfg.hidden;
 
         let embedded = linear(patches, &self.patch_w, &self.patch_b);
         record("patch_embed".into(), &embedded);
@@ -603,34 +657,34 @@ impl VisionTower {
         record("pos_add".into(), &x);
         let (cos, sin) = rope_2d(gh, gw, hd, device);
 
-        for (bi, b) in self.blocks.iter().enumerate() {
+        for (bi, block) in self.blocks.iter().enumerate() {
             // Attention: bidirectional, no mask. Position reaches it twice —
             // the absolute table added above, and the 2-D rotation applied to
             // queries and keys below. (Until 2026-09-20 this comment said "no
             // RoPE", which was true only of the first version, and was wrong
             // for as long as it survived the RoPE going in.)
-            let normed = layer_norm(x.clone(), &b.ln1_w, &b.ln1_b, self.cfg.eps);
-            let qkv = linear(normed, &b.qkv_w, &b.qkv_b);
+            let normed = layer_norm(x.clone(), &block.ln1_w, &block.ln1_b, self.cfg.eps);
+            let qkv = linear(normed, &block.qkv_w, &block.qkv_b);
             // `[n, 3h]` is laid out q|k|v along the feature axis, so the
             // three projections are contiguous slices — not an interleave.
             let head = |lo: usize| {
                 qkv.clone()
-                    .slice([0..n, lo * h..(lo + 1) * h])
+                    .slice([0..n, lo * width..(lo + 1) * width])
                     .reshape([n, heads, hd])
                     .swap_dims(0, 1)
             };
-            let (q, k, v) = (head(0), head(1), head(2));
+            let (query, key, value) = (head(0), head(1), head(2));
             // Queries and keys carry the 2-D rotation; values do not.
-            let q = apply_rope(q, &cos, &sin);
-            let k = apply_rope(k, &cos, &sin);
-            let scores = q.matmul(k.swap_dims(1, 2)) / (hd as f32).sqrt();
+            let query = apply_rope(query, &cos, &sin);
+            let key = apply_rope(key, &cos, &sin);
+            let scores = query.matmul(key.swap_dims(1, 2)) / f32_from_usize(hd).sqrt();
             let probs = burn::tensor::activation::softmax(scores, 2);
-            let attn = probs.matmul(v).swap_dims(0, 1).reshape([n, h]);
-            x = x + linear(attn, &b.out_w, &b.out_b);
+            let attn = probs.matmul(value).swap_dims(0, 1).reshape([n, width]);
+            x = x + linear(attn, &block.out_w, &block.out_b);
 
-            let normed = layer_norm(x.clone(), &b.ln2_w, &b.ln2_b, self.cfg.eps);
-            let up = gelu(linear(normed, &b.up_w, &b.up_b));
-            x = x + linear(up, &b.down_w, &b.down_b);
+            let normed = layer_norm(x.clone(), &block.ln2_w, &block.ln2_b, self.cfg.eps);
+            let up = gelu(linear(normed, &block.up_w, &block.up_b));
+            x = x + linear(up, &block.down_w, &block.down_b);
             record(format!("block_{bi:02}"), &x);
         }
 
@@ -640,11 +694,11 @@ impl VisionTower {
         // Spatial merge: fold each m x m block of neighbouring patches into
         // one token by concatenating their features. Row-major patch order
         // makes this a reshape-and-permute rather than a gather.
-        let (mh, mw) = (gh / m, gw / m);
+        let (mh, mw) = (gh / merge, gw / merge);
         let merged = x
-            .reshape([mh, m, mw, m, h])
+            .reshape([mh, merge, mw, merge, width])
             .swap_dims(1, 2)
-            .reshape([mh * mw, m * m * h]);
+            .reshape([mh * mw, merge * merge * width]);
         record("merge".into(), &merged);
 
         let hidden = gelu(linear(merged, &self.mm0_w, &self.mm0_b));
@@ -656,7 +710,7 @@ impl VisionTower {
 
     /// How many language-model tokens an image of this patch grid becomes.
     #[must_use]
-    pub fn token_count(&self, gh: usize, gw: usize) -> usize {
+    pub const fn token_count(&self, gh: usize, gw: usize) -> usize {
         (gh / self.cfg.merge) * (gw / self.cfg.merge)
     }
 }
@@ -719,16 +773,14 @@ impl VisionConfig {
         // grid — upsampling invents no detail, but it keeps the position
         // signal in the regime the table was fitted for.
         if mh * mw < MIN_IMAGE_TOKENS {
-            #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-            let scale = (MIN_IMAGE_TOKENS as f64 / (mh * mw) as f64).sqrt();
-            mh = ((mh as f64 * scale).round() as usize).max(1);
-            mw = ((mw as f64 * scale).round() as usize).max(1);
+            let scale = (f64_from_usize(MIN_IMAGE_TOKENS) / f64_from_usize(mh * mw)).sqrt();
+            mh = trunc_usize((f64_from_usize(mh) * scale).round()).max(1);
+            mw = trunc_usize((f64_from_usize(mw) * scale).round()).max(1);
         }
         if mh * mw > MAX_IMAGE_TOKENS {
-            #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-            let scale = (MAX_IMAGE_TOKENS as f64 / (mh * mw) as f64).sqrt();
-            mh = ((mh as f64 * scale).floor() as usize).max(1);
-            mw = ((mw as f64 * scale).floor() as usize).max(1);
+            let scale = (f64_from_usize(MAX_IMAGE_TOKENS) / f64_from_usize(mh * mw)).sqrt();
+            mh = trunc_usize((f64_from_usize(mh) * scale).floor()).max(1);
+            mw = trunc_usize((f64_from_usize(mw) * scale).floor()).max(1);
             // Flooring both can leave budget on the table; spend it on the
             // longer side, which is the one carrying the shape.
             while (mh + 1) * mw <= MAX_IMAGE_TOKENS && mh <= mw {
@@ -746,6 +798,17 @@ impl VisionConfig {
     /// The format is sniffed from the content, never from a filename or a
     /// client-supplied MIME type — those are attacker-controlled on this
     /// path, and `image` is perfectly able to tell a PNG from a JPEG itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when `bytes` is not an image the `image` crate can
+    /// decode, or when the decoded image has a zero width or height.
+    ///
+    /// # Panics
+    ///
+    /// Only on an internal invariant that cannot fail: the resampled pixel
+    /// size is converted to `u32` for the `image` crate, and the grid it
+    /// derives from is capped at [`MAX_IMAGE_TOKENS`] merged cells.
     pub fn preprocess(&self, bytes: &[u8]) -> Result<Patches, String> {
         let img = image::load_from_memory(bytes)
             .map_err(|e| format!("could not decode the image: {e}"))?;
@@ -755,13 +818,16 @@ impl VisionConfig {
         }
         let (grid_h, grid_w) = self.grid_for(w, h);
         let (px_h, px_w) = (grid_h * self.patch, grid_w * self.patch);
+        // The grid is capped at `MAX_IMAGE_TOKENS` merged cells per side, so
+        // the resampled size is a few thousand pixels at most.
+        let to_u32 = |v: usize| u32::try_from(v).expect("resized image coordinate fits u32");
 
         // Triangle filter: a plain nearest-neighbour resize aliases badly on
         // photographs, and the tower was trained on smoothly resampled input.
         let scaled = image::imageops::resize(
             &img.to_rgb8(),
-            px_w as u32,
-            px_h as u32,
+            to_u32(px_w),
+            to_u32(px_h),
             image::imageops::FilterType::Triangle,
         );
 
@@ -774,7 +840,7 @@ impl VisionConfig {
                 for c in 0..3 {
                     for y in 0..p {
                         for x in 0..p {
-                            let px = scaled.get_pixel((gx * p + x) as u32, (gy * p + y) as u32);
+                            let px = scaled.get_pixel(to_u32(gx * p + x), to_u32(gy * p + y));
                             // Normalize with the checkpoint's own statistics.
                             let v = f32::from(px.0[c]) / 255.0;
                             data[row + c * p * p + y * p + x] = (v - self.mean[c]) / self.std[c];
@@ -817,7 +883,7 @@ impl Patches {
     /// range, and a reordering moves neither.
     #[must_use]
     pub fn fingerprint(&self) -> String {
-        let n = self.data.len().max(1) as f64;
+        let n = f64_from_usize(self.data.len().max(1));
         let sum: f64 = self.data.iter().map(|&v| f64::from(v)).sum();
         let mean = sum / n;
         let var = self
@@ -877,6 +943,11 @@ pub struct VisionTokens {
 
 impl VisionTokens {
     /// Resolve the ids, or say which one is missing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming the first of [`VISION_START`],
+    /// [`VISION_END`] and [`IMAGE_PAD`] that the tokenizer has no id for.
     pub fn resolve(tok: &tokenizers::Tokenizer) -> Result<Self, String> {
         let id = |s: &str| {
             tok.token_to_id(s)
@@ -909,7 +980,7 @@ pub fn placeholder_text(count: usize) -> String {
 
 /// Merged token count for a preprocessed image.
 #[must_use]
-pub fn token_count(p: &Patches, merge: usize) -> usize {
+pub const fn token_count(p: &Patches, merge: usize) -> usize {
     (p.grid_h / merge) * (p.grid_w / merge)
 }
 
@@ -928,6 +999,12 @@ pub struct Placed {
 /// built from different assumptions, and the resulting sequence would be
 /// silently misaligned — every image row landing one position off reads as
 /// a different picture, with no error anywhere.
+///
+/// # Errors
+///
+/// Returns a message when the number of placeholder runs in `prompt_ids`
+/// differs from the number of `images`, or when a run reserves a different
+/// number of positions than the matching image has rows.
 pub fn place(prompt_ids: &[u32], pad: u32, images: Vec<Tensor<2>>) -> Result<Vec<Placed>, String> {
     let mut runs: Vec<(usize, usize)> = Vec::new();
     let mut i = 0;
@@ -970,6 +1047,7 @@ pub fn place(prompt_ids: &[u32], pad: u32, images: Vec<Tensor<2>>) -> Result<Vec
 /// Called per prefill chunk, so an image that straddles a chunk boundary is
 /// spliced in the pieces that land in each — which is why the overlap is
 /// computed rather than assumed to be whole.
+#[must_use]
 pub fn splice(x: Tensor<3>, past: usize, placed: &[Placed]) -> Tensor<3> {
     let [_, t, hidden] = x.dims();
     let mut x = x;

@@ -7,6 +7,8 @@
 //! MUMMU_LAYER_TRACE=1 cargo run --release -p mummu --example bonsai-probe -- <pack dir> [prompt]
 //! ```
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use mummu::models::CausalLm;
 use mummu::models::qwen35;
 use mummu::pack::Precision;
@@ -25,17 +27,19 @@ async fn main() {
     let header = pack.header().expect("header");
     let tok = mummu::tokenizer::tokenizer_from_gguf(&header).expect("tokenizer");
     let rendered = mummu::chat::ChatMl::qwen3().render(&[mummu::chat::Turn::user(prompt)]);
-    let ids: Vec<u32> = match std::env::var("PROBE_IDS") {
-        Ok(list) => list
-            .split(',')
-            .map(|s| s.trim().parse().expect("id"))
-            .collect(),
-        Err(_) => tok
-            .encode(rendered.as_str(), false)
-            .expect("encodes")
-            .get_ids()
-            .to_vec(),
-    };
+    let ids: Vec<u32> = std::env::var("PROBE_IDS").map_or_else(
+        |_| {
+            tok.encode(rendered.as_str(), false)
+                .expect("encodes")
+                .get_ids()
+                .to_vec()
+        },
+        |list| {
+            list.split(',')
+                .map(|s| s.trim().parse().expect("id"))
+                .collect()
+        },
+    );
     eprintln!("prompt ids ({}): {ids:?}", ids.len());
     let device = mummu::backend::cpu_device();
     let loaded = qwen35::load_from_pack(&dir, &device, &|_| match std::env::var("PROBE_LEVEL")
@@ -69,7 +73,6 @@ async fn main() {
     let e = loaded.model.embed_tokens.weight.val();
     let hidden = loaded.config.hidden_size;
     let row = e
-        .clone()
         .narrow(0, ids[0] as usize, 1)
         .into_data()
         .convert::<f32>()
@@ -101,7 +104,8 @@ async fn main() {
             "top: id={i} logit={:.4} logprob={:.4} tok={:?}",
             logits[i],
             logits[i] - lse,
-            tok.decode(&[i as u32], false).unwrap_or_default()
+            tok.decode(&[u32::try_from(i).expect("vocab index fits u32")], false)
+                .unwrap_or_default()
         );
     }
 }

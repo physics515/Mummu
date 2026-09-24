@@ -23,21 +23,24 @@
 //! ```
 //!
 //! Recorded 2026-09-16 that way from ghcr.io/ggml-org/llama.cpp:full (b10991)
-//! on the NVMe copy: ~9.5 min for the first leg, ~5 min for the second.
+//! on the `NVMe` copy: ~9.5 min for the first leg, ~5 min for the second.
 //!
-//! Point `MUMMU_QWEN4EXP_DIR` at an NVMe copy: the tokenizer read is small,
+//! Point `MUMMU_QWEN4EXP_DIR` at an `NVMe` copy: the tokenizer read is small,
 //! but the reference's random expert reads from spinning disks are ~1000x
 //! slower.
 
-mod gguf_compare;
-mod llama_ref;
-mod qwen4exp_fixture;
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
+use mummu_testkit::gguf_compare;
+use mummu_testkit::llama_ref;
+use mummu_testkit::qwen4exp_fixture;
 
 use std::path::PathBuf;
 
 use gguf_compare::{MAX_TOKENS, PROMPT, TOP_K};
 use llama_ref::{LlamaServer, parse_completion};
 use mummu::gguf::GgufFile;
+use mummu_num::narrow;
 use qwen4exp_fixture::{
     FIRST_SHARD, FIXTURE_PATH, FORMAT, Fixture, LEGS, LONG_FIXTURE_PATH, LONG_MAX_TOKENS,
     LONG_PROMPT, Leg, ModelInfo, N_PROBS, ReferenceInfo, Step, TopEntry, compare_leg,
@@ -203,7 +206,7 @@ fn record_leg(
         .as_array()
         .expect("return_tokens yields a tokens array")
         .iter()
-        .map(|t| t.as_u64().expect("token id") as u32)
+        .map(|t| u32::try_from(t.as_u64().expect("token id")).expect("token id fits u32"))
         .collect();
     assert_eq!(
         parsed.chosen, greedy_ids,
@@ -216,7 +219,8 @@ fn record_leg(
     let steps: Vec<Step> = positions
         .iter()
         .map(|pos| Step {
-            id: pos["id"].as_u64().expect("position id") as u32,
+            id: u32::try_from(pos["id"].as_u64().expect("position id"))
+                .expect("position id fits u32"),
             token: token_text(pos),
             logprob: pos["logprob"].as_f64().expect("position logprob"),
             top: pos["top_logprobs"]
@@ -224,7 +228,8 @@ fn record_leg(
                 .expect("top_logprobs")
                 .iter()
                 .map(|e| TopEntry {
-                    id: e["id"].as_u64().expect("entry id") as u32,
+                    id: u32::try_from(e["id"].as_u64().expect("entry id"))
+                        .expect("entry id fits u32"),
                     token: token_text(e),
                     logprob: e["logprob"].as_f64().expect("entry logprob"),
                 })
@@ -248,7 +253,10 @@ fn record_leg(
         prompt: prompt.to_string(),
         rendered,
         prompt_ids: ids,
-        tokens_evaluated: v["tokens_evaluated"].as_u64().expect("tokens_evaluated") as usize,
+        tokens_evaluated: usize::try_from(
+            v["tokens_evaluated"].as_u64().expect("tokens_evaluated"),
+        )
+        .expect("tokens_evaluated fits usize"),
         request,
         steps,
         greedy_ids,
@@ -361,7 +369,7 @@ fn the_reference_replayed_against_itself_passes_the_gate() {
         let vocab = tok.get_vocab_size(true);
         let mut logits = vec![-1.0e4_f32; vocab];
         for e in &leg.steps[0].top {
-            logits[e.id as usize] = e.logprob as f32;
+            logits[e.id as usize] = narrow(e.logprob);
         }
         compare_leg(leg, &logits, &leg.greedy_ids, &tok);
     }

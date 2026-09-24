@@ -1,12 +1,12 @@
 //! Attention-shaping configuration a checkpoint may declare that the shared
-//! blocks do not implement: **RoPE frequency scaling** (`rope_scaling`) and
+//! blocks do not implement: **`RoPE` frequency scaling** (`rope_scaling`) and
 //! **sliding-window attention** (`sliding_window`).
 //!
 //! [`crate::nn::rope_tables`] computes plain rotary frequencies and
 //! [`crate::nn::causal_mask`] a full causal mask. Every model currently in the
 //! zoo is fine — their configs ship `rope_scaling: null` and no *enabled*
 //! window — but this is the silent-wrong-answer class of gap: a checkpoint
-//! that carries `rope_scaling` (Qwen2.5 past its 32 k native context via YaRN)
+//! that carries `rope_scaling` (Qwen2.5 past its 32 k native context via `YaRN`)
 //! or an enabled `sliding_window` (Mistral-family; Gemma 2/3's alternating
 //! layers) would load clean, pass the short-prompt parity probes, and degrade
 //! numerically only far out in the context — exactly where nothing looks.
@@ -43,7 +43,7 @@ pub struct RopeScaling {
     /// carrying both disagreeing values is visible instead of arbitrated.
     #[serde(default, rename = "type")]
     pub legacy_type: Option<String>,
-    /// Context-extension factor (YaRN / linear / dynamic-NTK). Unused until
+    /// Context-extension factor (`YaRN` / linear / dynamic-NTK). Unused until
     /// the scaled tables land; parsed so the eventual implementation reads the
     /// same struct the rejection does.
     #[serde(default)]
@@ -53,7 +53,7 @@ pub struct RopeScaling {
     pub original_max_position_embeddings: Option<usize>,
     /// Everything else the object carries. Kept, not discarded, because the
     /// *shape* of the leftovers is load-bearing: transformers lets a
-    /// Gemma-3-style config nest one RoPE object **per layer type**
+    /// Gemma-3-style config nest one `RoPE` object **per layer type**
     /// (`{"full_attention": {…}, "sliding_attention": {…}}`), and a nested map
     /// deserializes into this struct with every named field absent — which
     /// would read as "plain rotary" and sail through [`Self::check`]. Seeing
@@ -95,6 +95,12 @@ impl RopeScaling {
     /// `"GGUF qwen2.rope.scaling.type"`) so a consumer knows which file to
     /// look at. Returns `Ok(())` for a plain/absent mode — the only case the
     /// shared blocks actually compute.
+    ///
+    /// # Errors
+    ///
+    /// A message naming `whose` when the object nests a per-layer-type
+    /// `RoPE` map, when `rope_type` and the legacy `type` name different modes, or
+    /// when the mode is anything but plain rotary (yarn, linear, dynamic, …).
     pub fn check(&self, whose: &str) -> Result<(), String> {
         debug_assert!(!whose.is_empty(), "check: `whose` must name a source");
         // A per-layer-type map (Gemma 3 and friends) names no mode of its own,
@@ -178,6 +184,13 @@ impl RopeScaling {
 /// A window at least as long as the trained context is also inert — it can
 /// never clip a position the model is allowed to reach — so it is accepted
 /// even when enabled, with `max_positions` supplying that ceiling.
+///
+/// # Errors
+///
+/// A message naming `whose` when the window is enabled and either zero or
+/// shorter than `max_positions` (or `max_positions` is unknown), since the
+/// full causal mask Mummu builds would then attend to keys the trained
+/// model masks.
 pub fn check_sliding_window(
     window: Option<usize>,
     enabled: bool,
@@ -208,10 +221,12 @@ pub fn check_sliding_window(
     ))
 }
 
-/// The sliding-window span a GGUF header declares (`<arch>.attention.
-/// sliding_window`), if any. llama.cpp writes the key only for architectures
-/// that use it, so `None` means "full attention" — the same convention the
-/// `rope.scaling.*` keys follow.
+/// The sliding-window span a GGUF header declares
+/// (`<arch>.attention.sliding_window`), if any.
+///
+/// llama.cpp writes the key only for architectures that use it, so `None`
+/// means "full attention" — the same convention the `rope.scaling.*` keys
+/// follow.
 #[must_use]
 pub fn sliding_window_from_gguf(f: &GgufFile, arch: &str) -> Option<usize> {
     debug_assert!(
@@ -311,7 +326,7 @@ mod tests {
         assert!(err.contains("sliding_attention"), "{err}");
     }
 
-    /// Scalar extras (YaRN's `beta_fast`, an `attention_factor`) are NOT
+    /// Scalar extras (`YaRN`'s `beta_fast`, an `attention_factor`) are NOT
     /// nesting, and must not be mistaken for it — the mode still decides.
     #[test]
     fn scalar_extras_do_not_trip_the_nesting_check() {

@@ -1,15 +1,15 @@
-//! **NVMe as a cache tier in front of the model's home disk.**
+//! **`NVMe` as a cache tier in front of the model's home disk.**
 //!
 //! A pack can live on bulk storage — on this host `/mnt/deepmem` is a
 //! 4-device btrfs over four SPINNING disks, shared with a household server
-//! stack — while the machine also has a fast NVMe with far less capacity
-//! than the model set. Neither "keep everything on NVMe" (a 207 GB pack and
+//! stack — while the machine also has a fast `NVMe` with far less capacity
+//! than the model set. Neither "keep everything on `NVMe`" (a 207 GB pack and
 //! a 111 GB model do not both fit, and copying is manual) nor "read
 //! everything from the array" (measured: a qwen4exp reference paging its
 //! working set off that array ran at 63 s/token) is right.
 //!
 //! So: leave the pack where it lives, and cache the ranges actually read on
-//! NVMe.
+//! `NVMe`.
 //!
 //! # Why keying on the exact range works here
 //!
@@ -22,7 +22,7 @@
 //!
 //! # Why not plain LRU
 //!
-//! MoE routing is skewed, and plain LRU throws away a hot expert after one
+//! `MoE` routing is skewed, and plain LRU throws away a hot expert after one
 //! cold burst (llama.cpp PR #25294 reports the same and evicts on decaying
 //! hotness instead). Entries here carry a hit count that **decays** as other
 //! entries are touched, and eviction takes the coldest, using
@@ -43,6 +43,8 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use mummu_num::f64_from_u64;
 
 /// Largest single range this will cache. A pack's biggest tensors are a few
 /// hundred MB; anything past this is streamed straight through rather than
@@ -108,6 +110,10 @@ impl DiskCache {
     ///
     /// # Errors
     /// If `dir` cannot be created.
+    ///
+    /// # Panics
+    /// If `capacity_bytes` is zero: a cache that can hold nothing is a
+    /// configuration bug, not something to run with.
     pub fn open(dir: &Path, capacity_bytes: u64) -> Result<Self, String> {
         assert!(
             capacity_bytes > 0,
@@ -161,7 +167,10 @@ impl DiskCache {
     #[must_use]
     pub fn get(&self, blob: &str, offset: u64, len: u64) -> Option<Vec<u8>> {
         let key = Self::key_of(blob, offset, len);
-        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !guard.entries.contains_key(&key) {
             self.misses.fetch_add(1, Ordering::Relaxed);
             return None;
@@ -176,11 +185,15 @@ impl DiskCache {
             if let Some(e) = guard.entries.remove(&key) {
                 guard.used_bytes = guard.used_bytes.saturating_sub(e.bytes);
             }
+            // Still under the lock: a concurrent `put` of the same key must
+            // not land a fresh file between the bookkeeping and this unlink.
             let _ = std::fs::remove_file(self.path_of(&key));
+            drop(guard);
             self.misses.fetch_add(1, Ordering::Relaxed);
             return None;
         }
         Self::touch(&mut guard, &key);
+        drop(guard);
         self.hits.fetch_add(1, Ordering::Relaxed);
         self.bytes_served.fetch_add(len, Ordering::Relaxed);
         debug_assert_eq!(buf.len() as u64, len, "hit returns exactly the range");
@@ -192,7 +205,7 @@ impl DiskCache {
     fn touch(state: &mut State, key: &str) {
         state.clock += 1;
         let clock = state.clock;
-        for (k, e) in state.entries.iter_mut() {
+        for (k, e) in &mut state.entries {
             if k == key {
                 e.hotness += HIT_BONUS;
                 e.last_touch = clock;
@@ -212,7 +225,10 @@ impl DiskCache {
             return; // cannot ever fit; do not evict everything trying
         }
         let key = Self::key_of(blob, offset, len);
-        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if guard.entries.contains_key(&key) {
             return;
         }
@@ -239,17 +255,18 @@ impl DiskCache {
             },
         );
         guard.used_bytes += len;
-        self.bytes_written.fetch_add(len, Ordering::Relaxed);
         debug_assert!(
             guard.used_bytes <= self.capacity_bytes,
             "eviction ran before insert"
         );
+        drop(guard);
+        self.bytes_written.fetch_add(len, Ordering::Relaxed);
     }
 
     /// Evict coldest-first until `need` more bytes fit.
     ///
     /// Coldest = lowest hotness, least-recently-touched breaking ties. Plain
-    /// LRU is deliberately NOT used: MoE routing is skewed, and LRU discards
+    /// LRU is deliberately NOT used: `MoE` routing is skewed, and LRU discards
     /// a persistently hot expert after one cold burst.
     fn evict_until_fits(&self, state: &mut State, need: u64) {
         assert!(
@@ -296,7 +313,7 @@ impl DiskCache {
     pub fn hit_rate(&self) -> Option<f64> {
         let (h, m, _, _) = self.stats();
         let total = h + m;
-        (total > 0).then(|| h as f64 / total as f64)
+        (total > 0).then(|| f64_from_u64(h) / f64_from_u64(total))
     }
 
     /// Bytes currently held.
@@ -304,7 +321,7 @@ impl DiskCache {
     pub fn used_bytes(&self) -> u64 {
         self.state
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .used_bytes
     }
 }
@@ -374,7 +391,7 @@ mod tests {
     fn the_cache_never_exceeds_its_capacity() {
         let (c, dir) = tmp_cache(4 * 1024);
         for i in 0..20u64 {
-            c.put("q4", i * 1024, 1024, &[i as u8; 1024]);
+            c.put("q4", i * 1024, 1024, &[(i & 0xFF) as u8; 1024]);
             assert!(
                 c.used_bytes() <= 4 * 1024,
                 "used {} past the 4096 ceiling",

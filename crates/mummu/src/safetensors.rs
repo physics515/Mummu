@@ -8,7 +8,7 @@
 //!    `model-0000N-of-0000M.safetensors` + a `model.safetensors.index.json`
 //!    weight map. `import::weights_file` only ever finds a single
 //!    `model.safetensors`.
-//! 2. **N:1 tensor fusion.** `burn-store`'s remapping is 1:1 (rename); an MoE
+//! 2. **N:1 tensor fusion.** `burn-store`'s remapping is 1:1 (rename); an `MoE`
 //!    checkpoint stores every expert separately
 //!    (`mlp.experts.{0..63}.gate_proj.weight`) while the module holds ONE
 //!    fused `[experts, out, in]` param — exactly the ggml `ffn_*_exps` layout
@@ -29,6 +29,7 @@
 //! where it already lives, in `FloatCastAdapter` on the load pipeline.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -37,7 +38,7 @@ use std::path::{Path, PathBuf};
 /// few hundred KB (one entry per tensor); 64 MiB is a corrupt or hostile file.
 const MAX_HEADER_BYTES: u64 = 64 << 20;
 
-/// Largest tensor count accepted across a whole checkpoint. A 64-expert MoE
+/// Largest tensor count accepted across a whole checkpoint. A 64-expert `MoE`
 /// at 16 layers already declares ~3 000; 1M is a runaway index.
 const MAX_TENSORS: usize = 1 << 20;
 
@@ -105,7 +106,7 @@ pub enum SafetensorsError {
 /// instead of an `.expect()`, so a 32-bit build degrades to a clean error.
 fn to_usize(value: u64, path: &Path, what: &'static str) -> Result<usize, SafetensorsError> {
     debug_assert!(
-        value <= usize::MAX as u64,
+        usize::try_from(value).is_ok(),
         "{what} fits usize on this target"
     );
     usize::try_from(value).map_err(|_| SafetensorsError::OverBound {
@@ -158,6 +159,24 @@ pub struct SafetensorsHeader {
 
 impl SafetensorsHeader {
     /// Read and validate one shard's header. No payload bytes are read.
+    ///
+    /// # Errors
+    ///
+    /// [`SafetensorsError::Io`] when the file cannot be opened, stat'ed, or
+    /// read through the end of its header; [`SafetensorsError::OverBound`]
+    /// when the header length exceeds 64 MiB or runs past the file, or when
+    /// the table declares more than 1M tensors;
+    /// [`SafetensorsError::BadHeader`] when the header is not a JSON object;
+    /// [`SafetensorsError::BadTensor`] for an entry that is not an object,
+    /// lacks `dtype`/`shape`/`data_offsets`, names an unsupported dtype, has
+    /// a non-integer dim or offset, offsets that are reversed or outside the
+    /// payload, or a shape whose byte size overflows or disagrees with the
+    /// offsets.
+    ///
+    /// # Panics
+    ///
+    /// Only on an internal invariant: the header was bounded against the
+    /// file length just above, so the payload starts inside the file.
     pub fn open(path: &Path) -> Result<Self, SafetensorsError> {
         let io = |source: std::io::Error| SafetensorsError::Io {
             path: path.display().to_string(),
@@ -341,6 +360,20 @@ pub enum Fuse {
 ///
 /// A single `model.safetensors` is the one-shard case; otherwise
 /// `model.safetensors.index.json`'s weight map names the shards.
+///
+/// # Errors
+///
+/// [`SafetensorsError::NoCheckpoint`] when `dir` holds neither file;
+/// [`SafetensorsError::Io`] when the index cannot be read;
+/// [`SafetensorsError::BadHeader`] when the index is not JSON, has no
+/// `weight_map`, or names no shards or more than 256;
+/// [`SafetensorsError::MissingShard`] when a shard the index names is not
+/// on disk (a `.part` sibling is called out as an interrupted download).
+///
+/// # Panics
+///
+/// Only on an internal invariant: `hub::shards_from_index` already bounds
+/// the shard count to `1..=256`.
 pub fn checkpoint_shards(dir: &Path) -> Result<Vec<PathBuf>, SafetensorsError> {
     let single = dir.join("model.safetensors");
     if single.is_file() {
@@ -402,6 +435,18 @@ pub fn checkpoint_shards(dir: &Path) -> Result<Vec<PathBuf>, SafetensorsError> {
 /// become one `[count, out, in]`. Every group must be exactly complete;
 /// a missing or duplicate member is a loud [`SafetensorsError::BadGroup`],
 /// raised during planning, before any payload byte is read.
+///
+/// # Errors
+///
+/// Everything [`checkpoint_shards`] and [`SafetensorsHeader::open`] report
+/// for the shards; [`SafetensorsError::BadTensor`] when `map` leaves a
+/// tensor unmapped or a target name is not encodable as JSON;
+/// [`SafetensorsError::BadGroup`] for a member index outside `0..count`,
+/// members that disagree on the count, dtype or shape, a duplicate member,
+/// or a group that is not exactly complete; [`SafetensorsError::OverBound`]
+/// when the fused payload exceeds 48 GiB or a single member exceeds 4 GiB;
+/// [`SafetensorsError::Io`] when a member's payload cannot be seeked to or
+/// read in full.
 pub fn fuse_checkpoint(
     dir: &Path,
     map: &dyn Fn(&str) -> Option<Fuse>,
@@ -419,6 +464,11 @@ pub fn fuse_checkpoint(
 /// box with other tenants actually fails to satisfy. Writing to disk trades
 /// the spike for temp space and lets `SafetensorsStore::from_file` page the
 /// weights in as it needs them.
+///
+/// # Errors
+///
+/// Everything [`fuse_checkpoint`] reports, plus [`SafetensorsError::Io`]
+/// when `out` cannot be created, written, flushed, or synced.
 pub fn fuse_checkpoint_to_file(
     dir: &Path,
     map: &dyn Fn(&str) -> Option<Fuse>,
@@ -483,13 +533,15 @@ fn fuse_into<W: std::io::Write>(
                 name: p.name.clone(),
                 reason: format!("name is not encodable as JSON: {e}"),
             })?;
-        header.push_str(&format!(
+        write!(
+            header,
             "{json_name}:{{\"dtype\":\"{}\",\"shape\":{:?},\"data_offsets\":[{},{}]}}",
             p.dtype,
             p.shape,
             p.start,
             p.start + p.len,
-        ));
+        )
+        .expect("formatting into a String cannot fail");
     }
     header.push('}');
 
@@ -737,6 +789,7 @@ struct PlannedNamed {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mummu_num::f32_from_usize;
 
     /// Build a synthetic safetensors file: `(name, dtype, shape, bytes)`.
     fn write_st(path: &Path, tensors: &[(&str, &str, Vec<u64>, Vec<u8>)]) {
@@ -748,11 +801,13 @@ mod tests {
             }
             let start = data.len();
             data.extend_from_slice(bytes);
-            header.push_str(&format!(
+            write!(
+                header,
                 "{:?}:{{\"dtype\":\"{dtype}\",\"shape\":{shape:?},\"data_offsets\":[{start},{}]}}",
                 name,
                 data.len()
-            ));
+            )
+            .expect("formatting into a String cannot fail");
         }
         header.push('}');
         let mut blob = (header.len() as u64).to_le_bytes().to_vec();
@@ -776,7 +831,8 @@ mod tests {
 
     /// Read a tensor back out of a fused blob by name.
     fn read_back(blob: &[u8], name: &str) -> (String, Vec<u64>, Vec<f32>) {
-        let header_len = u64::from_le_bytes(blob[..8].try_into().unwrap()) as usize;
+        let header_len =
+            usize::try_from(u64::from_le_bytes(blob[..8].try_into().unwrap())).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&blob[8..8 + header_len]).unwrap();
         let entry = &json[name];
         let dtype = entry["dtype"].as_str().unwrap().to_string();
@@ -786,8 +842,8 @@ mod tests {
             .iter()
             .map(|d| d.as_u64().unwrap())
             .collect();
-        let start = entry["data_offsets"][0].as_u64().unwrap() as usize;
-        let end = entry["data_offsets"][1].as_u64().unwrap() as usize;
+        let start = usize::try_from(entry["data_offsets"][0].as_u64().unwrap()).unwrap();
+        let end = usize::try_from(entry["data_offsets"][1].as_u64().unwrap()).unwrap();
         let base = 8 + header_len;
         let (words, rest) = blob[base + start..base + end].as_chunks::<4>();
         assert!(rest.is_empty(), "f32 payload is a whole number of words");
@@ -865,7 +921,7 @@ mod tests {
                     "F32",
                     vec![1],
                     // Expert i holds exactly the value i.
-                    f32s(&[i as f32]),
+                    f32s(&[f32_from_usize(i)]),
                 )
             })
             .collect();
@@ -895,7 +951,7 @@ mod tests {
         // Slot i must hold expert i — the whole point.
         assert_eq!(
             values,
-            (0..count).map(|i| i as f32).collect::<Vec<_>>(),
+            (0..count).map(f32_from_usize).collect::<Vec<_>>(),
             "experts must stack in numeric order (lexicographic would give 0,1,10,11,2,…)"
         );
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1012,7 +1068,8 @@ mod tests {
         .unwrap();
         let (_, shape, values) = read_back(&blob, "keep");
         assert_eq!((shape, values), (vec![1], vec![1.0]));
-        let header_len = u64::from_le_bytes(blob[..8].try_into().unwrap()) as usize;
+        let header_len =
+            usize::try_from(u64::from_le_bytes(blob[..8].try_into().unwrap())).unwrap();
         let header = std::str::from_utf8(&blob[8..8 + header_len]).unwrap();
         assert!(!header.contains("junk"), "dropped tensor is absent");
         std::fs::remove_dir_all(&dir).unwrap();

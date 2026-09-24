@@ -234,16 +234,20 @@ use crate::logs;
 
 /// The exit code of a restart this module asked for: `EX_TEMPFAIL` from
 /// `sysexits.h`, "a temporary failure; the user is invited to retry" — which
-/// is exactly the promise. Docker's `restart: unless-stopped` restarts on any
+/// is exactly the promise.
+///
+/// Docker's `restart: unless-stopped` restarts on any
 /// exit; the code is there so `docker inspect` says which kind this was.
 pub const EXIT_RESTART: i32 = 75;
 
-/// No second self-restart inside this window. Thirty minutes is long enough
+/// No second self-restart inside this window.
+///
+/// Thirty minutes is long enough
 /// that a card which stays full (a co-tenant that holds its memory until it
 /// has been idle for five minutes, and is not idle) costs one restart rather
 /// than a stream of them, and short enough that a sticky fault on a card that
 /// was fine for an afternoon still gets its clean process.
-pub const RESTART_COOLDOWN: Duration = Duration::from_secs(30 * 60);
+pub const RESTART_COOLDOWN: Duration = Duration::from_mins(30);
 
 /// How long an exiting process waits for open chat responses to deliver the
 /// error frames they owe. Every request queued behind the failure is refused
@@ -264,7 +268,9 @@ const EVIDENCE_COPY_WAIT: Duration = Duration::from_secs(2);
 
 /// From the moment an exit starts to the moment the process is gone, however
 /// the exit got stuck: the watchdog armed at its start terminates the process
-/// at this deadline. It covers the drain, the grace, the evidence and the
+/// at this deadline.
+///
+/// It covers the drain, the grace, the evidence and the
 /// exit itself (`atexit` handlers and driver teardown run with cubecl's
 /// device threads still alive, and either can block) with room to spare —
 /// 10 s + 0.3 s + 2 s of budgets against 20 s.
@@ -275,8 +281,9 @@ pub const EXIT_DEADLINE: Duration = Duration::from_secs(20);
 /// failed with it.
 pub const EVIDENCE_LINES: usize = 300;
 
-/// The most bytes the writer puts in an evidence file, header included. Well
-/// under [`EVIDENCE_MAX_BYTES`], so a file this server wrote is always one the
+/// The most bytes the writer puts in an evidence file, header included.
+///
+/// Well under [`EVIDENCE_MAX_BYTES`], so a file this server wrote is always one the
 /// next process replays — [`EVIDENCE_LINES`] alone does not bound it: a line
 /// is up to [`logs::MAX_LINE_BYTES`] and JSON escaping can grow a control
 /// character to six bytes, so 300 lines can reach several megabytes. The
@@ -284,13 +291,16 @@ pub const EVIDENCE_LINES: usize = 300;
 pub const EVIDENCE_WRITE_BUDGET: usize = 512 << 10;
 
 /// A previous-process file larger than this is not one we wrote in full
-/// (see [`EVIDENCE_WRITE_BUDGET`]). Its lines are set aside unread, but its
+/// (see [`EVIDENCE_WRITE_BUDGET`]).
+///
+/// Its lines are set aside unread, but its
 /// header — the first line, which carries the restart history — is still
 /// read, so the cooldown survives whatever happened to the rest.
 pub const EVIDENCE_MAX_BYTES: u64 = 1 << 20;
 
 /// The evidence directory under the models root (`/models`, bind-mounted,
 /// already home to cubecl's autotune cache at `/models/.cubecl-cache`).
+///
 /// Hidden, so nothing that lists models sees it. The SECOND copy — see
 /// [`local_dir`] for the first.
 pub const EVIDENCE_DIR: &str = ".mummu-serve";
@@ -299,7 +309,9 @@ pub const EVIDENCE_DIR: &str = ".mummu-serve";
 pub const EVIDENCE_FILE: &str = "previous-process.jsonl";
 
 /// cubecl's device-failure signatures: text that only a failing device puts
-/// in a panic message or an error. Each is quoted from the source it comes
+/// in a panic message or an error.
+///
+/// Each is quoted from the source it comes
 /// from. A panic is a device failure exactly when its text carries one of
 /// these — see the module header for why the thread it ran on is not enough.
 pub const DEVICE_SIGNATURES: &[&str] = &[
@@ -390,9 +402,11 @@ pub fn is_device_failure(message: &str) -> bool {
     DEVICE_SIGNATURES.iter().any(|s| message.contains(s))
 }
 
-/// One readable line out of a panic message: the escapes the `Debug`-formatted
-/// payloads carry (`Read("…\nCaused by:\n …")`) folded, whitespace collapsed,
-/// and the whole clipped — it is headed for a chat bubble and a status line.
+/// One readable line out of a panic message.
+///
+/// The escapes the `Debug`-formatted payloads carry (`Read("…\nCaused
+/// by:\n …")`) are folded, whitespace collapsed, and the whole clipped — it
+/// is headed for a chat bubble and a status line.
 #[must_use]
 pub fn summarize(message: &str) -> String {
     const MAX: usize = 240;
@@ -435,7 +449,9 @@ pub fn payload_text(payload: &(dyn std::any::Any + Send)) -> String {
 // State
 // ---------------------------------------------------------------------------
 
-/// What recovery is doing about a failure. Travels to the client in the error
+/// What recovery is doing about a failure.
+///
+/// Travels to the client in the error
 /// frame and to the pages in the status object, which render it as it is —
 /// a page that promised "the next request loads the model again" while the
 /// process was exiting would be the lie this module exists to end.
@@ -546,7 +562,9 @@ struct Supervisor {
 }
 
 /// Where the evidence goes FIRST: a private directory in the process's temp
-/// dir. In the container that is its own writable layer (`/tmp`, not a
+/// dir.
+///
+/// In the container that is its own writable layer (`/tmp`, not a
 /// tmpfs mount, and the image runs no `USER`, so it is root's), which a
 /// `restart: unless-stopped` restart keeps — Docker restarts the SAME
 /// container — and a recreate (a deploy) discards, which is exactly when the
@@ -595,18 +613,17 @@ struct State {
 
 impl State {
     fn book(&mut self, key: DeviceKey) -> &mut Book {
-        let at = match self.books.iter().position(|b| b.key == key) {
-            Some(at) => at,
-            None => {
-                self.books.push(Book {
-                    key,
-                    epoch: 0,
-                    consecutive: 0,
-                    error: None,
-                    last_cause: None,
-                });
-                self.books.len() - 1
-            }
+        let at = if let Some(at) = self.books.iter().position(|b| b.key == key) {
+            at
+        } else {
+            self.books.push(Book {
+                key,
+                epoch: 0,
+                consecutive: 0,
+                error: None,
+                last_cause: None,
+            });
+            self.books.len() - 1
         };
         &mut self.books[at]
     }
@@ -628,6 +645,114 @@ impl State {
             .collect::<Vec<_>>()
             .join(" + ")
     }
+
+    /// cubecl's text on a thread that is not a device's — the request's
+    /// read, say. Whoever catches it knows the device and records it there
+    /// (the engine, under the slot lock); the epoch moves now, so nothing
+    /// loaded before it is served in between.
+    fn note_unattributed_panic(&mut self, cause: String) {
+        EPOCH.fetch_add(1, SeqCst);
+        self.last_cause = Some(cause);
+    }
+
+    /// A device thread's own panic: its book moves, and its failure record
+    /// opens if none is open. `true` when this panic opened it.
+    fn note_device_panic(&mut self, name: &str, device: DeviceKey, cause: &str) -> bool {
+        EPOCH.fetch_add(1, SeqCst);
+        self.last_cause = Some(cause.to_owned());
+        let label = self.label(device);
+        let book = self.book(device);
+        book.epoch += 1;
+        book.last_cause = Some(cause.to_owned());
+        if let Some(e) = book.error.as_mut() {
+            e.faults += 1;
+            false
+        } else {
+            book.error = Some(BackendError {
+                message: format!(
+                    "{label} failed on its device thread {name}: {cause} — a model loaded \
+                     before this is not used again; the next request loads it fresh"
+                ),
+                at_ms: now_ms(),
+                recovery: Recovery::Reload,
+                previous_process: false,
+                faults: 1,
+                device: label,
+            });
+            true
+        }
+    }
+
+    /// A clean load on `devices` resolves their failures (and the previous
+    /// process's, when it named one of them or none). The lines to log.
+    fn clear_on_clean_load(&mut self, model: &str, devices: &[DeviceKey]) -> Vec<String> {
+        let mut lines = Vec::new();
+        let proves = |k: DeviceKey| devices.contains(&k) || k == DeviceKey::Unattributed;
+        let labels: Vec<String> = devices.iter().map(|&d| self.label(d)).collect();
+        for book in self.books.iter_mut().filter(|b| proves(b.key)) {
+            if let Some(e) = book.error.take() {
+                lines.push(format!(
+                    "{model} loaded cleanly on {} — clearing its failure from {} ({} device \
+                     fault(s))",
+                    e.device,
+                    rfc3339_ms(e.at_ms),
+                    e.faults
+                ));
+            }
+        }
+        let clears_previous = self
+            .previous
+            .as_ref()
+            .is_some_and(|p| p.device.is_empty() || labels.contains(&p.device));
+        if clears_previous {
+            self.previous = None;
+            lines.push(format!(
+                "{model} loaded cleanly on {} — the previous process's failure is behind us",
+                labels.join(" + ")
+            ));
+        }
+        lines
+    }
+
+    /// Count a failure that cost a request against every device in
+    /// `devices`, decide what happens, and record the failure on each: the
+    /// decision, the devices' joint label, and the message the client gets.
+    /// A decision to exit is latched here, under the lock.
+    fn decide_failure(
+        &mut self,
+        devices: &[DeviceKey],
+        cause: &str,
+        now: u64,
+    ) -> (Decision, String, String) {
+        EPOCH.fetch_add(1, SeqCst);
+        let mut worst = 0;
+        for &d in devices {
+            let book = self.book(d);
+            book.epoch += 1;
+            book.consecutive += 1;
+            worst = worst.max(book.consecutive);
+        }
+        let decision = decide(worst, self.supervisor.is_some(), &self.restarts_ms, now);
+        let label = self.labels_of(devices);
+        let message = decision_message(decision, &who_failed(devices, &label), cause);
+        for &d in devices {
+            let device = self.label(d);
+            let book = self.book(d);
+            let faults = book.error.as_ref().map_or(0, |e| e.faults);
+            book.error = Some(BackendError {
+                message: message.clone(),
+                at_ms: now,
+                recovery: decision.recovery(),
+                previous_process: false,
+                faults: faults.max(1),
+                device,
+            });
+        }
+        if decision == Decision::Restart {
+            EXITING.store(true, SeqCst);
+        }
+        (decision, label, message)
+    }
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
@@ -643,7 +768,9 @@ static STATE: Mutex<State> = Mutex::new(State {
 /// of a GPU failure because some other thread panicked is the wrong response
 /// to a module about panics.
 fn state() -> std::sync::MutexGuard<'static, State> {
-    STATE.lock().unwrap_or_else(|e| e.into_inner())
+    STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Every device failure, on every path and every device. A model remembers
@@ -670,7 +797,7 @@ static EXIT_THREADS: AtomicUsize = AtomicUsize::new(0);
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
+        .map_or(0, crate::millis)
 }
 
 fn rfc3339_ms(ms: u64) -> String {
@@ -754,7 +881,7 @@ pub const RESTARTING_MESSAGE: &str = "mummu is restarting its GPU backend after 
 
 /// [`RESTARTING_MESSAGE`], as a function for call sites that format it.
 #[must_use]
-pub fn restarting_message() -> &'static str {
+pub const fn restarting_message() -> &'static str {
     RESTARTING_MESSAGE
 }
 
@@ -802,44 +929,10 @@ fn note_panic(thread: Option<&str>, message: &str) {
     }
     let cause = summarize(message);
     let Some((name, device)) = thread.and_then(|t| DeviceKey::of_thread(t).map(|d| (t, d))) else {
-        // cubecl's text on a thread that is not a device's — the request's
-        // read, say. Whoever catches it knows the device and records it
-        // there (the engine, under the slot lock); the epoch moves now, so
-        // nothing loaded before it is served in between.
-        let mut st = state();
-        EPOCH.fetch_add(1, SeqCst);
-        st.last_cause = Some(cause);
+        state().note_unattributed_panic(cause);
         return;
     };
-    let first = {
-        let mut st = state();
-        EPOCH.fetch_add(1, SeqCst);
-        st.last_cause = Some(cause.clone());
-        let label = st.label(device);
-        let book = st.book(device);
-        book.epoch += 1;
-        book.last_cause = Some(cause.clone());
-        match book.error.as_mut() {
-            Some(e) => {
-                e.faults += 1;
-                false
-            }
-            None => {
-                book.error = Some(BackendError {
-                    message: format!(
-                        "{label} failed on its device thread {name}: {cause} — a model loaded \
-                         before this is not used again; the next request loads it fresh"
-                    ),
-                    at_ms: now_ms(),
-                    recovery: Recovery::Reload,
-                    previous_process: false,
-                    faults: 1,
-                    device: label,
-                });
-                true
-            }
-        }
-    };
+    let first = state().note_device_panic(name, device, &cause);
     // Once per failure, not once per panic: the incident's load raised thirty,
     // and the runtime has already printed every one of them.
     if first {
@@ -907,10 +1000,11 @@ impl EpochMark {
     }
 }
 
-/// Which devices a failure seen since `mark` belongs to: the ones a device
-/// thread named, if any did; otherwise the accelerators among `used` (only
-/// an accelerator carries cubecl's text); otherwise whatever `used` names;
-/// otherwise [`DeviceKey::Unattributed`].
+/// Which devices a failure seen since `mark` belongs to.
+///
+/// The ones a device thread named, if any did; otherwise the accelerators
+/// among `used` (only an accelerator carries cubecl's text); otherwise
+/// whatever `used` names; otherwise [`DeviceKey::Unattributed`].
 #[must_use]
 pub fn attribute(mark: &EpochMark, used: &[DeviceKey]) -> Vec<DeviceKey> {
     let moved = mark.moved_devices();
@@ -938,8 +1032,9 @@ pub struct LoadFault {
     pub cause: String,
 }
 
-/// Did a device fail while a load ran? `mark` is from before the load;
-/// `touched` the devices it placed anything on; `sync` waits for them to
+/// Did a device fail while a load ran?
+///
+/// `mark` is from before the load; `touched` the devices it placed anything on; `sync` waits for them to
 /// finish everything the load submitted and names the device that refused.
 ///
 /// The sync comes FIRST and is the reason this works: an upload is submitted,
@@ -983,38 +1078,12 @@ pub fn load_fault(
 }
 
 /// A load came up clean on `devices`: THEIR failures are resolved, as far as
-/// the status object and `/api/health` are concerned — and only theirs. A
-/// CPU load says nothing about the card. (The restart budget is not earned
+/// the status object and `/api/health` are concerned — and only theirs.
+///
+/// A CPU load says nothing about the card. (The restart budget is not earned
 /// back here: only a token does that — see [`generation_succeeded`].)
 pub fn load_succeeded(model: &str, devices: &[DeviceKey]) {
-    let mut lines = Vec::new();
-    {
-        let mut st = state();
-        let proves = |k: DeviceKey| devices.contains(&k) || k == DeviceKey::Unattributed;
-        let labels: Vec<String> = devices.iter().map(|&d| st.label(d)).collect();
-        for book in st.books.iter_mut().filter(|b| proves(b.key)) {
-            if let Some(e) = book.error.take() {
-                lines.push(format!(
-                    "{model} loaded cleanly on {} — clearing its failure from {} ({} device \
-                     fault(s))",
-                    e.device,
-                    rfc3339_ms(e.at_ms),
-                    e.faults
-                ));
-            }
-        }
-        let clears_previous = st
-            .previous
-            .as_ref()
-            .is_some_and(|p| p.device.is_empty() || labels.contains(&p.device));
-        if clears_previous {
-            st.previous = None;
-            lines.push(format!(
-                "{model} loaded cleanly on {} — the previous process's failure is behind us",
-                labels.join(" + ")
-            ));
-        }
-    }
+    let lines = state().clear_on_clean_load(model, devices);
     for line in lines {
         eprintln!("[mummu-serve] recovery: {line}");
     }
@@ -1092,7 +1161,7 @@ impl ChatError {
 
     /// Was this the GPU backend's failure (or a refusal because of one)?
     #[must_use]
-    pub fn is_device(&self) -> bool {
+    pub const fn is_device(&self) -> bool {
         matches!(self.kind, Kind::Device | Kind::Restarting)
     }
 
@@ -1115,7 +1184,7 @@ impl ChatError {
     /// is temporarily unable, and a retry is exactly the right response —
     /// 500 for everything else, as before.
     #[must_use]
-    pub fn http_status(&self) -> u16 {
+    pub const fn http_status(&self) -> u16 {
         if self.is_device() { 503 } else { 500 }
     }
 
@@ -1160,11 +1229,18 @@ impl From<&str> for ChatError {
 /// The engine decides the device failures it meets itself, under the slot
 /// lock (see the module header), and hands back an error that says so; this
 /// only reports those. What it decides here is a device failure that reached
-/// it UNdecided — a panic or an error carrying cubecl's text from a
+/// it `UNdecided` — a panic or an error carrying cubecl's text from a
 /// generation that is not the engine's — and it is decided the same way
 /// ([`record_failure`]), plus a best-effort eviction of whatever is resident.
 /// Any other panic is an internal error: it is reported, and nothing is
 /// unloaded.
+///
+/// # Errors
+///
+/// Whatever `run` returned as an error, passed through once decided: a
+/// device failure it left undecided comes back decided (and evicts the
+/// resident model), and a panic in `run` comes back as a [`ChatError`] — a
+/// device failure decided the same way, or an internal error for any other.
 pub async fn contain<T>(
     model: &str,
     run: impl Future<Output = Result<T, ChatError>>,
@@ -1239,7 +1315,7 @@ pub fn decide(consecutive: u32, supervised: bool, restarts_ms: &[u64], now_ms: u
     if !supervised {
         return Decision::ReloadUnsupervised;
     }
-    let cooldown = RESTART_COOLDOWN.as_millis() as u64;
+    let cooldown = crate::millis(RESTART_COOLDOWN);
     if let Some(&last) = restarts_ms
         .iter()
         .rev()
@@ -1285,7 +1361,7 @@ fn decision_message(decision: Decision, who: &str, cause: &str) -> String {
              not restart again before {}; it dropped what it had placed on the device and the \
              next request tries a fresh load",
             rfc3339_ms(last_restart_ms),
-            rfc3339_ms(last_restart_ms + RESTART_COOLDOWN.as_millis() as u64),
+            rfc3339_ms(last_restart_ms + crate::millis(RESTART_COOLDOWN)),
         ),
         Decision::ReloadUnsupervised => format!(
             "{who} again after a reload ({cause}). Nothing supervises this process, so it will \
@@ -1318,45 +1394,15 @@ pub(crate) fn record_failure(model: &str, devices: &[DeviceKey], cause: &str) ->
         devices.to_vec()
     };
     let now = now_ms();
-    let (decision, label, message) = {
-        let mut st = state();
-        EPOCH.fetch_add(1, SeqCst);
-        let mut worst = 0;
-        for &d in &devices {
-            let book = st.book(d);
-            book.epoch += 1;
-            book.consecutive += 1;
-            worst = worst.max(book.consecutive);
-        }
-        let decision = decide(worst, st.supervisor.is_some(), &st.restarts_ms, now);
-        let label = st.labels_of(&devices);
-        let message = decision_message(decision, &who_failed(&devices, &label), cause);
-        for &d in &devices {
-            let device = st.label(d);
-            let book = st.book(d);
-            let faults = book.error.as_ref().map_or(0, |e| e.faults);
-            book.error = Some(BackendError {
-                message: message.clone(),
-                at_ms: now,
-                recovery: decision.recovery(),
-                previous_process: false,
-                faults: faults.max(1),
-                device,
-            });
-        }
-        if decision == Decision::Restart {
-            EXITING.store(true, SeqCst);
-        }
-        (decision, label, message)
-    };
+    let (decision, label, message) = state().decide_failure(&devices, cause, now);
     eprintln!("[mummu-serve] recovery: chat {model}: {message}");
     if decision == Decision::Restart {
         begin_exit(
-            format!(
+            &format!(
                 "the GPU backend failed twice in a row on {label}, the second time after a reload \
                  ({cause})"
             ),
-            label,
+            &label,
         );
     }
     ChatError {
@@ -1394,7 +1440,7 @@ impl Drop for InFlight {
 /// its own. Two requests failing together, or a second failure while the
 /// first exit is draining, cannot start a second exit or write the evidence
 /// twice.
-fn begin_exit(reason: String, device: String) {
+fn begin_exit(reason: &str, device: &str) {
     let Some(supervisor) = state().supervisor.clone() else {
         return; // `decide` never says Restart without one; belt and braces
     };
@@ -1411,8 +1457,8 @@ fn begin_exit(reason: String, device: String) {
         .name("mummu-restart".to_owned())
         .spawn({
             let supervisor = supervisor.clone();
-            let reason = reason.clone();
-            let device = device.clone();
+            let reason = reason.to_owned();
+            let device = device.to_owned();
             move || run_exit(&supervisor, &reason, &device, supervisor.timing)
         });
     if spawned.is_err() {
@@ -1422,7 +1468,7 @@ fn begin_exit(reason: String, device: String) {
             grace: Duration::ZERO,
             ..supervisor.timing
         };
-        run_exit(&supervisor, &reason, &device, rushed);
+        run_exit(&supervisor, reason, device, rushed);
     }
 }
 
@@ -1952,9 +1998,11 @@ pub mod evidence {
     }
 
     /// Read what the previous process left in the PRIVATE `dir`
-    /// ([`super::local_dir`]) — refused, with a note, if `dir` fails the
-    /// private-directory rule, so a directory someone else planted in a
-    /// shared temp dir is never replayed onto `/logs`.
+    /// ([`super::local_dir`]).
+    ///
+    /// Refused, with a note, if `dir` fails the private-directory rule, so a
+    /// directory someone else planted in a shared temp dir is never replayed
+    /// onto `/logs`.
     #[must_use]
     pub fn take_private(dir: &Path) -> Taken {
         match std::fs::symlink_metadata(dir) {
@@ -2038,9 +2086,10 @@ pub mod evidence {
         }
     }
 
-    /// Of what the two places held, the one a restart wrote last: a header
-    /// beats none, a later exit beats an earlier one, and with no header on
-    /// either, lines beat none. The other's note, if any, is kept — it is
+    /// Of what the two places held, the one a restart wrote last.
+    ///
+    /// A header beats none, a later exit beats an earlier one, and with no
+    /// header on either, lines beat none. The other's note, if any, is kept — it is
     /// about a file the operator may want to know is unreadable.
     #[must_use]
     pub fn newer(a: Taken, b: Taken) -> Taken {
@@ -2087,10 +2136,10 @@ pub mod evidence {
         }
         if taken.skipped > 0 {
             let note = format!("{} unreadable line(s) in it were skipped", taken.skipped);
-            taken.note = Some(match taken.note.take() {
-                Some(n) => format!("{n}; {note}"),
-                None => format!("the previous process's log: {note}"),
-            });
+            taken.note = Some(taken.note.take().map_or_else(
+                || format!("the previous process's log: {note}"),
+                |n| format!("{n}; {note}"),
+            ));
         }
         taken
     }
@@ -2147,7 +2196,7 @@ pub mod evidence {
 // ---------------------------------------------------------------------------
 
 /// Put every piece of global state back. Tests that touch it hold
-/// `crate::progress_serial()`, which the status tests hold too — so an error
+/// `crate::progress_serial_blocking()`, which the status tests hold too — so an error
 /// set here can never leak into their assertions about the phase. The device
 /// names stay registered: they are facts about the build, not state.
 #[cfg(test)]
@@ -2326,7 +2375,7 @@ mod tests {
     /// but poisons no device (whoever catches it knows which).
     #[test]
     fn the_hook_charges_a_device_failure_to_the_device_that_raised_it() {
-        let _serial = crate::progress_serial();
+        let _serial = crate::progress_serial_blocking();
         reset_for_tests();
         install_panic_hook();
 
@@ -2367,7 +2416,7 @@ mod tests {
     /// and the failure is the failed device's, not the load's.
     #[test]
     fn a_load_fails_when_a_device_failed_under_it() {
-        let _serial = crate::progress_serial();
+        let _serial = crate::progress_serial_blocking();
         reset_for_tests();
         install_panic_hook();
 
@@ -2413,9 +2462,8 @@ mod tests {
     /// The fix for the empty stream, at its root: a generation that panics
     /// comes back as an error, and which kind depends on whose fault it was.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // serializes tests; nothing else waits on it
     async fn contain_turns_panics_into_errors_and_only_device_ones_into_recovery() {
-        let _serial = crate::progress_serial();
+        let _serial = crate::progress_serial().await;
         reset_for_tests();
         install_panic_hook();
 
@@ -2456,9 +2504,8 @@ mod tests {
     /// a panic does, so a model loaded before it is never served again. An
     /// ordinary request error moves nothing.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // serializes tests; nothing else waits on it
     async fn an_error_carrying_the_device_failure_moves_the_epoch_like_a_panic() {
-        let _serial = crate::progress_serial();
+        let _serial = crate::progress_serial().await;
         reset_for_tests();
         install_panic_hook();
 
@@ -2504,7 +2551,7 @@ mod tests {
     #[test]
     fn a_restart_needs_two_failures_a_supervisor_and_an_unspent_budget() {
         let now = 10 * 60 * 60 * 1000;
-        let cooldown = RESTART_COOLDOWN.as_millis() as u64;
+        let cooldown = crate::millis(RESTART_COOLDOWN);
         assert_eq!(decide(1, true, &[], now), Decision::Reload);
         assert_eq!(decide(2, false, &[], now), Decision::ReloadUnsupervised);
         assert_eq!(decide(2, true, &[], now), Decision::Restart);
@@ -2555,9 +2602,8 @@ mod tests {
     /// failure that survived a reload — and it leaves the evidence behind:
     /// the local copy FIRST, the models root's too when it can.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // serializes tests; nothing else waits on it
     async fn the_exit_is_taken_once_and_only_on_a_confirmed_poison() {
-        let _serial = crate::progress_serial();
+        let _serial = crate::progress_serial().await;
         reset_for_tests();
         install_panic_hook();
         let root = Scratch::new("exit");
@@ -2629,7 +2675,7 @@ mod tests {
     /// restart exists for, and CPU traffic must not hide it.
     #[test]
     fn a_token_resets_the_count_only_for_its_own_device() {
-        let _serial = crate::progress_serial();
+        let _serial = crate::progress_serial_blocking();
         reset_for_tests();
         let root = Scratch::new("reset");
         let local = Scratch::new("reset-local");
@@ -2672,7 +2718,7 @@ mod tests {
     /// one's failure without calling itself poisoned.
     #[test]
     fn a_clean_load_clears_only_its_own_devices() {
-        let _serial = crate::progress_serial();
+        let _serial = crate::progress_serial_blocking();
         reset_for_tests();
         install_panic_hook();
         device_thread_panic("DSD-0-0", LOAD_OOM);
@@ -2803,7 +2849,10 @@ mod tests {
 
         // A file far past the cap — written by anything — keeps its header.
         let mut huge = evidence::render(&head, &[]);
-        huge.extend(std::iter::repeat_n(b'x', (EVIDENCE_MAX_BYTES * 2) as usize));
+        huge.extend(std::iter::repeat_n(
+            b'x',
+            usize::try_from(EVIDENCE_MAX_BYTES * 2).expect("2 MiB fits a usize"),
+        ));
         std::fs::write(dir.path().join(EVIDENCE_FILE), &huge).expect("write huge");
         let t = evidence::take(dir.path());
         assert_eq!(
@@ -2811,7 +2860,7 @@ mod tests {
             Some(vec![now]),
             "an oversized file's restart history was discarded with its lines"
         );
-        assert!(t.lines.is_empty());
+        assert_eq!(t.lines, [] as [crate::recovery::evidence::Line; 0]);
         assert!(t.note.as_deref().is_some_and(|n| n.contains("set aside")));
         assert!(
             !dir.path().join(EVIDENCE_FILE).exists(),
@@ -2824,7 +2873,7 @@ mod tests {
     /// fresh backend poisoned; and the restart budget carried forward.
     #[test]
     fn a_restarted_process_shows_what_happened_and_keeps_the_budget() {
-        let _serial = crate::progress_serial();
+        let _serial = crate::progress_serial_blocking();
         reset_for_tests();
         let root = Scratch::new("replay");
         let local = Scratch::new("replay-local");
@@ -2896,9 +2945,8 @@ mod tests {
     /// quietly lift it. The local copy is written first, and the next process
     /// finds it there: the budget holds and the lines are replayed.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // serializes tests; nothing else waits on it
     async fn the_restart_budget_survives_a_models_root_that_cannot_be_written() {
-        let _serial = crate::progress_serial();
+        let _serial = crate::progress_serial().await;
         reset_for_tests();
         install_panic_hook();
         let root = Scratch::new("unwritable");
@@ -3007,9 +3055,8 @@ mod tests {
     /// never run and the budget below would be tested by nothing.
     #[cfg(unix)]
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // serializes tests; nothing else waits on it
     async fn the_exit_finishes_in_time_when_the_models_root_stalls() {
-        let _serial = crate::progress_serial();
+        let _serial = crate::progress_serial().await;
         reset_for_tests();
         install_panic_hook();
         let root = Scratch::new("stall");
@@ -3056,7 +3103,7 @@ mod tests {
     /// is what Docker's restart of the same container keeps, so it is enough.
     #[test]
     fn a_written_local_copy_keeps_the_exit_off_the_models_root() {
-        let _serial = crate::progress_serial();
+        let _serial = crate::progress_serial_blocking();
         reset_for_tests();
         install_panic_hook();
         let root = Scratch::new("offroot");
@@ -3109,7 +3156,7 @@ mod tests {
     /// every chat would be refused until a person intervened.
     #[test]
     fn a_hung_exit_is_ended_by_the_watchdog_at_its_deadline() {
-        let _serial = crate::progress_serial();
+        let _serial = crate::progress_serial_blocking();
         reset_for_tests();
         let root = Scratch::new("hang");
         let local = Scratch::new("hang-local");

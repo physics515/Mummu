@@ -8,8 +8,12 @@
 //! This is the largest unexplained term in the 27B's decode time — ~2.2 s of
 //! 3.91 s is not accounted for by the trunk's arithmetic or the FFN makespan
 //! — so it is worth measuring before designing around it.
+
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use burn::tensor::{Device, DeviceKind, Tensor, TensorData};
 use mummu::backend;
+use mummu_num::f64_from_usize;
 use std::time::Instant;
 
 const HIDDEN: usize = 5120;
@@ -21,7 +25,7 @@ fn timed(rounds: usize, mut f: impl FnMut()) -> f64 {
     for _ in 0..rounds {
         f();
     }
-    started.elapsed().as_secs_f64() * 1000.0 / rounds as f64
+    started.elapsed().as_secs_f64() * 1000.0 / f64_from_usize(rounds)
 }
 
 fn main() {

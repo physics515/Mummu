@@ -2,6 +2,7 @@
 // a CLI. Debug builds keep the console so the `[mummu-serve]` startup lines
 // (adapter inventory, device policy, listening addresses) stay visible.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 
 //! mummu-app — the Windows desktop shell around `mummu-serve`.
 //!
@@ -70,15 +71,19 @@ impl Server {
     /// short wait in practice; the timeout is there so a wedged task can
     /// never keep the process alive after the user asked it to close.
     fn stop(&self) {
-        if let Some(tx) = self
+        let shutdown = self
             .shutdown
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-        {
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(tx) = shutdown {
             let _ = tx.send(());
         }
-        let task = self.task.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let task = self
+            .task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         if let Some(task) = task {
             let drained = tauri::async_runtime::block_on(async {
                 tokio::time::timeout(Duration::from_secs(5), task).await
@@ -170,8 +175,14 @@ fn start(app: &AppHandle, server: &Arc<Server>) -> Result<(), Box<dyn std::error
         })
         .await
     });
-    *server.shutdown.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
-    *server.task.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
+    *server
+        .shutdown
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
+    *server
+        .task
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(task);
 
     WebviewWindowBuilder::new(app, "main", WebviewUrl::External(url.parse()?))
         .title("Mummu")

@@ -1,6 +1,9 @@
-//! Times ONE DeltaNet recurrence step at the 27B's real state shape, op by
+//! Times ONE `DeltaNet` recurrence step at the 27B's real state shape, op by
 //! op. The bandwidth and per-op probes both came in far under the observed
 //! 29.7 s/token, so the cost has to be inside these ops at this shape.
+
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use std::time::Instant;
 
 use burn::tensor::{Distribution, Tensor};
@@ -23,28 +26,28 @@ fn main() {
         Ok("gpu") => mummu::backend::gpu_device(),
         _ => mummu::backend::cpu_device(),
     };
-    println!("device: {:?}", device);
-    let (b, hv, ds) = (1usize, 24usize, 256usize);
-    let n = 20;
+    println!("device: {device:?}");
+    let (batch, hv, ds) = (1usize, 24usize, 256usize);
+    let reps = 20;
     let rnd4 = |dims: [usize; 4]| Tensor::<4>::random(dims, Distribution::Default, &device);
 
-    let s0 = rnd4([b, hv, ds, ds]);
-    let k_t = rnd4([b, hv, 1, ds]);
-    let q_t = rnd4([b, hv, 1, ds]);
-    let v_t = rnd4([b, hv, 1, ds]);
-    let g_t = rnd4([b, hv, 1, 1]);
+    let s0 = rnd4([batch, hv, ds, ds]);
+    let k_t = rnd4([batch, hv, 1, ds]);
+    let q_t = rnd4([batch, hv, 1, ds]);
+    let v_t = rnd4([batch, hv, 1, ds]);
+    let g_t = rnd4([batch, hv, 1, 1]);
 
     macro_rules! time {
         ($label:expr, $body:expr) => {{
             let _ = $body; // warm
-            let t = Instant::now();
-            for _ in 0..n {
+            let started = Instant::now();
+            for _ in 0..reps {
                 let _ = $body;
             }
             println!(
                 "{:<42} {:>8.3} ms",
                 $label,
-                t.elapsed().as_secs_f64() * 1e3 / f64::from(n)
+                started.elapsed().as_secs_f64() * 1e3 / f64::from(reps)
             );
         }};
     }
@@ -71,17 +74,17 @@ fn main() {
     );
 
     // The whole step, as the model runs it.
-    let t = Instant::now();
-    for _ in 0..n {
+    let started = Instant::now();
+    for _ in 0..reps {
         let mut s = s0.clone();
         s = s.mul(g_t.clone().exp());
         let v_hat = s.clone().mul(k_t.clone().swap_dims(2, 3)).sum_dim(2);
-        let d = v_t.clone().sub(v_hat).mul(g_t.clone());
-        s = s.add(k_t.clone().swap_dims(2, 3).matmul(d));
-        let o = s.clone().mul(q_t.clone().swap_dims(2, 3)).sum_dim(2);
-        let _ = o.into_data();
+        let delta = v_t.clone().sub(v_hat).mul(g_t.clone());
+        s = s.add(k_t.clone().swap_dims(2, 3).matmul(delta));
+        let out = s.mul(q_t.clone().swap_dims(2, 3)).sum_dim(2);
+        let _ = out.into_data();
     }
-    let per_step = t.elapsed().as_secs_f64() / f64::from(n);
+    let per_step = started.elapsed().as_secs_f64() / f64::from(reps);
     println!(
         "\nFULL DeltaNet step (1 layer, 1 token): {:.3} ms",
         per_step * 1e3

@@ -1,12 +1,14 @@
 [workspace]
 resolver = "3"
 members = [
+	"crates/mummu-num",
 	"crates/mummu",
 	"crates/mummu-app",
 	"crates/mummu-mix",
 	"crates/mummu-schedule",
 	"crates/mummu-bench",
 	"crates/mummu-serve",
+	"crates/mummu-testkit",
 ]
 
 [workspace.package]
@@ -79,6 +81,9 @@ burn-flex = "0.22.0-pre.3"
 # The two schedulers, as their own crates: A divides work across devices,
 # B decides the precision of the weights on each. Both are dependency-free —
 # see their crate docs — which is why they are separate rather than modules.
+# Exact, `as`-free numeric conversions (see the crate docs): the one thing
+# every crate — the dependency-free schedulers included — shares.
+mummu-num = { path = "crates/mummu-num" }
 mummu-mix = { path = "crates/mummu-mix" }
 mummu-schedule = { path = "crates/mummu-schedule" }
 # Direct handle on burn-store (the same crate burn's `store` feature pulls) to
@@ -142,10 +147,8 @@ tokio = { version = "1", features = [
 ] }
 # Async HTTP for mummu-serve, replacing tiny_http's thread-per-request model.
 axum = { version = "0.8", features = ["ws"] }
-tower = "0.5"
 futures = "0.3"
 async-stream = "0.3"
-tokio-stream = "0.1"
 # `preserve_order` (insertion-order maps) is deliberate and load-bearing for
 # prompt bytes: Python/transformers renders tool JSON in dict insertion order,
 # so our tool-bearing prompts only byte-match the reference stack's rendering

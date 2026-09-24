@@ -14,7 +14,9 @@
 //!   cargo test -p mummu --release --test real_qwen35_pack -- --ignored --nocapture
 //! ```
 
-use std::path::PathBuf;
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
+use std::path::{Path, PathBuf};
 
 use burn::tensor::Tensor;
 use mummu::models::CausalLm;
@@ -38,12 +40,58 @@ fn argmax(t: &Tensor<2>) -> u32 {
         .convert::<f32>()
         .try_to_vec::<f32>()
         .unwrap();
-    v.iter()
+    let best = v
+        .iter()
         .enumerate()
         .fold((0usize, f32::NEG_INFINITY), |m, (i, &x)| {
             if x > m.1 { (i, x) } else { m }
         })
-        .0 as u32
+        .0;
+    u32::try_from(best).expect("vocab index fits u32")
+}
+
+/// Import the GGUF into a pack beside it at every level, once (reused
+/// across runs when already complete).
+fn import_pack_once(path: &Path, trunk: usize) -> PathBuf {
+    let pack_dir = path.parent().unwrap().join("pack-gate");
+    if !Pack::is_pack(&pack_dir) {
+        let _ = std::fs::remove_dir_all(&pack_dir);
+        let t = std::time::Instant::now();
+        let manifest = mummu::pack::import_gguf(
+            path,
+            &pack_dir,
+            &Precision::ALL,
+            &|info| qwen35::pack_actions(info, trunk),
+            |i, n, name| {
+                if i % 50 == 0 {
+                    eprintln!("[pack-gate] import {i}/{n} {name}");
+                }
+            },
+        )
+        .expect("pack import");
+        eprintln!(
+            "[pack-gate] imported {} tensors in {:.1}s",
+            manifest.tensors.len(),
+            t.elapsed().as_secs_f32()
+        );
+    }
+    pack_dir
+}
+
+/// Print every blob's size and check the manifest lists every level.
+fn report_blobs(pack_dir: &Path) {
+    let pack = Pack::open(pack_dir).expect("pack opens");
+    let sizes: Vec<(Precision, u64)> = Precision::ALL
+        .iter()
+        .map(|&p| {
+            (
+                p,
+                std::fs::metadata(pack_dir.join(p.blob_name())).map_or(0, |m| m.len()),
+            )
+        })
+        .collect();
+    eprintln!("[pack-gate] blobs: {sizes:?}");
+    assert_eq!(pack.manifest.precisions, Precision::ALL.to_vec());
 }
 
 #[test]
@@ -68,41 +116,8 @@ fn qwen35_pack_round_trips_every_level() {
     let device = mummu::backend::cpu_device();
 
     // Import beside the fixture (reused across runs when already complete).
-    let pack_dir = path.parent().unwrap().join("pack-gate");
-    if !Pack::is_pack(&pack_dir) {
-        let _ = std::fs::remove_dir_all(&pack_dir);
-        let t = std::time::Instant::now();
-        let manifest = mummu::pack::import_gguf(
-            &path,
-            &pack_dir,
-            &Precision::ALL,
-            &|info| qwen35::pack_actions(info, trunk),
-            |i, n, name| {
-                if i % 50 == 0 {
-                    eprintln!("[pack-gate] import {i}/{n} {name}");
-                }
-            },
-        )
-        .expect("pack import");
-        eprintln!(
-            "[pack-gate] imported {} tensors in {:.1}s",
-            manifest.tensors.len(),
-            t.elapsed().as_secs_f32()
-        );
-    }
-    let pack = Pack::open(&pack_dir).expect("pack opens");
-    let sizes: Vec<(Precision, u64)> = Precision::ALL
-        .iter()
-        .map(|&p| {
-            (
-                p,
-                std::fs::metadata(pack_dir.join(p.blob_name())).map_or(0, |m| m.len()),
-            )
-        })
-        .collect();
-    eprintln!("[pack-gate] blobs: {sizes:?}");
-    assert_eq!(pack.manifest.precisions, Precision::ALL.to_vec());
-    drop(pack);
+    let pack_dir = import_pack_once(&path, trunk);
+    report_blobs(&pack_dir);
 
     let logits_of = |m: &qwen35::LoadedQwen35| {
         let mut cache = m.new_cache();

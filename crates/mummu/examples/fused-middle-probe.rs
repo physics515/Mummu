@@ -15,11 +15,14 @@
 //!
 //! Quiet-box rules apply; read ratios, not absolutes.
 
-use mummu::flex::gdn::{GdnGate, GdnL2, GdnMiddle, gdn_step};
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
+use mummu::flex::gdn::{GdnGate, GdnInputs, GdnL2, GdnMiddle, gdn_step};
 use mummu::flex::kernels::{PackedQ4, gemm_q4n_auto, gemv_q4n_auto};
+use mummu_num::{f32_from_usize, f64_from_usize};
 
 fn wave(len: usize, f: f32) -> Vec<f32> {
-    (0..len).map(|i| ((i as f32) * f).sin()).collect()
+    (0..len).map(|i| (f32_from_usize(i) * f).sin()).collect()
 }
 
 fn median_ms(reps: usize, mut f: impl FnMut()) -> f64 {
@@ -42,7 +45,7 @@ fn main() {
     let key_dim = hk * ds;
     let d_inner = hv * ds;
     let conv_dim = 2 * key_dim + d_inner;
-    let p = GdnMiddle {
+    let middle = GdnMiddle {
         hk,
         hv,
         ds,
@@ -53,7 +56,7 @@ fn main() {
         l2_eps: 1e-6,
         l2: GdnL2::ClampNorm,
         norm_eps: 1e-6,
-        scale: 1.0 / (ds as f32).sqrt(),
+        scale: 1.0 / f32_from_usize(ds).sqrt(),
         conv_w: wave(conv_dim * kk, 0.13),
         dt_bias: wave(hv, 0.7),
         a: wave(hv, 0.3).iter().map(|v| -v.abs() - 0.1).collect(),
@@ -65,16 +68,25 @@ fn main() {
     let z = wave(d_inner, 0.023);
     let beta = wave(hv, 0.5);
     let alpha = wave(hv, 0.9);
-    let mut ring = vec![0.0f32; p.ring_len()];
-    let mut state = wave(p.state_len(), 0.007);
+    let mut ring = vec![0.0f32; middle.ring_len()];
+    let mut state = wave(middle.state_len(), 0.007);
     let mut gated = vec![0.0f32; d_inner];
     let ms = median_ms(200, || {
         gdn_step(
-            &p, &mixed, &z, &beta, &alpha, &mut ring, &mut state, &mut gated,
+            &middle,
+            GdnInputs {
+                mixed: &mixed,
+                z: &z,
+                beta_logits: &beta,
+                alpha_logits: &alpha,
+            },
+            &mut ring,
+            &mut state,
+            &mut gated,
         );
         std::hint::black_box(&gated);
     });
-    let state_mb = (p.state_len() * 4) as f64 / 1e6;
+    let state_mb = f64_from_usize(middle.state_len() * 4) / 1e6;
     println!(
         "fused GDN middle [hk {hk} hv {hv} ds {ds} conv_dim {conv_dim}]: {ms:.3} ms/layer/token \
          (state {state_mb:.1} MB, two passes = {:.1} MB moved)",
@@ -87,18 +99,18 @@ fn main() {
 
     // The packed GEMM at prompt shapes vs the row loop it replaced.
     let (k, n) = (5120usize, 17408usize);
-    let w = PackedQ4::from_f32(&wave(k * n, 0.11), k, n);
+    let packed = PackedQ4::from_f32(&wave(k * n, 0.11), k, n);
     for m in [4usize, 16, 36, 64, 256] {
-        let x = wave(m * k, 0.009);
+        let acts = wave(m * k, 0.009);
         let mut out = vec![0.0f32; m * n];
         let gemm = median_ms(9, || {
-            gemm_q4n_auto(&w, &x, m, &mut out);
+            gemm_q4n_auto(&packed, &acts, m, &mut out);
             std::hint::black_box(&out);
         });
         let mut row_out = vec![0.0f32; n];
         let rows = median_ms(3, || {
-            for r in 0..m {
-                gemv_q4n_auto(&w, &x[r * k..(r + 1) * k], &mut row_out);
+            for row in 0..m {
+                gemv_q4n_auto(&packed, &acts[row * k..(row + 1) * k], &mut row_out);
             }
             std::hint::black_box(&row_out);
         });
@@ -106,7 +118,7 @@ fn main() {
             "gemm [{k} x {n}] m={m:>3}: {gemm:>8.2} ms vs row-loop {rows:>8.2} ms = {:>5.1}x \
              ({:.0} tok/s-equivalent per layer)",
             rows / gemm,
-            1e3 / (gemm / m as f64),
+            1e3 / (gemm / f64_from_usize(m)),
         );
     }
 }

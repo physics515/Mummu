@@ -4,7 +4,7 @@
 //! A block-quantized `[d_out, d_in]` tensor at group `g` carries a scale
 //! matrix `S in R^{d_out x d_in/g}` — at f32 scales and g = 32 that is a
 //! full 1.0 bit-per-weight of metadata (the difference between this repo's
-//! 5.0 effective bits and Q4_K's 4.5). Shrinking the scale *bit-width* is
+//! 5.0 effective bits and `Q4_K`'s 4.5). Shrinking the scale *bit-width* is
 //! one axis; this module attacks the scale *rank*: block scales across a
 //! real weight are highly structured (rows share dynamic range, channels
 //! share outlier patterns), so `S ~= U V^T` with `U: d_out x r`,
@@ -34,6 +34,8 @@
 //! arithmetic the mix planner uses). The runtime cost is one extra fused
 //! multiply per group in the dequant epilogue; the win is bytes.
 
+use mummu_num::{f64_from_usize, narrow};
+
 /// The factorization `S ~= exp(U V^T)` of one tensor's scale matrix.
 #[derive(Debug, Clone)]
 pub struct ScaleFactor {
@@ -52,20 +54,20 @@ impl ScaleFactor {
     pub fn scale_at(&self, i: usize, j: usize) -> f32 {
         let mut dot = 0.0f32;
         for t in 0..self.rank {
-            dot += self.u[i * self.rank + t] * self.v[j * self.rank + t];
+            dot = self.u[i * self.rank + t].mul_add(self.v[j * self.rank + t], dot);
         }
         dot.exp()
     }
 
     /// Bytes this factorization stores (f32 factors).
     #[must_use]
-    pub fn stored_bytes(&self) -> usize {
+    pub const fn stored_bytes(&self) -> usize {
         (self.rows + self.cols) * self.rank * 4
     }
 
     /// Bytes the dense scale matrix stores at `bytes_per_scale`.
     #[must_use]
-    pub fn dense_bytes(&self, bytes_per_scale: usize) -> usize {
+    pub const fn dense_bytes(&self, bytes_per_scale: usize) -> usize {
         self.rows * self.cols * bytes_per_scale
     }
 
@@ -75,6 +77,9 @@ impl ScaleFactor {
     /// *gate* (worst case matters for a quantizer step) but is an infinity
     /// norm and can wiggle non-monotonically between ranks; sweep on it,
     /// reason on this.
+    ///
+    /// # Panics
+    /// If `dense.len() != rows * cols`.
     #[must_use]
     pub fn rms_log_err(&self, dense: &[f32]) -> f64 {
         assert_eq!(dense.len(), self.rows * self.cols);
@@ -84,16 +89,19 @@ impl ScaleFactor {
                 let s = f64::from(dense[i * self.cols + j]);
                 let r = f64::from(self.scale_at(i, j));
                 let d = r.ln() - s.ln();
-                acc += d * d;
+                acc = f64::mul_add(d, d, acc);
             }
         }
-        (acc / (self.rows * self.cols) as f64).sqrt()
+        (acc / f64_from_usize(self.rows * self.cols)).sqrt()
     }
 
     /// Worst multiplicative error over the matrix:
     /// `max_ij max(s'/s, s/s')` where `s'` is the reconstruction. This is
     /// the number the calibration sweep gates on — a group's quantization
     /// step inflates by exactly this ratio in the worst case.
+    ///
+    /// # Panics
+    /// If `dense.len() != rows * cols`.
     #[must_use]
     pub fn max_ratio_err(&self, dense: &[f32]) -> f32 {
         assert_eq!(dense.len(), self.rows * self.cols);
@@ -149,7 +157,7 @@ pub fn factorize_scales(
     for row in logs.chunks_exact(cols) {
         for (a, &ra) in row.iter().enumerate() {
             for (b, &rb) in row.iter().enumerate() {
-                g[a * cols + b] += ra * rb;
+                g[a * cols + b] = f64::mul_add(ra, rb, g[a * cols + b]);
             }
         }
     }
@@ -160,7 +168,7 @@ pub fn factorize_scales(
     let mut x = vec![0.0f64; cols * rank]; // column-major by factor: x[j*rank + t]
     for j in 0..cols {
         for t in 0..rank {
-            let q = (j * rank + t) as f64 * 0.618_033_988_749_895;
+            let q = f64_from_usize(j * rank + t) * 0.618_033_988_749_895;
             x[j * rank + t] = q.fract() - 0.5;
         }
     }
@@ -172,7 +180,7 @@ pub fn factorize_scales(
             for t in 0..rank {
                 let mut acc = 0.0;
                 for l in 0..cols {
-                    acc += g[j * cols + l] * x[l * rank + t];
+                    acc = g[j * cols + l].mul_add(x[l * rank + t], acc);
                 }
                 gx[j * rank + t] = acc;
             }
@@ -188,7 +196,7 @@ pub fn factorize_scales(
         for t in 0..rank {
             let mut acc = 0.0;
             for (j, &rj) in row.iter().enumerate() {
-                acc += rj * x[j * rank + t];
+                acc = f64::mul_add(rj, x[j * rank + t], acc);
             }
             u[i * rank + t] = acc;
         }
@@ -198,10 +206,8 @@ pub fn factorize_scales(
         rows,
         cols,
         rank,
-        #[allow(clippy::cast_possible_truncation)]
-        u: u.into_iter().map(|v| v as f32).collect(),
-        #[allow(clippy::cast_possible_truncation)]
-        v: x.into_iter().map(|v| v as f32).collect(),
+        u: u.into_iter().map(narrow).collect(),
+        v: x.into_iter().map(narrow).collect(),
     }
 }
 
@@ -215,30 +221,30 @@ fn orthonormalize(x: &mut [f64], n: usize, rank: usize) {
         for p in 0..t {
             let mut dot = 0.0;
             for j in 0..n {
-                dot += x[j * rank + t] * x[j * rank + p];
+                dot = x[j * rank + t].mul_add(x[j * rank + p], dot);
             }
             for j in 0..n {
-                x[j * rank + t] -= dot * x[j * rank + p];
+                x[j * rank + t] = f64::mul_add(dot, -x[j * rank + p], x[j * rank + t]);
             }
         }
         let mut norm = 0.0;
         for j in 0..n {
-            norm += x[j * rank + t] * x[j * rank + t];
+            norm = x[j * rank + t].mul_add(x[j * rank + t], norm);
         }
         let mut norm = norm.sqrt();
         if norm < 1e-12 {
             // Re-seed deterministically and re-orthogonalize this column.
             for j in 0..n {
-                let q = (j * 31 + t * 17 + 7) as f64 * 0.754_877_666_246_693;
+                let q = f64_from_usize(j * 31 + t * 17 + 7) * 0.754_877_666_246_693;
                 x[j * rank + t] = q.fract() - 0.5;
             }
             for p in 0..t {
                 let mut dot = 0.0;
                 for j in 0..n {
-                    dot += x[j * rank + t] * x[j * rank + p];
+                    dot = x[j * rank + t].mul_add(x[j * rank + p], dot);
                 }
                 for j in 0..n {
-                    x[j * rank + t] -= dot * x[j * rank + p];
+                    x[j * rank + t] = f64::mul_add(dot, -x[j * rank + p], x[j * rank + t]);
                 }
             }
             norm = (0..n)
@@ -286,13 +292,12 @@ mod tests {
             for j in 0..cols {
                 let mut log = 0.0f64;
                 for t in 0..rank {
-                    let ui = (((i * 31 + t * 7) % 17) as f64 / 17.0 - 0.5) * 2.0;
-                    let vj = (((j * 13 + t * 5) % 19) as f64 / 19.0 - 0.5) * 2.0;
-                    log += ui * vj;
+                    let ui = (f64_from_usize((i * 31 + t * 7) % 17) / 17.0 - 0.5) * 2.0;
+                    let vj = (f64_from_usize((j * 13 + t * 5) % 19) / 19.0 - 0.5) * 2.0;
+                    log = ui.mul_add(vj, log);
                 }
-                #[allow(clippy::cast_possible_truncation)]
                 {
-                    s[i * cols + j] = (log.exp() * 0.01) as f32; // scales ~1e-2
+                    s[i * cols + j] = narrow(log.exp() * 0.01); // scales ~1e-2
                 }
             }
         }
@@ -350,7 +355,7 @@ mod tests {
         };
         let dense = f.dense_bytes(4);
         let stored = f.stored_bytes();
-        let ratio = stored as f64 / dense as f64;
+        let ratio = f64_from_usize(stored) / f64_from_usize(dense);
         assert!(
             ratio < 0.033,
             "r=4 must cut scale bytes by ~97%, got {:.1}%",
@@ -371,7 +376,7 @@ mod tests {
         }
     }
 
-    /// calibrate_rank returns the smallest clearing rank, and None when the
+    /// `calibrate_rank` returns the smallest clearing rank, and None when the
     /// bound is unreachable.
     #[test]
     fn calibration_sweep_finds_the_knee() {

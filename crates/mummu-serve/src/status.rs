@@ -45,8 +45,10 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 /// The crate version, which is the workspace version — bumped with every
-/// release since v0.3.0. It had sat at 0.1.0 through the v0.1.0, v0.1.1 and
-/// v0.2.0 tags, which is exactly why nobody could tell what was deployed.
+/// release since v0.3.0.
+///
+/// It had sat at 0.1.0 through the v0.1.0, v0.1.1 and v0.2.0 tags, which is
+/// exactly why nobody could tell what was deployed.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The git short sha this binary was built from, `<sha>-dirty` when it was
@@ -294,7 +296,9 @@ impl<T: Copy + Send + 'static> Stale<T> {
     /// A poisoned cache still holds a perfectly good reading, and refusing to
     /// draw a gauge because a *sample* lock was poisoned would be absurd.
     fn lock(&self) -> std::sync::MutexGuard<'_, StaleState<T>> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The last reading — `None` only until the first refresh lands — kicking
@@ -425,7 +429,9 @@ static HOST: Mutex<Option<(Instant, Option<HostMemory>)>> = Mutex::new(None);
 /// and the work under it is two small text files — microseconds, with no
 /// driver anywhere near it.
 fn host_sample() -> Option<HostMemory> {
-    let mut slot = HOST.lock().unwrap_or_else(|e| e.into_inner());
+    let mut slot = HOST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some((at, sample)) = *slot
         && at.elapsed() < SAMPLE_TTL
     {
@@ -703,7 +709,7 @@ pub fn with_error(error: Option<&crate::recovery::BackendError>, poisoned: bool)
 
 /// The build fields, for `GET /api/health`.
 #[must_use]
-pub fn build_json() -> (&'static str, &'static str) {
+pub const fn build_json() -> (&'static str, &'static str) {
     (VERSION, BUILD)
 }
 
@@ -762,7 +768,7 @@ mod tests {
     /// 0% with an ETA of zero.
     #[test]
     fn an_idle_server_reports_no_counts_and_no_eta() {
-        let _serial = crate::progress_serial();
+        let _serial = crate::progress_serial_blocking();
         mummu::progress::idle();
         let s = to_json();
         assert_eq!(s["phase"], json!("idle"));
@@ -780,7 +786,7 @@ mod tests {
     #[test]
     fn the_wire_carries_the_bar_verdict_for_every_phase() {
         use mummu::progress::Phase;
-        let _serial = crate::progress_serial();
+        let _serial = crate::progress_serial_blocking();
         for phase in [
             Phase::Idle,
             Phase::Loading,
@@ -809,7 +815,7 @@ mod tests {
     #[test]
     fn a_poisoned_backend_reports_the_error_phase_not_ready() {
         use crate::recovery::{BackendError, Recovery};
-        let _serial = crate::progress_serial();
+        let _serial = crate::progress_serial_blocking();
         // What the incident's panel saw: a model resident and "ready".
         {
             let load = mummu::progress::Load::begin("qwen3.8-27b-ud-q4ks");
@@ -957,7 +963,7 @@ mod tests {
     /// "tensors" under all three until the unit rode along with the count.
     #[test]
     fn the_counts_carry_the_unit_and_the_pass_they_belong_to() {
-        let _serial = crate::progress_serial();
+        let _serial = crate::progress_serial_blocking();
         mummu::progress::begin(
             mummu::progress::Phase::Loading,
             64,

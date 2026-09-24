@@ -1,5 +1,5 @@
 //! The MoE-tier perf-budget gate from `bench/BASELINE.md`: OLMoE-1B-7B
-//! greedy decode on the `Cpu` (burn-flex) backend, straight from its Q4_K_M
+//! greedy decode on the `Cpu` (burn-flex) backend, straight from its `Q4_K_M`
 //! GGUF. This tier is bounded by **latency per token**, not tok/s — the
 //! dense-mask expert forward touches all 7B params per token (see the
 //! routed-compute item in ROADMAP P2), so a budget in seconds/token is the
@@ -13,6 +13,8 @@
 //!   cargo test -p mummu-bench --release --test budget_moe -- --ignored --nocapture
 //! ```
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -20,6 +22,7 @@ use mummu::decode::argmax_id;
 use mummu::gguf::{GgufFile, GgufValue};
 use mummu::models::CausalLm;
 use mummu::models::olmoe;
+use mummu_num::f64_from_usize;
 
 /// From bench/BASELINE.md (recorded 0.76 s/token warm on 2026-08-03). The
 /// ceiling carries ~2.6x headroom so ordinary host-load noise is not a false
@@ -83,7 +86,7 @@ async fn olmoe_moe_cpu_decode_stays_inside_its_budget() {
         next = argmax_id(logits).await.expect("argmax");
         out.push(next);
     }
-    let secs_per_token = start.elapsed().as_secs_f64() / DECODE_STEPS as f64;
+    let secs_per_token = start.elapsed().as_secs_f64() / f64_from_usize(DECODE_STEPS);
     let text = tok.decode(&out, true).expect("decode");
 
     eprintln!(

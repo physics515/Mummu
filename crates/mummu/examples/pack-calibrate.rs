@@ -13,16 +13,19 @@
 //! behind the expert pool at f32, so the skip decision covers nearly the
 //! whole FFN and the measurement is about skipping, not quantization.
 
-use std::path::PathBuf;
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use burn::tensor::Tensor;
+use burn::tensor::{Device, Tensor};
 use mummu::models::CausalLm;
-use mummu::models::qwen35;
+use mummu::models::qwen35::{self, LoadedQwen35};
 use mummu::nn::{DeviceExpert, ExpertExec, ExpertPool};
 use mummu::pack::{Pack, Precision, SkipPoint};
 use mummu::tier::Tier;
+use mummu_num::{f32_from_u64, f32_from_usize, f64_from_usize, narrow};
 
 const PROMPTS: &[&str] = &[
     "What is 2+2? Answer in one short sentence.",
@@ -56,6 +59,116 @@ fn argmax(v: &[f32]) -> usize {
         .0
 }
 
+/// Largest |Δ| between two log-prob rows.
+fn max_abs_delta(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0f32, f32::max)
+}
+
+/// Every calibration prompt rendered as a Qwen3 user turn and tokenized.
+fn encode_prompts(tok: &tokenizers::Tokenizer) -> Vec<Vec<u32>> {
+    PROMPTS
+        .iter()
+        .map(|p| {
+            let r = mummu::chat::ChatMl::qwen3().render(&[mummu::chat::Turn::user(*p)]);
+            tok.encode(r.as_str(), false).unwrap().get_ids().to_vec()
+        })
+        .collect()
+}
+
+/// The dense, exact reference: every prompt's first-forward log-probs from
+/// the unpartitioned f32 model.
+fn dense_reference(dir: &Path, device: &Device, prompts: &[Vec<u32>]) -> Vec<Vec<f32>> {
+    let dense = qwen35::load_from_pack(dir, device, &|_| Precision::F32).expect("dense load");
+    prompts
+        .iter()
+        .map(|p| {
+            let mut c = dense.new_cache();
+            log_softmax(&dense.forward(p, 0, &mut c, device))
+        })
+        .collect()
+}
+
+/// The measurement model's expert pool: cluster 0 of every layer stays
+/// local, every other cluster runs remotely at f32.
+fn measurement_pool(pack: &Pack, layers: usize, epl: usize, device: &Device) -> Arc<ExpertPool> {
+    let rows: Vec<Vec<Arc<dyn ExpertExec>>> = (0..layers)
+        .map(|l| {
+            (1..epl)
+                .map(|c| {
+                    let w = qwen35::load_ffn_clusters(pack, l, &[c], Precision::F32, device)
+                        .expect("cluster");
+                    Arc::new(DeviceExpert {
+                        weights: w,
+                        device: device.clone(),
+                        tier: Tier {
+                            device: 0,
+                            precision: Precision::F32,
+                        },
+                        bytes: 0,
+                        native_ok: std::sync::atomic::AtomicBool::new(true),
+                    }) as Arc<dyn ExpertExec>
+                })
+                .collect()
+        })
+        .collect();
+    Arc::new(ExpertPool::new(rows))
+}
+
+/// Per-layer hotness rows from the pool's activation energy (flat: per
+/// layer, clusters 1..epl), each normalized to sum to one. Cluster 0 ran
+/// locally (unmeasured) and is given the mean share.
+fn hotness_rows(energy: &[f64], layers: usize, epl: usize) -> Vec<Vec<f32>> {
+    let mut hotness: Vec<Vec<f32>> = Vec::with_capacity(layers);
+    for l in 0..layers {
+        let remote = &energy[l * (epl - 1)..(l + 1) * (epl - 1)];
+        let mean = remote.iter().sum::<f64>() / f64_from_usize(remote.len().max(1));
+        let mut row: Vec<f64> = std::iter::once(mean)
+            .chain(remote.iter().copied())
+            .collect();
+        let total: f64 = row.iter().sum::<f64>().max(1e-12);
+        for v in &mut row {
+            *v /= total;
+        }
+        hotness.push(row.iter().map(|&v| narrow(v)).collect());
+    }
+    hotness
+}
+
+/// One skip-table point at the model's current `tau`: every prompt against
+/// its dense reference, plus the share of offered clusters the pool kept.
+fn skip_point(
+    model: &LoadedQwen35,
+    pool: &ExpertPool,
+    prompts: &[Vec<u32>],
+    refs: &[Vec<f32>],
+    device: &Device,
+    tau: f32,
+) -> SkipPoint {
+    let _ = pool.take_dense_rows();
+    let mut max_delta = 0f32;
+    let mut agree = 0usize;
+    for (p, r) in prompts.iter().zip(refs) {
+        let mut c = model.new_cache();
+        let out = log_softmax(&model.forward(p, 0, &mut c, device));
+        max_delta = max_delta.max(max_abs_delta(&out, r));
+        agree += usize::from(argmax(&out) == argmax(r));
+    }
+    let (kept, offered) = pool.take_dense_rows();
+    SkipPoint {
+        tau,
+        max_delta_logprob: max_delta,
+        argmax_agreement: f32_from_usize(agree) / f32_from_usize(prompts.len()),
+        kept_fraction: if offered > 0 {
+            f32_from_u64(kept) / f32_from_u64(offered)
+        } else {
+            1.0
+        },
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(dir) = args.first() else {
@@ -63,10 +176,10 @@ fn main() {
         std::process::exit(2);
     };
     let dir = PathBuf::from(dir);
-    let taus: Vec<f32> = args
-        .get(1)
-        .map(|s| s.split(',').filter_map(|t| t.trim().parse().ok()).collect())
-        .unwrap_or_else(|| vec![0.001, 0.003, 0.01, 0.02, 0.05]);
+    let taus: Vec<f32> = args.get(1).map_or_else(
+        || vec![0.001, 0.003, 0.01, 0.02, 0.05],
+        |s| s.split(',').filter_map(|t| t.trim().parse().ok()).collect(),
+    );
     let mut pack = Pack::open(&dir).unwrap_or_else(|e| {
         eprintln!("{}: {e}", dir.display());
         std::process::exit(1);
@@ -85,25 +198,11 @@ fn main() {
     let layers = part.layers.len();
     let epl = part.layers[0].len();
     let device = mummu::backend::cpu_device();
-    let prompts: Vec<Vec<u32>> = PROMPTS
-        .iter()
-        .map(|p| {
-            let r = mummu::chat::ChatMl::qwen3().render(&[mummu::chat::Turn::user(*p)]);
-            tok.encode(r.as_str(), false).unwrap().get_ids().to_vec()
-        })
-        .collect();
+    let prompts = encode_prompts(&tok);
 
     let started = Instant::now();
     // Reference: dense, exact.
-    let dense = qwen35::load_from_pack(&dir, &device, &|_| Precision::F32).expect("dense load");
-    let refs: Vec<Vec<f32>> = prompts
-        .iter()
-        .map(|p| {
-            let mut c = dense.new_cache();
-            log_softmax(&dense.forward(p, 0, &mut c, &device))
-        })
-        .collect();
-    drop(dense);
+    let refs = dense_reference(&dir, &device, &prompts);
     eprintln!(
         "[calibrate] dense reference over {} prompts in {:.0}s",
         prompts.len(),
@@ -111,27 +210,7 @@ fn main() {
     );
 
     // Measurement model: cluster 0 local, every other cluster remote at f32.
-    let rows: Vec<Vec<Arc<dyn ExpertExec>>> = (0..layers)
-        .map(|l| {
-            (1..epl)
-                .map(|c| {
-                    let w = qwen35::load_ffn_clusters(&pack, l, &[c], Precision::F32, &device)
-                        .expect("cluster");
-                    Arc::new(DeviceExpert {
-                        weights: w,
-                        device: device.clone(),
-                        tier: Tier {
-                            device: 0,
-                            precision: Precision::F32,
-                        },
-                        bytes: 0,
-                        native_ok: std::sync::atomic::AtomicBool::new(true),
-                    }) as Arc<dyn ExpertExec>
-                })
-                .collect()
-        })
-        .collect();
-    let pool = Arc::new(ExpertPool::new(rows));
+    let pool = measurement_pool(&pack, layers, epl, &device);
     let mut model =
         qwen35::load_from_pack_partitioned(&dir, &device, &|_| Precision::F32, &|_| vec![0])
             .expect("partitioned load")
@@ -148,57 +227,16 @@ fn main() {
     for (p, r) in prompts.iter().zip(&refs) {
         let mut c = model.new_cache();
         let out = log_softmax(&model.forward(p, 0, &mut c, &device));
-        worst_exact = worst_exact.max(
-            out.iter()
-                .zip(r)
-                .map(|(a, b)| (a - b).abs())
-                .fold(0f32, f32::max),
-        );
+        worst_exact = worst_exact.max(max_abs_delta(&out, r));
     }
     eprintln!("[calibrate] exact tiered vs dense: max |Δlogprob| = {worst_exact:.3e}");
-    let energy = pool.take_energy(); // flat: per layer, clusters 1..epl
-    let mut hotness: Vec<Vec<f32>> = Vec::with_capacity(layers);
-    for l in 0..layers {
-        let remote = &energy[l * (epl - 1)..(l + 1) * (epl - 1)];
-        let mean = remote.iter().sum::<f64>() / remote.len().max(1) as f64;
-        // Cluster 0 ran locally (unmeasured): give it the mean share.
-        let mut row: Vec<f64> = std::iter::once(mean)
-            .chain(remote.iter().copied())
-            .collect();
-        let total: f64 = row.iter().sum::<f64>().max(1e-12);
-        row.iter_mut().for_each(|v| *v /= total);
-        hotness.push(row.iter().map(|&v| v as f32).collect());
-    }
+    let hotness = hotness_rows(&pool.take_energy(), layers, epl);
 
     // Skip table.
     let mut table = Vec::with_capacity(taus.len());
     for &tau in &taus {
         model = model.with_ffn_skip(tau);
-        let _ = pool.take_dense_rows();
-        let mut max_delta = 0f32;
-        let mut agree = 0usize;
-        for (p, r) in prompts.iter().zip(&refs) {
-            let mut c = model.new_cache();
-            let out = log_softmax(&model.forward(p, 0, &mut c, &device));
-            max_delta = max_delta.max(
-                out.iter()
-                    .zip(r)
-                    .map(|(a, b)| (a - b).abs())
-                    .fold(0f32, f32::max),
-            );
-            agree += usize::from(argmax(&out) == argmax(r));
-        }
-        let (kept, offered) = pool.take_dense_rows();
-        let point = SkipPoint {
-            tau,
-            max_delta_logprob: max_delta,
-            argmax_agreement: agree as f32 / prompts.len() as f32,
-            kept_fraction: if offered > 0 {
-                kept as f32 / offered as f32
-            } else {
-                1.0
-            },
-        };
+        let point = skip_point(&model, &pool, &prompts, &refs, &device, tau);
         eprintln!(
             "[calibrate] tau={tau}: max |Δlogprob| {:.3}, argmax agreement {:.0}%, clusters kept {:.1}%",
             point.max_delta_logprob,

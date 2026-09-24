@@ -2,6 +2,9 @@
 //! GPU-PV. The 27B alternates CPU trunk <-> GPU FFN clusters 65 times per
 //! token; if each boundary costs a full device round trip, that is the
 //! missing ~28 s.
+
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use std::time::Instant;
 
 use burn::tensor::{Distribution, Tensor};
@@ -27,10 +30,10 @@ fn main() {
         t.elapsed().as_secs_f64() * 1e3 / f64::from(n)
     );
 
-    let x_gpu = Tensor::<2>::random([1, hidden], Distribution::Default, &gpu);
+    let x_resident = Tensor::<2>::random([1, hidden], Distribution::Default, &gpu);
     let t = Instant::now();
     for _ in 0..n {
-        let _ = x_gpu.clone().to_device(&cpu).into_data();
+        let _ = x_resident.clone().to_device(&cpu).into_data();
     }
     println!(
         "GPU->CPU->readback [1,5120]: {:.3} ms",
@@ -42,7 +45,7 @@ fn main() {
     let w = Tensor::<2>::random([hidden, 2176], Distribution::Default, &gpu);
     let t = Instant::now();
     for _ in 0..n {
-        let _ = x_gpu.clone().matmul(w.clone()).into_data();
+        let _ = x_resident.clone().matmul(w.clone()).into_data();
     }
     let per = t.elapsed().as_secs_f64() / f64::from(n);
     println!(

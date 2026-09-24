@@ -109,9 +109,11 @@ pub const QUIET_LINES: usize = 500;
 /// says so rather than letting the page print it as a count.
 const EVICTION_MEMORY: usize = MAX_LINES;
 
-/// Longest single line kept, in bytes. A runaway print (a panic payload
-/// carrying a whole tensor manifest, a client-supplied name, a binary blob
-/// that reached stderr) must not be able to grow the ring without bound:
+/// Longest single line kept, in bytes.
+///
+/// A runaway print (a panic payload carrying a whole tensor manifest, a
+/// client-supplied name, a binary blob that reached stderr) must not be able
+/// to grow the ring without bound:
 /// 2000 x 2 KiB caps the worst case at ~4 MiB, while the real lines here run
 /// well under 200 bytes. Nothing is actually lost — the tee wrote the full
 /// bytes through to the original fd before truncating for the ring.
@@ -428,13 +430,14 @@ static RING: Mutex<Ring> = Mutex::new(Ring::new());
 /// holder could have left behind is a half-pushed `VecDeque`, and losing the
 /// log is exactly the wrong response to the panic we are here to show.
 fn ring() -> std::sync::MutexGuard<'static, Ring> {
-    RING.lock().unwrap_or_else(|e| e.into_inner())
+    RING.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
+        .map_or(0, crate::millis)
 }
 
 /// Record a line under `source`, classifying its level from the text.
@@ -473,9 +476,11 @@ fn record(source: Source, level: Option<Level>, quiet: bool, text: String) {
 }
 
 /// Record a line that an EARLIER process printed, keeping its own time and
-/// level. It takes a seq in this process's sequence like any other line —
-/// which is what puts it in front of everything this process prints, where a
-/// reader expects the story of the restart to start.
+/// level.
+///
+/// It takes a seq in this process's sequence like any other line — which is
+/// what puts it in front of everything this process prints, where a reader
+/// expects the story of the restart to start.
 ///
 /// Only `recovery` calls this, replaying the tail the previous process wrote
 /// before it exited to restart the GPU backend.
@@ -766,7 +771,7 @@ impl LogsParams {
 pub async fn endpoint(params: axum::extract::Query<LogsParams>) -> Response {
     let q = match params.resolve() {
         Ok(q) => q,
-        Err(e) => return json_response(400, json!({ "error": e })),
+        Err(e) => return json_response(400, &json!({ "error": e })),
     };
     // On a blocking thread for the same reason `/api/health` is: the status
     // object reads `/proc` and calls into NVML, which are file and FFI work,
@@ -777,7 +782,7 @@ pub async fn endpoint(params: axum::extract::Query<LogsParams>) -> Response {
         if let Some(object) = body.as_object_mut() {
             object.insert("status".to_owned(), crate::status::to_json());
         }
-        json_response(200, body)
+        json_response(200, &body)
     })
     .await
 }
@@ -1138,10 +1143,11 @@ impl Reassembler {
     }
 }
 
-/// Start capturing this process's stdout and stderr into the ring. Idempotent:
-/// both the binary and [`crate::serve_on`] call it, because whichever runs
-/// first must win and the second must be a no-op — installing twice would
-/// point fd 1 at a pipe whose reader writes to another pipe.
+/// Start capturing this process's stdout and stderr into the ring.
+///
+/// Idempotent: both the binary and [`crate::serve_on`] call it, because
+/// whichever runs first must win and the second must be a no-op — installing
+/// twice would point fd 1 at a pipe whose reader writes to another pipe.
 ///
 /// Call it as early as possible: everything printed before it lands only in
 /// `docker logs`, and the lines worth seeing start at the first model load.
@@ -1211,7 +1217,7 @@ mod capture {
                 libc::close(original);
                 return;
             }
-            let (read_fd, write_fd) = (ends[0], ends[1]);
+            let [read_fd, write_fd] = ends;
             if libc::dup2(write_fd, fd) < 0 {
                 libc::close(read_fd);
                 libc::close(write_fd);
@@ -1298,7 +1304,8 @@ mod capture {
             if read == 0 {
                 break; // every writer is gone; the process is on its way out
             }
-            let chunk = &buf[..read as usize];
+            // `read > 0` here, so the cast is exact.
+            let chunk = &buf[..read.cast_unsigned()];
             // Write through FIRST. The ring is a convenience; `docker logs` is
             // the record, and it must not lag or lose a byte because we were
             // busy classifying.
@@ -1315,7 +1322,7 @@ mod capture {
             // stream, owned by this thread.
             let wrote = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
             if wrote > 0 {
-                buf = &buf[wrote as usize..];
+                buf = &buf[wrote.cast_unsigned()..];
                 continue;
             }
             if wrote < 0 && std::io::Error::last_os_error().kind() == ErrorKind::Interrupted {

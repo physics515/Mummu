@@ -1,11 +1,11 @@
 //! **The multiple-choice residency knapsack: device x precision x KV bits,
-//! per item, under one VRAM budget (SPEC P2.4/P2.5) — with the lm_head as a
+//! per item, under one VRAM budget (SPEC P2.4/P2.5) — with the `lm_head` as a
 //! first-class item (SPEC P4.1).**
 //!
 //! [`placement::place`](crate::placement) answers "which contiguous run of
 //! layers lives on the GPU" with every layer offered exactly two shapes
 //! (host or GPU at fixed precision). This module answers the finer question
-//! the VRAM work opens up: each *item* (a layer, the lm_head, a KV pool)
+//! the VRAM work opens up: each *item* (a layer, the `lm_head`, a KV pool)
 //! offers several **options** — (GPU @ Q4), (GPU @ F16), (host), (GPU with
 //! f16 KV), … — each with its own VRAM bytes and per-token cost, and the
 //! plan picks exactly one option per item to minimize total cost under the
@@ -25,6 +25,8 @@
 //! host layer's ~22 ms/GiB, so the head outranks ~4 layers the moment the
 //! bytes exist" — so the decision is a computation, not a rule of thumb.
 
+use mummu_num::f64_from_u64;
+
 /// One way an item can be realized: `bytes` of the shared budget (0 for a
 /// host-resident option), `cost_ms` per token.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -38,7 +40,7 @@ pub struct Choice {
 #[derive(Debug, Clone)]
 pub struct Item {
     /// A short label carried through for the audit trail ("layer 17",
-    /// "lm_head", "kv@4096").
+    /// "`lm_head`", "kv@4096").
     pub name: String,
     pub options: Vec<Choice>,
 }
@@ -53,7 +55,9 @@ pub struct ChoicePlan {
 }
 
 /// Exact multiple-choice knapsack over budget granules of `granularity`
-/// bytes. Bytes of every option are rounded UP to the granule, so the
+/// bytes.
+///
+/// Bytes of every option are rounded UP to the granule, so the
 /// returned plan's true byte total is `<= budget` whenever its granule
 /// total is — the discretization can only *waste* budget, never overdraw
 /// it. Cost ties keep the lower option index.
@@ -160,8 +164,8 @@ pub fn admit_head(
         .filter(|&(s, b)| s > 0.0 && b > 0)
         .collect();
     layers.sort_by(|a, b| {
-        let da = a.0 / a.1 as f64;
-        let db = b.0 / b.1 as f64;
+        let da = a.0 / f64_from_u64(a.1);
+        let db = b.0 / f64_from_u64(b.1);
         db.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal)
     });
     let mut bundle = 0.0f64;
@@ -199,7 +203,7 @@ mod tests {
             state = old
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
-            ((old >> 33) as u32) as u64
+            u64::from((old >> 33) as u32)
         };
         for trial in 0..40 {
             let n = 1 + (next() % 5) as usize;
@@ -207,9 +211,9 @@ mod tests {
                 .map(|i| {
                     let opts = 1 + (next() % 3) as usize;
                     let mut options: Vec<(u64, f64)> = (0..opts)
-                        .map(|_| ((next() % 8) * 10, (next() % 100) as f64 / 7.0))
+                        .map(|_| ((next() % 8) * 10, f64_from_u64(next() % 100) / 7.0))
                         .collect();
-                    options.push((0, (next() % 200) as f64 / 7.0)); // host fallback
+                    options.push((0, f64_from_u64(next() % 200) / 7.0)); // host fallback
                     item(&format!("i{i}"), &options)
                 })
                 .collect();

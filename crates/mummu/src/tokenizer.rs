@@ -5,17 +5,18 @@
 //! token id), per-token types, BPE `merges`, and a `pre` identifier naming
 //! the pre-tokenizer regex (the ecosystem hardcodes the regex per model
 //! family, exactly as llama.cpp's `llama_vocab` does). Rebuilt as:
-//! NFC → Split(pre regex) → ByteLevel → BPE, with control/user-defined
+//! NFC → Split(pre regex) → `ByteLevel` → BPE, with control/user-defined
 //! tokens re-added as special/non-special added tokens. Verified
 //! byte-identical vs the checkpoint's `tokenizer.json` in `tests/real_gguf.rs`.
 //!
-//! **SentencePiece `tokenizer.model`** ([`tokenizer_from_spm`]) — the SPM
+//! **`SentencePiece` `tokenizer.model`** ([`tokenizer_from_spm`]) — the SPM
 //! proto the Llama/Gemma/T5 families ship. A bounded hand-rolled protobuf
 //! reader (the `gguf.rs` approach — the schema is tiny and frozen) feeds the
 //! same pipeline HF's `convert_slow_tokenizer` assembles: Precompiled
 //! charsmap (+ multi-space collapse) → Metaspace → **Unigram**. Verified
 //! byte-identical vs the checkpoint's `tokenizer.json` in `tests/real_spm.rs`.
 
+use std::fmt::Write as _;
 use std::path::Path;
 
 use tokenizers::models::bpe::{BPE, Merges, Vocab};
@@ -86,6 +87,92 @@ fn required_array<'f>(f: &'f GgufFile, key: &str) -> Result<&'f [GgufValue], Str
         .ok_or_else(|| format!("missing or non-array GGUF metadata '{key}'"))
 }
 
+/// A control / user-defined token to re-add after BPE, as
+/// `(id, content, is_special)`.
+type GgufAddedToken = (u32, String, bool);
+
+/// What [`gguf_vocab`] resolves: the BPE vocab plus the tokens to re-add.
+type GgufVocab = (Vocab, Vec<GgufAddedToken>);
+
+/// The BPE vocab from the `tokens` / `token_type` arrays — every non-padding
+/// token at id = array index — plus the control / user-defined tokens to
+/// re-add post-BPE, as `(id, content, is_special)`.
+///
+/// Control/user-defined tokens go in the vocab TOO — `add_tokens` then
+/// reuses the model id it finds, which is what lets added tokens live at
+/// LOW ids (LFM2 puts its 500+ specials at 0..) instead of only after the
+/// vocab.
+fn gguf_vocab(tokens: &[GgufValue], types: &[GgufValue]) -> Result<GgufVocab, String> {
+    let mut vocab = Vocab::default();
+    let mut added: Vec<GgufAddedToken> = Vec::new();
+    for (index, (token, ty)) in tokens.iter().zip(types).enumerate() {
+        let text = token
+            .as_str()
+            .ok_or_else(|| format!("token {index} is not a string"))?;
+        let ty = ty
+            .as_i64()
+            .ok_or_else(|| format!("token_type {index} is not an integer"))?;
+        let id = u32::try_from(index).map_err(|_| format!("token id {index} does not fit u32"))?;
+        match ty {
+            TOKEN_TYPE_NORMAL => {
+                vocab.insert(text.to_string(), id);
+            }
+            TOKEN_TYPE_CONTROL | TOKEN_TYPE_USER_DEFINED => {
+                vocab.insert(text.to_string(), id);
+                added.push((id, text.to_string(), ty == TOKEN_TYPE_CONTROL));
+            }
+            TOKEN_TYPE_UNUSED => {} // vocab-padding entries ([PADn])
+            other => return Err(format!("token {index} has unsupported type {other}")),
+        }
+    }
+    Ok((vocab, added))
+}
+
+/// The BPE merge list from `tokenizer.ggml.merges` (`"left right"` strings).
+fn gguf_merges(f: &GgufFile) -> Result<Merges, String> {
+    let raw = required_array(f, "tokenizer.ggml.merges")?;
+    let mut merges = Merges::with_capacity(raw.len());
+    for (i, m) in raw.iter().enumerate() {
+        let m = m
+            .as_str()
+            .ok_or_else(|| format!("merge {i} is not a string"))?;
+        let (a, b) = m
+            .split_once(' ')
+            .ok_or_else(|| format!("merge {i} ('{m}') is not 'left right'"))?;
+        merges.push((a.to_string(), b.to_string()));
+    }
+    Ok(merges)
+}
+
+/// Re-add control/user-defined tokens in id order, then verify every id
+/// landed where the GGUF says it lives — a drifted id would silently
+/// corrupt every prompt.
+fn add_and_verify_gguf_specials(
+    tok: &mut Tokenizer,
+    added: &[(u32, String, bool)],
+) -> Result<(), String> {
+    for (_, text, special) in added {
+        let t = AddedToken::from(text.clone(), *special);
+        if *special {
+            tok.add_special_tokens([t])
+                .map_err(|e| format!("add special token '{text}': {e}"))?;
+        } else {
+            tok.add_tokens([t])
+                .map_err(|e| format!("add token '{text}': {e}"))?;
+        }
+    }
+    for (id, text, _) in added {
+        let got = tok.token_to_id(text);
+        if got != Some(*id) {
+            return Err(format!(
+                "added token '{text}' resolved to id {got:?}, GGUF says {id} — \
+                 non-contiguous added-token ids are not supported"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Build an HF [`Tokenizer`] from a GGUF file's `tokenizer.ggml.*` metadata.
 ///
 /// Supports the `gpt2` (byte-level BPE) tokenizer model with a known `pre`
@@ -94,6 +181,23 @@ fn required_array<'f>(f: &'f GgufFile, key: &str) -> Result<&'f [GgufValue], Str
 /// added tokens, unused (type 5) padding entries are skipped. Every added
 /// token's id is verified after construction — a drifted id would silently
 /// corrupt every prompt, so it fails loudly instead.
+///
+/// # Errors
+///
+/// When `tokenizer.ggml.model` is missing or not `gpt2`; when
+/// `tokenizer.ggml.pre` is missing or names a family with no registered
+/// regex; when `tokens`, `token_type` or `merges` is missing, not an array,
+/// or malformed (token/type lengths differ, a non-string token, a
+/// non-integer or unsupported token type, a merge that is not
+/// `"left right"`, an index past `u32`); when the BPE model, normalizer,
+/// split regex or BOS template fails to build; when `add_bos_token` is set
+/// without a `bos_token_id` inside the vocab; or when an added token
+/// resolves to an id other than its array index.
+///
+/// # Panics
+///
+/// If no token has the NORMAL type — a vocabulary with no BPE tokens is not
+/// a tokenizer.
 pub fn tokenizer_from_gguf(f: &GgufFile) -> Result<Tokenizer, String> {
     let model = f
         .get("tokenizer.ggml.model")
@@ -122,48 +226,9 @@ pub fn tokenizer_from_gguf(f: &GgufFile) -> Result<Tokenizer, String> {
         ));
     }
 
-    // The BPE vocab: every non-padding token at id = array index. Control/
-    // user-defined tokens go in TOO — `add_tokens` below then reuses the
-    // model id it finds, which is what lets added tokens live at LOW ids
-    // (LFM2 puts its 500+ specials at 0..) instead of only after the vocab.
-    let mut vocab = Vocab::default();
-    // (index, content, is_special) for everything re-added post-BPE.
-    let mut added: Vec<(usize, String, bool)> = Vec::new();
-    for (index, (token, ty)) in tokens.iter().zip(types).enumerate() {
-        let text = token
-            .as_str()
-            .ok_or_else(|| format!("token {index} is not a string"))?;
-        let ty = ty
-            .as_i64()
-            .ok_or_else(|| format!("token_type {index} is not an integer"))?;
-        #[allow(clippy::cast_possible_truncation)] // bounded by MAX_ARRAY_LEN
-        match ty {
-            TOKEN_TYPE_NORMAL => {
-                vocab.insert(text.to_string(), index as u32);
-            }
-            TOKEN_TYPE_CONTROL | TOKEN_TYPE_USER_DEFINED => {
-                vocab.insert(text.to_string(), index as u32);
-                added.push((index, text.to_string(), ty == TOKEN_TYPE_CONTROL));
-            }
-            TOKEN_TYPE_UNUSED => {} // vocab-padding entries ([PADn])
-            other => return Err(format!("token {index} has unsupported type {other}")),
-        }
-    }
+    let (vocab, added) = gguf_vocab(tokens, types)?;
     assert!(!vocab.is_empty(), "a tokenizer must have normal tokens");
-
-    let mut merges = Merges::with_capacity(required_array(f, "tokenizer.ggml.merges")?.len());
-    for (i, m) in required_array(f, "tokenizer.ggml.merges")?
-        .iter()
-        .enumerate()
-    {
-        let m = m
-            .as_str()
-            .ok_or_else(|| format!("merge {i} is not a string"))?;
-        let (a, b) = m
-            .split_once(' ')
-            .ok_or_else(|| format!("merge {i} ('{m}') is not 'left right'"))?;
-        merges.push((a.to_string(), b.to_string()));
-    }
+    let merges = gguf_merges(f)?;
 
     let bpe = BPE::builder()
         .vocab_and_merges(vocab, merges)
@@ -217,28 +282,7 @@ pub fn tokenizer_from_gguf(f: &GgufFile) -> Result<Tokenizer, String> {
         tok.with_post_processor(Some(byte_level));
     }
 
-    // Re-add control/user-defined tokens in id order, then verify every id
-    // landed where the GGUF says it lives.
-    for (_, text, special) in &added {
-        let t = AddedToken::from(text.clone(), *special);
-        if *special {
-            tok.add_special_tokens([t])
-                .map_err(|e| format!("add special token '{text}': {e}"))?;
-        } else {
-            tok.add_tokens([t])
-                .map_err(|e| format!("add token '{text}': {e}"))?;
-        }
-    }
-    for (index, text, _) in &added {
-        let got = tok.token_to_id(text);
-        #[allow(clippy::cast_possible_truncation)] // bounded by MAX_ARRAY_LEN
-        if got != Some(*index as u32) {
-            return Err(format!(
-                "added token '{text}' resolved to id {got:?}, GGUF says {index} — \
-                 non-contiguous added-token ids are not supported"
-            ));
-        }
-    }
+    add_and_verify_gguf_specials(&mut tok, &added)?;
     Ok(tok)
 }
 
@@ -251,8 +295,9 @@ pub const TOKENIZER_JSON: &str = "tokenizer.json";
 const MAX_LISTED_MISMATCHES: usize = 8;
 
 /// The full checkpoint-metadata gate a safetensors loader runs after parsing
-/// `config.json` and **before** reading any weight bytes. It layers the
-/// tokenizer-opening id cross-check on top of the tokenizer-free
+/// `config.json` and **before** reading any weight bytes.
+///
+/// It layers the tokenizer-opening id cross-check on top of the tokenizer-free
 /// [`tok_config::validate_dir`] gate (EOS agreement + tool-call convention),
 /// giving the loaders one call that fails loudly on *any* metadata
 /// disagreement at load time rather than at generate time.
@@ -267,6 +312,22 @@ const MAX_LISTED_MISMATCHES: usize = 8;
 /// disagree with the real `tokenizer.json` is an [`ImportError::Inconsistent`]
 /// (a repackaging bug a checked *weight* load cannot see). On success the parsed
 /// config is returned so a loader can reuse it (e.g. future config-driven BOS).
+///
+/// # Errors
+///
+/// Whatever [`tok_config::validate_dir`] reports — an [`ImportError::Parse`]
+/// for a `tokenizer_config.json` that is present but unreadable, oversize or
+/// malformed, an [`ImportError::Inconsistent`] when its EOS ids disagree with
+/// `config_eos_ids` or its chat template speaks a tool-call convention other
+/// than `expected_convention` — plus, when a `tokenizer.json` sits beside it,
+/// an [`ImportError::Parse`] if that file fails to load and an
+/// [`ImportError::Inconsistent`] naming every added token whose declared id
+/// differs from the one the tokenizer assigns.
+///
+/// # Panics
+///
+/// If `dir` is the empty path, or if `config_eos_ids` holds more than 256
+/// ids (a `config.json` EOS set is a handful).
 pub fn validate_checkpoint_dir(
     dir: &Path,
     config_eos_ids: &[u32],
@@ -327,13 +388,16 @@ fn check_added_token_ids(dir: &Path, cfg: &TokenizerConfig) -> Result<(), Import
         TOKENIZER_JSON,
     );
     for m in mismatches.iter().take(shown) {
-        reason.push_str(&format!(
+        write!(
+            reason,
             " {:?} (config={:?}, tokenizer={:?});",
             m.content, m.found, m.expected
-        ));
+        )
+        .expect("formatting into a String cannot fail");
     }
     if mismatches.len() > shown {
-        reason.push_str(&format!(" (+{} more)", mismatches.len() - shown));
+        write!(reason, " (+{} more)", mismatches.len() - shown)
+            .expect("formatting into a String cannot fail");
     }
     Err(ImportError::Inconsistent { file: path, reason })
 }
@@ -349,7 +413,7 @@ const MAX_SPM_FILE_BYTES: u64 = 64 * 1024 * 1024;
 /// Most pieces a proto may declare (Gemma: 256k; bound leaves headroom).
 const MAX_SPM_PIECES: usize = 1_048_576;
 
-/// SentencePiece `ModelProto.SentencePiece.Type` values.
+/// `SentencePiece` `ModelProto.SentencePiece.Type` values.
 const SPM_TYPE_NORMAL: i64 = 1;
 const SPM_TYPE_UNKNOWN: i64 = 2;
 const SPM_TYPE_CONTROL: i64 = 3;
@@ -368,7 +432,7 @@ struct SpmPiece {
     kind: i64,
 }
 
-/// The slice of a SentencePiece `ModelProto` that tokenizer assembly needs.
+/// The slice of a `SentencePiece` `ModelProto` that tokenizer assembly needs.
 struct SpmProto {
     pieces: Vec<SpmPiece>,
     model_type: i64,
@@ -388,7 +452,7 @@ struct ProtoReader<'a> {
 }
 
 impl<'a> ProtoReader<'a> {
-    fn new(buf: &'a [u8]) -> Self {
+    const fn new(buf: &'a [u8]) -> Self {
         Self { buf, pos: 0 }
     }
 
@@ -416,7 +480,6 @@ impl<'a> ProtoReader<'a> {
     /// The next field key as `(field_number, wire_type)`.
     fn key(&mut self) -> Result<(u64, u8), String> {
         let key = self.varint()?;
-        #[allow(clippy::cast_possible_truncation)] // wire type is 3 bits
         Ok((key >> 3, (key & 0x7) as u8))
     }
 
@@ -493,7 +556,7 @@ fn parse_spm_piece(buf: &[u8]) -> Result<SpmPiece, String> {
     Ok(piece)
 }
 
-/// Parse a SentencePiece `ModelProto`: `pieces`(1, repeated),
+/// Parse a `SentencePiece` `ModelProto`: `pieces`(1, repeated),
 /// `trainer_spec`(2) for `model_type`(3)/`unk_id`(40), `normalizer_spec`(3)
 /// for `precompiled_charsmap`(2)/`add_dummy_prefix`(3)/
 /// `remove_extra_whitespaces`(4). Unknown fields are skipped, truncation is a
@@ -558,10 +621,11 @@ fn parse_model_proto(buf: &[u8]) -> Result<SpmProto, String> {
     Ok(proto)
 }
 
-/// Build an HF [`Tokenizer`] from a SentencePiece `tokenizer.model` proto
-/// (the Llama/Gemma/T5-family format) — the same pipelines HF's own
-/// `convert_slow_tokenizer` assembles, dispatched on the proto's
-/// `model_type`:
+/// Build an HF [`Tokenizer`] from a `SentencePiece` `tokenizer.model` proto
+/// (the Llama/Gemma/T5-family format).
+///
+/// The same pipelines HF's own `convert_slow_tokenizer` assembles,
+/// dispatched on the proto's `model_type`:
 ///
 /// - **UNIGRAM** (T5/ALBERT/Gemma): `Precompiled` charsmap normalizer (+ a
 ///   `{2,}`-space collapse when `remove_extra_whitespaces`), a Metaspace
@@ -572,7 +636,7 @@ fn parse_model_proto(buf: &[u8]) -> Result<SpmProto, String> {
 ///   space→`▁` normalizer, no pre-tokenizer, and the
 ///   Replace/ByteFallback/Fuse/Strip decoder chain.
 ///
-/// In both, CONTROL/UNKNOWN pieces become special added tokens, USER_DEFINED
+/// In both, CONTROL/UNKNOWN pieces become special added tokens, `USER_DEFINED`
 /// become plain added tokens, and every added id is verified post-build
 /// exactly like the GGUF path. Tokens a checkpoint adds *beyond* the proto
 /// (T5's `<extra_id_*>`, chat specials) live in sibling metadata
@@ -581,6 +645,17 @@ fn parse_model_proto(buf: &[u8]) -> Result<SpmProto, String> {
 ///
 /// Faithfulness is verified against the same checkpoints' `tokenizer.json`
 /// (byte-identical ids over a battery of prompts) in `tests/real_spm.rs`.
+///
+/// # Errors
+///
+/// When `path` cannot be stat'ed or read or is larger than the 64 MiB
+/// bound; when the bytes are not a well-formed `ModelProto` (truncated or
+/// over-long varints, fields past the end, an unsupported wire type, a
+/// non-UTF-8 piece, more than 1M pieces, or no pieces at all); when
+/// `model_type` is neither UNIGRAM nor BPE, `unk_id` is outside the pieces,
+/// a piece has an unsupported type, or (BPE) two pieces share a text; when
+/// the HF model, normalizer or replace pattern fails to build; or when an
+/// added special/user-defined piece resolves to an id other than its index.
 pub fn tokenizer_from_spm(path: &Path) -> Result<Tokenizer, String> {
     let meta = std::fs::metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
     if meta.len() > MAX_SPM_FILE_BYTES {
@@ -678,8 +753,8 @@ fn assemble_spm_bpe(proto: &SpmProto) -> Result<Tokenizer, String> {
     let byte_fallback = proto.pieces.iter().any(|p| p.kind == SPM_TYPE_BYTE);
     let mut vocab = Vocab::default();
     for (index, p) in proto.pieces.iter().enumerate() {
-        #[allow(clippy::cast_possible_truncation)] // bounded by MAX_SPM_PIECES
-        vocab.insert(p.text.clone(), index as u32);
+        let id = u32::try_from(index).map_err(|_| format!("piece id {index} does not fit u32"))?;
+        vocab.insert(p.text.clone(), id);
     }
     if vocab.len() != proto.pieces.len() {
         return Err("duplicate piece text in the proto".into());
@@ -728,7 +803,7 @@ fn assemble_spm_bpe(proto: &SpmProto) -> Result<Tokenizer, String> {
     Ok(tok)
 }
 
-/// Reconstruct BPE merges from a SentencePiece BPE proto's vocab + scores —
+/// Reconstruct BPE merges from a `SentencePiece` BPE proto's vocab + scores —
 /// HF's `SentencePieceExtractor.extract(vocab_scores)`, literally: every
 /// piece contributes each split `(l, r)` whose halves are both pieces, local
 /// candidates ordered by `(id(l), id(r))`; the whole list is then
@@ -759,17 +834,19 @@ fn extract_spm_merges(pieces: &[SpmPiece], vocab: &Vocab) -> Merges {
 }
 
 /// CONTROL/UNKNOWN pieces are the proto's specials (`<s>`, `</s>`, `<unk>`,
-/// …); USER_DEFINED are plain added tokens. Re-add + verify every id like
+/// …); `USER_DEFINED` are plain added tokens. Re-add + verify every id like
 /// the GGUF path — a drifted id would silently corrupt every prompt.
 fn add_and_verify_spm_specials(tok: &mut Tokenizer, proto: &SpmProto) -> Result<(), String> {
-    let mut added: Vec<(usize, &str, bool)> = Vec::new();
+    let mut added: Vec<(u32, &str, bool)> = Vec::new();
     for (index, p) in proto.pieces.iter().enumerate() {
-        match p.kind {
-            SPM_TYPE_CONTROL | SPM_TYPE_UNKNOWN => added.push((index, &p.text, true)),
-            SPM_TYPE_USER_DEFINED => added.push((index, &p.text, false)),
-            SPM_TYPE_NORMAL | SPM_TYPE_UNUSED | SPM_TYPE_BYTE => {}
+        let special = match p.kind {
+            SPM_TYPE_CONTROL | SPM_TYPE_UNKNOWN => true,
+            SPM_TYPE_USER_DEFINED => false,
+            SPM_TYPE_NORMAL | SPM_TYPE_UNUSED | SPM_TYPE_BYTE => continue,
             other => return Err(format!("piece {index} has unsupported type {other}")),
-        }
+        };
+        let id = u32::try_from(index).map_err(|_| format!("piece id {index} does not fit u32"))?;
+        added.push((id, &p.text, special));
     }
     for &(_, text, special) in &added {
         let t = AddedToken::from(text.to_string(), special);
@@ -783,8 +860,7 @@ fn add_and_verify_spm_specials(tok: &mut Tokenizer, proto: &SpmProto) -> Result<
     }
     for &(index, text, _) in &added {
         let got = tok.token_to_id(text);
-        #[allow(clippy::cast_possible_truncation)] // bounded by MAX_SPM_PIECES
-        if got != Some(index as u32) {
+        if got != Some(index) {
             return Err(format!(
                 "added token '{text}' resolved to id {got:?}, the proto says {index}"
             ));
@@ -885,7 +961,8 @@ mod tests {
         let mut msg = pb_field(1, 2, text.as_bytes());
         msg.extend(pb_field(2, 5, &score.to_le_bytes()));
         if let Some(k) = kind {
-            msg.extend(pb_field(3, 0, &pb_varint(k as u64)));
+            let k = u64::try_from(k).expect("proto enum values are non-negative");
+            msg.extend(pb_field(3, 0, &pb_varint(k)));
         }
         msg
     }
@@ -903,7 +980,8 @@ mod tests {
         ] {
             buf.extend(pb_field(1, 2, &msg));
         }
-        let mut trainer = pb_field(3, 0, &pb_varint(model_type as u64));
+        let model_type = u64::try_from(model_type).expect("proto enum values are non-negative");
+        let mut trainer = pb_field(3, 0, &pb_varint(model_type));
         trainer.extend(pb_field(40, 0, &pb_varint(0))); // unk_id
         buf.extend(pb_field(2, 2, &trainer));
         let mut norm = pb_field(3, 0, &pb_varint(1)); // add_dummy_prefix

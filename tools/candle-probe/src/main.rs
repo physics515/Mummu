@@ -2,11 +2,13 @@
 //!
 //! Usage: `candle-probe <model-dir> [k]` — loads `config.json` /
 //! `tokenizer.json` / `model.safetensors` from `<model-dir>` (a Qwen2-family
-//! checkpoint), runs ONE forward over the fixed ChatML prompt below on CPU in
+//! checkpoint), runs ONE forward over the fixed `ChatML` prompt below on CPU in
 //! f32, and prints a JSON object with the prompt, the top-k ids, and their
 //! logits. Redirect the output into
 //! `crates/mummu/tests/fixtures/<model>_first_logits.json` to refresh the
 //! committed fixture that `tests/parity_qwen2.rs` compares Burn against.
+
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
@@ -26,7 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut args = std::env::args().skip(1);
     let dir = std::path::PathBuf::from(args.next().ok_or("usage: candle-probe <model-dir> [k]")?);
     let k: usize = args.next().map(|s| s.parse()).transpose()?.unwrap_or(5);
-    assert!(k >= 1 && k <= 64, "k out of range: {k}");
+    assert!((1..=64).contains(&k), "k out of range: {k}");
     assert!(dir.is_dir(), "not a directory: {}", dir.display());
 
     let device = Device::Cpu;

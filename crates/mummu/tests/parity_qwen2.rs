@@ -10,11 +10,14 @@
 //! This is the greedy leg of the P7 parity gate; the top-k-logits leg runs
 //! against the Candle probe (`tools/candle-probe`) which exposes raw logits.
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use std::path::PathBuf;
 use std::process::Command;
 
 use mummu::models::CausalLm;
 use mummu::models::qwen2;
+use mummu_num::narrow;
 use tokenizers::Tokenizer;
 
 const REFERENCE_TAG: &str = "qwen2.5:1.5b-instruct-fp16";
@@ -26,7 +29,7 @@ fn qwen2_dir() -> Option<PathBuf> {
     dir.is_dir().then_some(dir)
 }
 
-/// The Qwen2.5-Instruct ChatML wrapping (system + user turn + assistant open),
+/// The Qwen2.5-Instruct `ChatML` wrapping (system + user turn + assistant open),
 /// rendered by the library's own template — the fixture equality assert below
 /// is what byte-verifies `chat::ChatMl::qwen2` against the Candle reference.
 fn chatml(user: &str) -> String {
@@ -105,7 +108,7 @@ fn qwen2_first_forward_top_k_matches_candle_reference() {
         .as_array()
         .expect("prompt_ids")
         .iter()
-        .map(|v| v.as_u64().expect("id") as u32)
+        .map(|v| u32::try_from(v.as_u64().expect("id")).expect("fixture token id fits u32"))
         .collect();
     assert_eq!(prompt_ids, fixture_ids, "tokenizations diverge");
 
@@ -125,8 +128,8 @@ fn qwen2_first_forward_top_k_matches_candle_reference() {
         .iter()
         .map(|e| {
             (
-                e["id"].as_u64().expect("id") as usize,
-                e["logit"].as_f64().expect("logit") as f32,
+                usize::try_from(e["id"].as_u64().expect("id")).expect("fixture id fits usize"),
+                narrow(e["logit"].as_f64().expect("logit")),
             )
         })
         .collect();

@@ -18,7 +18,7 @@
 //! lookup tables stored in the rotated basis (`inverse_weight_names` — the
 //! token embedding, whose rows come out rotated and are restored with the
 //! inverse right after the gather), and `gdn_v_grouped`, which says the
-//! DeltaNet output projection was folded over the value heads in HF's
+//! `DeltaNet` output projection was folded over the value heads in HF's
 //! grouped order while the runtime's activation arrives in llama.cpp's
 //! tiled order (see [`tiled_to_grouped`]). Everything here mirrors the
 //! Prism llama.cpp fork (`llama-model.cpp` parses the keys; `build_lora_mm`
@@ -30,6 +30,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use burn::tensor::{Device, Tensor, TensorData};
+use mummu_num::f32_from_usize;
 
 use crate::gguf::{GgufFile, GgufValue};
 
@@ -37,6 +38,107 @@ use crate::gguf::{GgufFile, GgufValue};
 const PREFIX: &str = "prism.hadamard.";
 /// The only contract version this runtime implements.
 const VERSION: u64 = 1;
+
+/// The full metadata key for `k`.
+fn key(k: &str) -> String {
+    format!("{PREFIX}{k}")
+}
+
+/// `prism.hadamard.<k>` as a string.
+fn str_key<'a>(f: &'a GgufFile, k: &str) -> Result<&'a str, String> {
+    f.get(&key(k))
+        .and_then(GgufValue::as_str)
+        .ok_or_else(|| format!("prism.hadamard.{k} missing or not a string"))
+}
+
+/// `prism.hadamard.<k>` as an unsigned integer (a non-negative signed
+/// value counts).
+fn uint_key(f: &GgufFile, k: &str) -> Result<u64, String> {
+    let v = f
+        .get(&key(k))
+        .ok_or_else(|| format!("prism.hadamard.{k} missing"))?;
+    v.as_u64()
+        .or_else(|| v.as_i64().and_then(|i| u64::try_from(i).ok()))
+        .ok_or_else(|| format!("prism.hadamard.{k} is not an integer"))
+}
+
+/// `prism.hadamard.<k>` as a string array; an absent key is empty unless
+/// `required`.
+fn str_array(f: &GgufFile, k: &str, required: bool) -> Result<Vec<String>, String> {
+    match f.get(&key(k)) {
+        None if !required => Ok(Vec::new()),
+        None => Err(format!("prism.hadamard.{k} missing")),
+        Some(v) => v
+            .as_array()
+            .ok_or_else(|| format!("prism.hadamard.{k} is not an array"))?
+            .iter()
+            .map(|s| {
+                s.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| format!("prism.hadamard.{k} holds a non-string"))
+            })
+            .collect(),
+    }
+}
+
+/// `prism.hadamard.<k>` as an integer array.
+fn int_array(f: &GgufFile, k: &str) -> Result<Vec<i64>, String> {
+    f.get(&key(k))
+        .ok_or_else(|| format!("prism.hadamard.{k} missing"))?
+        .as_array()
+        .ok_or_else(|| format!("prism.hadamard.{k} is not an array"))?
+        .iter()
+        .map(|v| {
+            v.as_i64()
+                .or_else(|| v.as_u64().and_then(|u| i64::try_from(u).ok()))
+                .ok_or_else(|| format!("prism.hadamard.{k} holds a non-integer"))
+        })
+        .collect()
+}
+
+/// The explicit sign table: `sign_values` cut into one ±1 vector per
+/// `sign_widths` entry, each width a positive multiple of `block`.
+fn explicit_signs(
+    widths: &[i64],
+    values: &[i64],
+    block: usize,
+) -> Result<BTreeMap<usize, Vec<f32>>, String> {
+    if widths.is_empty() {
+        return Err("prism.hadamard.sign_mode is explicit but sign_widths is empty".into());
+    }
+    let mut signs = BTreeMap::new();
+    let mut off = 0usize;
+    for &w in widths {
+        let width = usize::try_from(w)
+            .ok()
+            .filter(|&w| w > 0 && w.is_multiple_of(block))
+            .ok_or_else(|| {
+                format!(
+                    "prism.hadamard sign width {w} is not a positive multiple of the block {block}"
+                )
+            })?;
+        let end = off
+            .checked_add(width)
+            .filter(|&e| e <= values.len())
+            .ok_or("prism.hadamard.sign_values is shorter than sign_widths declares")?;
+        let vec: Vec<f32> = values[off..end]
+            .iter()
+            .map(|&v| match v {
+                1 => Ok(1.0f32),
+                -1 => Ok(-1.0f32),
+                other => Err(format!("prism.hadamard sign value {other} is not ±1")),
+            })
+            .collect::<Result<_, _>>()?;
+        if signs.insert(width, vec).is_some() {
+            return Err(format!("prism.hadamard declares width {width} twice"));
+        }
+        off = end;
+    }
+    if off != values.len() {
+        return Err("prism.hadamard.sign_values length does not match sign_widths".into());
+    }
+    Ok(signs)
+}
 
 /// The `prism.hadamard.*` contract as a GGUF declares it, validated.
 #[derive(Debug, Clone, PartialEq)]
@@ -52,140 +154,65 @@ pub struct HadamardSpec {
     /// GGUF names of lookup tables stored rotated: the lookup RESULT is
     /// inverse-transformed.
     pub inverses: BTreeSet<String>,
-    /// The DeltaNet `ssm_out` fold was computed over grouped value heads.
+    /// The `DeltaNet` `ssm_out` fold was computed over grouped value heads.
     pub gdn_v_grouped: bool,
 }
 
 impl HadamardSpec {
     /// Parse the contract from a header. `Ok(None)` when the file declares
-    /// none (an ordinary checkpoint); an error for a contract this runtime
-    /// cannot honour — a different version, transform, axis or sign mode,
-    /// a block that is not a power of two, sign vectors that do not cut
-    /// into whole blocks or hold anything but ±1.
+    /// none (an ordinary checkpoint).
+    ///
+    /// # Errors
+    ///
+    /// An error for a contract this runtime cannot honour — a different
+    /// version, transform, axis or sign mode, a block that is not a power
+    /// of two, sign vectors that do not cut into whole blocks or hold
+    /// anything but ±1, a missing or malformed key, or a weight name listed
+    /// twice.
     pub fn from_gguf(f: &GgufFile) -> Result<Option<Self>, String> {
-        let key = |k: &str| format!("{PREFIX}{k}");
-        let Some(version) = f.get(&key("version")) else {
+        if f.get(&key("version")).is_none() {
             return Ok(None);
-        };
-        let version = version
-            .as_u64()
-            .or_else(|| version.as_i64().and_then(|v| u64::try_from(v).ok()))
-            .ok_or("prism.hadamard.version is not an integer")?;
+        }
+        let version = uint_key(f, "version")?;
         if version != VERSION {
             return Err(format!(
                 "prism.hadamard.version {version} is not supported (this runtime implements {VERSION})"
             ));
         }
-        let str_key = |k: &str| -> Result<&str, String> {
-            f.get(&key(k))
-                .and_then(GgufValue::as_str)
-                .ok_or_else(|| format!("prism.hadamard.{k} missing or not a string"))
-        };
-        let uint_key = |k: &str| -> Result<u64, String> {
-            let v = f
-                .get(&key(k))
-                .ok_or_else(|| format!("prism.hadamard.{k} missing"))?;
-            v.as_u64()
-                .or_else(|| v.as_i64().and_then(|i| u64::try_from(i).ok()))
-                .ok_or_else(|| format!("prism.hadamard.{k} is not an integer"))
-        };
-        let block = usize::try_from(uint_key("block_size")?).map_err(|_| "block_size too large")?;
+        let block =
+            usize::try_from(uint_key(f, "block_size")?).map_err(|_| "block_size too large")?;
         if block == 0 || !block.is_power_of_two() {
             return Err(format!(
                 "prism.hadamard.block_size {block} is not a power of two"
             ));
         }
-        let transform = str_key("transform")?;
+        let transform = str_key(f, "transform")?;
         if transform != "normalized-sylvester-walsh-hadamard" {
             return Err(format!(
                 "prism.hadamard.transform {transform:?} is not supported (only normalized-sylvester-walsh-hadamard)"
             ));
         }
-        let axis = str_key("axis")?;
+        let axis = str_key(f, "axis")?;
         if axis != "input-last-dimension" {
             return Err(format!(
                 "prism.hadamard.axis {axis:?} is not supported (only input-last-dimension)"
             ));
         }
-        let sign_mode = str_key("sign_mode")?;
-        let str_array = |k: &str, required: bool| -> Result<Vec<String>, String> {
-            match f.get(&key(k)) {
-                None if !required => Ok(Vec::new()),
-                None => Err(format!("prism.hadamard.{k} missing")),
-                Some(v) => v
-                    .as_array()
-                    .ok_or_else(|| format!("prism.hadamard.{k} is not an array"))?
-                    .iter()
-                    .map(|s| {
-                        s.as_str()
-                            .map(str::to_owned)
-                            .ok_or_else(|| format!("prism.hadamard.{k} holds a non-string"))
-                    })
-                    .collect(),
-            }
-        };
-        let int_array = |k: &str| -> Result<Vec<i64>, String> {
-            f.get(&key(k))
-                .ok_or_else(|| format!("prism.hadamard.{k} missing"))?
-                .as_array()
-                .ok_or_else(|| format!("prism.hadamard.{k} is not an array"))?
-                .iter()
-                .map(|v| {
-                    v.as_i64()
-                        .or_else(|| v.as_u64().and_then(|u| i64::try_from(u).ok()))
-                        .ok_or_else(|| format!("prism.hadamard.{k} holds a non-integer"))
-                })
-                .collect()
-        };
-        let mut signs = BTreeMap::new();
-        match sign_mode {
-            "identity" => {}
+        let sign_mode = str_key(f, "sign_mode")?;
+        let signs = match sign_mode {
+            "identity" => BTreeMap::new(),
             "explicit" => {
-                let widths = int_array("sign_widths")?;
-                let values = int_array("sign_values")?;
-                if widths.is_empty() {
-                    return Err(
-                        "prism.hadamard.sign_mode is explicit but sign_widths is empty".into(),
-                    );
-                }
-                let mut off = 0usize;
-                for w in widths {
-                    let width = usize::try_from(w)
-                        .ok()
-                        .filter(|&w| w > 0 && w.is_multiple_of(block))
-                        .ok_or_else(|| {
-                            format!("prism.hadamard sign width {w} is not a positive multiple of the block {block}")
-                        })?;
-                    let end = off
-                        .checked_add(width)
-                        .filter(|&e| e <= values.len())
-                        .ok_or("prism.hadamard.sign_values is shorter than sign_widths declares")?;
-                    let vec: Vec<f32> = values[off..end]
-                        .iter()
-                        .map(|&v| match v {
-                            1 => Ok(1.0f32),
-                            -1 => Ok(-1.0f32),
-                            other => Err(format!("prism.hadamard sign value {other} is not ±1")),
-                        })
-                        .collect::<Result<_, _>>()?;
-                    if signs.insert(width, vec).is_some() {
-                        return Err(format!("prism.hadamard declares width {width} twice"));
-                    }
-                    off = end;
-                }
-                if off != values.len() {
-                    return Err(
-                        "prism.hadamard.sign_values length does not match sign_widths".into(),
-                    );
-                }
+                let widths = int_array(f, "sign_widths")?;
+                let values = int_array(f, "sign_values")?;
+                explicit_signs(&widths, &values, block)?
             }
             other => {
                 return Err(format!(
                     "prism.hadamard.sign_mode {other:?} is not supported (identity or explicit)"
                 ));
             }
-        }
-        let weights: Vec<String> = str_array("weight_names", true)?;
+        };
+        let weights: Vec<String> = str_array(f, "weight_names", true)?;
         if weights.is_empty() {
             return Err("prism.hadamard.weight_names is empty".into());
         }
@@ -196,7 +223,7 @@ impl HadamardSpec {
             }
         }
         let mut inverses = BTreeSet::new();
-        for name in str_array("inverse_weight_names", false)? {
+        for name in str_array(f, "inverse_weight_names", false)? {
             if weight_set.contains(&name) || !inverses.insert(name.clone()) {
                 return Err(format!("prism.hadamard lists {name:?} twice"));
             }
@@ -235,6 +262,11 @@ impl HadamardSpec {
     /// The sign vector for an input `width`: `None` in identity mode, an
     /// error in explicit mode when the width has none (the fold would run
     /// with the wrong signs — refuse).
+    ///
+    /// # Errors
+    ///
+    /// In explicit sign mode, an error when no sign vector was declared
+    /// for `width`.
     pub fn signs_for(&self, width: usize) -> Result<Option<&[f32]>, String> {
         if self.signs.is_empty() {
             return Ok(None);
@@ -248,7 +280,12 @@ impl HadamardSpec {
     /// The transform on host memory: `x` is one row of `width` values.
     /// Signs first, then the normalized transform per block — exactly what
     /// [`DeviceConsts::forward`] computes on a device, for the paths that
-    /// keep activations on the host (the fused DeltaNet decode step).
+    /// keep activations on the host (the fused `DeltaNet` decode step).
+    ///
+    /// # Errors
+    ///
+    /// An error when the block does not divide `x.len()`, or (explicit
+    /// sign mode) when `x.len()` has no declared sign vector.
     pub fn forward_host(&self, x: &mut [f32]) -> Result<(), String> {
         let width = x.len();
         if !width.is_multiple_of(self.block) {
@@ -262,8 +299,7 @@ impl HadamardSpec {
                 *v *= s;
             }
         }
-        #[allow(clippy::cast_precision_loss)] // block is small
-        let scale = 1.0 / (self.block as f32).sqrt();
+        let scale = 1.0 / f32_from_usize(self.block).sqrt();
         for chunk in x.chunks_mut(self.block) {
             mummu_mix::hadamard::fwht(chunk);
             for v in chunk.iter_mut() {
@@ -276,14 +312,17 @@ impl HadamardSpec {
 
 /// The normalized Sylvester Walsh–Hadamard matrix of order `n`, row-major:
 /// `H[i][j] = (−1)^{popcount(i & j)} / √n`. Symmetric and its own inverse.
+///
+/// # Panics
+///
+/// Panics if `n` is not a power of two.
 #[must_use]
 pub fn sylvester_matrix(n: usize) -> Vec<f32> {
     assert!(
         n.is_power_of_two(),
         "Hadamard order {n} is not a power of two"
     );
-    #[allow(clippy::cast_precision_loss)]
-    let scale = 1.0 / (n as f32).sqrt();
+    let scale = 1.0 / f32_from_usize(n).sqrt();
     let mut h = Vec::with_capacity(n * n);
     for i in 0..n {
         for j in 0..n {
@@ -398,9 +437,11 @@ impl DeviceConsts {
     }
 }
 
-/// The contract plus its per-device constants, built lazily: layers of one
-/// model live on several devices and each needs its own copy of the block
-/// matrix (4 MiB at block 1024, once per device, not per layer).
+/// The contract plus its per-device constants, built lazily.
+///
+/// Layers of one model live on several devices and each needs its own copy
+/// of the block matrix (4 MiB at block 1024, once per device, not per
+/// layer).
 pub struct HadamardRuntime {
     spec: Arc<HadamardSpec>,
     per_device: Mutex<Vec<Arc<DeviceConsts>>>,
@@ -413,7 +454,7 @@ impl std::fmt::Debug for HadamardRuntime {
             .field("folded_weights", &self.spec.weights.len())
             .field("inverse_tables", &self.spec.inverses.len())
             .field("gdn_v_grouped", &self.spec.gdn_v_grouped)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -432,6 +473,11 @@ impl HadamardRuntime {
     }
 
     /// The constants on `device`, built on first use.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the per-device cache mutex is poisoned (a builder panicked
+    /// on another thread).
     pub fn on(&self, device: &Device) -> Arc<DeviceConsts> {
         let mut per = self.per_device.lock().expect("hadamard device cache");
         if let Some(c) = per.iter().find(|c| &c.device == device) {
@@ -443,11 +489,18 @@ impl HadamardRuntime {
     }
 }
 
-/// Reorder a DeltaNet value activation `[b, t, n_v·hd]` from the tiled head
-/// order this port computes in (head `h` reads key-head `h % n_k`, i.e.
-/// `[rep, n_k, hd]` row-major) to HF's grouped order (`[n_k, rep, hd]`,
-/// head `h` reads key-head `h / rep`) — the order a `gdn_v_grouped` fold of
-/// `ssm_out` expects its input in.
+/// Reorder a `DeltaNet` value activation `[b, t, n_v·hd]` from tiled to
+/// grouped head order.
+///
+/// The tiled order is what this port computes in (head `h` reads key-head
+/// `h % n_k`, i.e. `[rep, n_k, hd]` row-major); HF's grouped order
+/// (`[n_k, rep, hd]`, head `h` reads key-head `h / rep`) is the order a
+/// `gdn_v_grouped` fold of `ssm_out` expects its input in.
+///
+/// # Panics
+///
+/// Panics if `n_k == 0`, `n_v` is not a multiple of `n_k`, or the last dim
+/// of `x` is not `n_v * hd`.
 #[must_use]
 pub fn tiled_to_grouped(x: Tensor<3>, n_k: usize, n_v: usize, hd: usize) -> Tensor<3> {
     let [b, t, n] = x.dims();
@@ -465,6 +518,11 @@ pub fn tiled_to_grouped(x: Tensor<3>, n_k: usize, n_v: usize, hd: usize) -> Tens
 }
 
 /// The same reorder on a host row (see [`tiled_to_grouped`]).
+///
+/// # Panics
+///
+/// Panics if `n_k == 0`, `n_v` is not a multiple of `n_k`, or `x.len()` is
+/// not `n_v * hd`.
 #[must_use]
 pub fn tiled_to_grouped_host(x: &[f32], n_k: usize, n_v: usize, hd: usize) -> Vec<f32> {
     assert!(
@@ -496,8 +554,8 @@ mod tests {
         HadamardSpec {
             block,
             signs,
-            weights: ["blk.0.ffn_up.weight".to_string()].into_iter().collect(),
-            inverses: ["token_embd.weight".to_string()].into_iter().collect(),
+            weights: std::iter::once("blk.0.ffn_up.weight".to_string()).collect(),
+            inverses: std::iter::once("token_embd.weight".to_string()).collect(),
             gdn_v_grouped: true,
         }
     }
@@ -531,8 +589,8 @@ mod tests {
         let rt = HadamardRuntime::new((*s).clone());
         let device = crate::backend::cpu_device();
         let consts = rt.on(&device);
-        let vals: Vec<f32> = (0..2 * 3 * 24)
-            .map(|i| ((i * 37) % 11) as f32 * 0.25 - 1.0)
+        let vals: Vec<f32> = (0..2 * 3 * 24usize)
+            .map(|i| f32_from_usize((i * 37) % 11).mul_add(0.25, -1.0))
             .collect();
         let x = Tensor::<3>::from_data(TensorData::new(vals.clone(), [2, 3, 24]), &device);
         let got = consts
@@ -563,7 +621,7 @@ mod tests {
     #[test]
     fn tiled_to_grouped_reorders_value_heads() {
         let (n_k, n_v, hd) = (2usize, 6usize, 2usize);
-        let vals: Vec<f32> = (0..n_v * hd).map(|i| i as f32).collect();
+        let vals: Vec<f32> = (0..n_v * hd).map(f32_from_usize).collect();
         let host = tiled_to_grouped_host(&vals, n_k, n_v, hd);
         // grouped head (k=0, r=0) = tiled head 0, (k=0, r=1) = tiled head 2, (k=0,r=2) = 4
         assert_eq!(&host[..6], &[0.0, 1.0, 4.0, 5.0, 8.0, 9.0]);

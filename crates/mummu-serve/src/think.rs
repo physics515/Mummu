@@ -9,8 +9,8 @@
 //! was written for caps replies at 600.
 //!
 //! So thinking is suppressed unless a request opts in (ollama's `think`,
-//! OpenAI's `reasoning_effort`). Opting in passes it through unchanged, and
-//! the surface decides what to do with it: OpenAI's gets it inline, and the
+//! `OpenAI`'s `reasoning_effort`). Opting in passes it through unchanged, and
+//! the surface decides what to do with it: `OpenAI`'s gets it inline, and the
 //! ollama shim splits it into the `thinking` field ollama clients read
 //! ([`Filter::push_split`]).
 //!
@@ -41,7 +41,7 @@ const CLOSE: &str = "</think>";
 
 /// Streaming remover of `<think>…</think>` spans (or of any other pair of
 /// tags, see [`Filter::spans`]).
-pub(crate) struct Filter {
+pub struct Filter {
     /// The tag a span opens with.
     open: &'static str,
     /// The tag that closes it.
@@ -81,7 +81,7 @@ impl Default for Filter {
 /// One piece of an answer, split: what may be shown as the answer, and what
 /// was inside a span.
 #[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct Split {
+pub struct Split {
     pub(crate) visible: String,
     pub(crate) thought: String,
 }
@@ -98,7 +98,7 @@ fn dangling(s: &str, tag: &str) -> usize {
 
 impl Filter {
     /// A filter for the spans between `open` and `close`.
-    pub(crate) fn spans(open: &'static str, close: &'static str) -> Self {
+    pub(crate) const fn spans(open: &'static str, close: &'static str) -> Self {
         Self {
             open,
             close,
@@ -162,7 +162,7 @@ impl Filter {
     }
 
     /// Has a span opened?
-    fn opened(&self) -> bool {
+    const fn opened(&self) -> bool {
         !self.withheld.is_empty()
     }
 
@@ -232,7 +232,7 @@ impl Filter {
     }
 
     /// Did the model open a block that never closed?
-    pub(crate) fn truncated(&self) -> bool {
+    pub(crate) const fn truncated(&self) -> bool {
         self.inside
     }
 
@@ -486,7 +486,10 @@ mod tests {
             let whole = run(&[text]);
             let chars: Vec<String> = text.chars().map(String::from).collect();
             for size in 1..=chars.len() {
-                let deltas: Vec<String> = chars.chunks(size).map(|c| c.concat()).collect();
+                let deltas: Vec<String> = chars
+                    .chunks(size)
+                    .map(<[std::string::String]>::concat)
+                    .collect();
                 let deltas: Vec<&str> = deltas.iter().map(String::as_str).collect();
                 assert_eq!(run(&deltas), whole, "{text:?} in deltas of {size} chars");
             }

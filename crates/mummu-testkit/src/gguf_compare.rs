@@ -1,6 +1,7 @@
-//! The shared quantized-reference comparison used by every GGUF parity leg:
-//! llama.cpp running the SAME .gguf file our loader loads, compared by top-k
-//! first-forward ids and a byte-identical greedy sequence.
+//! The shared quantized-reference comparison used by every GGUF parity leg.
+//!
+//! llama.cpp runs the SAME .gguf file our loader loads, and the two are
+//! compared by top-k first-forward ids and a byte-identical greedy sequence.
 //!
 //! Lives beside `llama_ref` rather than inside it because `parity_lfm2.rs`
 //! drives the reference server directly (its BF16-vs-safetensors legs are
@@ -25,19 +26,28 @@ pub const MIN_SET_OVERLAP: usize = 4;
 
 /// Next free port for a reference server; each leg gets its own so a binary's
 /// tests can run concurrently.
-#[allow(dead_code)] // fixture-replay binaries use only the verdict half
 pub fn next_port(base: u16) -> u16 {
     static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
     base + NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
-/// One quantized-reference comparison: `load` builds our model from the GGUF,
-/// `render` wraps the prompt in the model's chat template, and `tolerance`
-/// bounds |Δlogprob| over the top-k. The caller supplies the `device` — the
-/// dense tiers compare on the GPU, OLMoE's ~28 GB f32 build only fits the host,
-/// and the f16 leg configures an f16 GPU device from its own binary (device
-/// dtype settings lock once per process). Panics (test style) on any divergence.
-#[allow(dead_code)] // fixture-replay binaries use only the verdict half
+/// One quantized-reference comparison against a live llama-server.
+///
+/// `load` builds our model from the GGUF, `render` wraps the prompt in the
+/// model's chat template, and `tolerance` bounds |Δlogprob| over the top-k.
+/// The caller supplies the `device` — the dense tiers compare on the GPU,
+/// `OLMoE`'s ~28 GB f32 build only fits the host, and the f16 leg configures
+/// an f16 GPU device from its own binary (device dtype settings lock once
+/// per process). Panics (test style) on any divergence.
+///
+/// # Panics
+///
+/// Test style, on every failure: `MUMMU_LLAMA_SERVER` unset or not a file,
+/// the GGUF header or its tokenizer metadata failing to parse, the rendered
+/// prompt tokenizing to fewer than 8 ids, the reference server failing to
+/// start or to answer with logprob steps (fewer than [`TOP_K`] included),
+/// our logits failing to read back, our greedy decode failing, or any
+/// divergence [`assert_matches_reference`] rejects.
 pub async fn compare_against_llama_cpp<M, C>(
     tag: &str,
     gguf: &std::path::Path,
@@ -107,9 +117,11 @@ pub async fn compare_against_llama_cpp<M, C>(
     );
 }
 
-/// The gate's verdict on one prompt, given our first-forward `logits`, our
-/// decoded greedy text `ours` (`out_len` tokens), the reference's best-first
-/// top-[`TOP_K`] `(id, logprob)` and its greedy `ref_content`. Split out of
+/// The gate's verdict on one prompt.
+///
+/// Given our first-forward `logits`, our decoded greedy text `ours`
+/// (`out_len` tokens), the reference's best-first top-[`TOP_K`]
+/// `(id, logprob)` and its greedy `ref_content`. Split out of
 /// [`compare_against_llama_cpp`] so a RECORDED reference (the Flash-Next
 /// fixture, whose 111 GB reference cannot share the box with our load) is
 /// judged by literally the same code as a live one — two copies of a policy
@@ -119,6 +131,15 @@ pub async fn compare_against_llama_cpp<M, C>(
 /// reference's at its i-th id, not the same id on both sides. Where ranks
 /// 4-5 swap that compares two different tokens' logprobs — measured tail
 /// drift, which is why the bound is loose and the greedy byte match primary.
+///
+/// # Panics
+///
+/// When `ref_top` does not hold exactly [`TOP_K`] entries or `logits` has
+/// fewer than [`TOP_K`] rows, and on every divergence: the top
+/// [`STRICT_ORDER_K`] ids differ in order, fewer than [`MIN_SET_OVERLAP`] of
+/// the top-[`TOP_K`] ids are shared, the rank-aligned max |Δlogprob| exceeds
+/// `tolerance`, the trimmed outputs share fewer than 8 bytes, or the greedy
+/// texts differ over their common prefix.
 pub fn assert_matches_reference(
     tag: &str,
     logits: &[f32],
@@ -135,7 +156,10 @@ pub fn assert_matches_reference(
     );
     let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
     indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
-    let our_ids: Vec<u32> = indexed[..TOP_K].iter().map(|&(id, _)| id as u32).collect();
+    let our_ids: Vec<u32> = indexed[..TOP_K]
+        .iter()
+        .map(|&(id, _)| u32::try_from(id).expect("a vocab index fits a u32 token id"))
+        .collect();
     let ref_ids: Vec<u32> = ref_top.iter().map(|&(id, _)| id).collect();
     let ours_lp = logprobs_at(logits, &our_ids);
     let max_abs_diff = ours_lp

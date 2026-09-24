@@ -15,6 +15,8 @@
 //! `tokenizer_config.json` must equal the id the sibling `tokenizer.json`
 //! assigns that content).
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use std::path::Path;
 
 use mummu::import::ImportError;

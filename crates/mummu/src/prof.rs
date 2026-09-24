@@ -34,6 +34,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -62,7 +63,10 @@ pub fn enabled() -> bool {
 /// Drop everything collected so far — the start of a profiled request, so
 /// one flame graph describes one generation rather than a process lifetime.
 pub fn reset() {
-    TOTALS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    TOTALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
 }
 
 /// Enter a scope. The returned guard records on drop; hold it for exactly
@@ -85,10 +89,27 @@ pub fn record(path: &str, elapsed: Duration) {
     if !enabled() {
         return;
     }
-    let mut totals = TOTALS.lock().unwrap_or_else(|e| e.into_inner());
-    let entry = totals.entry(path.to_string()).or_insert((0, 0));
-    entry.0 += elapsed.as_nanos() as u64;
-    entry.1 += 1;
+    add_sample(path.to_string(), nanos(elapsed));
+}
+
+/// Whole nanoseconds of a span, saturating: a span past 584 years is not a
+/// profile, and this must never panic from a guard's `Drop`.
+fn nanos(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Fold one span into `path`'s inclusive total and entry count. One
+/// statement, so the totals lock is released before anything else runs.
+fn add_sample(path: String, ns: u64) {
+    TOTALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(path)
+        .and_modify(|e| {
+            e.0 += ns;
+            e.1 += 1;
+        })
+        .or_insert((ns, 1));
 }
 
 pub struct ScopeGuard {
@@ -101,26 +122,28 @@ pub struct ScopeGuard {
 impl Drop for ScopeGuard {
     fn drop(&mut self) {
         let Some(start) = self.start else { return };
-        let elapsed = start.elapsed().as_nanos() as u64;
-        STACK.with(|s| {
+        let elapsed = nanos(start.elapsed());
+        let path = STACK.with(|s| {
             let mut stack = s.borrow_mut();
             let path = stack.join(";");
             stack.pop();
-            let mut totals = TOTALS.lock().unwrap_or_else(|e| e.into_inner());
-            let entry = totals.entry(path).or_insert((0, 0));
-            entry.0 += elapsed;
-            entry.1 += 1;
+            path
         });
+        add_sample(path, elapsed);
     }
 }
 
-/// The collected profile in folded-stack form: one `path count` line per
-/// path, where the count is **self time in microseconds** — inclusive time
-/// minus the inclusive time of direct children. Standard input for any
-/// flame-graph renderer, and readable enough to eyeball sorted.
+/// The collected profile in folded-stack form.
+///
+/// One `path count` line per path, where the count is **self time in
+/// microseconds** — inclusive time minus the inclusive time of direct
+/// children. Standard input for any flame-graph renderer, and readable
+/// enough to eyeball sorted.
 #[must_use]
 pub fn folded() -> String {
-    let totals = TOTALS.lock().unwrap_or_else(|e| e.into_inner());
+    let totals = TOTALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // Sum each path's direct children so self time can be derived. A direct
     // child of `a;b` is `a;b;c` — one more segment, no deeper.
     let mut child_sum: BTreeMap<&str, u64> = BTreeMap::new();
@@ -142,12 +165,21 @@ pub fn folded() -> String {
         // rendered frame reads `mlp.down (64x)` — dispatch-count questions
         // ("is this called once or 2048 times?") answer themselves.
         out.push_str(path);
-        out.push_str(&format!(" ({count}x) {self_us}\n"));
+        let _ = writeln!(out, " ({count}x) {self_us}");
     }
+    drop(totals);
     out
 }
 
 /// Render folded lines to a self-contained flame-graph SVG.
+///
+/// # Errors
+///
+/// When `inferno` rejects a line of `folded` (it must be `<stack> <count>`
+/// with an integer count, which [`folded`] always emits but hand-fed input
+/// need not) or fails to render, or when the rendered SVG is not valid
+/// UTF-8 — which `inferno`'s own output never is, so that arm is only a
+/// guard against a broken renderer.
 #[cfg(feature = "flamegraph")]
 pub fn flamegraph_svg(folded: &str) -> Result<String, String> {
     let mut opts = inferno::flamegraph::Options::default();
@@ -167,7 +199,9 @@ mod tests {
     static GATE: Mutex<()> = Mutex::new(());
 
     fn run_isolated(f: impl FnOnce()) {
-        let _g = GATE.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset();
         set_enabled(true);
         f();
@@ -225,9 +259,9 @@ mod tests {
             set_enabled(false);
             let dead = scope("phantom");
             set_enabled(true);
-            let _live = scope("real");
+            let live = scope("real");
             drop(dead); // must NOT pop "real"
-            drop(_live);
+            drop(live);
             let folded = folded();
             assert!(!folded.contains("phantom"), "{folded:?}");
             assert!(folded.lines().count() <= 1, "only 'real': {folded:?}");

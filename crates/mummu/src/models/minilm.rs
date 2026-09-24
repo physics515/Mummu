@@ -1,11 +1,12 @@
-//! all-MiniLM-class sentence embedder: a 6-layer post-LayerNorm BERT with
-//! absolute position embeddings, full bidirectional attention over an additive
-//! padding mask, exact (erf) GeLU, masked-mean pooling + L2 normalize (the
-//! sentence-transformers recipe — the checkpoint's `pooler.*` weights are
-//! intentionally unused).
+//! all-MiniLM-class sentence embedder.
+//!
+//! A 6-layer post-LayerNorm BERT with absolute position embeddings, full
+//! bidirectional attention over an additive padding mask, exact (erf)
+//! `GeLU`, masked-mean pooling + L2 normalize (the sentence-transformers
+//! recipe — the checkpoint's `pooler.*` weights are intentionally unused).
 //!
 //! Ported from laurelane's implementation (cosine ~1.0 vs the Candle BERT on
-//! identical weights). BERT's bidirectional attention and LayerNorm differ
+//! identical weights). BERT's bidirectional attention and `LayerNorm` differ
 //! from the causal GQA blocks in `nn`, so this file is self-contained.
 //!
 //! The library takes token ids + attention mask and returns embeddings; the
@@ -17,6 +18,7 @@ use burn::module::Module;
 use burn::nn::{Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear, LinearConfig};
 use burn::store::{ModuleAdapter, PyTorchToBurnAdapter, PytorchStore, SafetensorsStore};
 use burn::tensor::{Device, Int, Tensor, TensorData, activation};
+use mummu_num::f32_from_usize;
 
 use crate::import::{
     FloatCastAdapter, ImportError, WeightsFile, load_checked, required_file, weights_file,
@@ -36,12 +38,17 @@ pub struct BertConfig {
     pub layer_norm_eps: f64,
 }
 
-fn default_eps() -> f64 {
+const fn default_eps() -> f64 {
     1e-12
 }
 
 impl BertConfig {
     /// Parse `config.json` bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the JSON error as a string, or an error when `hidden_size`
+    /// is not a positive multiple of `num_attention_heads`.
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, String> {
         let cfg: Self = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
         if cfg.num_attention_heads == 0 || !cfg.hidden_size.is_multiple_of(cfg.num_attention_heads)
@@ -149,14 +156,21 @@ const KEY_REMAPS: &[(&str, &str)] = &[
     ),
 ];
 
-/// Build from `dir/config.json` and load the checkpoint, checked —
-/// `model.safetensors` preferred, `pytorch_model.bin` (the state dict this
-/// model family originally shipped) as the fallback.
-/// NOTE: LayerNorm keys keep their `.weight`/`.bias` suffixes — the
+/// Build from `dir/config.json` and load the checkpoint, checked.
+///
+/// `model.safetensors` is preferred, `pytorch_model.bin` (the state dict
+/// this model family originally shipped) is the fallback.
+/// NOTE: `LayerNorm` keys keep their `.weight`/`.bias` suffixes — the
 /// `PyTorchToBurnAdapter` renames those to `gamma`/`beta` itself (unlike
-/// RmsNorm in the decoder models, where the rename is manual — the asymmetry
+/// `RmsNorm` in the decoder models, where the rename is manual — the asymmetry
 /// is intentional; `PytorchStore` applies that adapter internally).
 /// `pooler.*` stays unused (masked-mean pooling instead).
+///
+/// # Errors
+///
+/// Returns an [`ImportError`] when `config.json` is missing, unreadable or
+/// invalid, when neither weights file exists, or when the checked load
+/// finds the checkpoint incomplete or mismatched.
 pub fn load_from_dir(dir: &Path, device: &Device) -> Result<LoadedMiniLm, ImportError> {
     let cfg_path = required_file(dir, "config.json")?;
     let cfg_bytes = std::fs::read(&cfg_path).map_err(|e| ImportError::Parse {
@@ -197,18 +211,19 @@ pub fn load_from_dir(dir: &Path, device: &Device) -> Result<LoadedMiniLm, Import
     Ok(LoadedMiniLm { model, config })
 }
 
-fn embeddings_forward(e: &Embeddings, ids: &Tensor<2, Int>, device: &Device) -> Tensor<3> {
+fn embeddings_forward(emb: &Embeddings, ids: &Tensor<2, Int>, device: &Device) -> Tensor<3> {
     let [b, n] = ids.dims();
-    let w = e.word_embeddings.forward(ids.clone()); // [b, n, h]
-    let pos = Tensor::<1, Int>::arange(0..n as i64, device).reshape([1, n]);
-    let p = e.position_embeddings.forward(pos); // [1, n, h]
-    let tt = Tensor::<2, Int>::zeros([b, n], device);
-    let t = e.token_type_embeddings.forward(tt); // [b, n, h]
-    e.layer_norm.forward(w.add(p).add(t))
+    let words = emb.word_embeddings.forward(ids.clone()); // [b, n, h]
+    let seq_len = i64::try_from(n).expect("sequence length fits i64");
+    let pos = Tensor::<1, Int>::arange(0..seq_len, device).reshape([1, n]);
+    let positions = emb.position_embeddings.forward(pos); // [1, n, h]
+    let type_ids = Tensor::<2, Int>::zeros([b, n], device);
+    let types = emb.token_type_embeddings.forward(type_ids); // [b, n, h]
+    emb.layer_norm.forward(words.add(positions).add(types))
 }
 
 fn layer_forward(
-    l: &EncoderLayer,
+    layer: &EncoderLayer,
     x: Tensor<3>,
     add_mask: &Tensor<4>,
     num_heads: usize,
@@ -217,41 +232,55 @@ fn layer_forward(
     debug_assert!(h.is_multiple_of(num_heads), "hidden not divisible by heads");
     let hd = h / num_heads;
 
-    let q = l
+    let query = layer
         .query
         .forward(x.clone())
         .reshape([b, n, num_heads, hd])
         .swap_dims(1, 2);
-    let k = l
+    let keys = layer
         .key
         .forward(x.clone())
         .reshape([b, n, num_heads, hd])
         .swap_dims(1, 2);
-    let v = l
+    let values = layer
         .value
         .forward(x.clone())
         .reshape([b, n, num_heads, hd])
         .swap_dims(1, 2);
 
-    let scale = 1.0 / (hd as f32).sqrt();
-    let scores = q
-        .matmul(k.swap_dims(2, 3))
+    let scale = 1.0 / f32_from_usize(hd).sqrt();
+    let scores = query
+        .matmul(keys.swap_dims(2, 3))
         .mul_scalar(scale)
         .add(add_mask.clone());
     let probs = activation::softmax(scores, 3);
-    let ctx = probs.matmul(v).swap_dims(1, 2).reshape([b, n, h]);
+    let ctx = probs.matmul(values).swap_dims(1, 2).reshape([b, n, h]);
 
     // Self-attention output: dense → LayerNorm(+ residual).
-    let x = l.attn_layer_norm.forward(l.attn_output.forward(ctx).add(x));
+    let x = layer
+        .attn_layer_norm
+        .forward(layer.attn_output.forward(ctx).add(x));
     // Feed-forward: dense → exact GeLU → dense → LayerNorm(+ residual).
-    let inter = activation::gelu(l.intermediate.forward(x.clone()));
-    l.output_layer_norm.forward(l.output.forward(inter).add(x))
+    let inter = activation::gelu(layer.intermediate.forward(x.clone()));
+    layer
+        .output_layer_norm
+        .forward(layer.output.forward(inter).add(x))
 }
 
 impl LoadedMiniLm {
     /// Encode one tokenized string (`ids` + `mask`, 1.0 = real token) into a
     /// masked-mean-pooled, **L2-normalized** sentence embedding of
     /// `hidden_size` floats.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the embedding cannot be read back from the
+    /// device as f32.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `ids` is empty, if `mask.len() != ids.len()`, or if a
+    /// token id does not fit an `i32`.
     pub fn embed_ids(
         &self,
         ids: &[u32],
@@ -270,7 +299,10 @@ impl LoadedMiniLm {
             "embed_ids: sequence longer than max_position_embeddings"
         );
 
-        let ids32: Vec<i32> = ids.iter().map(|&i| i as i32).collect();
+        let ids32: Vec<i32> = ids
+            .iter()
+            .map(|&i| i32::try_from(i).expect("token id fits i32"))
+            .collect();
         // Dtypes pinned to the backend TYPE, never the per-device policy.
         let id_t = Tensor::<1, Int>::from_data(
             TensorData::new(ids32, [n]),

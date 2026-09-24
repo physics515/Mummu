@@ -11,6 +11,8 @@
 //! MUMMU_QWEN2_DIR=path/to/qwen2.5-1.5b cargo test -p mummu-bench --release --test warmup_api_f16 -- --ignored --nocapture
 //! ```
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -19,6 +21,7 @@ use mummu::backend::inventory;
 use mummu::decode::argmax_id;
 use mummu::models::CausalLm;
 use mummu::models::qwen2;
+use mummu_num::f64_from_usize;
 use tokenizers::Tokenizer;
 
 /// Same burst size as `warmup_f16.rs` and `budget_f16.rs`, so the numbers
@@ -87,7 +90,7 @@ async fn warm_up_puts_the_first_burst_at_steady_state() {
         }
         let elapsed = start.elapsed().as_secs_f64();
         assert!(elapsed > 0.0, "a burst cannot take zero time");
-        *rate = BURST_TOKENS as f64 / elapsed;
+        *rate = f64_from_usize(BURST_TOKENS) / elapsed;
     }
 
     let [first, second] = rates;

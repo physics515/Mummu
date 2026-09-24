@@ -8,7 +8,7 @@
 //! flash-attention evaluation could not adopt its one winning quadrant (f16
 //! prefill) — an f16-only numeric fork would have shipped unverified.
 //!
-//! This leg closes that: llama.cpp runs the SAME Q4_K_M file, our side loads
+//! This leg closes that: llama.cpp runs the SAME `Q4_K_M` file, our side loads
 //! it onto **`GpuF16`** (dequantize once, cast to f16 on load, f32 attention
 //! -score island), and the two are compared by the same top-k + byte-identical
 //! greedy asserts as every other port. Own test binary because `GpuF16` locks
@@ -22,8 +22,9 @@
 //!   cargo test -p mummu --release --test parity_f16 -- --ignored --nocapture
 //! ```
 
-mod gguf_compare;
-mod llama_ref;
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
+use mummu_testkit::gguf_compare;
 
 use std::path::PathBuf;
 
@@ -33,7 +34,7 @@ use mummu::models::{qwen2, qwen3};
 
 /// Max |Δlogprob| for the f16 legs. The f32 legs run at 7.5e-1 against
 /// measured 2.66e-1 (Qwen2) / 4.02e-1 (Qwen3); f16 adds its own rounding on
-/// top of the reference's Q8_K activation quantization, so this sits one step
+/// top of the reference's `Q8_K` activation quantization, so this sits one step
 /// looser. The primary assert is unchanged and unrelaxed: the top-3 ids in
 /// order and the 24-token greedy sequence byte-identical.
 const LOGPROB_ABS_TOLERANCE: f64 = 1.5e0;
@@ -43,10 +44,8 @@ const LOGPROB_ABS_TOLERANCE: f64 = 1.5e0;
 const PORT_BASE: u16 = 18501;
 
 fn env_path(var: &str, what: &str) -> PathBuf {
-    let p = std::env::var_os(var)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| panic!("set {var} to {what}"));
-    assert!(p.is_file(), "{var} is not a file: {p:?}");
+    let p = std::env::var_os(var).map_or_else(|| panic!("set {var} to {what}"), PathBuf::from);
+    assert!(p.is_file(), "{var} is not a file: {}", p.display());
     p
 }
 

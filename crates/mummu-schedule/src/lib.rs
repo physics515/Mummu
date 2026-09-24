@@ -32,12 +32,16 @@
 //! size that removes the unchunked ~855 MB activation peak from the
 //! reserve entirely.
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 pub mod choices;
 pub mod governor;
 pub mod p2;
 pub mod placement;
 pub mod prefill;
 pub mod watermark;
+
+use mummu_num::f64_from_usize;
 
 /// One device the scheduler may assign work to.
 #[derive(Debug, Clone)]
@@ -61,7 +65,7 @@ pub struct Device {
 }
 
 /// How the work came out.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
     /// Units assigned, parallel to the `devices` slice.
     pub units: Vec<usize>,
@@ -81,7 +85,7 @@ impl Plan {
             .iter()
             .zip(&self.units)
             .filter(|(d, _)| d.throughput > 0.0)
-            .map(|(d, &n)| (d.preload_units + n) as f64 / d.throughput)
+            .map(|(d, &n)| f64_from_usize(d.preload_units + n) / d.throughput)
             .fold(0.0, f64::max)
     }
 }
@@ -112,7 +116,7 @@ pub fn divide(devices: &[Device], total_units: usize) -> Plan {
             .filter(|&i| devices[i].throughput > 0.0 && units[i] < devices[i].capacity_units)
             .min_by(|&a, &b| {
                 let finish_with = |i: usize| {
-                    (devices[i].preload_units + units[i] + 1) as f64 / devices[i].throughput
+                    f64_from_usize(devices[i].preload_units + units[i] + 1) / devices[i].throughput
                 };
                 finish_with(a)
                     .partial_cmp(&finish_with(b))
@@ -171,7 +175,7 @@ mod tests {
         // The fast device should carry roughly 9x either slow one.
         assert!(plan.units[0] > 8 * plan.units[1], "got {:?}", plan.units);
         // And the two slow devices, being near-equal, get near-equal shares.
-        let (a, b) = (plan.units[1] as f64, plan.units[2] as f64);
+        let (a, b) = (f64_from_usize(plan.units[1]), f64_from_usize(plan.units[2]));
         assert!((a - b).abs() / a.max(b) < 0.1, "got {:?}", plan.units);
     }
 
@@ -221,7 +225,7 @@ mod tests {
             "the busy device takes less: {plan:?}"
         );
         // ...and they still finish together, which is the point.
-        let finish = |i: usize| (loaded[i].preload_units + plan.units[i]) as f64;
+        let finish = |i: usize| f64_from_usize(loaded[i].preload_units + plan.units[i]);
         assert!((finish(0) - finish(1)).abs() <= 1.0, "{plan:?}");
     }
 

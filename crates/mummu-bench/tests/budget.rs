@@ -11,12 +11,15 @@
 //! regression (a kernel falling off a fast path, an accidental sync per
 //! layer) still trips it.
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use std::path::PathBuf;
 use std::time::Instant;
 
 use mummu::decode::argmax_id;
 use mummu::models::CausalLm;
 use mummu::models::qwen2;
+use mummu_num::f64_from_usize;
 use tokenizers::Tokenizer;
 
 /// From bench/BASELINE.md (recorded 100.5 ms / 13.3 tok/s on 2026-07-10).
@@ -82,7 +85,7 @@ async fn qwen2_stays_inside_its_perf_budgets() {
         let logits = loaded.forward(&[next], past, &mut cache, &device);
         next = argmax_id(logits).await.expect("argmax");
     }
-    let tok_per_s = DECODE_STEPS as f64 / start.elapsed().as_secs_f64();
+    let tok_per_s = f64_from_usize(DECODE_STEPS) / start.elapsed().as_secs_f64();
 
     // Long-context prefill over the same weights, prompt tiled to length.
     let long_ids: Vec<u32> = ids

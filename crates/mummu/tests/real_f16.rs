@@ -15,6 +15,8 @@
 //! (observed 2026-07-23: an f32 GGUF leg read back F16 logits after an f16
 //! test ran first). Separate test binaries = separate processes = isolation.
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use std::path::PathBuf;
 
 use mummu::backend::inventory;
@@ -84,7 +86,7 @@ async fn qwen2_decodes_coherently_in_f16_on_gpu() {
 }
 
 /// f16 leg for the Qwen3 dense arch — bf16 weights cast to f16 on load
-/// (`FloatCastAdapter`), and its per-head q/k RMSNorm + decoupled head_dim
+/// (`FloatCastAdapter`), and its per-head q/k `RMSNorm` + decoupled `head_dim`
 /// ride the SAME f32-softmax attention island Qwen2/LFM2 use, so the q·kᵀ
 /// scores never overflow f16. Proves the dtype path (P3) and the f16
 /// precision milestone (P6) cover the new architecture, not just Qwen2.
@@ -136,7 +138,7 @@ async fn real_qwen3_decodes_coherently_in_f16() {
 }
 
 /// The P2 function-calling TIER proof on real 4B weights: the catalog's
-/// Qwen3-4B Q4_K_M spec downloads through the registry (resumable,
+/// Qwen3-4B `Q4_K_M` spec downloads through the registry (resumable,
 /// hash-verified, cache-first), parses as the `qwen3` dense arch, loads on
 /// `GpuF16` (8 GB resident — the only precision the 16 GB card fits; the f32
 /// dequant blob is transient host RAM), and greedy-emits a parseable Hermes

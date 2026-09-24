@@ -15,10 +15,13 @@
 //! measure it with a plain stream over the same buffer (printed first) so
 //! the roofline fraction is honest for THIS machine, not a spec sheet.
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use mummu::flex::kernels::{self, PackedQ4, Q8Acts};
+use mummu_num::{f32_from_usize, f64_from_usize, trunc_i8};
 
 fn wave(len: usize, f: f32) -> Vec<f32> {
-    (0..len).map(|i| ((i as f32) * f).sin()).collect()
+    (0..len).map(|i| (f32_from_usize(i) * f).sin()).collect()
 }
 
 /// Best-of-N wall time for one closure, milliseconds.
@@ -51,7 +54,7 @@ fn main() {
                 .reduce(|| 0, u64::wrapping_add);
             std::hint::black_box(s);
         });
-        let gbs = (words * 8) as f64 / (ms * 1e6);
+        let gbs = f64_from_usize(words * 8) / (ms * 1e6);
         println!("dram read roofline (1 GiB threaded sum): {ms:.2} ms = {gbs:.1} GB/s\n");
     }
 
@@ -63,7 +66,7 @@ fn main() {
         (5120, 6144, "qkv"),
         (6144, 5120, "out"),
     ] {
-        let vals = wave(k * n, 0.000037);
+        let vals = wave(k * n, 0.000_037);
         let w = PackedQ4::from_f32(&vals, k, n);
         let x = wave(k, 0.011);
         let acts = Q8Acts::quantize(&x);
@@ -74,12 +77,12 @@ fn main() {
             std::hint::black_box(&out);
         });
         let bytes_vnni = w.streamed_bytes();
-        let gbs_vnni = bytes_vnni as f64 / (ms_vnni * 1e6);
+        let gbs_vnni = f64_from_usize(bytes_vnni) / (ms_vnni * 1e6);
 
         // The incumbent's traffic model: 1 i8/elem + f32 scale per 32.
         let i8s: Vec<i8> = vals
             .iter()
-            .map(|&v| (v * 7.0).round().clamp(-7.0, 7.0) as i8)
+            .map(|&v| trunc_i8((v * 7.0).round().clamp(-7.0, 7.0)))
             .collect();
         let scales = vec![0.14f32; k * n / 32];
         let mut out2 = vec![0.0f32; n];
@@ -88,7 +91,7 @@ fn main() {
             std::hint::black_box(&out2);
         });
         let bytes_i8 = k * n + (k * n / 32) * 4;
-        let gbs_i8 = bytes_i8 as f64 / (ms_i8 * 1e6);
+        let gbs_i8 = f64_from_usize(bytes_i8) / (ms_i8 * 1e6);
 
         // The DRAM regime: production cycles ~22 host layers (~3 GB packed)
         // per token, so no tensor stays L3-resident (128 MB on this part).
@@ -97,7 +100,7 @@ fn main() {
         let copies = (192 * 1024 * 1024 / bytes_vnni).max(2) + 1;
         let ws: Vec<PackedQ4> = (0..copies)
             .map(|c| {
-                let v = wave(k * n, 0.000037 + c as f32 * 1e-6);
+                let v = wave(k * n, f32_from_usize(c).mul_add(1e-6, 0.000_037));
                 PackedQ4::from_f32(&v, k, n)
             })
             .collect();
@@ -107,14 +110,14 @@ fn main() {
             idx += 1;
             std::hint::black_box(&out);
         });
-        let gbs_stream = bytes_vnni as f64 / (ms_stream * 1e6);
+        let gbs_stream = f64_from_usize(bytes_vnni) / (ms_stream * 1e6);
 
         println!(
             "[{tag}] [{k} x {n}]  vnni warm {ms_vnni:.3} ms ({gbs_vnni:.1} GB/s of {:.1} MB)  |  \
 			 vnni DRAM {ms_stream:.3} ms ({gbs_stream:.1} GB/s)  |  \
 			 i8 {ms_i8:.3} ms ({gbs_i8:.1} GB/s of {:.1} MB)  |  speedup {:.2}x (DRAM {:.2}x)",
-            bytes_vnni as f64 / 1e6,
-            bytes_i8 as f64 / 1e6,
+            f64_from_usize(bytes_vnni) / 1e6,
+            f64_from_usize(bytes_i8) / 1e6,
             ms_i8 / ms_vnni,
             ms_i8 / ms_stream,
         );
@@ -128,7 +131,7 @@ fn incumbent_i8(wq: &[i8], scales: &[f32], xs: &[f32], out: &mut [f32], k_len: u
     use rayon::prelude::*;
     let blocks = n / 32;
     let chunk_blocks = blocks.div_ceil(rayon::current_num_threads().max(1)).max(4);
-    out.iter_mut().for_each(|o| *o = 0.0);
+    out.fill(0.0);
     out.par_chunks_mut(chunk_blocks * 32)
         .enumerate()
         .for_each(|(t, chunk)| {
@@ -143,7 +146,12 @@ fn incumbent_i8(wq: &[i8], scales: &[f32], xs: &[f32], out: &mut [f32], k_len: u
                     let src = &row[b * 32..b * 32 + 32];
                     let dst = &mut chunk[b * 32..b * 32 + 32];
                     for j in 0..32 {
-                        dst[j] += xs_s * f32::from(src[j]);
+                        // Two roundings on purpose: this is the scalar
+                        // BASELINE the VNNI speedup is quoted against, so
+                        // it must not get a fused multiply-add the kernel
+                        // it is compared with does not have.
+                        let prod = xs_s * f32::from(src[j]);
+                        dst[j] += prod;
                     }
                 }
             }

@@ -45,6 +45,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use burn::tensor::{Device, Tensor};
+use mummu_num::{f64_from_u64, f64_from_usize};
 
 // ---------------------------------------------------------------------------
 // Deliverable 1: the three-state per-layer planner
@@ -79,7 +80,7 @@ pub struct LayerCost {
 #[derive(Debug, Clone)]
 pub struct OverlayModel {
     /// Host->device staging bandwidth, bytes per millisecond (measure it —
-    /// see `examples/overlay-floor-probe.rs`; never assume the PCIe sticker).
+    /// see `examples/overlay-floor-probe.rs`; never assume the `PCIe` sticker).
     pub tx_bytes_per_ms: f64,
     /// Fixed latency of one slot handoff (submit + fence visibility), ms.
     /// Amortized over the ring depth in the per-layer stream cost.
@@ -113,7 +114,7 @@ fn tx_ms(bytes: u64, m: &OverlayModel) -> f64 {
     if m.tx_bytes_per_ms <= 0.0 {
         return f64::INFINITY;
     }
-    bytes as f64 / m.tx_bytes_per_ms
+    f64_from_u64(bytes) / m.tx_bytes_per_ms
 }
 
 /// A streamed layer's per-layer charge: `max(gpu_ms, tx_ms)` — the steady
@@ -126,7 +127,7 @@ fn stream_slot_cost(l: &LayerCost, m: &OverlayModel) -> f64 {
     if m.ring_slots == 0 {
         return f64::INFINITY; // no slots, no stream
     }
-    l.gpu_ms.max(tx_ms(l.bytes, m)) + m.slot_latency_ms / m.ring_slots as f64
+    l.gpu_ms.max(tx_ms(l.bytes, m)) + m.slot_latency_ms / f64_from_usize(m.ring_slots)
 }
 
 /// What [`evaluate`] reports for a feasible assignment.
@@ -221,7 +222,7 @@ fn evaluate(
             boundaries += 1;
         }
     }
-    let crossings = m.crossing_ms * boundaries as f64;
+    let crossings = m.crossing_ms * f64_from_usize(boundaries);
 
     let hide = (hide_window - max_tx).max(0.0);
     let exposed = (sum_tx - hide).max(0.0);
@@ -267,6 +268,13 @@ fn evaluate(
 ///    unaffordable gets re-pinned here.
 ///
 /// O(sweeps * layers^2): trivial at model scale (tens of layers).
+///
+/// # Panics
+///
+/// Only on an internal invariant that cannot fail: the eviction loop ends
+/// either with a plan [`evaluate`] accepted or with the all-host fallback,
+/// which holds no device bytes and therefore always fits, so the final
+/// `expect` before the exchange sweep has nothing to reject.
 #[must_use]
 pub fn plan(layers: &[LayerCost], vram_budget_bytes: u64, m: &OverlayModel) -> OverlayPlan {
     if layers.is_empty() {
@@ -302,31 +310,28 @@ pub fn plan(layers: &[LayerCost], vram_budget_bytes: u64, m: &OverlayModel) -> O
             }
             let l = &layers[i];
             let off = stream_slot_cost(l, m).min(l.host_ms);
-            let per_byte = (off - l.gpu_ms) / l.bytes.max(1) as f64;
+            let per_byte = (off - l.gpu_ms) / f64_from_u64(l.bytes.max(1));
             if victim.is_none_or(|(_, best)| per_byte < best) {
                 victim = Some((i, per_byte));
             }
         }
-        match victim {
-            Some((i, _)) => {
-                let l = &layers[i];
-                actions[i] = if stream_slot_cost(l, m) < l.host_ms {
-                    LayerAction::Stream
-                } else {
-                    LayerAction::Host
-                };
-            }
-            None => {
-                // No residents left and still over budget: the ring reserve
-                // alone does not fit. Streaming is unaffordable here — fall
-                // back to the host, which needs no device bytes at all.
-                for a in &mut actions {
-                    if *a == LayerAction::Stream {
-                        *a = LayerAction::Host;
-                    }
+        if let Some((i, _)) = victim {
+            let l = &layers[i];
+            actions[i] = if stream_slot_cost(l, m) < l.host_ms {
+                LayerAction::Stream
+            } else {
+                LayerAction::Host
+            };
+        } else {
+            // No residents left and still over budget: the ring reserve
+            // alone does not fit. Streaming is unaffordable here — fall
+            // back to the host, which needs no device bytes at all.
+            for a in &mut actions {
+                if *a == LayerAction::Stream {
+                    *a = LayerAction::Host;
                 }
-                break;
             }
+            break;
         }
     }
 
@@ -444,10 +449,13 @@ pub fn pipelined_layer_ms(
     block_latency_ms: f64,
 ) -> f64 {
     assert!(blocks >= 1, "a layer streams in at least one block");
-    let n = blocks as f64;
+    let n = f64_from_usize(blocks);
     let a = tx_ms / n + block_latency_ms;
     let b = compute_ms / n;
-    a + (n - 1.0) * a.max(b) + b
+    // Two roundings on purpose: the steady-state term is its own product so
+    // the prediction stays the exact sum the tests pin.
+    let steady = (n - 1.0) * a.max(b);
+    a + steady + b
 }
 
 /// The block count minimizing [`pipelined_layer_ms`], scanned exactly over
@@ -458,7 +466,7 @@ pub fn pipelined_layer_ms(
 /// `blocks * latency` in issue overhead. The turn sits near the block whose
 /// transfer time equals the issue latency — block bytes ≈ latency ×
 /// bandwidth — giving `n* ≈ sqrt(min(tx, compute) / latency)` in the
-/// transfer-bound regime. The scan is exact, O(max_blocks), and ties keep
+/// transfer-bound regime. The scan is exact, `O(max_blocks)`, and ties keep
 /// the smaller count (fewer submits for the same time).
 ///
 /// # Panics
@@ -558,14 +566,27 @@ struct RingShared<P> {
     blocks_landed: AtomicU64,
 }
 
+impl<P> RingShared<P> {
+    /// The layer scheduled at position `pos` of the infinite repetition.
+    fn layer_at(&self, pos: u64) -> usize {
+        let len = self.order.len() as u64;
+        usize::try_from(pos % len).expect("a remainder below a usize length fits a usize")
+    }
+}
+
 /// Sets `prefetcher_gone` however the prefetch loop exits — clean shutdown
 /// or a panic inside an upload — so consumers never wait on a dead thread.
 struct Retire<'a, P>(&'a RingShared<P>);
 
 impl<P> Drop for Retire<'_, P> {
     fn drop(&mut self) {
-        let mut st = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut st = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         st.prefetcher_gone = true;
+        drop(st);
         self.0.cv.notify_all();
     }
 }
@@ -574,9 +595,15 @@ fn prefetch_loop<S: SlotStage>(shared: &RingShared<S::Payload>, stage: &S) {
     let _retire = Retire(shared);
     loop {
         let pos = {
-            let mut st = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut st = shared
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             while !st.shutdown && st.occupied >= shared.slots {
-                st = shared.cv.wait(st).unwrap_or_else(|e| e.into_inner());
+                st = shared
+                    .cv
+                    .wait(st)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
             if st.shutdown {
                 return;
@@ -586,13 +613,17 @@ fn prefetch_loop<S: SlotStage>(shared: &RingShared<S::Payload>, stage: &S) {
             st.occupied += 1; // the slot is spoken for while the upload flies
             pos
         };
-        let layer = shared.order[(pos % shared.order.len() as u64) as usize];
+        let layer = shared.layer_at(pos);
         let payload = stage.upload_blocks(layer, &mut |b: Block| {
             debug_assert!(b.of >= 1 && b.index < b.of, "malformed block {b:?}");
             shared.blocks_landed.fetch_add(1, Ordering::Relaxed);
         });
-        let mut st = shared.state.lock().unwrap_or_else(|e| e.into_inner());
-        st.ready.push_back((pos, payload));
+        shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ready
+            .push_back((pos, payload));
         shared.cv.notify_all();
     }
 }
@@ -681,9 +712,13 @@ where
     /// condition), or when the prefetch thread died before delivering.
     #[must_use]
     pub fn acquire(&self, layer: usize) -> SlotGuard<S::Payload> {
-        let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut st = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let pos = st.next_acquire;
-        let expected = self.shared.order[(pos % self.shared.order.len() as u64) as usize];
+        let expected = self.shared.layer_at(pos);
         assert_eq!(
             layer, expected,
             "ring acquire must follow the scheduled order: position {pos} is layer {expected}"
@@ -702,7 +737,11 @@ where
                 !st.prefetcher_gone,
                 "ring prefetch thread exited before layer {layer} landed"
             );
-            st = self.shared.cv.wait(st).unwrap_or_else(|e| e.into_inner());
+            st = self
+                .shared
+                .cv
+                .wait(st)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
     }
 
@@ -723,8 +762,13 @@ where
 impl<S: SlotStage> Drop for Ring<S> {
     fn drop(&mut self) {
         {
-            let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut st = self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             st.shutdown = true;
+            drop(st);
             self.shared.cv.notify_all();
         }
         if let Some(t) = self.prefetcher.take() {
@@ -735,10 +779,11 @@ impl<S: SlotStage> Drop for Ring<S> {
     }
 }
 
-/// Holds one acquired payload and, through it, one ring slot. Dropping the
-/// guard drops the payload FIRST (freeing its device memory) and only then
-/// releases the slot — the other order would let the prefetcher briefly
-/// over-commit the device by one layer.
+/// Holds one acquired payload and, through it, one ring slot.
+///
+/// Dropping the guard drops the payload FIRST (freeing its device memory)
+/// and only then releases the slot — the other order would let the
+/// prefetcher briefly over-commit the device by one layer.
 pub struct SlotGuard<P> {
     layer: usize,
     payload: Option<P>,
@@ -748,7 +793,7 @@ pub struct SlotGuard<P> {
 impl<P> SlotGuard<P> {
     /// The layer this payload belongs to.
     #[must_use]
-    pub fn layer(&self) -> usize {
+    pub const fn layer(&self) -> usize {
         self.layer
     }
 }
@@ -769,9 +814,14 @@ impl<P> std::ops::DerefMut for SlotGuard<P> {
 impl<P> Drop for SlotGuard<P> {
     fn drop(&mut self) {
         drop(self.payload.take());
-        let mut st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut st = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         debug_assert!(st.occupied >= 1, "a live guard implies an occupied slot");
         st.occupied -= 1;
+        drop(st);
         self.shared.cv.notify_all();
     }
 }
@@ -797,7 +847,7 @@ pub struct TensorStage {
 impl TensorStage {
     /// Stage over `host` tensors (index = layer), uploading to `target`.
     #[must_use]
-    pub fn new(host: Vec<Tensor<2>>, target: Device) -> Self {
+    pub const fn new(host: Vec<Tensor<2>>, target: Device) -> Self {
         Self { host, target }
     }
 }
@@ -858,7 +908,7 @@ mod tests {
     #[test]
     fn empty_model_plans_to_nothing() {
         let p = plan(&[], 1_000, &model(1.0));
-        assert!(p.actions.is_empty());
+        assert_eq!(p.actions, [] as [crate::overlay::LayerAction; 0]);
         assert!(close(p.predicted_token_ms, 0.0));
         assert_eq!(p.resident_bytes, 0);
         assert_eq!(p.ring_bytes, 0);
@@ -874,10 +924,10 @@ mod tests {
         assert_eq!(p.ring_bytes, 0);
     }
 
-    /// The pinned rule, host direction: host_ms 5 vs tx 12 (gpu 2) — a fast
+    /// The pinned rule, host direction: `host_ms` 5 vs tx 12 (gpu 2) — a fast
     /// host kernel must WIN over streaming, from the input numbers alone.
     /// This is the "planner must not silently fight the host-kernel lane"
-    /// test: when the VNNI lane lands, host_ms drops and this is the branch
+    /// test: when the VNNI lane lands, `host_ms` drops and this is the branch
     /// the planner takes.
     #[test]
     fn a_fast_host_kernel_beats_streaming() {
@@ -900,7 +950,7 @@ mod tests {
         assert_eq!(p.ring_bytes, 0, "no stream, no ring reserve");
     }
 
-    /// The pinned rule, stream direction: host_ms 36 vs tx 12, gpu 14 —
+    /// The pinned rule, stream direction: `host_ms` 36 vs tx 12, gpu 14 —
     /// streaming wins (max(14, 12) + 0.5 = 14.5 < 36), again from inputs.
     #[test]
     fn streaming_beats_a_slow_host() {
@@ -1200,7 +1250,9 @@ mod tests {
 
     impl SimClock {
         fn lock(&self) -> std::sync::MutexGuard<'_, SimState> {
-            self.state.lock().unwrap_or_else(|e| e.into_inner())
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
         }
     }
 
@@ -1276,7 +1328,7 @@ mod tests {
                     .wait_timeout_while(clock.lock(), Duration::from_secs(20), |s| {
                         s.started < pos + slots
                     })
-                    .unwrap_or_else(|e| e.into_inner());
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 assert!(
                     !wait.timed_out(),
                     "position {pos} is held, but the ring never started position {}",
@@ -1291,15 +1343,17 @@ mod tests {
             }
         }
         drop(ring);
-        let st = clock.lock();
+        let (early_starts, peak) = {
+            let st = clock.lock();
+            (st.early_starts, st.peak)
+        };
         assert_eq!(
-            st.early_starts, 0,
+            early_starts, 0,
             "an upload started before the slot it fills was released"
         );
         assert!(
-            st.peak <= slots,
-            "at most `slots` payloads may be alive at once: {}",
-            st.peak
+            peak <= slots,
+            "at most `slots` payloads may be alive at once: {peak}"
         );
         now_ms
     }
@@ -1390,7 +1444,10 @@ mod tests {
                     of: self.blocks,
                 };
                 {
-                    let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut events = self
+                        .events
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     let landed_ms = events.last().map_or(0, |&(_, t)| t) + self.block_ms;
                     events.push((b, landed_ms));
                 }
@@ -1416,7 +1473,9 @@ mod tests {
             }
         }
         assert!(ring.blocks_landed() >= 16, "4 uploads x 4 blocks");
-        let seen = events.lock().unwrap_or_else(|e| e.into_inner());
+        let seen = events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for chunk in seen.chunks(4).take(4) {
             assert_eq!(chunk.len(), 4);
             for (i, (b, _)) in chunk.iter().enumerate() {
@@ -1454,35 +1513,42 @@ mod tests {
             for _ in 0..blocks {
                 let b = brx.recv().expect("producer sends every block");
                 assert_eq!(b.of, blocks);
-                let landed_ms = events.lock().unwrap_or_else(|e| e.into_inner())[b.index].1;
+                let landed_ms = events
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)[b.index]
+                    .1;
                 now_ms = now_ms.max(landed_ms) + compute_ms;
             }
             producer.join().expect("producer exits cleanly");
             let n = blocks as u64;
-            let predicted =
-                pipelined_layer_ms((n * block_ms) as f64, (n * compute_ms) as f64, blocks, 0.0);
+            let predicted = pipelined_layer_ms(
+                f64_from_u64(n * block_ms),
+                f64_from_u64(n * compute_ms),
+                blocks,
+                0.0,
+            );
             assert!(
-                close(now_ms as f64, predicted),
+                close(f64_from_u64(now_ms), predicted),
                 "block pipelining must land on {predicted} ms (serial is 360 ms): {now_ms}"
             );
         }
     }
 
-    /// TensorStage plumbing on the CPU device: the ring hands back the
+    /// `TensorStage` plumbing on the CPU device: the ring hands back the
     /// right layer's tensor with the right shape (no GPU required; the
     /// device-transfer semantics ride `move_to`, tested in backend.rs).
     #[test]
     fn tensor_stage_hands_over_device_tensors() {
         let cpu = crate::backend::cpu_device();
-        let host: Vec<Tensor<2>> = (0..2)
+        let host: Vec<Tensor<2>> = (0..2u8)
             .map(|i| {
                 Tensor::<2>::from_data(
-                    burn::tensor::TensorData::new(vec![i as f32; 6], [2, 3]),
+                    burn::tensor::TensorData::new(vec![f32::from(i); 6], [2, 3]),
                     (&cpu, crate::backend::float_dtype(&cpu)),
                 )
             })
             .collect();
-        let ring = Ring::new(TensorStage::new(host, cpu.clone()), 2, vec![0, 1]);
+        let ring = Ring::new(TensorStage::new(host, cpu), 2, vec![0, 1]);
         for _token in 0..2 {
             for l in 0..2usize {
                 let g = ring.acquire(l);
@@ -1494,7 +1560,7 @@ mod tests {
                     .try_to_vec::<f32>()
                     .expect("payload reads back");
                 assert!(
-                    data.iter().all(|v| close(f64::from(*v), l as f64)),
+                    data.iter().all(|v| close(f64::from(*v), f64_from_usize(l))),
                     "layer {l} must get layer {l}'s tensor"
                 );
             }

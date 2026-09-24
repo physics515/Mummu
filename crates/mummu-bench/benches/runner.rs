@@ -9,6 +9,8 @@
 //! Without `MUMMU_QWEN2_DIR` (or weights on disk) only the harness smoke runs,
 //! so `cargo bench` stays green on machines without the multi-GB checkpoint.
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};

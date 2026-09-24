@@ -1,5 +1,7 @@
-//! Model downloads: HuggingFace Hub (or any HTTP host) → the local model
-//! cache. Streaming, **resumable** (a `<file>.part` picks up where a killed
+//! Model downloads: `HuggingFace` Hub (or any HTTP host) → the local model
+//! cache.
+//!
+//! Streaming, **resumable** (a `<file>.part` picks up where a killed
 //! download stopped, via HTTP `Range`), **integrity-checked** (streamed
 //! sha256 against the Hub's announced LFS `X-Linked-ETag`, length as the
 //! fallback), and **sharded-checkpoint aware** (`model.safetensors.index.json`
@@ -69,6 +71,10 @@ pub struct Progress<'a> {
 
 /// `https://huggingface.co/{repo}/resolve/{revision}/{file}` — the Hub's
 /// stable raw-file endpoint.
+///
+/// # Panics
+///
+/// When `repo` is not of the form `owner/name` or `revision` is empty.
 #[must_use]
 pub fn hub_file_url(repo: &str, revision: &str, file: &str) -> String {
     assert!(
@@ -79,8 +85,13 @@ pub fn hub_file_url(repo: &str, revision: &str, file: &str) -> String {
     format!("https://huggingface.co/{repo}/resolve/{revision}/{file}")
 }
 
-/// The unique shard files referenced by a `*.index.json` (weight_map values,
+/// The unique shard files referenced by a `*.index.json` (`weight_map` values,
 /// deduped, sorted for a deterministic fetch order).
+///
+/// # Errors
+///
+/// [`HubError::BadIndex`] when `index_json` is not JSON, has no `weight_map`
+/// object, or names no shards or more than [`MAX_SHARDS`].
 pub fn shards_from_index(index_json: &[u8], index_path: &Path) -> Result<Vec<String>, HubError> {
     let v: serde_json::Value =
         serde_json::from_slice(index_json).map_err(|e| HubError::BadIndex {
@@ -205,17 +216,18 @@ fn sha256_hex_of_file(path: &Path) -> Result<String, HubError> {
     let mut f = std::fs::File::open(path).map_err(io_err)?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; CHUNK_BYTES];
-    let mut hashed = 0u64;
+    let mut seen = 0u64;
     loop {
         let n = f.read(&mut buf).map_err(io_err)?;
         if n == 0 {
             break;
         }
         hasher.update(&buf[..n]);
-        hashed += n as u64;
+        seen += n as u64;
         assert!(
-            hashed <= MAX_FILE_BYTES,
-            "{path:?}: exceeds the file bound while hashing"
+            seen <= MAX_FILE_BYTES,
+            "{}: exceeds the file bound while hashing",
+            path.display()
         );
     }
     Ok(hex64(&hasher.finalize()))
@@ -232,13 +244,18 @@ fn hash_part_prefix(part: &Path, resume_from: u64, hasher: &mut Sha256) -> Resul
     let mut remaining = resume_from;
     let mut buf = vec![0u8; CHUNK_BYTES];
     while remaining > 0 {
-        let want = remaining.min(CHUNK_BYTES as u64) as usize;
+        let want = usize::try_from(remaining.min(CHUNK_BYTES as u64))
+            .expect("a chunk of at most CHUNK_BYTES fits usize");
         let n = f.read(&mut buf[..want]).map_err(|e| HubError::Io {
             path: part.to_path_buf(),
             reason: e.to_string(),
         })?;
         // The prefix length came from this file's own metadata an instant ago.
-        assert!(n > 0, "{part:?}: prefix ended {remaining} bytes early");
+        assert!(
+            n > 0,
+            "{}: prefix ended {remaining} bytes early",
+            part.display()
+        );
         hasher.update(&buf[..n]);
         remaining -= n as u64;
     }
@@ -246,10 +263,16 @@ fn hash_part_prefix(part: &Path, resume_from: u64, hasher: &mut Sha256) -> Resul
 }
 
 /// Fetch `url` into `dest`, streaming through `<dest>.part` and resuming any
-/// earlier partial download. No-op when `dest` already exists (cache-first).
-/// `on_progress` fires after every chunk with cumulative counts. The stream
-/// is verified against the server's announced sha256 when there is one
-/// (Hub LFS files), else by length.
+/// earlier partial download.
+///
+/// No-op when `dest` already exists (cache-first). `on_progress` fires after
+/// every chunk with cumulative counts. The stream is verified against the
+/// server's announced sha256 when there is one (Hub LFS files), else by
+/// length.
+///
+/// # Errors
+///
+/// The same as [`fetch_file_with`] with default options.
 pub fn fetch_file(
     url: &str,
     dest: &Path,
@@ -258,10 +281,29 @@ pub fn fetch_file(
     fetch_file_with(url, dest, FetchOptions::default(), on_progress)
 }
 
-/// [`fetch_file`] with explicit [`FetchOptions`]. With `verify_cached`, an
-/// existing `dest` is re-hashed against the announced sha256; a mismatch
-/// deletes the corrupt copy (and any stale `.part` that would poison a
-/// resume) and re-fetches once — self-healing, never silent.
+/// [`fetch_file`] with explicit [`FetchOptions`].
+///
+/// With `verify_cached`, an existing `dest` is re-hashed against the
+/// announced sha256; a mismatch deletes the corrupt copy (and any stale
+/// `.part` that would poison a resume) and re-fetches once — self-healing,
+/// never silent.
+///
+/// # Errors
+///
+/// - [`HubError::Http`] when the HEAD or GET fails at the transport level, or
+///   the body stream errors mid-read.
+/// - [`HubError::Io`] when the destination's parent cannot be created, the
+///   `.part` file cannot be opened, written or renamed into place, the
+///   cached copy cannot be re-hashed, or a stale/corrupt file cannot be
+///   removed.
+/// - [`HubError::Incomplete`] when the server announced a length and the
+///   stream ended short of it (the `.part` is kept for a resume).
+/// - [`HubError::Corrupt`] when the announced sha256 does not match the
+///   streamed bytes (the `.part` is deleted).
+///
+/// # Panics
+///
+/// When `url` is not `https://`.
 pub fn fetch_file_with(
     url: &str,
     dest: &Path,
@@ -301,9 +343,12 @@ fn download(
     debug_assert!(!dest.exists(), "download() requires a vacant destination");
     let file_label = dest
         .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    assert!(!file_label.is_empty(), "dest must name a file: {dest:?}");
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    assert!(
+        !file_label.is_empty(),
+        "dest must name a file: {}",
+        dest.display()
+    );
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| HubError::Io {
             path: parent.to_path_buf(),
@@ -312,7 +357,7 @@ fn download(
     }
 
     let part = part_path(dest);
-    let resume_from = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+    let resume_from = std::fs::metadata(&part).map_or(0, |m| m.len());
     // One cheap HEAD up front: with an announced sha256 the whole stream
     // (resumed prefix included) is verified; without one, length still is.
     let expected_sha = announced_sha256(url)?;
@@ -389,6 +434,25 @@ fn download(
     }
     drop(out);
 
+    verify_stream(url, &part, received, total, expected_sha, hasher)?;
+    std::fs::rename(&part, dest).map_err(|e| HubError::Io {
+        path: dest.to_path_buf(),
+        reason: e.to_string(),
+    })
+}
+
+/// The post-stream checks of [`download`]: the byte count against the
+/// announced length, then the digest against the announced sha256. A short
+/// stream keeps its `.part` for a resume; a wrong-hash `.part` is deleted so
+/// it can never seed one.
+fn verify_stream(
+    url: &str,
+    part: &Path,
+    received: u64,
+    total: Option<u64>,
+    expected_sha: Option<String>,
+    hasher: Option<Sha256>,
+) -> Result<(), HubError> {
     if let Some(expected) = total
         && received != expected
     {
@@ -403,8 +467,8 @@ fn download(
         let computed = hex64(&h.finalize());
         if computed != expected {
             // A wrong-hash .part must never seed a resume — drop it.
-            std::fs::remove_file(&part).map_err(|e| HubError::Io {
-                path: part.clone(),
+            std::fs::remove_file(part).map_err(|e| HubError::Io {
+                path: part.to_path_buf(),
                 reason: e.to_string(),
             })?;
             return Err(HubError::Corrupt {
@@ -414,22 +478,25 @@ fn download(
             });
         }
     }
-    std::fs::rename(&part, dest).map_err(|e| HubError::Io {
-        path: dest.to_path_buf(),
-        reason: e.to_string(),
-    })
+    Ok(())
 }
 
-/// Fetch a whole model from the Hub into `dest_dir`: `config.json`,
-/// `tokenizer.json`, the weights — `model.safetensors` when the repo is
-/// single-file, else every shard listed by `model.safetensors.index.json` —
-/// and, when the repo ships them, the optional siblings in [`OPTIONAL_FILES`].
-/// Returns `dest_dir` ready for the per-model `load_from_dir`.
+/// Fetch a whole model from the Hub into `dest_dir`.
+///
+/// That is `config.json`, `tokenizer.json`, the weights —
+/// `model.safetensors` when the repo is single-file, else every shard listed
+/// by `model.safetensors.index.json` — and, when the repo ships them, the
+/// optional siblings in [`OPTIONAL_FILES`]. Returns `dest_dir` ready for the
+/// per-model `load_from_dir`.
 ///
 /// `config.json` and `tokenizer.json` are required: a 404 on either is an
 /// error. The optional siblings are best-effort, because a repo that does not
 /// ship them is normal — but they are asked for, so a checkpoint installed
 /// this way arrives with the files the import-validation gates need.
+///
+/// # Errors
+///
+/// The same as [`fetch_model_with`] with default options.
 pub fn fetch_model(
     repo: &str,
     revision: &str,
@@ -447,6 +514,16 @@ pub fn fetch_model(
 
 /// [`fetch_model`] with explicit [`FetchOptions`] (e.g. re-verify cached
 /// files' sha256 before trusting them).
+///
+/// # Errors
+///
+/// Everything [`fetch_file_with`] returns, for `config.json`,
+/// `tokenizer.json`, any optional sibling the repo ships, and the weights;
+/// [`HubError::Http`] when the existence probe for an optional sibling fails
+/// at the transport level; [`HubError::Io`] when a downloaded shard index
+/// cannot be read back; [`HubError::BadIndex`] when it is malformed. When
+/// neither `model.safetensors` nor the shard index can be fetched, the
+/// single-file error is the one reported.
 pub fn fetch_model_with(
     repo: &str,
     revision: &str,

@@ -32,6 +32,11 @@ pub struct ShortConvConfig {
 
 impl ShortConvConfig {
     /// Initialize the module (random weights; real weights come from import).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `hidden_size` is 0 or `kernel_len` is below 2.
+    #[must_use]
     pub fn init(&self, device: &Device) -> ShortConv {
         let (d, k) = (self.hidden_size, self.kernel_len);
         assert!(d >= 1, "ShortConv: hidden_size must be >= 1");
@@ -54,6 +59,10 @@ impl ShortConvConfig {
 impl ShortConv {
     /// Cache-aware forward. `x` is `[b, t, d]`: the whole prompt at prefill,
     /// one token per decode step after. Rolls `state` forward either way.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `kernel_len` is below 2 or `x` has no positions (`t == 0`).
     pub fn forward(&self, x: Tensor<3>, kernel_len: usize, state: &mut ConvState) -> Tensor<3> {
         let [b, t, d] = x.dims();
         let kk = kernel_len;
@@ -71,7 +80,10 @@ impl ShortConv {
         let bx = bb.mul(xx).swap_dims(1, 2); // input gate, channel-major [b, d, t]
 
         let conv_out = if t > 1 {
-            match state.as_ref() {
+            state.as_ref().map_or_else(
+                // Fresh prefill: the padded depthwise Conv1d gives the full
+                // causal output.
+                || self.conv.forward(bx.clone()).narrow(2, 0, t), // [b, d, t]
                 // Continuation (a later prefill chunk, or a prompt after
                 // decode): the first K-1 positions' windows reach into the
                 // cached span. Convolve [cached | new] and take the outputs
@@ -79,33 +91,30 @@ impl ShortConv {
                 // (The fresh-start branch used to take every continuation
                 // too, convolving those positions against zero history —
                 // the same boundary bug found in qwen35's DeltaNet conv.)
-                Some(prev) => {
+                |prev| {
                     let ext = Tensor::cat(vec![prev.clone(), bx.clone()], 2);
                     self.conv.forward(ext).narrow(2, kk - 1, t)
-                }
-                // Fresh prefill: the padded depthwise Conv1d gives the full
-                // causal output.
-                None => self.conv.forward(bx.clone()).narrow(2, 0, t), // [b, d, t]
-            }
+                },
+            )
         } else {
             // Decode: weighted sum over the last K inputs = [cached (K-1), new (1)].
             // Equivalent to the padded conv at the new position.
-            let window = match state {
-                Some(prev) => Tensor::cat(vec![prev.clone(), bx.clone()], 2), // [b, d, K]
-                None => {
+            let window = state.as_ref().map_or_else(
+                || {
                     let pad = Tensor::<3>::zeros([b, d, kk - 1], &bx.device());
                     Tensor::cat(vec![pad, bx.clone()], 2)
-                }
-            };
-            let w = self.conv.weight.val().reshape([1, d, kk]); // depthwise kernel
-            window.mul(w).sum_dim(2) // [b, d, 1]
+                },
+                |prev| Tensor::cat(vec![prev.clone(), bx.clone()], 2), // [b, d, K]
+            );
+            let kernel = self.conv.weight.val().reshape([1, d, kk]); // depthwise kernel
+            window.mul(kernel).sum_dim(2) // [b, d, 1]
         };
 
         // Roll the state forward: keep the last (K-1) gated inputs.
         let new_state = {
             let combined = match state {
-                Some(prev) => Tensor::cat(vec![prev.clone(), bx.clone()], 2),
-                None => bx.clone(),
+                Some(prev) => Tensor::cat(vec![prev.clone(), bx], 2),
+                None => bx,
             };
             let len = combined.dims()[2];
             if len >= kk - 1 {
@@ -142,7 +151,7 @@ mod tests {
 
     fn input(t: usize, seed: f32, device: &Dev) -> Tensor<3> {
         let data: Vec<f32> = (0..t * D)
-            .map(|i| ((i as f32 + seed) * 0.9).cos())
+            .map(|i| ((mummu_num::f32_from_usize(i) + seed) * 0.9).cos())
             .collect();
         Tensor::<2>::from_data(TensorData::new(data, [t, D]), device).reshape([1, t, D])
     }

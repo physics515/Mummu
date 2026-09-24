@@ -1,10 +1,13 @@
-//! Decode-loop primitives shared by every causal model: on-device argmax, a
-//! top-k probe, temperature/top-p sampling with a deterministic in-house RNG,
-//! and the streaming `generate_loop` driver with cooperative cancellation.
+//! Decode-loop primitives shared by every causal model.
+//!
+//! On-device argmax, a top-k probe, temperature/top-p sampling with a
+//! deterministic in-house RNG, and the streaming `generate_loop` driver with
+//! cooperative cancellation.
 
 use std::ops::ControlFlow;
 
 use burn::tensor::Tensor;
+use mummu_num::f32_from_u32;
 
 use crate::constrain::Constraint;
 
@@ -20,6 +23,11 @@ const DEFAULT_TOP_K: usize = 1024;
 /// Greedy next-token id from `[1, vocab]` logits. The argmax runs
 /// **on-device** and only the single winning index is synced back — vs.
 /// copying a whole ~150k-logit vector to the CPU every decode step.
+///
+/// # Errors
+///
+/// A message when the device readback fails, returns no element, or returns
+/// an index that is negative or does not fit a `u32`.
 pub async fn argmax_id(logits: Tensor<2>) -> Result<u32, String> {
     debug_assert!(logits.dims()[0] == 1, "argmax_id expects [1, vocab] logits");
     let data = logits
@@ -32,17 +40,25 @@ pub async fn argmax_id(logits: Tensor<2>) -> Result<u32, String> {
         .map_err(|e| format!("argmax readback: {e:?}"))?;
     debug_assert!(data.len() == 1, "argmax over [1, vocab] must yield one id");
     let id = data.first().copied().ok_or("argmax returned no data")?;
-    Ok(id as u32)
+    u32::try_from(id).map_err(|_| format!("argmax returned an out-of-range id {id}"))
 }
 
 /// Indices of the `k` largest values, descending (the parity probe's top-k).
+///
+/// # Panics
+///
+/// When `v` is empty or `k` is 0. The indices are also converted to `u32`,
+/// which cannot fail for any vocabulary this crate loads.
 #[must_use]
 pub fn top_k_ids(v: &[f32], k: usize) -> Vec<u32> {
     assert!(!v.is_empty(), "top_k_ids: empty logits");
     assert!(k >= 1, "top_k_ids: k must be >= 1");
     let mut idx: Vec<usize> = (0..v.len()).collect();
     idx.sort_unstable_by(|&a, &b| v[b].partial_cmp(&v[a]).unwrap_or(std::cmp::Ordering::Equal));
-    idx.into_iter().take(k).map(|i| i as u32).collect()
+    idx.into_iter()
+        .take(k)
+        .map(|i| u32::try_from(i).expect("vocab index fits u32"))
+        .collect()
 }
 
 /// Sampling knobs for one generation. `temperature == 0` means exact greedy
@@ -104,7 +120,7 @@ impl Pcg32 {
     const MULT: u64 = 6_364_136_223_846_793_005;
 
     #[must_use]
-    pub fn new(seed: u64) -> Self {
+    pub const fn new(seed: u64) -> Self {
         // Fixed stream; the standard seeding dance (advance, add, advance).
         let mut rng = Self {
             state: 0,
@@ -116,23 +132,32 @@ impl Pcg32 {
         rng
     }
 
-    pub fn next_u32(&mut self) -> u32 {
+    pub const fn next_u32(&mut self) -> u32 {
         let old = self.state;
         self.state = old.wrapping_mul(Self::MULT).wrapping_add(self.inc);
-        let xorshifted = (((old >> 18) ^ old) >> 27) as u32;
+        // The low 32 bits are the output word; the mask makes that explicit.
+        let xorshifted = ((((old >> 18) ^ old) >> 27) & 0xFFFF_FFFF) as u32;
         let rot = (old >> 59) as u32;
         xorshifted.rotate_right(rot)
     }
 
     /// Uniform in [0, 1) with 24 bits of mantissa.
     pub fn next_f32(&mut self) -> f32 {
-        (self.next_u32() >> 8) as f32 * (1.0 / (1 << 24) as f32)
+        // 24 random bits scaled by 2^-24: both factors are exact in f32.
+        f32_from_u32(self.next_u32() >> 8) * (1.0 / 16_777_216.0)
     }
 }
 
 /// Sample a token id from raw logits with temperature + top-k + top-p.
 /// Pure and deterministic given (logits, opts, rng state). `temperature == 0`
 /// callers should use [`argmax_id`] instead (asserted here).
+///
+/// # Panics
+///
+/// As [`sample_id_filtered`]: an invalid `opts` (non-finite or negative
+/// temperature, `top_p` outside `(0, 1]`, `top_k` of 0), empty logits or
+/// more than the readback bound of them, or a temperature of 0. The
+/// unfiltered candidate set is never empty, so the unwrap here cannot fail.
 #[must_use]
 pub fn sample_id(logits: &[f32], opts: &SamplerOptions, rng: &mut Pcg32) -> u32 {
     sample_id_filtered(logits, opts, rng, |_| true)
@@ -149,6 +174,13 @@ pub fn sample_id(logits: &[f32], opts: &SamplerOptions, rng: &mut Pcg32) -> u32 
 /// instead of sample-then-reject, which would quietly bias toward whatever
 /// the grammar happens to permit. `None` means the grammar rejected every
 /// candidate in the top-k; callers widen the search from there.
+///
+/// # Panics
+///
+/// When `opts` is invalid (non-finite or negative temperature, `top_p`
+/// outside `(0, 1]`, `top_k` of 0), when `logits` is empty or longer than
+/// the readback bound, or when `temperature` is 0 — that is the
+/// [`argmax_id`] path.
 #[must_use]
 pub fn sample_id_filtered(
     logits: &[f32],
@@ -170,7 +202,8 @@ pub fn sample_id_filtered(
 
     // Top-k prefilter: O(vocab) partial select, then sort just the candidates.
     let k = opts.top_k.min(logits.len());
-    let mut idx: Vec<u32> = (0..logits.len() as u32).collect();
+    let vocab = u32::try_from(logits.len()).expect("vocab size fits u32");
+    let mut idx: Vec<u32> = (0..vocab).collect();
     let by_logit_desc = |&a: &u32, &b: &u32| logits[b as usize].total_cmp(&logits[a as usize]);
     if k < idx.len() {
         idx.select_nth_unstable_by(k - 1, by_logit_desc);
@@ -232,13 +265,19 @@ pub fn sample_id_filtered(
 /// ~150k vocabulary is not. The tail is only sorted when the head had
 /// nothing, which in practice means a grammar that has painted the model
 /// into a corner.
+///
+/// # Panics
+///
+/// Only on an internal invariant that cannot fail: the vocabulary size is
+/// converted to `u32` for the ids.
 #[must_use]
 pub fn best_allowed(logits: &[f32], allowed: impl Fn(u32) -> bool) -> Option<u32> {
     /// Head width for the first stage.
     const PROBE: usize = 512;
 
     let by_logit_desc = |&a: &u32, &b: &u32| logits[b as usize].total_cmp(&logits[a as usize]);
-    let mut idx: Vec<u32> = (0..logits.len() as u32).collect();
+    let vocab = u32::try_from(logits.len()).expect("vocab size fits u32");
+    let mut idx: Vec<u32> = (0..vocab).collect();
     if idx.len() > PROBE {
         idx.select_nth_unstable_by(PROBE - 1, by_logit_desc);
         let (head, tail) = idx.split_at_mut(PROBE);
@@ -254,7 +293,9 @@ pub fn best_allowed(logits: &[f32], allowed: impl Fn(u32) -> bool) -> Option<u32
 }
 
 /// Prompt tokens fed per prefill call (`MUMMU_PREFILL_CHUNK`; `0`/`off`
-/// disables chunking). The default 1024 keeps the peak SwiGLU activation
+/// disables chunking).
+///
+/// The default 1024 keeps the peak `SwiGLU` activation
 /// (`3 · chunk · intermediate · 4 B`) near 200 MiB on the 27B — the number
 /// the accelerator reserve in mummu-serve is derived from, so the two must
 /// move together. `mummu_schedule::prefill::best_chunk` solves for the
@@ -270,9 +311,10 @@ pub fn prefill_chunk_len() -> usize {
 }
 
 /// The shared decode driver: prefill via `step` (in chunks — see
-/// [`prefill_chunk_len`]), then one token per iteration. Emits each accepted
-/// token through `on_token`; a `Break` return cancels cooperatively *before*
-/// the next forward. EOS is never emitted.
+/// [`prefill_chunk_len`]), then one token per iteration.
+///
+/// Emits each accepted token through `on_token`; a `Break` return cancels
+/// cooperatively *before* the next forward. EOS is never emitted.
 ///
 /// `step(new_ids, past, need_logits)` advances the cache; it must return
 /// `Some([1, vocab] logits)` for the last position whenever `need_logits`
@@ -285,6 +327,20 @@ pub fn prefill_chunk_len() -> usize {
 /// [`crate::constrain`]). It also owns the stop condition: EOS is suppressed
 /// until the constrained value is complete, and the loop ends the moment it
 /// is.
+///
+/// # Errors
+///
+/// A message when a device readback (the on-device argmax or the logit row)
+/// fails, when the argmax returns an id outside the vocabulary — the NaN /
+/// numeric-collapse signature — or when the constraint rejects every token
+/// in the vocabulary.
+///
+/// # Panics
+///
+/// When `opts` is invalid (see [`sample_id_filtered`]), `prompt_ids` is
+/// empty, `max_tokens` is 0, or `step` returns `None` for a call that asked
+/// for logits. The vocabulary width is also converted to `u32`, which
+/// cannot fail for any model this crate loads.
 pub async fn generate_loop(
     mut step: impl FnMut(&[u32], usize, bool) -> Option<Tensor<2>>,
     prompt_ids: &[u32],
@@ -328,7 +384,7 @@ pub async fn generate_loop(
     };
     let mut out: Vec<u32> = Vec::with_capacity(max_tokens);
     for past in (prompt_ids.len()..).take(max_tokens) {
-        let vocab = logits.dims()[1] as u32;
+        let vocab = u32::try_from(logits.dims()[1]).expect("vocab size fits u32");
         // This span crosses an await, so it must not hold a scope guard
         // (thread-local stack; the future may resume on another worker) —
         // timed by hand and attributed with `record` instead. It is also
@@ -401,7 +457,10 @@ pub async fn generate_loop(
         // The constrained value closed. Nothing after it can belong to the
         // value, and letting the model free-associate past the last brace
         // costs a full token of decode per word of it.
-        if constraint.as_deref().is_some_and(|c| c.is_complete()) {
+        if constraint
+            .as_deref()
+            .is_some_and(super::constrain::Constraint::is_complete)
+        {
             break;
         }
         // Cooperative yield: a CPU-backend decode is a long stretch of
@@ -454,19 +513,22 @@ mod tests {
 
     #[test]
     fn pcg32_is_deterministic_per_seed_and_in_unit_range() {
-        let (mut a, mut b) = (Pcg32::new(7), Pcg32::new(7));
-        let seq_a: Vec<u32> = (0..8).map(|_| a.next_u32()).collect();
-        let seq_b: Vec<u32> = (0..8).map(|_| b.next_u32()).collect();
+        let (mut first, mut second) = (Pcg32::new(7), Pcg32::new(7));
+        let seq_a: Vec<u32> = (0..8).map(|_| first.next_u32()).collect();
+        let seq_b: Vec<u32> = (0..8).map(|_| second.next_u32()).collect();
         assert_eq!(seq_a, seq_b, "same seed must replay the same stream");
 
-        let mut c = Pcg32::new(8);
-        let seq_c: Vec<u32> = (0..8).map(|_| c.next_u32()).collect();
+        let mut other = Pcg32::new(8);
+        let seq_c: Vec<u32> = (0..8).map(|_| other.next_u32()).collect();
         assert_ne!(seq_a, seq_c, "different seeds must diverge");
 
-        let mut r = Pcg32::new(99);
+        let mut rng = Pcg32::new(99);
         for _ in 0..1000 {
-            let f = r.next_f32();
-            assert!((0.0..1.0).contains(&f), "next_f32 out of [0,1): {f}");
+            let sample = rng.next_f32();
+            assert!(
+                (0.0..1.0).contains(&sample),
+                "next_f32 out of [0,1): {sample}"
+            );
         }
     }
 

@@ -36,9 +36,9 @@
 pub struct P2Quantile {
     /// The target quantile, fixed at construction.
     q: f64,
-    /// Marker heights q_1..q_5: min, lower mid, target, upper mid, max.
+    /// Marker heights `q_1..q_5`: min, lower mid, target, upper mid, max.
     heights: [f64; 5],
-    /// Actual marker positions n_1..n_5 (1-based sample counts). Kept as
+    /// Actual marker positions `n_1..n_5` (1-based sample counts). Kept as
     /// f64 for the update arithmetic but always integral, and exact: they
     /// grow by 1 per sample, far below f64's 2^53 integer horizon.
     positions: [f64; 5],
@@ -64,12 +64,18 @@ impl P2Quantile {
             q > 0.0 && q < 1.0,
             "P2Quantile: q must be in (0,1), got {q}"
         );
-        P2Quantile {
+        Self {
             q,
             heights: [0.0; 5],
             positions: [1.0, 2.0, 3.0, 4.0, 5.0],
-            desired: [1.0, 1.0 + 2.0 * q, 1.0 + 4.0 * q, 3.0 + 2.0 * q, 5.0],
-            increments: [0.0, q / 2.0, q, (1.0 + q) / 2.0, 1.0],
+            desired: [
+                1.0,
+                2.0f64.mul_add(q, 1.0),
+                4.0f64.mul_add(q, 1.0),
+                2.0f64.mul_add(q, 3.0),
+                5.0,
+            ],
+            increments: [0.0, q / 2.0, q, f64::midpoint(1.0, q), 1.0],
             count: 0,
             nan_count: 0,
         }
@@ -77,20 +83,20 @@ impl P2Quantile {
 
     /// The quantile this estimator tracks.
     #[must_use]
-    pub fn q(&self) -> f64 {
+    pub const fn q(&self) -> f64 {
         self.q
     }
 
     /// Samples accepted so far (NaNs not included).
     #[must_use]
-    pub fn count(&self) -> u64 {
+    pub const fn count(&self) -> u64 {
         self.count
     }
 
     /// NaN inputs ignored so far. Non-zero means the telemetry source fed
     /// garbage at least once; the estimate itself is unaffected.
     #[must_use]
-    pub fn nan_ignored(&self) -> u64 {
+    pub const fn nan_ignored(&self) -> u64 {
         self.nan_count
     }
 
@@ -99,7 +105,7 @@ impl P2Quantile {
     /// and pretending otherwise would hand the caller a number with no
     /// distributional meaning.
     #[must_use]
-    pub fn estimate(&self) -> Option<f64> {
+    pub const fn estimate(&self) -> Option<f64> {
         if self.count < 5 {
             None
         } else {
@@ -108,6 +114,10 @@ impl P2Quantile {
     }
 
     /// Feed one observation. NaN is ignored (see the type-level contract).
+    ///
+    /// # Panics
+    /// Never in practice: the only `expect` converts a sample count below
+    /// five to a `usize`, which cannot fail on any target.
     pub fn observe(&mut self, x: f64) {
         if x.is_nan() {
             self.nan_count += 1;
@@ -119,7 +129,8 @@ impl P2Quantile {
         // holding buffer — positions/desired stay at their constructed
         // values, which are exactly the paper's initial values.)
         if self.count < 5 {
-            self.heights[self.count as usize] = x;
+            let slot = usize::try_from(self.count).expect("fewer than five samples fits usize");
+            self.heights[slot] = x;
             self.count += 1;
             if self.count == 5 {
                 self.heights.sort_by(f64::total_cmp);
@@ -168,14 +179,15 @@ impl P2Quantile {
 
                 // Piecewise-parabolic: fit a parabola through the marker
                 // and its neighbors, evaluate one position over.
-                let parabolic = self.heights[i]
-                    + d / (self.positions[i + 1] - self.positions[i - 1])
-                        * ((self.positions[i] - self.positions[i - 1] + d)
-                            * (self.heights[i + 1] - self.heights[i])
-                            / (self.positions[i + 1] - self.positions[i])
-                            + (self.positions[i + 1] - self.positions[i] - d)
-                                * (self.heights[i] - self.heights[i - 1])
-                                / (self.positions[i] - self.positions[i - 1]));
+                let parabolic = (d / (self.positions[i + 1] - self.positions[i - 1])).mul_add(
+                    (self.positions[i] - self.positions[i - 1] + d)
+                        * (self.heights[i + 1] - self.heights[i])
+                        / (self.positions[i + 1] - self.positions[i])
+                        + (self.positions[i + 1] - self.positions[i] - d)
+                            * (self.heights[i] - self.heights[i - 1])
+                            / (self.positions[i] - self.positions[i - 1]),
+                    self.heights[i],
+                );
 
                 // The parabola may overshoot a neighbor when the local
                 // density is lopsided; heights must stay strictly ordered
@@ -198,6 +210,7 @@ impl P2Quantile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mummu_num::{f64_from_usize, trunc_usize};
 
     /// Minimal PCG32 (O'Neill) — this crate is deliberately dependency-free,
     /// so the tests carry their own 10-line generator. Deterministic by
@@ -205,16 +218,17 @@ mod tests {
     struct Pcg(u64);
     impl Pcg {
         fn new(seed: u64) -> Self {
-            Pcg(seed
-                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                .wrapping_add(0xDA3E_39CB_94B9_5BDB))
+            Self(
+                seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    .wrapping_add(0xDA3E_39CB_94B9_5BDB),
+            )
         }
         fn next_u32(&mut self) -> u32 {
             let old = self.0;
             self.0 = old
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
-            let xorshifted = (((old >> 18) ^ old) >> 27) as u32;
+            let xorshifted = ((((old >> 18) ^ old) >> 27) & 0xFFFF_FFFF) as u32;
             let rot = (old >> 59) as u32;
             xorshifted.rotate_right(rot)
         }
@@ -231,7 +245,7 @@ mod tests {
 
     /// Exact empirical quantile by nearest rank on a sorted copy.
     fn exact_quantile(sorted: &[f64], q: f64) -> f64 {
-        let idx = ((sorted.len() - 1) as f64 * q).round() as usize;
+        let idx = trunc_usize((f64_from_usize(sorted.len() - 1) * q).round());
         sorted[idx]
     }
 
@@ -240,7 +254,7 @@ mod tests {
     /// Tolerance: 5% of the IQR plus 2% of |exact|. The IQR term is the
     /// scale-free "body" tolerance — published P2 results and these fixed
     /// streams both land well inside a few percent of the distribution's
-    /// spread at n = 10_000. The relative term matters only for far-tail
+    /// spread at n = `10_000`. The relative term matters only for far-tail
     /// quantiles of the heavy-tailed stream, where the local sample spacing
     /// is many IQRs wide and expecting IQR-scale accuracy from ~10 tail
     /// samples per marker step would test the sample, not the estimator.
@@ -254,7 +268,7 @@ mod tests {
         sorted.sort_by(f64::total_cmp);
         let exact = exact_quantile(&sorted, q);
         let iqr = exact_quantile(&sorted, 0.75) - exact_quantile(&sorted, 0.25);
-        let tol = 0.05 * iqr + 0.02 * exact.abs();
+        let tol = 0.02f64.mul_add(exact.abs(), 0.05 * iqr);
         let got = est.estimate().expect("10k samples in, estimate must exist");
         assert!(
             (got - exact).abs() <= tol,

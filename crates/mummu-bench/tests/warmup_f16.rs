@@ -16,6 +16,8 @@
 //! MUMMU_QWEN2_DIR=path/to/qwen2.5-1.5b cargo test -p mummu-bench --release --test warmup_f16 -- --ignored --nocapture
 //! ```
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -24,6 +26,7 @@ use mummu::backend::inventory;
 use mummu::decode::argmax_id;
 use mummu::models::CausalLm;
 use mummu::models::qwen2;
+use mummu_num::f64_from_usize;
 use tokenizers::Tokenizer;
 
 /// Tokens per burst — the same 32 the two existing f16 rows use, so a burst
@@ -113,7 +116,7 @@ async fn f16_decode_warms_up_within_a_bounded_number_of_tokens() {
             ids.len() + BURST_TOKENS,
             "cache position must advance one step per decoded token"
         );
-        rates.push(BURST_TOKENS as f64 / elapsed);
+        rates.push(f64_from_usize(BURST_TOKENS) / elapsed);
     }
     assert_eq!(rates.len(), BURSTS, "every burst must record a rate");
 

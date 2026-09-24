@@ -1,7 +1,9 @@
 //! The `.mummu` pack — mummu's own multi-precision model artifact (P9
-//! stage 3). Import converts a source checkpoint **once** into a directory
+//! stage 3).
+//!
+//! Import converts a source checkpoint **once** into a directory
 //! holding every tensor at every stored precision, so any device can pull
-//! exactly the tensors and the precision it runs best — per MoE **expert** —
+//! exactly the tensors and the precision it runs best — per `MoE` **expert** —
 //! without re-importing, and the planner can re-tier at will.
 //!
 //! Layout of `<model>.mummu/`:
@@ -32,6 +34,8 @@ use std::sync::{Arc, Mutex};
 use burn::tensor::quantization::QuantScheme;
 use burn::tensor::{Device, Tensor, TensorData};
 
+use mummu_num::trunc_i8;
+
 use crate::gguf::{GgufFile, GgufTensorInfo};
 use crate::quant::QuantPolicy;
 // `scheme()` is an extension trait: the ladder lives in `mummu-mix`, which
@@ -60,7 +64,7 @@ impl Precision {
 
     /// Blob file name inside the pack.
     #[must_use]
-    pub fn blob_name(self) -> &'static str {
+    pub const fn blob_name(self) -> &'static str {
         match self {
             Self::Q4 => "q4.bin",
             Self::Q8 => "q8.bin",
@@ -71,7 +75,7 @@ impl Precision {
 
     /// The quant policy this level corresponds to (`Off` for floats).
     #[must_use]
-    pub fn policy(self) -> QuantPolicy {
+    pub const fn policy(self) -> QuantPolicy {
         match self {
             Self::Q4 => QuantPolicy::Q4,
             Self::Q8 => QuantPolicy::Q8,
@@ -80,6 +84,12 @@ impl Precision {
     }
 
     /// Parse `q4,q8,f16,f32` lists (the `MUMMU_PACK_PRECISIONS` convention).
+    ///
+    /// # Errors
+    ///
+    /// When an item is not one of `q4`/`int4`, `q8`/`int8`, `f16`/`half`,
+    /// `f32`/`float` (case-insensitive), or when the list holds no items
+    /// once blanks are trimmed.
     pub fn parse_list(s: &str) -> Result<Vec<Self>, String> {
         let mut out = Vec::new();
         for item in s.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -112,7 +122,7 @@ pub enum Role {
     Vector,
     /// A depthwise conv kernel `[channels, 1, k]`.
     Conv,
-    /// One member of a split MoE expert bank, stored `[in, out]`.
+    /// One member of a split `MoE` expert bank, stored `[in, out]`.
     Expert {
         layer: usize,
         index: usize,
@@ -222,6 +232,13 @@ pub enum ImportAction {
 /// Quantize a row-major tensor whose LAST dim is a multiple of [`BLOCK`]:
 /// returns (i8 values, f32 scale per block). Blocks run along rows — a
 /// block never straddles two rows.
+///
+/// # Panics
+///
+/// If `last_dim` is not a multiple of [`BLOCK`] or does not divide
+/// `values.len()`, or if `precision` is a float level (only `Q4`/`Q8`
+/// quantize).
+#[must_use]
 pub fn quantize_blocks(
     values: &[f32],
     last_dim: usize,
@@ -246,7 +263,7 @@ pub fn quantize_blocks(
         q.extend(
             block
                 .iter()
-                .map(|&x| (x * inv).round().clamp(-range_max, range_max) as i8),
+                .map(|&x| trunc_i8((x * inv).round().clamp(-range_max, range_max))),
         );
     }
     (q, scales)
@@ -257,8 +274,10 @@ pub fn quantize_blocks(
 fn pack_nibbles(values: &[i8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(values.len().div_ceil(2));
     for pair in values.chunks(2) {
-        let lo = (pair[0] as u8) & 0x0F;
-        let hi = pair.get(1).map_or(0, |&v| (v as u8) & 0x0F);
+        let lo = u8::from_ne_bytes(pair[0].to_ne_bytes()) & 0x0F;
+        let hi = pair
+            .get(1)
+            .map_or(0, |&v| u8::from_ne_bytes(v.to_ne_bytes()) & 0x0F);
         out.push(lo | (hi << 4));
     }
     out
@@ -274,13 +293,31 @@ fn unpack_nibbles(bytes: &[u8], n: usize) -> Vec<i8> {
             }
             // 4-bit two's complement sign extension.
             out.push(if nib & 0x8 != 0 {
-                (nib | 0xF0) as i8
+                i8::from_ne_bytes([nib | 0xF0])
             } else {
-                nib as i8
+                i8::from_ne_bytes([nib])
             });
         }
     }
     out
+}
+
+/// Each i8 as its raw byte (two's complement) — the Q8 blob encoding.
+fn i8_bytes(values: &[i8]) -> Vec<u8> {
+    values
+        .iter()
+        .map(|&v| u8::from_ne_bytes(v.to_ne_bytes()))
+        .collect()
+}
+
+/// The on-disk bytes of a quantized level's values: nibbles for Q4, the
+/// i8 values' own bytes for Q8.
+fn quant_bytes(q: &[i8], p: Precision) -> Vec<u8> {
+    if p == Precision::Q4 {
+        pack_nibbles(q)
+    } else {
+        i8_bytes(q)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -315,47 +352,37 @@ impl BlobWriter {
     }
 }
 
-/// Import a GGUF into a pack at `out_dir` with the given stored precisions.
-/// `map` classifies every source tensor; the importer reads each tensor
-/// once (dequantizing whatever the source stored), lays it out for the
-/// loaders, and writes every requested level. Float-only roles (embedding,
-/// vectors, convs) get only the float levels requested (f16/f32; if neither
-/// was requested, f32 is added for them). Quantized levels apply only where
-/// `QuantPolicy::eligible` would.
-pub fn import_gguf(
-    gguf_path: &Path,
-    out_dir: &Path,
-    precisions: &[Precision],
-    map: &dyn Fn(&GgufTensorInfo) -> Option<ImportAction>,
-    mut on_progress: impl FnMut(usize, usize, &str),
-) -> Result<Manifest, String> {
-    let f = GgufFile::open(gguf_path).map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(out_dir).map_err(|e| format!("create {}: {e}", out_dir.display()))?;
+/// One tensor in the pack's stored layout, before its levels are written:
+/// `(pack name, role, stored shape, row-major f32 values)`.
+type PackItem = (String, Role, Vec<usize>, Vec<f32>);
 
-    // Header copy: the first `data_offset` bytes are exactly metadata +
-    // tensor table — a valid payload-less GGUF for every header reader.
-    {
-        let mut src = std::fs::File::open(gguf_path).map_err(|e| e.to_string())?;
-        let mut header = vec![0u8; usize::try_from(f.data_offset).expect("header fits")];
-        src.read_exact(&mut header)
-            .map_err(|e| format!("read header: {e}"))?;
-        std::fs::write(out_dir.join("header.gguf"), &header).map_err(|e| e.to_string())?;
-    }
+/// Copy the source header (the first `data_offset` bytes: metadata + tensor
+/// table, no payload) into the pack as `header.gguf` — a valid payload-less
+/// GGUF for every header reader.
+fn copy_header(gguf_path: &Path, out_dir: &Path, data_offset: u64) -> Result<(), String> {
+    let mut src = std::fs::File::open(gguf_path).map_err(|e| e.to_string())?;
+    let len = usize::try_from(data_offset)
+        .map_err(|_| format!("header of {data_offset} bytes does not fit usize"))?;
+    let mut header = vec![0u8; len];
+    src.read_exact(&mut header)
+        .map_err(|e| format!("read header: {e}"))?;
+    std::fs::write(out_dir.join("header.gguf"), &header).map_err(|e| e.to_string())
+}
 
-    let mut precisions: Vec<Precision> = precisions.to_vec();
+/// The requested levels sorted and deduplicated; the float levels among
+/// them (f32 when none was asked for); and the union of the two, sorted.
+fn resolve_levels(requested: &[Precision]) -> (Vec<Precision>, Vec<Precision>, Vec<Precision>) {
+    let mut precisions: Vec<Precision> = requested.to_vec();
     precisions.sort();
     precisions.dedup();
-    let float_levels: Vec<Precision> = {
-        let mut v: Vec<Precision> = precisions
-            .iter()
-            .copied()
-            .filter(|p| matches!(p, Precision::F16 | Precision::F32))
-            .collect();
-        if v.is_empty() {
-            v.push(Precision::F32);
-        }
-        v
-    };
+    let mut float_levels: Vec<Precision> = precisions
+        .iter()
+        .copied()
+        .filter(|p| matches!(p, Precision::F16 | Precision::F32))
+        .collect();
+    if float_levels.is_empty() {
+        float_levels.push(Precision::F32);
+    }
     let mut all_levels = precisions.clone();
     for p in &float_levels {
         if !all_levels.contains(p) {
@@ -363,9 +390,16 @@ pub fn import_gguf(
         }
     }
     all_levels.sort();
+    (precisions, float_levels, all_levels)
+}
 
-    let mut writers: BTreeMap<Precision, BlobWriter> = BTreeMap::new();
-    for &p in &all_levels {
+/// One empty blob writer per stored level, created in `out_dir`.
+fn open_writers(
+    out_dir: &Path,
+    levels: &[Precision],
+) -> Result<BTreeMap<Precision, BlobWriter>, String> {
+    let mut writers = BTreeMap::new();
+    for &p in levels {
         let file = std::fs::File::create(out_dir.join(p.blob_name())).map_err(|e| e.to_string())?;
         writers.insert(
             p,
@@ -376,6 +410,178 @@ pub fn import_gguf(
             },
         );
     }
+    Ok(writers)
+}
+
+/// Lay one source tensor out for the loaders: a single item, or one per
+/// expert for a bank. `values` are the tensor's f32 in ggml order and
+/// `dims_rev` its dims in row-major order.
+fn materialize(
+    info: &GgufTensorInfo,
+    action: ImportAction,
+    dims_rev: &[usize],
+    values: Vec<f32>,
+) -> Result<Vec<PackItem>, String> {
+    let mut items: Vec<PackItem> = Vec::new();
+    match action {
+        ImportAction::Skip => unreachable!("skipped tensors are never laid out"),
+        ImportAction::Linear => {
+            let &[out, inp] = dims_rev else {
+                return Err(format!(
+                    "'{}' linear must be 2-D, got {dims_rev:?}",
+                    info.name
+                ));
+            };
+            items.push((
+                info.name.clone(),
+                Role::Linear,
+                vec![inp, out],
+                transpose(&values, out, inp),
+            ));
+        }
+        ImportAction::Embedding => {
+            items.push((
+                info.name.clone(),
+                Role::Embedding,
+                dims_rev.to_vec(),
+                values,
+            ));
+        }
+        ImportAction::Vector => {
+            items.push((info.name.clone(), Role::Vector, dims_rev.to_vec(), values));
+        }
+        ImportAction::Conv => {
+            // ggml ne = [k, ch] ⇒ row-major [ch, k] == checkpoint [ch, 1, k] bytes.
+            let &[ch, k] = dims_rev else {
+                return Err(format!(
+                    "'{}' conv must be 2-D squeezed, got {dims_rev:?}",
+                    info.name
+                ));
+            };
+            items.push((info.name.clone(), Role::Conv, vec![ch, 1, k], values));
+        }
+        ImportAction::ExpertBank { layer, proj } => {
+            let &[e, out, inp] = dims_rev else {
+                return Err(format!(
+                    "'{}' expert bank must be 3-D, got {dims_rev:?}",
+                    info.name
+                ));
+            };
+            let stride = out * inp;
+            for expert in 0..e {
+                let member = &values[expert * stride..(expert + 1) * stride];
+                items.push((
+                    format!("{}/e{expert}", info.name),
+                    Role::Expert {
+                        layer,
+                        index: expert,
+                        proj: proj.clone(),
+                    },
+                    vec![inp, out],
+                    transpose(member, out, inp),
+                ));
+            }
+        }
+    }
+    Ok(items)
+}
+
+/// Append one tensor's bytes at level `p` to its blob: float values
+/// verbatim, or block-quantized values followed by their f32 scales.
+fn write_level(
+    w: &mut BlobWriter,
+    p: Precision,
+    data: &[f32],
+    last_dim: usize,
+) -> Result<Blob, String> {
+    let blob = match p {
+        Precision::F32 => {
+            let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let (o, l) = w.append(&bytes).map_err(|e| e.to_string())?;
+            Blob {
+                values_offset: o,
+                values_len: l,
+                scales_offset: 0,
+                scales_len: 0,
+            }
+        }
+        Precision::F16 => {
+            let bytes: Vec<u8> = data
+                .iter()
+                .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
+                .collect();
+            let (o, l) = w.append(&bytes).map_err(|e| e.to_string())?;
+            Blob {
+                values_offset: o,
+                values_len: l,
+                scales_offset: 0,
+                scales_len: 0,
+            }
+        }
+        Precision::Q8 | Precision::Q4 => {
+            let (q, scales) = quantize_blocks(data, last_dim, p);
+            let vbytes = quant_bytes(&q, p);
+            let (vo, vl) = w.append(&vbytes).map_err(|e| e.to_string())?;
+            let sbytes: Vec<u8> = scales.iter().flat_map(|s| s.to_le_bytes()).collect();
+            let (so, sl) = w.append(&sbytes).map_err(|e| e.to_string())?;
+            Blob {
+                values_offset: vo,
+                values_len: vl,
+                scales_offset: so,
+                scales_len: sl,
+            }
+        }
+    };
+    Ok(blob)
+}
+
+/// Import a GGUF into a pack at `out_dir` with the given stored precisions.
+///
+/// `map` classifies every source tensor; the importer reads each tensor
+/// once (dequantizing whatever the source stored), lays it out for the
+/// loaders, and writes every requested level. Float-only roles (embedding,
+/// vectors, convs) get only the float levels requested (f16/f32; if neither
+/// was requested, f32 is added for them). Quantized levels apply only where
+/// `QuantPolicy::eligible` would.
+///
+/// # Errors
+///
+/// When the GGUF header fails to parse or its first `data_offset` bytes
+/// cannot be read back; when `out_dir`, a blob, `header.gguf` or
+/// `manifest.json` cannot be created or written; when `map` leaves a tensor
+/// unmapped; when a tensor's dims do not fit its role (a linear or conv
+/// that is not 2-D, an expert bank that is not 3-D, a dim past `usize`);
+/// when a payload cannot be read or dequantized; or when the manifest does
+/// not serialize.
+///
+/// # Panics
+///
+/// Only on internal invariants: the float level list always holds at least
+/// f32, every stored level has a writer, and every laid-out shape is
+/// non-empty. A quantized level is written only for shapes
+/// `QuantPolicy::eligible` accepts, whose last dim is a whole number of
+/// [`BLOCK`]s, so [`quantize_blocks`]'s assertion cannot trip here.
+pub fn import_gguf(
+    gguf_path: &Path,
+    out_dir: &Path,
+    precisions: &[Precision],
+    map: &dyn Fn(&GgufTensorInfo) -> Option<ImportAction>,
+    mut on_progress: impl FnMut(usize, usize, &str),
+) -> Result<Manifest, String> {
+    let f = GgufFile::open(gguf_path).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(out_dir).map_err(|e| format!("create {}: {e}", out_dir.display()))?;
+    copy_header(gguf_path, out_dir, f.data_offset)?;
+
+    let (precisions, float_levels, all_levels) = resolve_levels(precisions);
+    let mut writers = open_writers(out_dir, &all_levels)?;
+    let integer_requested = precisions
+        .iter()
+        .any(|p| matches!(p, Precision::Q4 | Precision::Q8));
+    let narrowest_float = float_levels
+        .iter()
+        .copied()
+        .min()
+        .expect("float_levels always holds at least f32");
 
     let mut entries: Vec<TensorEntry> = Vec::new();
     let total = f.tensors.len();
@@ -385,66 +591,17 @@ pub fn import_gguf(
         if matches!(action, ImportAction::Skip) {
             continue;
         }
-        let dims_rev: Vec<usize> = info.dims.iter().rev().map(|&d| d as usize).collect();
+        let dims_rev = info
+            .dims
+            .iter()
+            .rev()
+            .map(|&d| {
+                usize::try_from(d)
+                    .map_err(|_| format!("'{}' dim {d} does not fit usize", info.name))
+            })
+            .collect::<Result<Vec<usize>, String>>()?;
         let values = f.read_tensor_f32(&info.name).map_err(|e| e.to_string())?;
-
-        // Materialize the stored layout(s): one or many (expert bank) tensors.
-        let mut items: Vec<(String, Role, Vec<usize>, Vec<f32>)> = Vec::new();
-        match action {
-            ImportAction::Skip => unreachable!(),
-            ImportAction::Linear => {
-                let &[out, inp] = dims_rev.as_slice() else {
-                    return Err(format!(
-                        "'{}' linear must be 2-D, got {dims_rev:?}",
-                        info.name
-                    ));
-                };
-                items.push((
-                    info.name.clone(),
-                    Role::Linear,
-                    vec![inp, out],
-                    transpose(&values, out, inp),
-                ));
-            }
-            ImportAction::Embedding => {
-                items.push((info.name.clone(), Role::Embedding, dims_rev.clone(), values));
-            }
-            ImportAction::Vector => {
-                items.push((info.name.clone(), Role::Vector, dims_rev.clone(), values));
-            }
-            ImportAction::Conv => {
-                // ggml ne = [k, ch] ⇒ row-major [ch, k] == checkpoint [ch, 1, k] bytes.
-                let &[ch, k] = dims_rev.as_slice() else {
-                    return Err(format!(
-                        "'{}' conv must be 2-D squeezed, got {dims_rev:?}",
-                        info.name
-                    ));
-                };
-                items.push((info.name.clone(), Role::Conv, vec![ch, 1, k], values));
-            }
-            ImportAction::ExpertBank { layer, proj } => {
-                let &[e, out, inp] = dims_rev.as_slice() else {
-                    return Err(format!(
-                        "'{}' expert bank must be 3-D, got {dims_rev:?}",
-                        info.name
-                    ));
-                };
-                let stride = out * inp;
-                for expert in 0..e {
-                    let member = &values[expert * stride..(expert + 1) * stride];
-                    items.push((
-                        format!("{}/e{expert}", info.name),
-                        Role::Expert {
-                            layer,
-                            index: expert,
-                            proj: proj.clone(),
-                        },
-                        vec![inp, out],
-                        transpose(member, out, inp),
-                    ));
-                }
-            }
-        }
+        let items = materialize(info, action, &dims_rev, values)?;
 
         // A ternary-family source (Bonsai's PQ2_0/PTQ1_0/Q2_0/Q1_0, every
         // value a scale times −1/0/+1) carries two bits per value, so the
@@ -456,14 +613,6 @@ pub fn import_gguf(
         // 27B, f16+f32 of a 2-bit checkpoint would be 160 GB written and
         // re-read for nothing.
         let ternary = info.dtype.is_ternary_family();
-        let integer_requested = precisions
-            .iter()
-            .any(|p| matches!(p, Precision::Q4 | Precision::Q8));
-        let narrowest_float = float_levels
-            .iter()
-            .copied()
-            .min()
-            .expect("float_levels always holds at least f32");
         for (name, role, shape, data) in items {
             let quantizable = matches!(role, Role::Linear | Role::Expert { .. })
                 && QuantPolicy::Q8.eligible(&shape);
@@ -482,50 +631,8 @@ pub fn import_gguf(
                     continue;
                 }
                 let w = writers.get_mut(&p).expect("writer exists");
-                let blob = match p {
-                    Precision::F32 => {
-                        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-                        let (o, l) = w.append(&bytes).map_err(|e| e.to_string())?;
-                        Blob {
-                            values_offset: o,
-                            values_len: l,
-                            scales_offset: 0,
-                            scales_len: 0,
-                        }
-                    }
-                    Precision::F16 => {
-                        let bytes: Vec<u8> = data
-                            .iter()
-                            .flat_map(|&v| half::f16::from_f32(v).to_le_bytes())
-                            .collect();
-                        let (o, l) = w.append(&bytes).map_err(|e| e.to_string())?;
-                        Blob {
-                            values_offset: o,
-                            values_len: l,
-                            scales_offset: 0,
-                            scales_len: 0,
-                        }
-                    }
-                    Precision::Q8 | Precision::Q4 => {
-                        let last = *shape.last().expect("non-empty shape");
-                        let (q, scales) = quantize_blocks(&data, last, p);
-                        let vbytes: Vec<u8> = if p == Precision::Q4 {
-                            pack_nibbles(&q)
-                        } else {
-                            q.iter().map(|&v| v as u8).collect()
-                        };
-                        let (vo, vl) = w.append(&vbytes).map_err(|e| e.to_string())?;
-                        let sbytes: Vec<u8> = scales.iter().flat_map(|s| s.to_le_bytes()).collect();
-                        let (so, sl) = w.append(&sbytes).map_err(|e| e.to_string())?;
-                        Blob {
-                            values_offset: vo,
-                            values_len: vl,
-                            scales_offset: so,
-                            scales_len: sl,
-                        }
-                    }
-                };
-                per.insert(p, blob);
+                let last = *shape.last().expect("non-empty shape");
+                per.insert(p, write_level(w, p, &data, last)?);
             }
             entries.push(TensorEntry {
                 name,
@@ -545,7 +652,7 @@ pub fn import_gguf(
         source_file: gguf_path
             .file_name()
             .map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
-        source_bytes: std::fs::metadata(gguf_path).map(|m| m.len()).unwrap_or(0),
+        source_bytes: std::fs::metadata(gguf_path).map_or(0, |m| m.len()),
         architecture: f.architecture().unwrap_or("").to_string(),
         precisions: all_levels,
         tensors: entries,
@@ -573,6 +680,7 @@ fn transpose(values: &[f32], out: usize, inp: usize) -> Vec<f32> {
 // ---------------------------------------------------------------------------
 
 /// An opened pack: manifest + lazily-read blobs.
+///
 /// Burn's canonical quantized `TensorData` bytes for block-quantized i8/i4
 /// values: the values packed little-endian into u32 words (8 nibbles or 4
 /// bytes per word, element `j` at bits `j·bits`), then the f32 block scales
@@ -580,6 +688,11 @@ fn transpose(values: &[f32], out: usize, inp: usize) -> Vec<f32> {
 /// what every backend's `q_from_data` consumes. (`TensorData::quantized`
 /// itself only handles 8-bit values under the default `PackedU32` store:
 /// its Q4 reader unpacks nibbles the constructor never packed.)
+///
+/// # Panics
+///
+/// If `scheme.value` is not one of `Q8S`/`Q8F`/`Q4S`/`Q4F` — the only
+/// value types this packing is defined for.
 pub fn quantized_tensor_data(
     values: &[i8],
     scales: &[f32],
@@ -599,7 +712,7 @@ pub fn quantized_tensor_data(
     for chunk in values.chunks(per_word) {
         let mut w = 0u32;
         for (j, &v) in chunk.iter().enumerate() {
-            w |= ((v as u8 as u32) & mask) << (j * bits);
+            w |= (u32::from(u8::from_ne_bytes(v.to_ne_bytes())) & mask) << (j * bits);
         }
         words.push(w);
     }
@@ -654,7 +767,7 @@ pub struct Pack {
     blobs: Mutex<BTreeMap<Precision, Arc<std::fs::File>>>,
     /// Blob bytes read through this pack, for load-progress reporting.
     bytes_read: AtomicU64,
-    /// Optional NVMe cache in front of the blobs (see [`crate::diskcache`]).
+    /// Optional `NVMe` cache in front of the blobs (see [`crate::diskcache`]).
     /// `None` unless `MUMMU_DISK_CACHE_DIR` asked for one — this writes tens
     /// of GB, so it is never started implicitly.
     disk_cache: Option<crate::diskcache::DiskCache>,
@@ -680,6 +793,13 @@ impl Pack {
         }
     }
 
+    /// Open the pack at `dir` by parsing its manifest (blobs are opened
+    /// lazily on first read).
+    ///
+    /// # Errors
+    ///
+    /// When `manifest.json` cannot be read or parsed, or declares a pack
+    /// version other than [`PACK_VERSION`].
     pub fn open(dir: &Path) -> Result<Self, String> {
         let json = std::fs::read_to_string(dir.join("manifest.json"))
             .map_err(|e| format!("read manifest: {e}"))?;
@@ -703,6 +823,11 @@ impl Pack {
     }
 
     /// Write the manifest back (after partitioning / calibration).
+    ///
+    /// # Errors
+    ///
+    /// When the manifest does not serialize, the temporary file cannot be
+    /// written, or the rename over `manifest.json` fails.
     pub fn save_manifest(&self) -> Result<(), String> {
         let json = serde_json::to_string_pretty(&self.manifest).map_err(|e| e.to_string())?;
         let tmp = self.dir.join("manifest.json.tmp");
@@ -714,6 +839,18 @@ impl Pack {
     /// same shape, **in place** (same byte sizes — the quantized levels are
     /// re-quantized along the same last dim). Used by the FFN partitioner,
     /// whose permutation keeps shapes.
+    ///
+    /// # Errors
+    ///
+    /// When `values.len()` is not the entry's element count, when a level's
+    /// re-encoded bytes differ in size from what the manifest records, or
+    /// when a blob cannot be opened for writing, seeked, written, or synced.
+    ///
+    /// # Panics
+    ///
+    /// If the entry's shape is empty, or — for a quantized level — if its
+    /// last dim is not a multiple of [`BLOCK`] ([`quantize_blocks`]'s
+    /// precondition, which the importer guaranteed when it stored the level).
     pub fn rewrite_entry(&self, entry: &TensorEntry, values: &[f32]) -> Result<(), String> {
         let numel: usize = entry.shape.iter().product();
         if values.len() != numel {
@@ -740,12 +877,10 @@ impl Pack {
                 ),
                 Precision::Q8 | Precision::Q4 => {
                     let (q, scales) = quantize_blocks(values, last, p);
-                    let v = if p == Precision::Q4 {
-                        pack_nibbles(&q)
-                    } else {
-                        q.iter().map(|&x| x as u8).collect()
-                    };
-                    (v, scales.iter().flat_map(|s| s.to_le_bytes()).collect())
+                    (
+                        quant_bytes(&q, p),
+                        scales.iter().flat_map(|s| s.to_le_bytes()).collect(),
+                    )
                 }
             };
             if vbytes.len() as u64 != blob.values_len || sbytes.len() as u64 != blob.scales_len {
@@ -779,6 +914,19 @@ impl Pack {
     /// in order) as a tensor at `precision`: `[rows, Σ len]`. Quantized
     /// levels are sliced at block granularity (ranges must be block-aligned)
     /// straight from the stored bytes — no re-quantization.
+    ///
+    /// # Errors
+    ///
+    /// When the entry is not 2-D, when a quantized level is asked for with a
+    /// range that is not [`BLOCK`]-aligned, or when the level cannot be read
+    /// (not stored for this entry, blob I/O failure, size mismatch against
+    /// the shape).
+    ///
+    /// # Panics
+    ///
+    /// If a range reaches past the entry's column count (the slice bounds
+    /// are taken from `ranges` as given). The scheme lookup for a quantized
+    /// level is an internal invariant: `Q4`/`Q8` always have one.
     pub fn tensor_cols(
         &self,
         entry: &TensorEntry,
@@ -835,6 +983,18 @@ impl Pack {
 
     /// A 2-D entry's **rows** `ranges` (concatenated) as a tensor at
     /// `precision`: `[Σ len, cols]`.
+    ///
+    /// # Errors
+    ///
+    /// When the entry is not 2-D, or when the level cannot be read (not
+    /// stored for this entry, blob I/O failure, size mismatch against the
+    /// shape).
+    ///
+    /// # Panics
+    ///
+    /// If a range reaches past the entry's row count (the slice bounds are
+    /// taken from `ranges` as given). The scheme lookup for a quantized
+    /// level is an internal invariant: `Q4`/`Q8` always have one.
     pub fn tensor_rows(
         &self,
         entry: &TensorEntry,
@@ -879,6 +1039,11 @@ impl Pack {
 
     /// The source header as a payload-less GGUF — config + tokenizer readers
     /// take it as-is.
+    ///
+    /// # Errors
+    ///
+    /// When `header.gguf` is missing from the pack or fails
+    /// [`GgufFile::open`]'s validation.
     pub fn header(&self) -> Result<GgufFile, String> {
         GgufFile::open(&self.dir.join("header.gguf")).map_err(|e| e.to_string())
     }
@@ -910,6 +1075,7 @@ impl Pack {
                 .map_err(|e| format!("open {}: {e}", precision.blob_name()))?,
         );
         blobs.insert(precision, Arc::clone(&f));
+        drop(blobs);
         Ok(f)
     }
 
@@ -930,7 +1096,12 @@ impl Pack {
             return Ok(bytes);
         }
         let file = self.blob(precision)?;
-        let mut buf = vec![0u8; usize::try_from(len).expect("blob fits")];
+        let mut buf = vec![
+            0u8;
+            usize::try_from(len).map_err(|_| format!(
+                "{blob}: range of {len} bytes does not fit usize"
+            ))?
+        ];
         read_exact_at(&file, &mut buf, offset).map_err(|e| format!("read {blob}: {e}"))?;
         self.bytes_read.fetch_add(len, Ordering::Relaxed);
         if let Some(cache) = &self.disk_cache {
@@ -939,9 +1110,9 @@ impl Pack {
         Ok(buf)
     }
 
-    /// The NVMe cache in front of this pack's blobs, when one is configured.
+    /// The `NVMe` cache in front of this pack's blobs, when one is configured.
     #[must_use]
-    pub fn disk_cache(&self) -> Option<&crate::diskcache::DiskCache> {
+    pub const fn disk_cache(&self) -> Option<&crate::diskcache::DiskCache> {
         self.disk_cache.as_ref()
     }
 
@@ -956,6 +1127,11 @@ impl Pack {
     /// used to funnel through `read_f32`, which prefers f32 — so every
     /// "F16" load silently read `f32.bin`, including the probe that once
     /// "measured" F16 speed on flex.
+    ///
+    /// # Errors
+    ///
+    /// When the entry has no stored level at all, or when a blob range
+    /// cannot be read (blob missing, short read, range past `usize`).
     pub fn read_floats(&self, entry: &TensorEntry, prefer: Precision) -> Result<Vec<f32>, String> {
         if prefer == Precision::F16
             && let Some(b) = entry.precisions.get(&Precision::F16)
@@ -973,6 +1149,12 @@ impl Pack {
 
     /// The f32 values of a tensor at its best float level (f32, else f16
     /// widened, else a quantized level dequantized).
+    ///
+    /// # Errors
+    ///
+    /// When the entry has no stored level at all, when a blob range cannot
+    /// be read (blob missing, short read, range past `usize`), or when a
+    /// quantized level's decoded sizes disagree with the shape.
     pub fn read_f32(&self, entry: &TensorEntry) -> Result<Vec<f32>, String> {
         if let Some(b) = entry.precisions.get(&Precision::F32) {
             let bytes = self.read_range(Precision::F32, b.values_offset, b.values_len)?;
@@ -1006,6 +1188,13 @@ impl Pack {
     }
 
     /// The (i8 values, f32 block scales) of a quantized level.
+    ///
+    /// # Errors
+    ///
+    /// When the entry has no `precision` level, when `precision` is a float
+    /// level, when the blob cannot be read (missing, short read, a length
+    /// past `usize`), or when the decoded value / scale counts disagree
+    /// with the entry's shape.
     pub fn read_quant(
         &self,
         entry: &TensorEntry,
@@ -1023,7 +1212,13 @@ impl Pack {
         let (vbytes, sbytes) = if b.scales_offset == b.values_offset + b.values_len {
             let mut joined =
                 self.read_range(precision, b.values_offset, b.values_len + b.scales_len)?;
-            let sbytes = joined.split_off(usize::try_from(b.values_len).expect("blob fits"));
+            let values_len = usize::try_from(b.values_len).map_err(|_| {
+                format!(
+                    "'{}' {precision:?}: values_len {} does not fit usize",
+                    entry.name, b.values_len
+                )
+            })?;
+            let sbytes = joined.split_off(values_len);
             (joined, sbytes)
         } else {
             (
@@ -1033,7 +1228,7 @@ impl Pack {
         };
         let values: Vec<i8> = match precision {
             Precision::Q4 => unpack_nibbles(&vbytes, n),
-            Precision::Q8 => vbytes.iter().map(|&b| b as i8).collect(),
+            Precision::Q8 => vbytes.iter().map(|&b| i8::from_ne_bytes([b])).collect(),
             _ => return Err(format!("{precision:?} is not a quantized level")),
         };
         let scales: Vec<f32> = sbytes
@@ -1051,6 +1246,15 @@ impl Pack {
     /// Build a device tensor for `entry` at `precision`. Quantized levels
     /// arrive through burn's canonical quantized `TensorData` (no
     /// re-quantization); float levels through the backend's float dtype.
+    ///
+    /// # Errors
+    ///
+    /// When the entry's rank is not `D`, or when the level cannot be read
+    /// (see [`Self::read_quant`] and [`Self::read_floats`]).
+    ///
+    /// # Panics
+    ///
+    /// Only on an internal invariant: `Q4`/`Q8` always have a quant scheme.
     pub fn tensor<const D: usize>(
         &self,
         entry: &TensorEntry,
@@ -1089,6 +1293,7 @@ impl Pack {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mummu_num::{f32_from_u32, f32_from_usize, trunc_i32};
 
     /// A ternary source stores only what carries information: the integer
     /// levels for a projection, the narrowest float level for the embedding
@@ -1112,7 +1317,10 @@ mod tests {
             payload.extend(std::iter::repeat_n(0b0110_1001u8, 32));
         }
         let f32_off = payload.len() as u64; // 17952, 32-aligned
-        payload.extend((0..65536u32).flat_map(|i| ((i % 17) as f32 * 0.1 - 0.8).to_le_bytes()));
+        payload.extend((0..65536u32).flat_map(|i| {
+            let scaled = f32_from_u32(i % 17) * 0.1;
+            (scaled - 0.8).to_le_bytes()
+        }));
         let bytes = TestGguf::new()
             .kv_str("general.architecture", "test")
             .tensor("blk.0.ffn_up.weight", &[256, 256], 142, 0)
@@ -1169,12 +1377,12 @@ mod tests {
             .into_data()
             .try_to_vec::<f32>()
             .expect("f32");
-        let want = crate::gguf::dequantize(crate::gguf::GgmlType::PQ2_0, &payload[..512 * 34])
+        let want = crate::gguf::dequantize(crate::gguf::GgmlType::Pq20, &payload[..512 * 34])
             .expect("dequant");
         // Stored [in, out] = transposed; compare as a multiset per value class.
         assert_eq!(q4.len(), want.len());
-        let mut a: Vec<i32> = q4.iter().map(|v| (v / 0.5).round() as i32).collect();
-        let mut b: Vec<i32> = want.iter().map(|v| (v / 0.5).round() as i32).collect();
+        let mut a: Vec<i32> = q4.iter().map(|v| trunc_i32((v / 0.5).round())).collect();
+        let mut b: Vec<i32> = want.iter().map(|v| trunc_i32((v / 0.5).round())).collect();
         a.sort_unstable();
         b.sort_unstable();
         assert_eq!(a, b, "the Q4 level reproduces the ternary values exactly");
@@ -1186,7 +1394,7 @@ mod tests {
     }
 
     /// A pack read must return the SAME bytes whether they came off the
-    /// blob or out of the NVMe cache, and the second read of a range must
+    /// blob or out of the `NVMe` cache, and the second read of a range must
     /// actually be served by the cache. This is the property that makes the
     /// tier safe to enable: placement affects speed, never contents.
     #[test]
@@ -1216,7 +1424,7 @@ mod tests {
             tensors: Vec::new(),
             ffn_partition: None,
         };
-        let mut pack = Pack::new(pack_dir.clone(), manifest);
+        let mut pack = Pack::new(pack_dir, manifest);
         pack.disk_cache =
             Some(crate::diskcache::DiskCache::open(&cache_dir, 1 << 20).expect("cache opens"));
 
@@ -1239,7 +1447,9 @@ mod tests {
 
     #[test]
     fn block_quantizer_roundtrips_within_half_scale() {
-        let vals: Vec<f32> = (0..256).map(|i| ((i as f32) * 0.37).sin() * 3.0).collect();
+        let vals: Vec<f32> = (0..256u16)
+            .map(|i| (f32::from(i) * 0.37).sin() * 3.0)
+            .collect();
         for p in [Precision::Q8, Precision::Q4] {
             let (q, scales) = quantize_blocks(&vals, 64, p);
             assert_eq!(scales.len(), 8);
@@ -1251,7 +1461,7 @@ mod tests {
                     "{p:?} elem {i}: {v} vs {back} (scale {})",
                     scales[i / BLOCK]
                 );
-                assert!(qq.abs() as f32 <= range_max);
+                assert!(f32::from(qq.abs()) <= range_max);
             }
         }
     }
@@ -1285,7 +1495,7 @@ mod tests {
             (Precision::Q4, 2048, 6144),
         ] {
             let n = rows * cols;
-            let vals: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.11).cos()).collect();
+            let vals: Vec<f32> = (0..n).map(|i| (f32_from_usize(i) * 0.11).cos()).collect();
             let (q, scales) = quantize_blocks(&vals, cols, p);
             let scheme = p.policy().scheme().unwrap();
             let data = quantized_tensor_data(&q, &scales, [rows, cols], scheme);
@@ -1299,6 +1509,77 @@ mod tests {
         }
     }
 
+    /// Append `vals` to both blobs as one entry stored at f32 and Q8.
+    fn write_test_entry(
+        f32w: &mut BlobWriter,
+        q8w: &mut BlobWriter,
+        name: &str,
+        vals: &[f32],
+        shape: Vec<usize>,
+    ) -> TensorEntry {
+        let last = *shape.last().unwrap();
+        let fbytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let (fo, fl) = f32w.append(&fbytes).unwrap();
+        let (q, sc) = quantize_blocks(vals, last, Precision::Q8);
+        let qb = i8_bytes(&q);
+        let sb: Vec<u8> = sc.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let (qo, ql) = q8w.append(&qb).unwrap();
+        let (so, sl) = q8w.append(&sb).unwrap();
+        TensorEntry {
+            name: name.into(),
+            role: Role::Linear,
+            shape,
+            precisions: [
+                (
+                    Precision::F32,
+                    Blob {
+                        values_offset: fo,
+                        values_len: fl,
+                        scales_offset: 0,
+                        scales_len: 0,
+                    },
+                ),
+                (
+                    Precision::Q8,
+                    Blob {
+                        values_offset: qo,
+                        values_len: ql,
+                        scales_offset: so,
+                        scales_len: sl,
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        }
+    }
+
+    /// Every `(start, len)` column range of `got` (a `[rows, Σ len]` slab)
+    /// matches the `[rows, cols]` `source` within `tol`.
+    fn assert_cols_match(
+        got: &[f32],
+        source: &[f32],
+        rows: usize,
+        cols: usize,
+        ranges: &[(usize, usize)],
+        tol: f32,
+        what: &str,
+    ) {
+        let width: usize = ranges.iter().map(|r| r.1).sum();
+        for r in 0..rows {
+            for (k, &(start, len)) in ranges.iter().enumerate() {
+                let base: usize = ranges[..k].iter().map(|x| x.1).sum();
+                for j in 0..len {
+                    let want = source[r * cols + start + j];
+                    assert!(
+                        (got[r * width + base + j] - want).abs() < tol,
+                        "{what} r{r} j{j}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn column_and_row_slices_round_trip_through_a_written_pack() {
         // Build a tiny two-tensor pack by hand, then slice cluster ranges
@@ -1308,10 +1589,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let (rows, cols) = (64usize, 128usize); // both dims multiples of BLOCK
         let gate: Vec<f32> = (0..rows * cols)
-            .map(|i| ((i as f32) * 0.017).sin())
+            .map(|i| (f32_from_usize(i) * 0.017).sin())
             .collect();
         let down: Vec<f32> = (0..cols * rows)
-            .map(|i| ((i as f32) * 0.023).cos())
+            .map(|i| (f32_from_usize(i) * 0.023).cos())
             .collect();
         // Write f32 and Q8 blobs with two entries.
         let mut f32w = BlobWriter {
@@ -1324,45 +1605,8 @@ mod tests {
             len: 0,
             unsynced: 0,
         };
-        let mut entry = |name: &str, vals: &[f32], shape: Vec<usize>| -> TensorEntry {
-            let last = *shape.last().unwrap();
-            let fbytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
-            let (fo, fl) = f32w.append(&fbytes).unwrap();
-            let (q, sc) = quantize_blocks(vals, last, Precision::Q8);
-            let qb: Vec<u8> = q.iter().map(|&x| x as u8).collect();
-            let sb: Vec<u8> = sc.iter().flat_map(|s| s.to_le_bytes()).collect();
-            let (qo, ql) = q8w.append(&qb).unwrap();
-            let (so, sl) = q8w.append(&sb).unwrap();
-            TensorEntry {
-                name: name.into(),
-                role: Role::Linear,
-                shape,
-                precisions: [
-                    (
-                        Precision::F32,
-                        Blob {
-                            values_offset: fo,
-                            values_len: fl,
-                            scales_offset: 0,
-                            scales_len: 0,
-                        },
-                    ),
-                    (
-                        Precision::Q8,
-                        Blob {
-                            values_offset: qo,
-                            values_len: ql,
-                            scales_offset: so,
-                            scales_len: sl,
-                        },
-                    ),
-                ]
-                .into_iter()
-                .collect(),
-            }
-        };
-        let ge = entry("gate", &gate, vec![rows, cols]);
-        let de = entry("down", &down, vec![cols, rows]);
+        let ge = write_test_entry(&mut f32w, &mut q8w, "gate", &gate, vec![rows, cols]);
+        let de = write_test_entry(&mut f32w, &mut q8w, "down", &down, vec![cols, rows]);
         f32w.file.flush().unwrap();
         q8w.file.flush().unwrap();
         let manifest = Manifest {
@@ -1389,18 +1633,7 @@ mod tests {
             .unwrap();
         assert_eq!(cslab.dims(), [rows, 64]);
         let got = cslab.into_data().try_to_vec::<f32>().unwrap();
-        for r in 0..rows {
-            for (k, &(start, len)) in ranges.iter().enumerate() {
-                let base: usize = ranges[..k].iter().map(|x| x.1).sum();
-                for j in 0..len {
-                    let want = gate[r * cols + start + j];
-                    assert!(
-                        (got[r * 64 + base + j] - want).abs() < 1e-6,
-                        "col f32 r{r} j{j}"
-                    );
-                }
-            }
-        }
+        assert_cols_match(&got, &gate, rows, cols, &ranges, 1e-6, "col f32");
         // Same ranges as rows of down → [64, rows].
         let rslab = pack
             .tensor_rows(&de, Precision::F32, &ranges, &device)
@@ -1424,18 +1657,7 @@ mod tests {
             .tensor_cols(&ge, Precision::Q8, &ranges, &device)
             .unwrap();
         let dq = cq.dequantize().into_data().try_to_vec::<f32>().unwrap();
-        for r in 0..rows {
-            for (k, &(start, len)) in ranges.iter().enumerate() {
-                let base: usize = ranges[..k].iter().map(|x| x.1).sum();
-                for j in 0..len {
-                    let want = gate[r * cols + start + j];
-                    assert!(
-                        (dq[r * 64 + base + j] - want).abs() < 0.05,
-                        "col q8 r{r} j{j}"
-                    );
-                }
-            }
-        }
+        assert_cols_match(&dq, &gate, rows, cols, &ranges, 0.05, "col q8");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

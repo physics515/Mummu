@@ -1,6 +1,6 @@
 //! The **f16** perf-budget gate from `bench/BASELINE.md`: Qwen2.5-1.5B TTFT
 //! and greedy decode on `GpuF16`. Ignored by default (multi-GB weights + a
-//! SHADER_F16 GPU); run with
+//! `SHADER_F16` GPU); run with
 //!
 //! ```text
 //! MUMMU_QWEN2_DIR=path/to/qwen2.5-1.5b cargo test -p mummu-bench --release --test budget_f16 -- --ignored --nocapture
@@ -17,6 +17,8 @@
 //! it loud if it ever becomes possible again: a gate that cannot tell which
 //! precision it measured is not a gate.
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -25,6 +27,7 @@ use mummu::backend::inventory;
 use mummu::decode::argmax_id;
 use mummu::models::CausalLm;
 use mummu::models::qwen2;
+use mummu_num::f64_from_usize;
 use tokenizers::Tokenizer;
 
 /// Budgets are set against what THIS harness measures (25 ms / 16.4 tok/s on
@@ -104,7 +107,7 @@ async fn qwen2_f16_stays_inside_its_perf_budgets() {
         let logits = loaded.forward(&[next], past, &mut cache, &device);
         next = argmax_id(logits).await.expect("argmax");
     }
-    let tok_per_s = DECODE_STEPS as f64 / start.elapsed().as_secs_f64();
+    let tok_per_s = f64_from_usize(DECODE_STEPS) / start.elapsed().as_secs_f64();
 
     let features = mummu_bench::gpu_feature_set();
     eprintln!(

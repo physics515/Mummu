@@ -1,11 +1,15 @@
 //! Parity + speed of the packed m=1 Q4S GEMV on the real GPU, at the 27B's
 //! production shapes (gate/up: [5120, W], down: [W, 5120], W = 22 clusters
 //! x 544). Baseline is what clusters run today: m=1 `x.matmul(wq)` through
-//! burn's q_matmul (the dequantize-first path measured at 0.91 ms/cluster).
+//! burn's `q_matmul` (the dequantize-first path measured at 0.91 ms/cluster).
+
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use burn::tensor::{Distribution, Tensor};
 use mummu::backend;
 use mummu::nn::try_q4s_gemv;
 use mummu::quant::{QuantPolicy, quantize_weight};
+use mummu_num::f64_from_usize;
 use std::time::Instant;
 
 fn bench(label: &str, iters: usize, f: &mut dyn FnMut() -> Tensor<2>) -> f64 {
@@ -18,7 +22,7 @@ fn bench(label: &str, iters: usize, f: &mut dyn FnMut() -> Tensor<2>) -> f64 {
         last = Some(f());
     }
     let _ = last.unwrap().into_data(); // sync
-    let ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
+    let ms = t0.elapsed().as_secs_f64() * 1e3 / f64_from_usize(iters);
     println!("  {label}: {ms:.3} ms/call");
     ms
 }
@@ -45,7 +49,6 @@ fn main() {
         let got = try_q4s_gemv(&x, &wq).expect("packed path must engage");
         let want = x.clone().matmul(wq.clone().dequantize());
         let diff = got
-            .clone()
             .sub(want.clone())
             .abs()
             .max()

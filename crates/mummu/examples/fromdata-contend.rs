@@ -4,6 +4,9 @@
 //! milliseconds here, the 27 ms "first-op cost" was never an op cost at all
 //! — it is pool starvation, and the fix is to keep worker threads out of
 //! the flex pool entirely.
+
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use burn::tensor::{Tensor, TensorData};
 use mummu::backend;
 use std::sync::Arc;
@@ -44,7 +47,7 @@ fn main() {
     }
     stop.store(true, Ordering::Relaxed);
     let times = worker.join().unwrap();
-    let mut us: Vec<u128> = times.iter().map(|d| d.as_micros()).collect();
+    let mut us: Vec<u128> = times.iter().map(std::time::Duration::as_micros).collect();
     us.sort_unstable();
     let pct = |p: usize| us.get(us.len() * p / 100).copied().unwrap_or(0);
     println!(

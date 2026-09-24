@@ -3,6 +3,8 @@
 //! recorded number needs to be trustworthy — the label it wears, and the
 //! precondition that decides whether it should have been taken at all.
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 /// The GPU feature set this binary was compiled with, as it appears beside
 /// every recorded number.
 ///
@@ -62,6 +64,11 @@ fn fits(free_mib: u64, need_mib: u64) -> bool {
 /// card. When nothing on the machine will say, this returns `true`: no
 /// information is not the same as no room, and a box without an NVIDIA driver
 /// must keep behaving exactly as it did before this check existed.
+///
+/// # Panics
+///
+/// When `need_mib` is zero (a gate that needs no VRAM should not ask) or
+/// `label` is empty (the skip line has to name which gate skipped).
 #[must_use]
 pub fn gpu_has_room_for(need_mib: u64, label: &str) -> bool {
     assert!(need_mib > 0, "a gate that needs no VRAM should not ask");
@@ -96,7 +103,7 @@ mod tests {
         let set = gpu_feature_set();
         assert_eq!(set.contains("fusion"), cfg!(feature = "fusion"));
         assert_eq!(set.contains("vulkan-spirv"), cfg!(feature = "vulkan-spirv"));
-        assert!(!set.is_empty());
+        assert_ne!(set, "");
     }
 
     /// The boundary is the whole point: a card with exactly the need free

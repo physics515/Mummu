@@ -35,20 +35,25 @@
 //!   alpha, reality said more, so correct the estimate, don't just retry.
 
 use crate::p2::P2Quantile;
+use mummu_num::{f64_from_u64, f64_from_usize, trunc_u64, trunc_usize};
 
 /// Multiplier applied per recorded breach (allocation failure): the
-/// posterior correction. 1.5 is deliberately coarse — a breach is a rare,
-/// high-information event, and under-reacting to one repeats it, while
-/// over-reacting costs a few layers of residency until the session ends.
+/// posterior correction.
+///
+/// 1.5 is deliberately coarse — a breach is a rare, high-information
+/// event, and under-reacting to one repeats it, while over-reacting costs
+/// a few layers of residency until the session ends.
 /// Two breaches more than double the quantile term; the boost never decays
 /// within a session because the evidence never un-happens.
 pub const BREACH_BOOST: f64 = 1.5;
 
-/// Tuning for [`Watermark`]. `Default` gives the drop-in replacement for
-/// the guards it removes: the old fixed 2 GiB desktop reserve is demoted to
-/// `floor_bytes` (a lower bound, no longer the whole story), and the slack
-/// covers allocator fragmentation between "bytes reported free" and "bytes
-/// a real allocation can get".
+/// Tuning for [`Watermark`].
+///
+/// `Default` gives the drop-in replacement for the guards it removes: the
+/// old fixed 2 GiB desktop reserve is demoted to `floor_bytes` (a lower
+/// bound, no longer the whole story), and the slack covers allocator
+/// fragmentation between "bytes reported free" and "bytes a real
+/// allocation can get".
 #[derive(Debug, Clone, PartialEq)]
 pub struct WatermarkConfig {
     /// Acceptable probability of ambient exceeding the guard. The tracked
@@ -76,7 +81,7 @@ pub struct WatermarkConfig {
 
 impl Default for WatermarkConfig {
     fn default() -> Self {
-        WatermarkConfig {
+        Self {
             alpha: 1e-3,
             hysteresis_window: 32,
             floor_bytes: 2 * 1024 * 1024 * 1024,
@@ -122,7 +127,7 @@ impl Watermark {
     pub fn new(cfg: WatermarkConfig) -> Self {
         let quantile = P2Quantile::new(1.0 - cfg.alpha);
         let guard = cfg.floor_bytes.max(cfg.frag_slack_bytes);
-        Watermark {
+        Self {
             cfg,
             quantile,
             max_seen: 0,
@@ -137,19 +142,19 @@ impl Watermark {
     /// number moved up the instant evidence demanded it, and down only
     /// after a full hysteresis window of quiet.
     #[must_use]
-    pub fn guard_bytes(&self) -> u64 {
+    pub const fn guard_bytes(&self) -> u64 {
         self.guard
     }
 
     /// Allocation failures reported via [`Watermark::breach`] so far.
     #[must_use]
-    pub fn breaches(&self) -> u32 {
+    pub const fn breaches(&self) -> u32 {
         self.breaches
     }
 
     /// Ambient samples observed so far.
     #[must_use]
-    pub fn samples(&self) -> u64 {
+    pub const fn samples(&self) -> u64 {
         self.quantile.count()
     }
 
@@ -157,7 +162,7 @@ impl Watermark {
     /// this process).
     pub fn observe_ambient(&mut self, bytes: u64) {
         self.max_seen = self.max_seen.max(bytes);
-        self.quantile.observe(bytes as f64);
+        self.quantile.observe(f64_from_u64(bytes));
         if self.cfg.window > 0 {
             if self.recent.len() == self.cfg.window as usize {
                 self.recent.pop_front();
@@ -203,7 +208,7 @@ impl Watermark {
     /// here by setting a floor, which the default config does.)
     pub fn breach(&mut self) {
         self.breaches = self.breaches.saturating_add(1);
-        let scaled = to_bytes_saturating(self.guard as f64 * BREACH_BOOST);
+        let scaled = to_bytes_saturating(f64_from_u64(self.guard) * BREACH_BOOST);
         self.guard = self.guard.max(self.settle_target()).max(scaled);
         self.quiet = 0;
     }
@@ -224,29 +229,29 @@ impl Watermark {
             // hundred u64 per poll is nothing next to an NVML read).
             let mut v: Vec<u64> = self.recent.iter().copied().collect();
             v.sort_unstable();
-            let rank = ((1.0 - self.cfg.alpha) * (v.len() - 1) as f64).ceil() as usize;
-            v[rank.min(v.len() - 1)] as f64
+            let rank = trunc_usize(((1.0 - self.cfg.alpha) * f64_from_usize(v.len() - 1)).ceil());
+            f64_from_u64(v[rank.min(v.len() - 1)])
         } else {
             self.quantile
                 .estimate()
-                .unwrap_or(self.max_seen as f64)
+                .unwrap_or_else(|| f64_from_u64(self.max_seen))
                 .max(0.0)
         };
         // powi capped so the boost stays finite; the guard saturates at
         // u64::MAX long before 1.5^64 matters.
-        q * BREACH_BOOST.powi(self.breaches.min(64) as i32)
+        q * BREACH_BOOST.powi(i32::try_from(self.breaches).unwrap_or(i32::MAX).min(64))
     }
 }
 
 /// f64 -> bytes, rounding up (a guard rounds against itself) and
 /// saturating at the ends instead of invoking float-cast UB corners.
 fn to_bytes_saturating(x: f64) -> u64 {
-    if x >= u64::MAX as f64 {
+    if x >= f64_from_u64(u64::MAX) {
         u64::MAX
     } else if x <= 0.0 {
         0
     } else {
-        x.ceil() as u64
+        trunc_u64(x.ceil())
     }
 }
 
@@ -293,16 +298,17 @@ mod tests {
     struct Pcg(u64);
     impl Pcg {
         fn new(seed: u64) -> Self {
-            Pcg(seed
-                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                .wrapping_add(0xDA3E_39CB_94B9_5BDB))
+            Self(
+                seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    .wrapping_add(0xDA3E_39CB_94B9_5BDB),
+            )
         }
         fn next_u32(&mut self) -> u32 {
             let old = self.0;
             self.0 = old
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
-            let xorshifted = (((old >> 18) ^ old) >> 27) as u32;
+            let xorshifted = ((((old >> 18) ^ old) >> 27) & 0xFFFF_FFFF) as u32;
             let rot = (old >> 59) as u32;
             xorshifted.rotate_right(rot)
         }
@@ -411,7 +417,7 @@ mod tests {
         wm.breach();
         assert_eq!(wm.breaches(), 1);
         assert!(
-            wm.guard_bytes() as f64 >= before as f64 * BREACH_BOOST,
+            f64_from_u64(wm.guard_bytes()) >= f64_from_u64(before) * BREACH_BOOST,
             "breach must scale the guard: {} -> {}",
             before,
             wm.guard_bytes()
@@ -452,9 +458,9 @@ mod tests {
         // launcher, capture tool) — the observed drift pattern.
         let sample = |r: &mut Pcg| -> u64 {
             let base = 2 * GIB;
-            let noise = (r.uniform() * 256.0 * MIB as f64) as u64;
+            let noise = trunc_u64(r.uniform() * 256.0 * f64_from_u64(MIB));
             let spike = if r.uniform() < 0.02 {
-                (r.uniform() * 4.0 * GIB as f64) as u64
+                trunc_u64(r.uniform() * 4.0 * f64_from_u64(GIB))
             } else {
                 0
             };

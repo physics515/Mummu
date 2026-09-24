@@ -1,10 +1,11 @@
 //! Cache-aware grouped-query attention (GQA), shared by every decoder in the
 //! zoo. Covers both proven variants: plain GQA with projection bias (Qwen2)
-//! and per-head q/k RMSNorm without bias (LFM2).
+//! and per-head q/k `RMSNorm` without bias (LFM2).
 
 use burn::module::Module;
 use burn::nn::{Linear, LinearConfig, RmsNorm, RmsNormConfig};
 use burn::tensor::{DType, Device, Tensor, TensorData, activation};
+use mummu_num::f32_from_usize;
 
 use super::MAX_CONTEXT_TOKENS;
 use super::rope::apply_rope;
@@ -13,10 +14,17 @@ use super::rope::apply_rope;
 /// `None` until the layer's first forward (the prompt prefill seeds it).
 pub type LayerKv = Option<(Tensor<4>, Tensor<4>)>;
 
-/// Additive causal mask `[1, 1, t, past+t]`: query row `i` (absolute position
-/// `past+i`) may attend to key columns `0..=past+i`; future columns get a
-/// large negative. `-1e4` (not `-inf`) so the f16 GPU path (max ~65504) never
-/// overflows — `exp(-1e4)` is still exactly 0 after softmax.
+/// Additive causal mask `[1, 1, t, past+t]`.
+///
+/// Query row `i` (absolute position `past+i`) may attend to key columns
+/// `0..=past+i`; future columns get a large negative. `-1e4` (not `-inf`) so
+/// the f16 GPU path (max ~65504) never overflows — `exp(-1e4)` is still
+/// exactly 0 after softmax.
+///
+/// # Panics
+///
+/// Panics if `t == 0` or `past + t` exceeds [`MAX_CONTEXT_TOKENS`].
+#[must_use]
 pub fn causal_mask(t: usize, past: usize, device: &Device) -> Tensor<4> {
     assert!(t >= 1, "causal_mask: need at least one query row, got t=0");
     assert!(
@@ -41,6 +49,11 @@ pub fn causal_mask(t: usize, past: usize, device: &Device) -> Tensor<4> {
 
 /// GQA expand: `[b, nkv, s, hd]` → `[b, nkv*group, s, hd]`, each KV head
 /// repeated `group` times contiguously (HF `repeat_kv`).
+///
+/// # Panics
+///
+/// Panics if `group == 0`.
+#[must_use]
 pub fn repeat_kv(x: Tensor<4>, group: usize) -> Tensor<4> {
     assert!(group >= 1, "repeat_kv: group must be >= 1");
     if group == 1 {
@@ -53,20 +66,22 @@ pub fn repeat_kv(x: Tensor<4>, group: usize) -> Tensor<4> {
         .reshape([b, nkv * group, s, hd])
 }
 
-/// Grouped-query attention with a per-layer KV cache. Field names mirror the
-/// HF checkpoint layout (`q_proj`/`k_proj`/`v_proj`/`o_proj`); architectures
-/// whose checkpoints differ (LFM2's `out_proj`, `q_layernorm`) remap keys at
-/// load time instead of renaming fields.
+/// Grouped-query attention with a per-layer KV cache.
+///
+/// Field names mirror the HF checkpoint layout
+/// (`q_proj`/`k_proj`/`v_proj`/`o_proj`); architectures whose checkpoints
+/// differ (LFM2's `out_proj`, `q_layernorm`) remap keys at load time instead
+/// of renaming fields.
 #[derive(Module, Debug)]
 pub struct GqaAttention {
     pub q_proj: Linear,
     pub k_proj: Linear,
     pub v_proj: Linear,
     pub o_proj: Linear,
-    /// Per-head RMSNorm on q, applied post-projection at `[b, t, nh, hd]`
+    /// Per-head `RMSNorm` on q, applied post-projection at `[b, t, nh, hd]`
     /// (LFM2-style). `None` for architectures without it (Qwen2).
     pub q_norm: Option<RmsNorm>,
-    /// Per-head RMSNorm on k — present iff `q_norm` is.
+    /// Per-head `RMSNorm` on k — present iff `q_norm` is.
     pub k_norm: Option<RmsNorm>,
 }
 
@@ -80,16 +95,41 @@ pub struct GqaAttentionConfig {
     /// Projection bias on q/k/v (Qwen2: true; LFM2: false). `o_proj` never
     /// has bias in either.
     pub bias: bool,
-    /// q/k RMSNorm epsilon (LFM2/Qwen3/OLMoE: eps of the model; Qwen2: `None`).
+    /// q/k `RMSNorm` epsilon (LFM2/Qwen3/OLMoE: eps of the model; Qwen2: `None`).
     pub qk_norm_eps: Option<f64>,
     /// Where the q/k norm applies: `false` = per-head over `head_dim`
     /// (LFM2/Qwen3), `true` = over the **whole projection** before the head
-    /// split (OLMoE — its `q_norm`/`k_norm` span `num_heads * head_dim`).
+    /// split (`OLMoE` — its `q_norm`/`k_norm` span `num_heads * head_dim`).
     pub qk_norm_projection: bool,
 }
 
+/// The head geometry one [`GqaAttention::forward`] call runs at: how many
+/// query heads, how many KV heads they share, and the width of each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeadShape {
+    pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+}
+
 impl GqaAttentionConfig {
+    /// The [`HeadShape`] this config's attention runs at.
+    #[must_use]
+    pub const fn head_shape(&self) -> HeadShape {
+        HeadShape {
+            num_heads: self.num_heads,
+            num_kv_heads: self.num_kv_heads,
+            head_dim: self.head_dim,
+        }
+    }
+
     /// Initialize the module (random weights; real weights come from import).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `num_heads` is not a positive multiple of `num_kv_heads`, or
+    /// if `head_dim` is odd or below 2.
+    #[must_use]
     pub fn init(&self, device: &Device) -> GqaAttention {
         assert!(
             self.num_kv_heads >= 1 && self.num_heads.is_multiple_of(self.num_kv_heads),
@@ -134,9 +174,9 @@ impl GqaAttentionConfig {
     }
 }
 
-/// Apply a q/k RMSNorm at the placement its gamma width implies: `head_dim` →
+/// Apply a q/k `RMSNorm` at the placement its gamma width implies: `head_dim` →
 /// per-head at `[b, t, n, hd]` (LFM2/Qwen3), `n * head_dim` → over the whole
-/// projection **before** the head split (OLMoE). The two coincide at `n == 1`.
+/// projection **before** the head split (`OLMoE`). The two coincide at `n == 1`.
 /// Inferring from the loaded gamma keeps the module shape identical across
 /// families — a checkpoint's own norm width picks its semantics.
 fn qk_norm_forward(
@@ -161,25 +201,33 @@ fn qk_norm_forward(
 }
 
 impl GqaAttention {
-    /// Cache-aware forward: RoPE the new q/k at the offset positions, append
+    /// Cache-aware forward: `RoPE` the new q/k at the offset positions, append
     /// the new k/v to this layer's cache, attend over the full cached range.
     ///
     /// `x` is `[b, t, hidden]` — the prompt at prefill (`kv == None`), a
     /// single new token per decode step after. Returns `[b, t, hidden]`.
-    #[allow(clippy::too_many_arguments)] // mirrors the proven reference signature
+    ///
+    /// # Panics
+    ///
+    /// Panics if `shape.num_heads` is not a positive multiple of
+    /// `shape.num_kv_heads`, if a loaded q/k norm's width matches neither
+    /// `head_dim` nor the projection width, or if `cos`/`sin` do not cover
+    /// `x`'s `[t, head_dim]`.
     pub fn forward(
         &self,
         x: Tensor<3>,
-        num_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
+        shape: HeadShape,
         cos: &Tensor<4>,
         sin: &Tensor<4>,
         mask: Option<&Tensor<4>>,
         kv: &mut LayerKv,
     ) -> Tensor<3> {
         let [b, t, _h] = x.dims();
-        let (nh, nkv, hd) = (num_heads, num_kv_heads, head_dim);
+        let HeadShape {
+            num_heads: nh,
+            num_kv_heads: nkv,
+            head_dim: hd,
+        } = shape;
         assert!(
             nkv >= 1 && nh.is_multiple_of(nkv),
             "GQA forward: num_heads ({nh}) must be a positive multiple of num_kv_heads ({nkv})"
@@ -193,10 +241,10 @@ impl GqaAttention {
         // transpose + RoPE — the LFM2 ordering, validated against Ollama.
         // Placement (per-head vs whole-projection) follows the loaded norm's
         // own width; see `qk_norm_forward`.
-        let q = self.q_proj.forward(x.clone());
-        let q = match &self.q_norm {
-            Some(norm) => qk_norm_forward(norm, q, nh, hd),
-            None => q.reshape([b, t, nh, hd]),
+        let query = self.q_proj.forward(x.clone());
+        let query = match &self.q_norm {
+            Some(norm) => qk_norm_forward(norm, query, nh, hd),
+            None => query.reshape([b, t, nh, hd]),
         }
         .swap_dims(1, 2);
         let k_new = self.k_proj.forward(x.clone());
@@ -211,18 +259,18 @@ impl GqaAttention {
             .reshape([b, t, nkv, hd])
             .swap_dims(1, 2);
 
-        let q = apply_rope(q, cos, sin);
+        let query = apply_rope(query, cos, sin);
         let k_new = apply_rope(k_new, cos, sin);
 
         // Append to (or seed) the cache, then attend over everything so far.
-        let ambient = q.dtype();
+        let ambient = query.dtype();
         let (k_all, v_all) = kv_append(kv, k_new, v_new);
 
         let group = nh / nkv;
-        let k = repeat_kv(k_all, group);
+        let keys = repeat_kv(k_all, group);
         // The value path computes in the ambient dtype — a no-op cast
         // unless the cache stores f16 (see [`kv_append`]).
-        let v = repeat_kv(v_all, group).cast(ambient);
+        let values = repeat_kv(v_all, group).cast(ambient);
 
         // f32 island: Qwen-class attention logits overflow f16 (max 65504)
         // in the q·kᵀ scores, collapsing softmax to NaN — llama.cpp pins this
@@ -230,21 +278,26 @@ impl GqaAttention {
         // softmax run in f32, the probabilities (all in [0, 1]) return to the
         // ambient dtype for the value matmul. Every cast is a no-op on f32
         // backends.
-        let scale = 1.0 / (hd as f32).sqrt();
-        let mut scores = q
+        let scale = 1.0 / f32_from_usize(hd).sqrt();
+        let mut scores = query
             .cast(DType::F32)
-            .matmul(k.cast(DType::F32).swap_dims(2, 3))
+            .matmul(keys.cast(DType::F32).swap_dims(2, 3))
             .mul_scalar(scale);
-        if let Some(m) = mask {
-            scores = scores.add(m.clone().cast(DType::F32));
+        if let Some(mask) = mask {
+            scores = scores.add(mask.clone().cast(DType::F32));
         }
         let probs = activation::softmax(scores, 3).cast(ambient);
-        let ctx = probs.matmul(v).swap_dims(1, 2).reshape([b, t, nh * hd]);
+        let ctx = probs
+            .matmul(values)
+            .swap_dims(1, 2)
+            .reshape([b, t, nh * hd]);
         self.o_proj.forward(ctx)
     }
 }
 
-/// Is the half-precision KV cache on? Storage-only: scores keep their f32
+/// Is the half-precision KV cache on?
+///
+/// Storage-only: scores keep their f32
 /// island and the value matmul upcasts, so the change is the cache's
 /// persistent bytes (half) and one rounding on stored k/v. `MUMMU_KV_F16`,
 /// default OFF — it moves logits within f16 quantization noise, and this
@@ -263,9 +316,11 @@ pub fn kv_f16_enabled() -> bool {
 }
 
 /// Append this step's k/v to a [`LayerKv`] in the configured storage dtype
-/// and return the full cached range (in storage dtype — callers cast for
-/// compute; both attention paths already run scores through the f32
-/// island). With [`kv_f16_enabled`] and f32 inputs, new entries are stored
+/// and return the full cached range.
+///
+/// The range is in storage dtype — callers cast for compute; both attention
+/// paths already run scores through the f32 island.
+/// With [`kv_f16_enabled`] and f32 inputs, new entries are stored
 /// as f16: at ctx 4096 on the 27B that is 2.1 → 1.05 GiB of persistent KV
 /// (~4 more resident layers), for one f16 rounding on stored keys/values
 /// whose logit effect sits inside the reference's own quantization noise
@@ -277,7 +332,9 @@ pub fn kv_append(kv: &mut LayerKv, k_new: Tensor<4>, v_new: Tensor<4>) -> (Tenso
 }
 
 /// [`kv_append`] with the storage choice explicit — the seam tests use to
-/// exercise the f16 cache without a process-global toggle. `f16` applies
+/// exercise the f16 cache without a process-global toggle.
+///
+/// `f16` applies
 /// only when seeding a fresh cache from f32 inputs; an existing cache
 /// dictates its own dtype.
 pub fn kv_append_as(
@@ -319,6 +376,11 @@ mod tests {
     const KV_HEADS: usize = 2;
     const HEAD_DIM: usize = 4;
     const THETA: f32 = 1e4;
+    const SHAPE: HeadShape = HeadShape {
+        num_heads: HEADS,
+        num_kv_heads: KV_HEADS,
+        head_dim: HEAD_DIM,
+    };
 
     fn attn(qk_norm: bool, projection: bool, device: &Dev) -> GqaAttention {
         GqaAttentionConfig {
@@ -336,7 +398,7 @@ mod tests {
     /// Deterministic pseudo-random input `[1, t, HIDDEN]`.
     fn input(t: usize, seed: f32, device: &Dev) -> Tensor<3> {
         let data: Vec<f32> = (0..t * HIDDEN)
-            .map(|i| ((i as f32 + seed) * 0.7).sin())
+            .map(|i| ((f32_from_usize(i) + seed) * 0.7).sin())
             .collect();
         Tensor::<2>::from_data(TensorData::new(data, [t, HIDDEN]), device).reshape([1, t, HIDDEN])
     }
@@ -347,19 +409,10 @@ mod tests {
         let (cos, sin) = rope_tables(t, 0, HEAD_DIM, THETA, device);
         let mask = causal_mask(t, 0, device);
         let mut kv: LayerKv = None;
-        a.forward(
-            x,
-            HEADS,
-            KV_HEADS,
-            HEAD_DIM,
-            &cos,
-            &sin,
-            Some(&mask),
-            &mut kv,
-        )
-        .into_data()
-        .try_to_vec::<f32>()
-        .unwrap()
+        a.forward(x, SHAPE, &cos, &sin, Some(&mask), &mut kv)
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap()
     }
 
     #[test]
@@ -415,21 +468,12 @@ mod tests {
             let prefill = x.clone().narrow(1, 0, 5);
             let (cos, sin) = rope_tables(5, 0, HEAD_DIM, THETA, &device);
             let mask = causal_mask(5, 0, &device);
-            let _ = a.forward(
-                prefill,
-                HEADS,
-                KV_HEADS,
-                HEAD_DIM,
-                &cos,
-                &sin,
-                Some(&mask),
-                &mut kv,
-            );
+            let _ = a.forward(prefill, SHAPE, &cos, &sin, Some(&mask), &mut kv);
 
             let step = x.narrow(1, 5, 1);
             let (cos1, sin1) = rope_tables(1, 5, HEAD_DIM, THETA, &device);
             let out = a
-                .forward(step, HEADS, KV_HEADS, HEAD_DIM, &cos1, &sin1, None, &mut kv)
+                .forward(step, SHAPE, &cos1, &sin1, None, &mut kv)
                 .into_data()
                 .try_to_vec::<f32>()
                 .unwrap();
@@ -465,9 +509,7 @@ mod tests {
         let mask = causal_mask(5, 0, &device);
         let _ = a.forward(
             x.clone().narrow(1, 0, 5),
-            HEADS,
-            KV_HEADS,
-            HEAD_DIM,
+            SHAPE,
             &cos,
             &sin,
             Some(&mask),
@@ -481,7 +523,7 @@ mod tests {
         let step = x.narrow(1, 5, 1);
         let (cos1, sin1) = rope_tables(1, 5, HEAD_DIM, THETA, &device);
         let out = a
-            .forward(step, HEADS, KV_HEADS, HEAD_DIM, &cos1, &sin1, None, &mut kv)
+            .forward(step, SHAPE, &cos1, &sin1, None, &mut kv)
             .into_data()
             .try_to_vec::<f32>()
             .unwrap();
@@ -505,8 +547,8 @@ mod tests {
         let device = crate::backend::cpu_device();
         let kvt = |seed: f32| {
             Tensor::<1>::from_floats(
-                (0..8)
-                    .map(|i| (i as f32) * 0.1 + seed)
+                (0..8u8)
+                    .map(|i| f32::from(i).mul_add(0.1, seed))
                     .collect::<Vec<_>>()
                     .as_slice(),
                 &device,
@@ -586,16 +628,7 @@ mod tests {
         let (cos, sin) = rope_tables(3, 0, HEAD_DIM, THETA, &device);
         let mask = causal_mask(3, 0, &device);
         let mut kv: LayerKv = None;
-        let out = projection.forward(
-            x,
-            HEADS,
-            KV_HEADS,
-            HEAD_DIM,
-            &cos,
-            &sin,
-            Some(&mask),
-            &mut kv,
-        );
+        let out = projection.forward(x, SHAPE, &cos, &sin, Some(&mask), &mut kv);
         assert_eq!(out.dims(), [1, 3, HIDDEN]);
     }
 }

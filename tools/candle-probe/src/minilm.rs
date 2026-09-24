@@ -1,4 +1,4 @@
-//! Same-weights Candle reference for the MiniLM leg of the P7 parity gate.
+//! Same-weights Candle reference for the `MiniLM` leg of the P7 parity gate.
 //!
 //! Usage: `minilm-probe <model-dir>` — loads the all-MiniLM checkpoint from
 //! `<model-dir>` (`config.json` / `tokenizer.json` / `model.safetensors`),
@@ -7,6 +7,8 @@
 //! ids, and the full embedding vector as JSON. Redirect into
 //! `crates/mummu/tests/fixtures/minilm_embedding.json` to refresh the
 //! committed fixture that `tests/real_minilm.rs` compares Burn against.
+
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;

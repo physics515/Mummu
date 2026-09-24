@@ -25,6 +25,7 @@
 use burn::module::{Module, Param};
 use burn::nn::Linear;
 use burn::tensor::{DType, Tensor, activation};
+use mummu_num::f32_from_usize;
 
 /// `Linear::forward` without touching the weight's shape — the stand-in for
 /// `qwen35::qlinear` until that is `pub(crate)`. burn's `Linear` unsqueezes
@@ -33,21 +34,18 @@ use burn::tensor::{DType, Tensor, activation};
 /// one), so the FLOAT input is flattened to `[b·t, in]` instead and the
 /// weight goes into the matmul exactly as stored (`[in, out]`). Decode-shape
 /// quantized weights take the packed GEMV, as in qwen35.
-pub(super) fn linear3(l: &Linear, x: Tensor<3>) -> Tensor<3> {
-    debug_assert!(l.bias.is_none(), "qwen4exp projections are bias-free");
+pub(super) fn linear3(lin: &Linear, x: Tensor<3>) -> Tensor<3> {
+    debug_assert!(lin.bias.is_none(), "qwen4exp projections are bias-free");
     let [b, t, d_in] = x.dims();
-    let w = l.weight.val(); // [in, out]
-    let [w_in, d_out] = w.dims();
+    let weight = lin.weight.val(); // [in, out]
+    let [w_in, d_out] = weight.dims();
     assert_eq!(
         w_in, d_in,
         "projection expects {w_in} input features, got {d_in}"
     );
     let x2 = crate::nn::refarith::linear_input2(x.reshape([b * t, d_in]), d_in, d_out);
-    let y = match crate::nn::try_q4s_gemv(&x2, &w) {
-        Some(y) => y,
-        None => x2.matmul(w),
-    };
-    y.reshape([b, t, d_out])
+    let out = crate::nn::try_q4s_gemv(&x2, &weight).unwrap_or_else(|| x2.matmul(weight));
+    out.reshape([b, t, d_out])
 }
 
 /// A bias-free `Linear` around a ready `[in, out]` weight (possibly packed).
@@ -60,7 +58,7 @@ pub(super) fn linear_from(weight: Tensor<2>) -> Linear {
     }
 }
 
-/// Grouped RMSNorm: `x [b, t, G·E]` normalized over each of the `G`
+/// Grouped `RMSNorm`: `x [b, t, G·E]` normalized over each of the `G`
 /// stream-major groups of `E`, then scaled by the full-width `gamma [G·E]`.
 ///
 /// `v / sqrt(mean(v²) + eps)` — ggml's `rms_norm` and transformers'
@@ -94,6 +92,12 @@ pub(super) fn grouped_rms(x: Tensor<3>, gamma: Tensor<1>, groups: usize, eps: f6
 /// `2·sigmoid` centres the scatter weights on 1, so a zero injection is a
 /// plain residual add into every stream. Weight-free, hence also a free
 /// function; [`HyperConnection::combine`] forwards here.
+///
+/// # Panics
+///
+/// When `block_out`'s batch/time differ from `res`'s, when `res` is not
+/// `streams` whole streams of `block_out`'s width, or when `inject` is not
+/// `[b, t, streams]`.
 #[must_use]
 pub fn hc_combine(
     res: Tensor<3>,
@@ -118,7 +122,7 @@ pub fn hc_combine(
         [b, t, streams],
         "inject is one weight per stream"
     );
-    let w = activation::sigmoid(inject.div_scalar(streams as f32))
+    let w = activation::sigmoid(inject.div_scalar(f32_from_usize(streams)))
         .mul_scalar(2.0)
         .reshape([b, t, streams, 1]);
     let add = block_out.reshape([b, t, 1, hidden]).mul(w); // [b, t, H, E]
@@ -145,7 +149,7 @@ pub struct HyperConnection {
     pub hidden: usize,
     /// `H`: number of residual streams.
     pub streams: usize,
-    /// RMSNorm epsilon (`rms_norm_eps`).
+    /// `RMSNorm` epsilon (`rms_norm_eps`).
     pub eps: f64,
 }
 
@@ -198,6 +202,10 @@ impl HyperConnection {
     /// `res [b, t, H·E]` → (`mixed [b, t, E]`, `inject [b, t, H]` when this
     /// mixer has an inject projection). The inject logits are returned raw;
     /// [`Self::combine`] applies the `2·sigmoid(·/H)`.
+    ///
+    /// # Panics
+    ///
+    /// When `res` is not `streams` whole streams of `hidden`.
     #[must_use]
     pub fn mix(&self, res: Tensor<3>) -> (Tensor<3>, Option<Tensor<3>>) {
         let [b, t, width] = res.dims();
@@ -208,7 +216,7 @@ impl HyperConnection {
             "residual width {width} is not {h} streams of {e}"
         );
         let xn = grouped_rms(res, self.norm.val(), h, self.eps); // [b, t, HE]
-        let inv_h = 1.0 / h as f32;
+        let inv_h = 1.0 / f32_from_usize(h);
         // The 1/H scale sits BEFORE the silu in both references.
         let lo = activation::silu(linear3(&self.down, xn.clone()).mul_scalar(inv_h));
         let gate = linear3(&self.up, lo); // [b, t, HE]
@@ -233,6 +241,7 @@ impl HyperConnection {
 #[cfg(test)]
 mod tests {
     use burn::tensor::{Device, TensorData};
+    use mummu_num::f32_from_u64;
 
     use super::*;
 
@@ -244,7 +253,9 @@ mod tests {
                 *seed ^= *seed << 13;
                 *seed ^= *seed >> 7;
                 *seed ^= *seed << 17;
-                ((*seed >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0) * scale
+                let unit = f32_from_u64(*seed >> 40) / f32_from_u64(1u64 << 24);
+                let doubled = unit * 2.0;
+                (doubled - 1.0) * scale
             })
             .collect()
     }
@@ -281,14 +292,19 @@ mod tests {
             .collect()
     }
 
+    /// One mixer's weights in GGUF row-major `[out, in]` order, for the
+    /// scalar reference.
+    struct RefWeights<'a> {
+        norm: &'a [f32],
+        down: &'a [f32],
+        up: &'a [f32],
+        inject: Option<&'a [f32]>,
+    }
+
     /// Scalar reference for one token, transcribed from the spec (section 2).
-    #[allow(clippy::too_many_arguments)]
     fn ref_mix(
         res: &[f32],
-        norm: &[f32],
-        down: &[f32],
-        up: &[f32],
-        inject: Option<&[f32]>,
+        weights: &RefWeights<'_>,
         e: usize,
         h: usize,
         r: usize,
@@ -297,38 +313,42 @@ mod tests {
         let mut xn = vec![0.0; h * e];
         for s in 0..h {
             let v = &res[s * e..(s + 1) * e];
-            let ms = v.iter().map(|x| x * x).sum::<f32>() / e as f32;
+            let ms = v.iter().map(|x| x * x).sum::<f32>() / f32_from_usize(e);
             let inv = 1.0 / (ms + eps).sqrt();
             for i in 0..e {
-                xn[s * e + i] = v[i] * inv * norm[s * e + i];
+                xn[s * e + i] = v[i] * inv * weights.norm[s * e + i];
             }
         }
-        let lo: Vec<f32> = matvec(down, &xn, r)
+        let lo: Vec<f32> = matvec(weights.down, &xn, r)
             .into_iter()
             .map(|x| {
-                let x = x / h as f32;
+                let x = x / f32_from_usize(h);
                 x * sigmoid(x)
             })
             .collect();
-        let gate = matvec(up, &lo, h * e);
+        let gate = matvec(weights.up, &lo, h * e);
         let mut mixed = vec![0.0; e];
         for s in 0..h {
             for i in 0..e {
-                mixed[i] += xn[s * e + i] * sigmoid(gate[s * e + i]);
+                // Separate multiply and add, like the tensor path's mul + sum.
+                let term = xn[s * e + i] * sigmoid(gate[s * e + i]);
+                mixed[i] += term;
             }
         }
         for m in &mut mixed {
-            *m /= h as f32;
+            *m /= f32_from_usize(h);
         }
-        (mixed, inject.map(|w| matvec(w, &xn, h)))
+        (mixed, weights.inject.map(|w| matvec(w, &xn, h)))
     }
 
     fn ref_combine(res: &[f32], block: &[f32], inject: &[f32], e: usize, h: usize) -> Vec<f32> {
         let mut out = res.to_vec();
         for s in 0..h {
-            let w = 2.0 * sigmoid(inject[s] / h as f32);
+            let w = 2.0 * sigmoid(inject[s] / f32_from_usize(h));
             for i in 0..e {
-                out[s * e + i] += block[i] * w;
+                // Separate multiply and add, like the tensor path's mul + add.
+                let scaled = block[i] * w;
+                out[s * e + i] += scaled;
             }
         }
         out
@@ -351,7 +371,7 @@ mod tests {
     #[test]
     fn mix_and_combine_match_the_scalar_reference() {
         let device = crate::backend::cpu_device();
-        let (b, t, e, h, r) = (2, 3, 6, 3, 4);
+        let (batch, tokens, e, h, r) = (2, 3, 6, 3, 4);
         let eps = 1e-6_f32;
         let mut seed = 0x9E37_79B9_7F4A_7C15;
         let norm: Vec<f32> = rand_vec(&mut seed, h * e, 0.5)
@@ -361,8 +381,8 @@ mod tests {
         let down = rand_vec(&mut seed, r * h * e, 0.8);
         let up = rand_vec(&mut seed, h * e * r, 0.8);
         let inj = rand_vec(&mut seed, h * h * e, 0.8);
-        let res = rand_vec(&mut seed, b * t * h * e, 2.0);
-        let block = rand_vec(&mut seed, b * t * e, 1.5);
+        let res = rand_vec(&mut seed, batch * tokens * h * e, 2.0);
+        let block = rand_vec(&mut seed, batch * tokens * e, 1.5);
 
         let hc = HyperConnection::from_weights(
             t1(&norm, &device),
@@ -374,15 +394,25 @@ mod tests {
             f64::from(eps),
         );
         assert_eq!(hc.low_rank(), r);
-        let res_t = t3(&res, [b, t, h * e], &device);
+        let res_t = t3(&res, [batch, tokens, h * e], &device);
         let (mixed, inject) = hc.mix(res_t.clone());
         let inject = inject.expect("attn/ffn mixers carry an inject projection");
-        let combined = hc.combine(res_t, t3(&block, [b, t, e], &device), inject.clone());
+        let combined = hc.combine(
+            res_t,
+            t3(&block, [batch, tokens, e], &device),
+            inject.clone(),
+        );
         let (mixed, inject, combined) = (host(mixed), host(inject), host(combined));
 
-        for tok in 0..b * t {
+        for tok in 0..batch * tokens {
             let r_tok = &res[tok * h * e..(tok + 1) * h * e];
-            let (m_ref, i_ref) = ref_mix(r_tok, &norm, &down, &up, Some(&inj), e, h, r, eps);
+            let weights = RefWeights {
+                norm: &norm,
+                down: &down,
+                up: &up,
+                inject: Some(&inj),
+            };
+            let (m_ref, i_ref) = ref_mix(r_tok, &weights, e, h, r, eps);
             let i_ref = i_ref.expect("inject requested");
             assert_close(&mixed[tok * e..(tok + 1) * e], &m_ref, 1e-5, "mixed");
             assert_close(&inject[tok * h..(tok + 1) * h], &i_ref, 1e-5, "inject");
@@ -464,13 +494,13 @@ mod tests {
         let down = rand_vec(&mut seed, r * h * e, 0.3);
         let up = rand_vec(&mut seed, h * e * r, 0.3);
         let inj = rand_vec(&mut seed, h * h * e, 0.3);
-        let build = |q: bool| {
-            let w = |v: &[f32], o, i| {
-                let t = weight(v, o, i, &device);
-                if q {
-                    quantize_weight(QuantPolicy::Q8, t)
+        let build = |packed: bool| {
+            let w = |vals: &[f32], out, inp| {
+                let tensor = weight(vals, out, inp, &device);
+                if packed {
+                    quantize_weight(QuantPolicy::Q8, tensor)
                 } else {
-                    t
+                    tensor
                 }
             };
             HyperConnection::from_weights(
@@ -485,8 +515,8 @@ mod tests {
         };
         let res = rand_vec(&mut seed, 3 * h * e, 1.0);
         let run = |hc: &HyperConnection| {
-            let (m, i) = hc.mix(t3(&res, [1, 3, h * e], &device));
-            (host(m), host(i.expect("inject")))
+            let (mixed, inj_out) = hc.mix(t3(&res, [1, 3, h * e], &device));
+            (host(mixed), host(inj_out.expect("inject")))
         };
         let (mf, i_f) = run(&build(false));
         let (mq, iq) = run(&build(true));

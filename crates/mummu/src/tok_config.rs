@@ -33,10 +33,12 @@ use crate::import::ImportError;
 pub const FILE_NAME: &str = "tokenizer_config.json";
 
 /// A standalone chat-template file recent `transformers` `save_pretrained`
-/// writes *instead of* the `chat_template` key of [`FILE_NAME`] (some
-/// checkpoints — e.g. Gemma4 — ship it only here). [`TokenizerConfig::from_dir`]
-/// falls back to it when the JSON key is absent, so the template-dependent
-/// checks keep working for those checkpoints.
+/// writes *instead of* the `chat_template` key of [`FILE_NAME`].
+///
+/// Some checkpoints — e.g. Gemma4 — ship it only here.
+/// [`TokenizerConfig::from_dir`] falls back to it when the JSON key is
+/// absent, so the template-dependent checks keep working for those
+/// checkpoints.
 pub const CHAT_TEMPLATE_FILE: &str = "chat_template.jinja";
 
 /// Hard cap on the config file size. Chat templates (esp. tool-calling ones)
@@ -76,7 +78,9 @@ pub struct SpecialToken {
 }
 
 /// The tool-call convention a chat template speaks, detected from its marker
-/// tokens. Lets an app pick the matching [`crate::chat`] render style
+/// tokens.
+///
+/// Lets an app pick the matching [`crate::chat`] render style
 /// (`render_with_tools` Hermes vs LFM) from the checkpoint's own template
 /// instead of hardcoding it per model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,8 +181,17 @@ fn read_chat_template_file(dir: &Path) -> Result<Option<String>, ImportError> {
 impl TokenizerConfig {
     /// Read + parse `dir/tokenizer_config.json`.
     ///
-    /// [`ImportError::MissingFile`] if absent, [`ImportError::Parse`] if it is
-    /// oversized, unreadable, or malformed.
+    /// # Errors
+    ///
+    /// [`ImportError::MissingFile`] when the file is absent or not a regular
+    /// file; [`ImportError::Parse`] when it is over [`MAX_CONFIG_BYTES`],
+    /// unreadable, or malformed (see [`Self::from_json`]), or when a sibling
+    /// [`CHAT_TEMPLATE_FILE`] consulted in its place is oversized or not
+    /// UTF-8.
+    ///
+    /// # Panics
+    ///
+    /// When `dir` is the empty path.
     pub fn from_dir(dir: &Path) -> Result<Self, ImportError> {
         assert!(!dir.as_os_str().is_empty(), "from_dir: empty dir");
         let path = dir.join(FILE_NAME);
@@ -212,6 +225,18 @@ impl TokenizerConfig {
     }
 
     /// Parse `tokenizer_config.json` bytes (`file` only labels errors).
+    ///
+    /// # Errors
+    ///
+    /// [`ImportError::Parse`] when `bytes` is not JSON, the top level is not
+    /// an object, or `added_tokens_decoder` is malformed: not an object, over
+    /// [`MAX_ADDED_TOKENS`] entries, a key that is not a token id, an entry
+    /// without string `content`, or two keys naming the same id.
+    ///
+    /// # Panics
+    ///
+    /// When `file` is the empty path. The added-token bound is also asserted,
+    /// but the parser has already enforced it, so that cannot fail.
     pub fn from_json(bytes: &[u8], file: &Path) -> Result<Self, ImportError> {
         assert!(!file.as_os_str().is_empty(), "from_json: empty file label");
         let root: Value =
@@ -268,7 +293,7 @@ impl TokenizerConfig {
 
     /// Whether an embedded chat template was imported.
     #[must_use]
-    pub fn has_chat_template(&self) -> bool {
+    pub const fn has_chat_template(&self) -> bool {
         self.chat_template.is_some()
     }
 
@@ -301,6 +326,16 @@ impl TokenizerConfig {
     /// Takes a closure, not a `Tokenizer`, so this module stays free of a
     /// tokenizer dependency and any id source can be validated. `Ok` when all
     /// agree; `Err` lists every mismatch (bounded by the added-token count).
+    ///
+    /// # Errors
+    ///
+    /// One [`IdMismatch`] per added token that `token_to_id` maps to a
+    /// different id (or to none), when there is at least one.
+    ///
+    /// # Panics
+    ///
+    /// Only on an internal invariant that cannot fail: the added-token list
+    /// is bounded by the parser that built it.
     pub fn check_ids_against(
         &self,
         token_to_id: impl Fn(&str) -> Option<u32>,
@@ -346,6 +381,12 @@ impl TokenizerConfig {
     /// This catches the real bug — a checkpoint packaged with a *different*
     /// tool-call style than the loader's renderer emits (e.g. an LFM template
     /// dropped into a Qwen dir) — without rejecting tool-less templates.
+    ///
+    /// # Errors
+    ///
+    /// A message when the resolved EOS id is not in `config_eos_ids` (see
+    /// [`Self::check_eos_agrees`]), or when the template declares a tool-call
+    /// convention that differs from `expected_convention`.
     pub fn check_consistency(
         &self,
         config_eos_ids: &[u32],
@@ -373,6 +414,17 @@ impl TokenizerConfig {
     /// where the two files disagree on which token ends a turn (the model then
     /// never stops, or stops on the wrong id). `Ok` when they agree or when no
     /// EOS id was resolved (nothing to check); `Err` names the disagreement.
+    ///
+    /// # Errors
+    ///
+    /// An [`IdMismatch`] when the config resolved an EOS id and it is not one
+    /// of `config_eos_ids`.
+    ///
+    /// # Panics
+    ///
+    /// When `config_eos_ids` holds more than 256 ids. A resolved EOS with
+    /// empty content is also asserted against, which cannot happen: the
+    /// parser only resolves non-empty content.
     pub fn check_eos_agrees(&self, config_eos_ids: &[u32]) -> Result<(), IdMismatch> {
         assert!(
             config_eos_ids.len() <= 256,
@@ -411,6 +463,17 @@ impl TokenizerConfig {
 /// and a present, well-formed file that *disagrees* with `config_eos_ids` or the
 /// family renderer becomes [`ImportError::Inconsistent`]. On success the parsed
 /// config is returned (`Some`) so a loader can reuse it (e.g. future BOS wiring).
+///
+/// # Errors
+///
+/// [`ImportError::Parse`] when a present `tokenizer_config.json` (or its
+/// sibling template file) is oversized, unreadable or malformed;
+/// [`ImportError::Inconsistent`] when it disagrees with `config_eos_ids` or
+/// `expected_convention` (see [`TokenizerConfig::check_consistency`]).
+///
+/// # Panics
+///
+/// When `dir` is the empty path.
 pub fn validate_dir(
     dir: &Path,
     config_eos_ids: &[u32],
@@ -571,15 +634,15 @@ mod tests {
                 }
             }"#,
         );
-        assert_eq!(cfg.eos_id(), Some(151645));
-        assert_eq!(cfg.pad_id(), Some(151643));
+        assert_eq!(cfg.eos_id(), Some(151_645));
+        assert_eq!(cfg.pad_id(), Some(151_643));
         assert!(cfg.eos_token.as_ref().unwrap().special);
         assert_eq!(cfg.unk_token, None, "null token is absent");
         assert!(!cfg.add_bos_token);
         assert_eq!(cfg.added_tokens.len(), 2);
         // added_tokens are sorted by id.
-        assert_eq!(cfg.added_tokens[0].id, 151643);
-        assert_eq!(cfg.added_tokens[1].id, 151645);
+        assert_eq!(cfg.added_tokens[0].id, 151_643);
+        assert_eq!(cfg.added_tokens[1].id, 151_645);
     }
 
     #[test]
@@ -807,14 +870,17 @@ mod tests {
         assert_eq!(cfg.eos_token, None);
         assert_eq!(cfg.model_max_length, None);
         assert!(!cfg.has_chat_template());
-        assert!(cfg.added_tokens.is_empty());
+        assert_eq!(
+            cfg.added_tokens,
+            [] as [crate::tok_config::AddedTokenInfo; 0]
+        );
     }
 
     #[test]
     fn model_max_length_and_add_eos_are_read() {
         let cfg = parse(r#"{ "add_eos_token": true, "model_max_length": 131072 }"#);
         assert!(cfg.add_eos_token);
-        assert_eq!(cfg.model_max_length, Some(131072));
+        assert_eq!(cfg.model_max_length, Some(131_072));
     }
 
     #[test]

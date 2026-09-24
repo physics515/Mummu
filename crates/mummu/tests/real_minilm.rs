@@ -1,4 +1,4 @@
-//! Real-weights MiniLM smoke: load the actual all-MiniLM checkpoint on the
+//! Real-weights `MiniLM` smoke: load the actual all-MiniLM checkpoint on the
 //! CPU backend and check the embedding space behaves semantically. Ignored by
 //! default; run with
 //!
@@ -6,9 +6,12 @@
 //! MUMMU_MINILM_DIR=path/to/minilm cargo test -p mummu --test real_minilm -- --ignored --nocapture
 //! ```
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use std::path::PathBuf;
 
 use mummu::models::minilm;
+use mummu_num::{f32_from_u32, narrow};
 use tokenizers::Tokenizer;
 
 fn minilm_dir() -> Option<PathBuf> {
@@ -34,7 +37,11 @@ fn minilm_embeds_similar_sentences_closer_than_dissimilar() {
     let embed = |text: &str| -> Vec<f32> {
         let enc = tok.encode(text, true).expect("encodes");
         let ids = enc.get_ids().to_vec();
-        let mask: Vec<f32> = enc.get_attention_mask().iter().map(|&m| m as f32).collect();
+        let mask: Vec<f32> = enc
+            .get_attention_mask()
+            .iter()
+            .map(|&m| f32_from_u32(m))
+            .collect();
         loaded.embed_ids(&ids, &mask, &device).expect("embeds")
     };
 
@@ -84,11 +91,15 @@ fn minilm_embedding_matches_candle_reference() {
         .as_array()
         .expect("ids")
         .iter()
-        .map(|v| v.as_u64().expect("id") as u32)
+        .map(|v| u32::try_from(v.as_u64().expect("id")).expect("fixture token id fits u32"))
         .collect();
     assert_eq!(ids, fixture_ids, "tokenizations diverge");
 
-    let mask: Vec<f32> = enc.get_attention_mask().iter().map(|&m| m as f32).collect();
+    let mask: Vec<f32> = enc
+        .get_attention_mask()
+        .iter()
+        .map(|&m| f32_from_u32(m))
+        .collect();
     let device = mummu::backend::cpu_device();
     let loaded = minilm::load_from_dir(&dir, &device).expect("weights load checked");
     let ours = loaded.embed_ids(&ids, &mask, &device).expect("embeds");
@@ -97,7 +108,7 @@ fn minilm_embedding_matches_candle_reference() {
         .as_array()
         .expect("embedding")
         .iter()
-        .map(|v| v.as_f64().expect("component") as f32)
+        .map(|v| narrow(v.as_f64().expect("component")))
         .collect();
     assert_eq!(ours.len(), reference.len(), "embedding widths diverge");
 

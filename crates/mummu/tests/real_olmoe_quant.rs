@@ -1,4 +1,4 @@
-//! P9 MoE gate: OLMoE with **per-expert quantized** experts (routed compute)
+//! P9 `MoE` gate: `OLMoE` with **per-expert quantized** experts (routed compute)
 //! must agree with the fused f32 model on the first token's argmax and
 //! answer correctly under greedy decoding. CPU — where flex's dequantize
 //! fallback executes the quantized matmuls. Ignored by default; run with
@@ -7,6 +7,8 @@
 //! MUMMU_OLMOE_GGUF_PATH=path/to/OLMoE-1B-7B-0125-Instruct-Q4_K_M.gguf \
 //!   cargo test -p mummu --release --test real_olmoe_quant -- --ignored --nocapture
 //! ```
+
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 
 use std::path::PathBuf;
 

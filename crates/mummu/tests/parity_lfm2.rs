@@ -2,8 +2,8 @@
 //! llama.cpp reference**.
 //!
 //! No Candle port of LFM2 exists and the local Ollama `lfm2.5` tag resolves to
-//! the 8.5B MoE (different weights), so the reference is llama.cpp itself
-//! (`llama-server`, raw `/completion`, CPU) running LiquidAI's official
+//! the 8.5B `MoE` (different weights), so the reference is llama.cpp itself
+//! (`llama-server`, raw `/completion`, CPU) running `LiquidAI`'s official
 //! **BF16 GGUF** of the same checkpoint — bit-identical weights to the bf16
 //! safetensors these tests load on the GPU. Prompts travel as token-id arrays
 //! rendered by our byte-verified `ChatMl::lfm2()`, never through llama.cpp's
@@ -22,7 +22,9 @@
 //! conv/attention loader covers both — so the legs below are written once and
 //! parameterized by tier.
 
-mod llama_ref;
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
+use mummu_testkit::llama_ref;
 
 use std::path::PathBuf;
 
@@ -69,36 +71,48 @@ const LFM2_230M: Tier = Tier {
 };
 
 fn model_dir(tier: &Tier) -> PathBuf {
-    let dir = std::env::var_os(tier.dir_env)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
+    let dir = std::env::var_os(tier.dir_env).map_or_else(
+        || {
             panic!(
                 "set {} to a dir with config.json/tokenizer.json/model.safetensors",
                 tier.dir_env
             )
-        });
-    assert!(dir.is_dir(), "{} is not a directory: {dir:?}", tier.dir_env);
+        },
+        PathBuf::from,
+    );
+    assert!(
+        dir.is_dir(),
+        "{} is not a directory: {}",
+        tier.dir_env,
+        dir.display()
+    );
     dir
 }
 
 fn reference_gguf(tier: &Tier) -> PathBuf {
-    let p = std::env::var_os(tier.gguf_env)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| panic!("set {} to LiquidAI's same-weights BF16 GGUF", tier.gguf_env));
-    assert!(p.is_file(), "{} is not a file: {p:?}", tier.gguf_env);
+    let p = std::env::var_os(tier.gguf_env).map_or_else(
+        || panic!("set {} to LiquidAI's same-weights BF16 GGUF", tier.gguf_env),
+        PathBuf::from,
+    );
+    assert!(
+        p.is_file(),
+        "{} is not a file: {}",
+        tier.gguf_env,
+        p.display()
+    );
     p
 }
 
 fn server(tier: &Tier) -> LlamaServer {
-    let exe =
-        llama_ref::server_exe().expect("set MUMMU_LLAMA_SERVER to a llama.cpp llama-server binary");
     // One port per test: the legs run concurrently in one test binary.
     static NEXT_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(18471);
+    let exe =
+        llama_ref::server_exe().expect("set MUMMU_LLAMA_SERVER to a llama.cpp llama-server binary");
     let port = NEXT_PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     LlamaServer::start(&exe, &reference_gguf(tier), port).expect("llama-server starts")
 }
 
-/// The LFM2.5 ChatML wrapping (BOS + user turn + assistant open), rendered by
+/// The LFM2.5 `ChatML` wrapping (BOS + user turn + assistant open), rendered by
 /// the library's own byte-verified template.
 fn chatml(user: &str) -> String {
     mummu::chat::ChatMl::lfm2().render(&[mummu::chat::Turn::user(user)])
@@ -148,7 +162,10 @@ fn first_forward_leg(tier: &Tier) {
 
     let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
     indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
-    let our_ids: Vec<u32> = indexed[..TOP_K].iter().map(|&(id, _)| id as u32).collect();
+    let our_ids: Vec<u32> = indexed[..TOP_K]
+        .iter()
+        .map(|&(id, _)| u32::try_from(id).expect("vocab index fits u32"))
+        .collect();
     let ref_ids: Vec<u32> = ref_top.iter().map(|&(id, _)| id).collect();
 
     let ours_lp = logprobs_at(&logits, &our_ids);

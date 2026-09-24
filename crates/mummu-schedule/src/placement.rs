@@ -114,7 +114,7 @@ pub fn place(w: &[u64], g: &[f64], h: &[f64], kappa: f64, budget: u64) -> Placem
             if cost < best_cost {
                 best_cost = cost;
                 best_run = Some((s, e));
-                best_bytes = bytes as u64;
+                best_bytes = u64::try_from(bytes).expect("a run within the u64 budget fits u64");
             }
         }
     }
@@ -285,22 +285,24 @@ pub fn place_free(w: &[u64], g: &[f64], h: &[f64], kappa: f64, budget: u64) -> P
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mummu_num::{f64_from_u64, trunc_u64};
 
     /// Same 10-line PCG32 as the sibling modules — self-contained on
     /// purpose in a dependency-free crate.
     struct Pcg(u64);
     impl Pcg {
         fn new(seed: u64) -> Self {
-            Pcg(seed
-                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                .wrapping_add(0xDA3E_39CB_94B9_5BDB))
+            Self(
+                seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    .wrapping_add(0xDA3E_39CB_94B9_5BDB),
+            )
         }
         fn next_u32(&mut self) -> u32 {
             let old = self.0;
             self.0 = old
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
-            let xorshifted = (((old >> 18) ^ old) >> 27) as u32;
+            let xorshifted = ((((old >> 18) ^ old) >> 27) & 0xFFFF_FFFF) as u32;
             let rot = (old >> 59) as u32;
             xorshifted.rotate_right(rot)
         }
@@ -313,17 +315,20 @@ mod tests {
     /// 27B's ~236 MB/layer (jittered so byte sums are distinct and the
     /// Pareto frontier is exercised), GPU decode ~10x faster than host,
     /// budget anywhere from tight to loose.
-    fn instance(seed: u64, l: usize) -> (Vec<u64>, Vec<f64>, Vec<f64>, f64, u64) {
-        let mut r = Pcg::new(seed);
-        let w: Vec<u64> = (0..l)
-            .map(|_| 150_000_000 + (u64::from(r.next_u32()) % 200_000_000))
+    fn instance(seed: u64, layers: usize) -> (Vec<u64>, Vec<f64>, Vec<f64>, f64, u64) {
+        let mut rng = Pcg::new(seed);
+        let w: Vec<u64> = (0..layers)
+            .map(|_| 150_000_000 + (u64::from(rng.next_u32()) % 200_000_000))
             .collect();
-        let g: Vec<f64> = (0..l).map(|_| 0.5 + 1.5 * r.uniform()).collect();
-        let h: Vec<f64> = (0..l).map(|_| 4.0 + 12.0 * r.uniform()).collect();
-        let kappa = 0.2 + 3.0 * r.uniform();
+        let g: Vec<f64> = (0..layers)
+            .map(|_| 1.5f64.mul_add(rng.uniform(), 0.5))
+            .collect();
+        let h: Vec<f64> = (0..layers)
+            .map(|_| 12.0f64.mul_add(rng.uniform(), 4.0))
+            .collect();
+        let kappa = 3.0f64.mul_add(rng.uniform(), 0.2);
         let total: u64 = w.iter().sum();
-        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-        let budget = (total as f64 * (0.1 + 1.1 * r.uniform())) as u64;
+        let budget = trunc_u64(f64_from_u64(total) * 1.1f64.mul_add(rng.uniform(), 0.1));
         (w, g, h, kappa, budget)
     }
 
@@ -336,7 +341,8 @@ mod tests {
             .enumerate()
             .map(|(i, &on)| if on { g[i] } else { h[i] })
             .sum();
-        let transitions = mask.windows(2).filter(|p| p[0] != p[1]).count() as u32;
+        let transitions = u32::try_from(mask.windows(2).filter(|p| p[0] != p[1]).count())
+            .expect("a test mask has far fewer than u32::MAX layers");
         decode + transition_cost(kappa, transitions)
     }
 
@@ -348,20 +354,20 @@ mod tests {
             .sum()
     }
 
-    /// place() against brute force over every contiguous run (plus the
+    /// `place()` against brute force over every contiguous run (plus the
     /// empty run) on random instances.
     #[test]
     fn place_matches_contiguous_brute_force() {
         for seed in 0..25 {
-            let l = 12;
-            let (w, g, h, kappa, budget) = instance(seed, l);
+            let layers = 12;
+            let (w, g, h, kappa, budget) = instance(seed, layers);
             let got = place(&w, &g, &h, kappa, budget);
 
             let mut best = h.iter().sum::<f64>(); // empty run
-            for s in 0..l {
-                for e in s..l {
-                    let mut mask = vec![false; l];
-                    mask[s..=e].iter_mut().for_each(|b| *b = true);
+            for start in 0..layers {
+                for end in start..layers {
+                    let mut mask = vec![false; layers];
+                    mask[start..=end].iter_mut().for_each(|b| *b = true);
                     if bytes_of(&mask, &w) <= budget {
                         best = best.min(cost_of(&mask, &g, &h, kappa));
                     }
@@ -376,13 +382,13 @@ mod tests {
             assert!(got.gpu_bytes <= budget);
             assert!((cost_of(&got.gpu, &g, &h, kappa) - got.cost_ms).abs() < 1e-9);
             match got.run {
-                Some((s, e)) => assert!(got.gpu[s..=e].iter().all(|&b| b)),
+                Some((first, last)) => assert!(got.gpu[first..=last].iter().all(|&b| b)),
                 None => assert!(got.gpu.iter().all(|&b| !b)),
             }
         }
     }
 
-    /// place_free() against brute force over ALL 2^L assignments under the
+    /// `place_free()` against brute force over ALL 2^L assignments under the
     /// budget — the frontier DP must be exact, not just Pareto-plausible.
     #[test]
     fn place_free_matches_exhaustive_brute_force() {
@@ -469,7 +475,7 @@ mod tests {
         let got = place(&w, &g, &h, kappa, 3);
         assert_eq!(got.run, Some((1, 3)));
         // h[0] + h[4] + g[1..=3] + 2 boundaries.
-        assert!((got.cost_ms - (1.0 + 1.0 + 0.3 + 2.0 * kappa)).abs() < 1e-12);
+        assert!((got.cost_ms - 2.0f64.mul_add(kappa, 1.0 + 1.0 + 0.3)).abs() < 1e-12);
         assert_eq!(got.gpu_bytes, 3);
     }
 

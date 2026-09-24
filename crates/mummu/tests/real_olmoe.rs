@@ -1,5 +1,5 @@
 //! Real-weights validation of the OLMoE-1B-7B port (P2's first MoE): the
-//! registry spec fetches the official allenai Q4_K_M GGUF, the ONE file
+//! registry spec fetches the official allenai `Q4_K_M` GGUF, the ONE file
 //! yields config + tokenizer + weights, and the model loads and greedy-
 //! decodes coherently on the **CPU** backend — the resident-everything first
 //! cut dequantizes ~7B params to ~28 GB of f32, which is CPU-RAM territory
@@ -12,16 +12,20 @@
 //!   cargo test -p mummu --release --test real_olmoe -- --ignored --nocapture
 //! ```
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use std::path::PathBuf;
 
 use mummu::gguf::{GgufFile, GgufValue};
 use mummu::models::CausalLm;
 use mummu::models::olmoe;
+use mummu_num::f64_from_usize;
 
 fn hub_dest() -> PathBuf {
-    std::env::var_os("MUMMU_HUB_DEST")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| panic!("set MUMMU_HUB_DEST to the models dir for the ~4.2 GB download"))
+    std::env::var_os("MUMMU_HUB_DEST").map_or_else(
+        || panic!("set MUMMU_HUB_DEST to the models dir for the ~4.2 GB download"),
+        PathBuf::from,
+    )
 }
 
 fn fetch_olmoe() -> PathBuf {
@@ -32,7 +36,11 @@ fn fetch_olmoe() -> PathBuf {
         .expect("the OLMoE GGUF is in the catalog");
     spec.fetch(&dest, |_| {}).expect("registry fetch");
     let path = spec.gguf_path(&dest).expect("gguf specs have a file path");
-    assert!(path.is_file(), "downloaded file exists at {path:?}");
+    assert!(
+        path.is_file(),
+        "downloaded file exists at {}",
+        path.display()
+    );
     path
 }
 
@@ -83,7 +91,7 @@ fn olmoe_gguf_tokenizer_matches_the_hf_tokenizer() {
 }
 
 /// The end-to-end proof: the ONE .gguf file loads (checked, every tensor
-/// mapped) and greedy-decodes a correct answer through the MoE stack on the
+/// mapped) and greedy-decodes a correct answer through the `MoE` stack on the
 /// CPU backend.
 #[tokio::test]
 #[ignore = "needs network (MUMMU_HUB_DEST; ~4.2 GB), ~30 GB free COMMIT and ~28 GB \
@@ -147,7 +155,7 @@ async fn olmoe_gguf_loads_and_decodes_on_cpu() {
     eprintln!(
         "[real_olmoe] {} tokens in {secs:.1}s ({:.2} s/token): {text:?}",
         ids.len(),
-        secs / ids.len() as f64
+        secs / f64_from_usize(ids.len())
     );
     assert!(
         text.contains('4') || text.to_lowercase().contains("four"),

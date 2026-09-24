@@ -1,6 +1,8 @@
 //! LFM2 / LFM2.5 (Liquid Foundation Model) hybrid decoder on the shared `nn`
-//! blocks: Embedding → N×{operator_norm, (gated ShortConv "LIV" | GQA attention
-//! with per-head q/k RMSNorm), ffn_norm, SwiGLU} → embedding_norm → tied
+//! blocks.
+//!
+//! Embedding → `N×{operator_norm`, (gated `ShortConv` "LIV" | GQA attention
+//! with per-head q/k `RMSNorm`), `ffn_norm`, `SwiGLU`} → `embedding_norm` → tied
 //! lm-head. `layer_types[i]` in the checkpoint's `config.json` selects the
 //! operator per layer (10 conv + 6 attention for the 1.2B).
 //!
@@ -23,8 +25,8 @@ use crate::import::{
 use crate::models::CausalLm;
 use crate::models::qwen2::EosIds;
 use crate::nn::{
-    ConvState, GqaAttention, GqaAttentionConfig, LayerKv, ShortConv, ShortConvConfig, SwiGluMlp,
-    SwiGluMlpConfig, causal_mask, rope_tables,
+    ConvState, GqaAttention, GqaAttentionConfig, HeadShape, LayerKv, ShortConv, ShortConvConfig,
+    SwiGluMlp, SwiGluMlpConfig, causal_mask, rope_tables,
 };
 
 /// LFM2 architecture hyperparameters, read from the checkpoint's `config.json`.
@@ -73,11 +75,11 @@ pub struct Lfm2Config {
 
 impl Lfm2Config {
     #[must_use]
-    pub fn head_dim(&self) -> usize {
+    pub const fn head_dim(&self) -> usize {
         self.hidden_size / self.num_attention_heads
     }
 
-    /// SwiGLU hidden dim: `block_auto_adjust_ff_dim` shrinks to 2/3 then
+    /// `SwiGLU` hidden dim: `block_auto_adjust_ff_dim` shrinks to 2/3 then
     /// rounds up to `block_multiple_of` (8192 for the 1.2B).
     #[must_use]
     pub fn ff_dim(&self) -> usize {
@@ -100,6 +102,16 @@ impl Lfm2Config {
     /// checkpoints) or nested under `rope_parameters` (the newer transformers
     /// convention, LFM2.5-230M) — only plain rotary (`rope_type: "default"`)
     /// is implemented, anything else fails loudly.
+    ///
+    /// # Errors
+    ///
+    /// Returns the JSON error as a string, an error when `rope_parameters`
+    /// names a non-default rope type or disagrees with a top-level
+    /// `rope_theta`, or when validation refuses the config: a non-plain rope
+    /// scaling, a declared sliding window, a `layer_types` length that is
+    /// not `num_hidden_layers`, a head count that is not a positive multiple
+    /// of the KV heads, `conv_L_cache` below 2, or a non-positive
+    /// `rope_theta`.
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, String> {
         let mut cfg: Self = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
         if let Some(rp) = cfg.rope_parameters.take() {
@@ -111,7 +123,9 @@ impl Lfm2Config {
                 ..RopeScaling::default()
             }
             .check("lfm2 config.json rope_parameters")?;
-            if cfg.rope_theta != 0.0 && cfg.rope_theta != rp.rope_theta {
+            // Exact disagreement is the condition: two spellings of the same
+            // value must be bit-identical, so compare the bits.
+            if cfg.rope_theta != 0.0 && cfg.rope_theta.to_bits() != rp.rope_theta.to_bits() {
                 return Err(format!(
                     "rope_theta given twice and disagreeing: {} (top-level) vs {} (rope_parameters)",
                     cfg.rope_theta, rp.rope_theta
@@ -126,8 +140,18 @@ impl Lfm2Config {
     /// Hyperparameters from a GGUF header's `lfm2.*` metadata. Layer kinds
     /// come from llama.cpp's per-layer `attention.head_count_kv` array:
     /// `0` marks a shortconv layer, nonzero an attention layer.
-    /// `feed_forward_length` in a GGUF is the already-adjusted SwiGLU dim,
+    /// `feed_forward_length` in a GGUF is the already-adjusted `SwiGLU` dim,
     /// so auto-adjust is off.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the architecture is not `lfm2`, a required
+    /// `lfm2.*` key is missing or malformed, the per-layer `head_count_kv`
+    /// array is absent, mis-sized, mixes KV geometries or has no attention
+    /// layer, `token_embd.weight` is absent or does not match
+    /// `embedding_length`, the file carries an untied `output.weight`, or
+    /// the resulting config fails the same validation as
+    /// [`Self::from_json_bytes`].
     pub fn from_gguf(f: &GgufFile) -> Result<Self, String> {
         let arch = f.architecture().unwrap_or("<missing>");
         if arch != "lfm2" {
@@ -368,9 +392,18 @@ fn build(cfg: &Lfm2Config, device: &Device) -> Lfm2 {
 }
 
 /// Build the architecture from `dir/config.json` and load
-/// `dir/model.safetensors`, checked. Key remap: strip `model.`, RmsNorm
-/// `weight` → `gamma`, and LFM2's `out_proj`/`q_layernorm`/`k_layernorm` onto
-/// the shared block's `o_proj`/`q_norm`/`k_norm`.
+/// `dir/model.safetensors`, checked.
+///
+/// Key remap: strip `model.`, `RmsNorm` `weight` → `gamma`, and LFM2's
+/// `out_proj`/`q_layernorm`/`k_layernorm` onto the shared block's
+/// `o_proj`/`q_norm`/`k_norm`.
+///
+/// # Errors
+///
+/// Returns an [`ImportError`] when `config.json` or `model.safetensors` is
+/// missing, when the config is unreadable or invalid, when the sibling
+/// tokenizer metadata contradicts it, or when the checked load finds the
+/// checkpoint incomplete or mismatched.
 pub fn load_from_dir(dir: &Path, device: &Device) -> Result<LoadedLfm2, ImportError> {
     let cfg_path = required_file(dir, "config.json")?;
     let weights = required_file(dir, "model.safetensors")?;
@@ -472,10 +505,18 @@ fn gguf_tensor_to_hf(info: &GgufTensorInfo) -> Option<GgufMap> {
     Some(GgufMap::Rename(format!("model.layers.{layer}.{mapped}")))
 }
 
-/// Load an LFM2/LFM2.5 model straight from a **GGUF** file: hyperparameters
-/// from the `lfm2.*` metadata (layer kinds from the per-layer kv-head
-/// array), weights dequantized and driven through the exact store pipeline
-/// the safetensors path uses.
+/// Load an LFM2/LFM2.5 model straight from a **GGUF** file.
+///
+/// Hyperparameters come from the `lfm2.*` metadata (layer kinds from the
+/// per-layer kv-head array), weights are dequantized and driven through the
+/// exact store pipeline the safetensors path uses.
+///
+/// # Errors
+///
+/// Returns an [`ImportError`] when the file cannot be opened or parsed as
+/// a GGUF, when its metadata fails [`Lfm2Config::from_gguf`], when a
+/// tensor name is unmapped or the dequant fails, or when the checked load
+/// finds the checkpoint incomplete or mismatched.
 pub fn load_from_gguf(path: &Path, device: &Device) -> Result<LoadedLfm2, ImportError> {
     let parse = |reason: String| ImportError::Parse {
         file: path.to_path_buf(),
@@ -549,7 +590,10 @@ impl CausalLm for LoadedLfm2 {
         let cfg = &self.config;
 
         // Dtype pinned to the backend TYPE, never the per-device policy.
-        let ids32: Vec<i32> = new_ids.iter().map(|&i| i as i32).collect();
+        let ids32: Vec<i32> = new_ids
+            .iter()
+            .map(|&i| i32::try_from(i).expect("token id fits i32"))
+            .collect();
         let input = Tensor::<1, Int>::from_data(
             TensorData::new(ids32, [t]),
             (device, crate::backend::int_dtype(device)),
@@ -565,16 +609,14 @@ impl CausalLm for LoadedLfm2 {
             let h = layer.operator_norm.forward(x.clone());
             let h = match (&layer.conv, &layer.self_attn, kv) {
                 (Some(conv), None, HybridKv::Conv(state)) => conv.forward(h, kk, state.as_mut()),
-                (None, Some(attn), HybridKv::Attn(kv_state)) => attn.forward(
-                    h,
-                    cfg.num_attention_heads,
-                    cfg.num_key_value_heads,
-                    cfg.head_dim(),
-                    &cos,
-                    &sin,
-                    mask.as_ref(),
-                    kv_state.as_mut(),
-                ),
+                (None, Some(attn), HybridKv::Attn(kv_state)) => {
+                    let shape = HeadShape {
+                        num_heads: cfg.num_attention_heads,
+                        num_kv_heads: cfg.num_key_value_heads,
+                        head_dim: cfg.head_dim(),
+                    };
+                    attn.forward(h, shape, &cos, &sin, mask.as_ref(), kv_state.as_mut())
+                }
                 // Layer kind and cache kind disagree — a caller bug.
                 _ => unreachable!("LFM2 forward: layer/cache kind mismatch"),
             };
