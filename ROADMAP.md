@@ -6,9 +6,22 @@
 > README (perf claims link a benchmark artifact); everything not-done / discovered / next is a `[ ]`
 > here; git history + PRs are the record. Edit surgically; never rewrite wholesale.
 
-**Stack:** Rust 2024 · **Burn 0.21** (`wgpu` 29 + `burn-flex` CPU, `fusion` + `autotune`, multi-device) ·
-`burn-store` · HF `tokenizers` · runs on **any hardware** — CPU, one GPU, or several (multi-GPU + CPU
-offload). Reference dev machine: Ryzen 9 7950X3D · 128 GB · RTX 4070 Ti SUPER 16 GB.
+**Stack:** Rust 2024 · **Burn 0.22.0-pre.3** (`wgpu` 30 + `burn-flex` CPU, `fusion` + `autotune`,
+multi-device) · `burn-store` · HF `tokenizers` · runs on **any hardware** — CPU, one GPU, or several
+(multi-GPU + CPU offload). Reference dev machine: Ryzen 9 7950X3D · 128 GB · RTX 4070 Ti SUPER 16 GB.
+*(2026-09-23) Pin watch: `cargo update` brought 30 transitive deps current (793 lib tests green,
+and **numerically inert against both reference gates that can run on this host**: `parity_qwen2`'s
+Candle leg top-5 ids exact with max |Δlogit| 7.43866e-5, and `parity_qwen4exp` reproducing its
+recorded llama.cpp deltas to the digit — primes 0.8791688539675455 (the 0.879 FAIL this roadmap
+already records, unmoved), moon 4.9252595444553826e-1 PASS, greedy text byte-identical on both.
+The qwen2 *ollama* leg fails with `curl exit Some(7)` — connection refused, there is no ollama on
+this Linux host; that is the separate open item in P7, not a regression.);
+**`pliron` is held at 0.17.0 and `pliron-derive` with it**, because `pliron-llvm 0.17.0` asks for
+`pliron = "^0"` and the update floated it to 0.18.0, whose `=0.18.0` derive pin then got compiled
+against the `pliron 0.17.0` that `cubecl-core 0.11.0-pre.3` actually uses — 40+ `cannot find `ident`
+in `pliron`` errors out of `pliron_attr`. Nothing of ours to fix; it unsticks when cubecl moves.
+**`burn 0.22.0-pre.4` (2026-09-22) is NOT taken** — see the P0 migration item; it is a wide breaking
+change, not a version bump. Still no stable 0.22.*
 *(2026-08-21) Pin watch: **burn 0.21.0 is still the latest STABLE release** (crates.io, checked
 2026-08-21) — the workspace is already on the newest burn there is; a `cargo update` pass brought
 transitive deps current (7 patch/minor bumps, 243 lib tests green). 0.22 exists only as pre-releases
@@ -410,6 +423,31 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       target (Nanna's Tauri build): a *good* tune shipped deliberately, rather than whatever the user's
       first busy minute produced. — https://github.com/tracel-ai/cubecl/pull/1423 ·
       https://github.com/tracel-ai/cubecl
+      *(2026-09-23 research) **cubecl pre.4 closes two cache-poisoning routes, and one of them
+      contradicts "warm every probe".**
+      (i) https://github.com/tracel-ai/cubecl/pull/1621 adds `TunableSet::with_eviction`, a cache
+      eviction the tuner runs **before every measured sample**, because a warm operand that fits in
+      LLC is served from cache from the second launch on: a memory-bound kernel then reads at several
+      times bus bandwidth, hits the set's throughput bound on the first candidate, and the round ends
+      with a winner chosen on a read no real call ever gets. Measured upstream on a Radeon 8060S — a
+      21 MB weight streaming at 124 GB/s cold was **tuned at over 400 GB/s warm, with only two rows
+      ever compiled.** This is the exact inverse of the warm-probe rule we run every perf probe by,
+      and both are right in their own place: warm for *measuring a decode we will really serve*, cold
+      for *choosing between kernels*. Worth stating that distinction wherever the warm rule is
+      written down.
+      (ii) https://github.com/tracel-ai/cubecl/pull/1659: a throughput probe that failed to allocate
+      used to fail **invisibly** — `initialize_memory` panicked on the device thread while
+      `check`/`sync_buffers`/`sync` all answered `Ok`, the probe timed an empty pass, and
+      `measure_peak_throughput` **cached that timing as the device's peak**. Probes now allocate in a
+      persistent window outside the workload budget, failed reservations fail `check`, and errors are
+      not cached. Since we install custom pools, this is a failure mode we were exposed to.
+      Consequence for us either way: **a cache written by pre.3 should be distrusted and
+      re-measured** after the port, not carried over. Also in pre.4, cubecl #1677 swaps `rusqlite`
+      for Turso in the tune-cache persistence layer (pure Rust, no libsqlite3-sys, no `links`
+      conflict) — with the caveat from its own issue that Turso is WAL-only, so `journal_mode =
+      DELETE` silently does nothing and a shipped bundle keeps a WAL-mode header even after
+      `wal_checkpoint(TRUNCATE)`. That matters precisely for the "ship a warm cache with the binary"
+      route above.*
 
 - [ ] **The 27B decode gap is still unexplained — but it is NOT a broken quantized matmul.**
       *(2026-08-23)* Measured against native Windows ollama on the same box and checkpoint: ollama
@@ -749,6 +787,19 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       repacked from the i8 slab, a second 4-bit rounding) ignores `think: false` and reasons at length.
       Follow-ups are the open items below. **v0.4.0 OOMed on its first production load** (1 GiB
       working-set prior; head and embedding at f32) and v0.4.1 fixed both — see the first item.
+- [ ] **The pre.4 upload fix is for integrated adapters — this box does not get it, and that is the
+      point of writing it down.** *(2026-09-23 research)* https://github.com/tracel-ai/cubecl/pull/1651
+      makes Vulkan uploads write **straight into mapped storage** instead of going through a staging
+      buffer and a queue submit: measured upstream at 256 MiB on an Iris Xe, 85.3 ms -> 31.7 ms
+      (~2.7 -> ~7.5 GiB/s). Reading only the headline, it looks like the answer to the upload path
+      this section has measured at ~4.2-4.4 GB/s. It is not, on this hardware: the direct copy is
+      taken only where host memory *is* device memory, discrete GPUs keep `DEVICE_LOCAL` and the queue
+      path unchanged, and it additionally needs an already-idle queue (non-blocking poll, never a
+      stall). An RTX 4070 Ti SUPER is discrete, so the expected delta here is **zero** — do not spend
+      a run A/B'ing it after the pre.4 port, and do not read a post-port upload change as caused by
+      it. It DOES matter for consumers: a Nanna or laurelane build on an integrated Vulkan adapter is
+      exactly the case it helps, so it belongs in the consumer-hardware story rather than in this
+      box's numbers.
 - [ ] **Placement follow-ups from v0.4.0/v0.4.1** *(2026-09-21)* — what the live runs and the incident
       left open, most consequential first.
       - [ ] **Verify placement changes on the 27B, and make that a gate.** v0.4.0 passed every test and
@@ -1709,6 +1760,47 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       (c) **wgpu 30 arrived with the bump**, as this item predicted — no separate action, and no second
       wgpu in the graph. Still open here: the dtype-pinning / alias story (the `Gpu`/`GpuF16` seam) and
       the graph-capture measurement, which pre-3 now makes possible — see the new item below.*
+      *(2026-09-23 research) **pre.4 is out (2026-09-22) and is NOT a version bump — budget a port.**
+      Read before touching it: https://github.com/tracel-ai/burn/compare/v0.22.0-pre.3...v0.22.0-pre.4
+      and the migration guide that is itself new in pre.4,
+      https://github.com/tracel-ai/burn/blob/v0.22.0-pre.4/burn-book/src/migrating-to-0.22.md (a
+      migration guide appearing IS release prep — 0.21 went pre.5 to stable in two days, 0.20 pre.6 to
+      stable in four weeks; there is still no milestone and no maintainer date, so do not plan around
+      one). The bump is all-or-nothing: pre.4 pins `cubecl = "=0.11.0-pre.4"` and `cubek =
+      "=0.3.0-pre.4"`, so every `=`-pinned crate in our manifest moves together or none do. What lands
+      on us, worst first:
+      - **CubeCL runtime erasure** (cubecl #1590/#1603/#1604): `CubeTensor<R>` becomes `CubeTensor`,
+        the `CubeRuntime` trait is gone, `ComputeClient`->`Client`, `empty_device::<R, E>` ->
+        `empty_device::<E>`, `R::client(device)` -> `device.client()`. Every file naming a CubeCL
+        runtime type is touched — mechanical, but wide, and the packed Q4 GEMV lives right in it.
+      - **`#[backend_extension(Wgpu, ...)]` no longer compiles.** The selector catalog is now
+        `Cube, Flex, NdArray, LibTorch, Remote, Capture`; `Cube` covers every CubeCL runtime and
+        `Wgpu`/`Cuda` are not selectors. No deprecation path. Upside: a new `Fusion` selector
+        (burn #5673) generates the `Fusion<B>` impl we hand-wrote — but read its caveat first, it
+        returns the metadata callback's non-tensor fields WITHOUT waiting for execution and discards
+        the backend's, unchecked even in debug.
+      - **`CubeTensor` shape/rank now go through `logical_shape()`/`logical_rank()`** because of
+        storage tiling (a tiled tensor's physical dims split each matrix dim in two), and
+        `From<CubeTensor> for TensorHandle` must use `from_metadata` or the tiling is lost. Anything
+        of ours that rebuilds a handle from shape+strides is wrong after the bump.
+      - **No implicit backend fallback** (burn #5722): `Device::default()` panics unless a backend
+        feature is named. Our feature list must become explicit.
+      - `burn_store::nested` -> `burn_store::pytorch_reader::nested` (the reader is its own
+        burn-free crate now, #5656), `Tensor::into_primitive` -> `try_into_primitive::<B>()`,
+        `TensorData::to_vec`/`into_vec` -> `try_to_vec`/`try_into_vec`, `AutodiffModule` merged into
+        `Module` (#5721), quant scheme `with_level`/`with_param` -> `per_tensor`/`per_block`.
+      - Unchanged and therefore cheap: `Device::flex()`, `into_data_async`, `CustomOpIr`'s fields,
+        the memory-pool API (`memory_pool_usage` and friends), and `burn-capture` is byte-identical,
+        so the graph-capture item below does not move.
+      Two reasons to want it anyway, both measured upstream rather than promised: cubecl #1659 and
+      #1621 are **autotune-cache poisoning fixes** (a failed probe allocation used to be cached as the
+      device's peak throughput; and warm-cache tuning measured a 21 MB weight at >400 GB/s when its
+      cold rate was 124 GB/s, picking a winner on a read no real call gets) — which means a cache
+      written by pre.3 should be distrusted and re-measured, and it cuts against "warm every perf
+      probe" for autotune specifically. And cubecl #1672 adds `MemoryDeviceProperties::max_memory`,
+      the card's total capacity from the runtime — a number the live-placement item has been deriving
+      from NVML. Also relevant: burn #5678 fixes cross-device tensor moves that silently never wrote
+      the destination on wgpu/ROCm/Metal, and left the scales behind on a quantized same-runtime move.*
 - [ ] **Measure burn 0.22's graph capture on the decode step — the named lever for dispatch-bound
       decode.** 0.22.0-pre.3 ships a **graph-capture backend producing `GraphIr`** (plus a fix to
       preserve initializers across capture scopes), and it is now in the tree rather than a
@@ -1943,6 +2035,21 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       `olmoe-tok`** — i.e. the MoE gates specifically. Also still absent and tracked separately: the
       qwen3.5-2b BF16 fixture `parity_qwen35` wants. Refetching the OLMoE pair costs ~18 GB against
       8.5 TB free, so it is bandwidth, not space, that gates it.
+      *(2026-09-23) **The MoE gates are back, and so is qwen3.5-2b.*** Fetched this run:
+      `olmoe-1b-7b-0125-instruct-q4km/OLMoE-1B-7B-0125-Instruct-Q4_K_M.gguf` (4,213,512,192 B, from
+      `allenai/OLMoE-1B-7B-0125-Instruct-GGUF`) and `olmoe-tok/` (`tokenizer.json` 3.57 MB plus
+      `tokenizer_config.json` and `config.json`, from the non-GGUF repo — the GGUF repo does not ship
+      them). Three gates that were unrunnable now pass on this host, run `--release`:
+      `real_olmoe_quant::olmoe_per_expert_q8_agrees_with_f32_and_answers` (362 s),
+      `real_olmoe::olmoe_gguf_tokenizer_matches_the_hf_tokenizer` (byte-identical on 8 prompts) and
+      `real_olmoe::olmoe_gguf_loads_and_decodes_on_cpu` (16 layers x 64 experts loaded in 117.1 s,
+      6 tokens in 6.5 s = 1.09 s/token, "2 + 2 equals 4."). `qwen3.5-2b` is present too
+      (`Qwen3.5-2B-BF16.gguf`, 3,775,709,216 B) — the separately-tracked absence above is stale.
+      **Still missing: `qwen3-4b-q4km`, and OLMoE's 13.84 GB safetensors twin**
+      (`allenai/OLMoE-1B-7B-0125-Instruct`, which `load_from_dir` fuses into `[experts, out, in]`
+      banks) — the GGUF leg is what the three gates above needed, the safetensors leg is its own.
+      `budget_moe::olmoe_moe_cpu_decode_stays_inside_its_budget` was NOT run: it wants ~30 GB of
+      commit and the live `mummu-serve` deployment was holding 54-68 GB of this 124 GB box all run.
 - [ ] **Linking is the memory peak of this build, and the linker is `rust-lld`, not `ld`.** Worth
       writing down because it cost this run three failed gates and two wrong diagnoses. `cc` execs
       GCC's `collect2` (a ~2.6 MB wrapper) which execs
@@ -2006,12 +2113,39 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       anywhere (auto-discovery only), no `include!`/`#[path]` reference from outside the tree, and
       `cargo metadata` reports the **same 30 example targets before and after**, none named `src`.
       40 files, 25,984 deletions. *(2026-09-07)*
-- [ ] **Pin `-j` for this workspace in `.cargo/config.toml`.** Following from the linker note above:
+- [x] **Pin `-j` for this workspace in `.cargo/config.toml`.** Following from the linker note above:
       add a `[build] jobs = 6` (or a documented host-specific override) so the default parallelism
       cannot spawn ~16 concurrent `rust-lld` at ~4.5 GB each and swap the box. Needs a check that it
       does not throttle the *compile* phase unacceptably — compiles are ~0.5 GB each and happily run
       at full width, so the honest fix may be per-phase rather than a blanket cap, in which case
       record why a blanket cap was chosen anyway. *(2026-09-13)*
+      *(2026-09-23) Measured, and `-j` alone does not bound it.* A `cargo build --workspace
+      --all-targets -j 6` on this box still had **five concurrent `rust-lld` at 4.3-5.7 GiB RSS**
+      (~25 GiB) at the tail of the build, because cargo's `-j` counts *units* and at the tail every
+      remaining unit is a link — `-j 6` is a cap of six linkers, not of one. That ran while
+      `mummu-serve` held 54 GiB of the 124 GiB box, i.e. inside ~5 GiB of the commit-charge limit.
+      The `line-tables-only` change in the item below is the bigger lever on the same number (it is
+      DWARF that makes a 5 GiB linker), so re-measure the link peak on top of it before choosing a
+      `jobs` value — a cap picked against the old 4.5-5.7 GiB peak will throttle compiles for
+      nothing. Whatever is chosen, record it as host-specific: 16 cores and 124 GiB is this box.
+      *(2026-09-23, same run, after the `line-tables-only` change) **Decided: NO blanket cap, and
+      here is the evidence.** Re-measured on top of it, sampling `rust-lld` once a second through a
+      full `--all-targets` relink: **max 5 concurrent, 11.8 GiB combined, 4.19 GiB the largest single
+      linker** (that one is `mummu-app`, which keeps full DWARF because it is ours). Against the
+      2026-09-13 datum of 4.5-5.7 GiB each, and against the ~25 GiB combined measured earlier in this
+      same run before the debuginfo change, the link phase now peaks at under half what it did — on a
+      124 GiB box. There is nothing left for a `jobs` cap to defend against that the debuginfo change
+      has not already defended, and a blanket cap in `.cargo/config.toml` would throttle the compile
+      phase of every build, for every consumer and any CI, to buy that nothing. **Guidance instead of
+      a pin: pass `-j 6` from the nightly routine's own commands** (it does), which is where the
+      host-specific knowledge belongs, and revisit only if a link peak is measured above ~20 GiB.
+      **Read this before trusting any concurrency number from this box:** the first measurement this
+      run said "19 concurrent linkers under `-j 6`", which would have been a spectacular finding and
+      was entirely false — the extra 14 belonged to other routines linking into
+      `.claude/worktrees/*/target/agent-N`. `-j` bounds cargo's units and it does so correctly. Any
+      `ps`-based count here MUST filter `rust-lld` by the target directory it is writing into, or it
+      measures the whole box. Same trap as the `pkill` rule: this machine runs many routines in one
+      cgroup.*
 - [ ] **Put the build's target directory on NVMe, not the HDD array.** Following from the iowait
       finding above: `/mnt/deepmem` is four spinning disks shared with the household server stack, and
       the link phase starves on it (50+ min/link at 2-3% CPU), while the same build on
@@ -2021,6 +2155,23 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       filesystem. Note the tradeoff this trades INTO: a target dir off the worktree is shared state
       again, so if it is made global it re-creates the concurrent-routine collision the per-worktree
       layout was chosen to avoid; per-worktree-under-NVMe keeps both properties. *(2026-09-13)*
+      *(2026-09-23) **33 GB was an underestimate by 4x, and that is the finding.** A cold
+      `cargo build --workspace --all-targets` on NVMe reached **147 GiB** and took this box's 1.1 TB
+      root from 84% to 98% before it was stopped — not 33 GB. The shape: ~70 test and bench binaries
+      under `debug/build/<pkg>/<hash>/out/` at **2.0-2.2 GiB each**, which is the whole burn / wgpu /
+      tauri graph statically linked into every one of them at `-C debuginfo=2`. Our own five crates
+      are a rounding error beside it. So the target dir is not a placement problem first; it is a
+      *size* problem, and moving 147 GiB to a faster disk only moves it. Shipped this run:
+      `debug = "line-tables-only"` on `[profile.dev.package."*"]` — **147 GiB -> 74 GiB** measured on
+      the same build, per binary 2.0-2.2 -> 0.87-1.1 GiB, with file and line still in every panic and
+      backtrace (only our own crates keep full DWARF, and they are the ones actually stepped
+      through). Release is untouched, so bench/BASELINE.md is unaffected by construction. What is
+      still open: 74 GiB per worktree is *still* too much to keep several of on a 160 GB-free root,
+      so the durable form is undecided — the honest candidates now are (a) per-worktree on NVMe plus
+      a hard rule that the routine removes it with the worktree, (b) `--all-targets` only when a
+      run actually needs every test binary, or (c) one shared `build-dir` (nightly cargo's
+      `build.build-dir`, which splits intermediates from the final artifacts) so ~70 binaries stop
+      being ~70 copies. Measure (c) before choosing it.
 
 ### P1 — Backends & device *(ex-laurelane)*
 - [x] Backend abstraction generic over `B: Backend`; one binary compiling BOTH `Wgpu` (Vulkan/DX12/Metal,
@@ -2796,6 +2947,34 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       `ternary-bonsai-2-27b-pq2_0` (fe70feb, 32/64 layers, 7.52 planned / 9.52 resident) answered
       byte-identically to the reference and then hit the same panic 13 s after residency. *(2026-09-23,
       Ternary-Bonsai bring-up.)*
+      *(2026-09-23, nightly) **(3) is shipped, and it was two ratchets, not one.*** The re-plan after
+      a drop is what turns one OOM into a loop, and both mechanisms that did it are now bounded.
+      **(a) The post-drop ambient reading.** `A = used − reserved` is right only while our pool and
+      the driver agree about what we hold, and for seconds after a drop they do not: the pool reports
+      `reserved` down at once, the driver keeps the pages attributed to this process, and every one
+      of those bytes then reads as somebody else's — the 12.1 GiB reading on a box whose desktop
+      ambient is 3.1. That sample is not merely wrong once: the guard is an envelope over a
+      120-sample window, so ONE of them holds the guard above 12 GiB for ten minutes and every reload
+      inside that window fits nothing. A fall in `reserved` now opens a 30 s window in which the
+      reading is credited back by at most what we released and never below the ambient trusted before
+      it, with the credit shrinking as the driver returns pages. Growth beyond
+      `ambient_before + released` is still believed immediately, so the watermark keeps its "up at
+      once" property, and the placement log line prints the raw reading beside the corrected one
+      whenever they differ — that gap IS the window, and an incident is read from there.
+      **(b) The working-set estimate had no ceiling.** `note_device_failure` doubled ε̂ on every
+      out-of-memory and *persisted* it: from the 4 GiB prior on this 16 GiB card that is 8, then 16,
+      and at 16 the working set alone exceeds the card — 0/64 layers, written to
+      `.mummu-serve/placement-<model>.json`, so every restart after it serves entirely from the host.
+      ε̂ is now clamped to half the card on write AND on read (so a file from an older build, or the
+      hand-seeded 5 GiB from this incident, cannot carry a dead card into a fresh process), and at
+      the ceiling the escalation stops and says so instead of writing a bigger number.
+      Seven tests in `mummu-serve::engine::placement`; the correction is a pure function over its
+      state, so the sequences that matter — a drop, a slow reclaim, a co-tenant arriving during one —
+      are testable without a card. **Still open: (1) and (2).** What the ~2 GB actually is has NOT
+      been identified; this run bounds the *recovery*, it does not stop the first OOM. And the guard
+      is still `Watermark(ambient)` rather than `ambient + measured pool slack + working set`. Both
+      want the cubecl memory trace on a first request. Not yet verified on a live 27B — see the
+      placement gate item above.
 - [ ] **Llama-family decoder port (`llama`)** *(mistral.rs parity)* — the loader that multiplies
       checkpoint coverage most per unit of new surface: Llama 2/3.x and the wide Mistral/TinyLlama-style
       fine-tune space share one architecture shape, and it is strictly a subset of blocks Mummu already
@@ -3636,6 +3815,27 @@ that fits the model AND uses every device to the fullest.
       device boundary between stages, KV-cache per shard, and a micro-batch/pipeline schedule so the GPUs
       overlap rather than idle. *(Tensor-parallel within a layer is the stretch goal; layer/pipeline split is
       the tractable first cut.)*
+      *(2026-09-23 research) **Burn is building this upstream, in the open, and it is worth reading
+      before we build our own:** https://github.com/tracel-ai/burn/pull/5702 — "pipeline trait to
+      split a model by layers across devices", opened 2026-09-16, still open, not a draft. A
+      `Pipeline` trait (`forward_input` -> `forward_block` per block -> `forward_output`) plus a
+      `PipelineLayout` naming each segment's submodules (because a module tree does not say what
+      order forward runs in), a `PipelinePlacement` assigning a device per segment, and `place`
+      forking each parameter onto its segment's device. The stated point is ours exactly — "the model
+      never exists whole on one device", each stage loads straight onto its own device so an
+      oversized model can load at all — and it is tested on a four-GPU box with `--features
+      cuda,vulkan`. What it explicitly does NOT do, which is why it does not replace this item: no
+      scheduling at all (capacity, not speed — overlap needs microbatching), no tensor parallelism,
+      and **KV-cached generation does not work** because `forward_block` takes `&self` while cached
+      attention wants `&mut MhaCache`. Bare tensors do not follow a module either, so tables like
+      `RotaryEncoding` stay put. Decide deliberately: adopt the trait and keep our scheduling, or
+      keep ours whole. Two things that DID merge and are usable the moment we are on pre.4:
+      `Device::enumerate_physical() -> Vec<PhysicalGpu>` (burn #5688 — one entry per card, so a card
+      reachable by both CUDA and Vulkan is listed once rather than twice; see the Device inventory
+      item) and burn #5678, which fixes `CubeTensor::to_client` silently never writing the
+      destination on wgpu/ROCm/Metal (it always took the collective send/recv path, which only CUDA
+      implements) and leaving the scales behind on a quantized same-runtime move. That second one is
+      a correctness bug in exactly the operation this item is made of.*
 - [ ] **The 27B pack load is NOT I/O-bound — fix the LOADER, not the disk.** Measured 2026-09-15
       A/B'ing `mummu::diskcache` against the 193 GB qwen3.8-27b pack on the spinning array, and the
       result kills the premise the cache was reached for here:
@@ -4132,6 +4332,26 @@ The VRAM lever the P6 planner pulls to make the largest useful model fit the use
       the kernel substrate a Q4-weights × f16-activations decode path would ride (vs hand-writing a
       dequant-fused kernel); gate any adoption on the parity harness + `bench/BASELINE.md` —
       https://github.com/tracel-ai/cubecl/releases · https://burn.dev/blog/release-0.21.0/
+      *(2026-09-23 research) The kernels moved OUT of cubecl into `tracel-ai/cubek` (burn pins
+      `cubek = "=0.3.0-pre.4"`), and the design doc there —
+      https://github.com/tracel-ai/cubek/blob/main/QUANT_PLAN.md — describes almost exactly the shape
+      our packed path wants, so re-read this item against it rather than against the cubecl notes.
+      The premise is "scales are an operand, folding them in is a verb": instead of a quantization
+      *scheme* attached to a tensor, you bind values and scales as separate tiles and call
+      `c.mm_scaled(&w, &x, &s, Semiring::SUM_PROD)`. Landed per the doc: coarse scale operands by
+      rational projection (`PhysicalAxisMap::of(K).over(block)` is literally block-wise scaling,
+      proven at block-equal, finer and coarser cuts), f16 scales on either operand with the side
+      inferred from the scales' own axes, and `TileSpec::packed(field)` — packed values with NO
+      scheme, served through `PackedView` — with the note that "the q4 kernel the plan was blocked on
+      now runs end to end" via `w.tile_packed()` + a scales tensor + `mm_scaled`. Caveat that decides
+      whether it is usable here: **Q4S/Q2S need a device whose vector width reaches the packing
+      factor; Q8S runs everywhere.** Also in cubecl pre.4: a **`dp4a` intrinsic** (packed int8x4
+      dot-and-accumulate — CUDA `__dp4a`, Vulkan/SPIR-V `OpSDot`+add, polyfill elsewhere), added
+      explicitly for Q8 MMVQ, which is the same shape as our VNNI host kernel but on the card.
+      Sourcing caveat: most cubek PRs have empty bodies and QUANT_PLAN.md is an in-repo design doc,
+      not a release note — treat it as intent, and one of its sections is already marked superseded.
+      All of this is gated behind the pre.4 port (see the P0 migration item); none of it is reachable
+      on pre.3.*
 - [ ] **KV-cache quantization (FP8/e4m3)** — quantize the KV cache (and optionally the QK/ScoreV attention
       matmuls) to 8-bit, halving per-token cache footprint — the *other* VRAM lever besides weights, and the
       one that grows with context length. vLLM shipped exactly this (April 2026) and published the lessons

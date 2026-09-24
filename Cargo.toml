@@ -28,11 +28,17 @@ image = { version = "0.25", default-features = false, features = [
 	"png",
 	"webp",
 ] }
-# Intentional pins (see ROADMAP "Stack"): burn 0.21 + wgpu 29 are the parity-validated
-# combination proven in laurelane (byte-identical logits vs Candle). wgpu is not ours to
-# pick — burn 0.21 resolves 29 transitively, so wgpu 30 unblocks with a burn bump, not a
-# `cargo upgrade`. tokenizers rides 0.23 as of 2026-07-16: every parity number came back
-# bit-identical to 0.22, so it is no longer part of the pinned combination.
+# Intentional pins (see ROADMAP "Stack"): burn 0.22.0-pre.3 + wgpu 30 are the
+# parity-validated combination. wgpu is not ours to pick — burn resolves it transitively,
+# so a wgpu bump rides a burn bump, not a `cargo upgrade`. tokenizers rides 0.23 as of
+# 2026-07-16: every parity number came back bit-identical to 0.22, so it is no longer part
+# of the pinned combination.
+# Held at pre.3, deliberately: `0.22.0-pre.4` (2026-09-22) carries CubeCL's runtime
+# erasure — `CubeTensor<R>` loses its parameter, the `CubeRuntime` trait is gone, and
+# `#[backend_extension(Wgpu, ...)]` stops compiling because the selector catalog becomes
+# Cube/Flex/NdArray/LibTorch/Remote/Capture. That is a port, not a bump, and it is
+# all-or-nothing (pre.4 pins cubecl and cubek with `=`). The ROADMAP's P0 migration item
+# has the full list of what lands on us.
 # `fusion` + `autotune` are the throughput levers: fusion compiles streams of tensor ops
 # into far fewer GPU kernels and autotune picks the fastest kernel variant; with `fusion`,
 # `Wgpu` transparently becomes `Fusion<Wgpu>`.
@@ -142,10 +148,8 @@ tokio = { version = "1", features = [
 ] }
 # Async HTTP for mummu-serve, replacing tiny_http's thread-per-request model.
 axum = { version = "0.8", features = ["ws"] }
-tower = "0.5"
 futures = "0.3"
 async-stream = "0.3"
-tokio-stream = "0.1"
 # `preserve_order` (insertion-order maps) is deliberate and load-bearing for
 # prompt bytes: Python/transformers renders tool JSON in dict insertion order,
 # so our tool-bearing prompts only byte-match the reference stack's rendering
@@ -187,3 +191,18 @@ lto = "thin"
 # This is why the real-weights GPU suites could only be run `--release`.
 [profile.dev.package."*"]
 opt-level = 2
+# Line tables, not full DWARF, for the DEPENDENCIES. Measured 2026-09-23:
+# `cargo build --workspace --all-targets` produced 147 GiB of artifacts —
+# ~2.0-2.2 GiB per test binary across ~70 of them — and filled this box's
+# 1.1 TB NVMe root to 98 %. Almost all of it is `-C debuginfo=2` on the burn /
+# wgpu / tauri graph, statically linked into every one of those binaries; our
+# own five crates are a rounding error beside it. Line tables keep what a test
+# failure is actually read from — file and line in a panic message and a
+# backtrace — and drop the variable and type DWARF that only an interactive
+# debugger steps through, which is not how this workspace is debugged. Our own
+# crates keep full `debug` (the dev profile default) because they ARE stepped
+# through. `split-debuginfo` was the other candidate and was rejected: it moves
+# the bytes out of the binary but not off the disk, and the disk is the
+# constraint. The release profile is untouched, so every number in
+# bench/BASELINE.md is unaffected by construction.
+debug = "line-tables-only"
