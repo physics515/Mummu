@@ -28,8 +28,17 @@
 //! recording off entirely.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::Duration;
+
+use mummu_num::{f64_from_u64, f64_from_usize, trunc_usize};
+
+/// `v as f64` for the ledger's 128-bit totals, saturating at `u64::MAX`
+/// (2^64 bytes or nanoseconds — 18 EB, 584 years — is beyond any ledger).
+fn f64_from_u128(v: u128) -> f64 {
+    f64_from_u64(u64::try_from(v).unwrap_or(u64::MAX))
+}
 
 /// Recording on? `MUMMU_INSITU`, default on (`0`/`off`/`false` disables).
 #[must_use]
@@ -57,6 +66,27 @@ struct ShapeStats {
     cursor: usize,
 }
 
+impl ShapeStats {
+    /// Fold one call of `bytes` streamed in `ns` nanoseconds into the totals,
+    /// the best-call proxy and the bounded ring.
+    fn observe(&mut self, bytes: usize, ns: u64) {
+        self.calls += 1;
+        self.bytes += bytes as u128;
+        self.total_ns += u128::from(ns);
+        self.best_ns = if self.best_ns == 0 {
+            ns
+        } else {
+            self.best_ns.min(ns)
+        };
+        if self.recent_ns.len() < RING {
+            self.recent_ns.push(ns);
+        } else {
+            self.recent_ns[self.cursor] = ns;
+            self.cursor = (self.cursor + 1) % RING;
+        }
+    }
+}
+
 /// Per-shape call statistics, keyed by `(k, n, m)`.
 type ShapeLedger = HashMap<(usize, usize, usize), ShapeStats>;
 
@@ -72,22 +102,12 @@ pub fn record(k: usize, n: usize, m: usize, bytes: usize, dur: Duration) {
         return;
     }
     let ns = u64::try_from(dur.as_nanos()).unwrap_or(u64::MAX);
-    let mut map = ledger().lock().unwrap_or_else(PoisonError::into_inner);
-    let e = map.entry((k, n, m)).or_default();
-    e.calls += 1;
-    e.bytes += bytes as u128;
-    e.total_ns += u128::from(ns);
-    e.best_ns = if e.best_ns == 0 {
-        ns
-    } else {
-        e.best_ns.min(ns)
-    };
-    if e.recent_ns.len() < RING {
-        e.recent_ns.push(ns);
-    } else {
-        e.recent_ns[e.cursor] = ns;
-        e.cursor = (e.cursor + 1) % RING;
-    }
+    ledger()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry((k, n, m))
+        .or_default()
+        .observe(bytes, ns);
 }
 
 /// Forget everything (per-request reporting resets between requests).
@@ -120,34 +140,36 @@ pub struct ShapeReport {
 /// the token come first).
 #[must_use]
 pub fn shape_reports() -> Vec<ShapeReport> {
-    let map = ledger().lock().unwrap_or_else(PoisonError::into_inner);
-    let mut rows: Vec<ShapeReport> = map
-        .iter()
-        .map(|(&(k, n, m), s)| {
-            let bytes_per_call = if s.calls > 0 {
-                s.bytes as f64 / s.calls as f64
-            } else {
-                0.0
-            };
-            let mut recent = s.recent_ns.clone();
-            recent.sort_unstable();
-            let p50_ns = recent.get(recent.len() / 2).copied().unwrap_or(0);
-            let gbps = |ns: f64, bytes: f64| {
-                if ns > 0.0 { bytes / ns } else { 0.0 } // bytes/ns == GB/s
-            };
-            ShapeReport {
-                k,
-                n,
-                m,
-                calls: s.calls,
-                gib_moved: s.bytes as f64 / f64::from(1u32 << 30),
-                mean_gbps: gbps(s.total_ns as f64 / s.calls.max(1) as f64, bytes_per_call),
-                p50_gbps: gbps(p50_ns as f64, bytes_per_call),
-                best_gbps: gbps(s.best_ns as f64, bytes_per_call),
-                mean_ms: s.total_ns as f64 / s.calls.max(1) as f64 / 1e6,
-            }
-        })
-        .collect();
+    let mut rows: Vec<ShapeReport> = {
+        let map = ledger().lock().unwrap_or_else(PoisonError::into_inner);
+        map.iter()
+            .map(|(&(k, n, m), s)| {
+                let bytes_per_call = if s.calls > 0 {
+                    f64_from_u128(s.bytes) / f64_from_u64(s.calls)
+                } else {
+                    0.0
+                };
+                let mut recent = s.recent_ns.clone();
+                recent.sort_unstable();
+                let p50_ns = recent.get(recent.len() / 2).copied().unwrap_or(0);
+                let gbps = |ns: f64, bytes: f64| {
+                    if ns > 0.0 { bytes / ns } else { 0.0 } // bytes/ns == GB/s
+                };
+                let mean_ns = f64_from_u128(s.total_ns) / f64_from_u64(s.calls.max(1));
+                ShapeReport {
+                    k,
+                    n,
+                    m,
+                    calls: s.calls,
+                    gib_moved: f64_from_u128(s.bytes) / f64::from(1u32 << 30),
+                    mean_gbps: gbps(mean_ns, bytes_per_call),
+                    p50_gbps: gbps(f64_from_u64(p50_ns), bytes_per_call),
+                    best_gbps: gbps(f64_from_u64(s.best_ns), bytes_per_call),
+                    mean_ms: mean_ns / 1e6,
+                }
+            })
+            .collect()
+    };
     rows.sort_by(|a, b| {
         (b.gib_moved)
             .partial_cmp(&a.gib_moved)
@@ -171,18 +193,23 @@ pub fn report() -> String {
     );
     let (mut bytes, mut ns) = (0f64, 0f64);
     for r in &rows {
-        out.push_str(&format!(
-            "[insitu] {:>6} x {:<6} {:>4} {:>7} {:>7.2} {:>10.1} {:>10.1} {:>10.1} {:>9.2}\n",
+        // Writing to a String cannot fail.
+        let _ = writeln!(
+            out,
+            "[insitu] {:>6} x {:<6} {:>4} {:>7} {:>7.2} {:>10.1} {:>10.1} {:>10.1} {:>9.2}",
             r.k, r.n, r.m, r.calls, r.gib_moved, r.mean_gbps, r.p50_gbps, r.best_gbps, r.mean_ms
-        ));
-        bytes += r.gib_moved * f64::from(1u32 << 30);
-        ns += r.mean_ms * 1e6 * r.calls as f64;
+        );
+        let row_bytes = r.gib_moved * f64::from(1u32 << 30);
+        bytes += row_bytes;
+        let row_ns = r.mean_ms * 1e6 * f64_from_u64(r.calls);
+        ns += row_ns;
     }
-    out.push_str(&format!(
-        "[insitu] aggregate: {:.2} GiB at {:.1} GB/s effective\n",
+    let _ = writeln!(
+        out,
+        "[insitu] aggregate: {:.2} GiB at {:.1} GB/s effective",
         bytes / f64::from(1u32 << 30),
         if ns > 0.0 { bytes / ns } else { 0.0 }
-    ));
+    );
     out
 }
 
@@ -199,15 +226,17 @@ pub struct CellStats {
     pub q95_ms: f64,
 }
 
-/// Median and 5/95 quantiles of one cell (nearest-rank). Panics on empty
-/// input — a cell with no measurements is a harness bug.
+/// Median and 5/95 quantiles of one cell (nearest-rank).
+///
+/// # Panics
+/// On empty input — a cell with no measurements is a harness bug.
 #[must_use]
 pub fn cell_stats(samples_ms: &[f64]) -> CellStats {
     assert!(!samples_ms.is_empty(), "cell_stats: empty cell");
     let mut v: Vec<f64> = samples_ms.to_vec();
     v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let at = |q: f64| {
-        let idx = ((v.len() as f64 - 1.0) * q).round() as usize;
+        let idx = trunc_usize(((f64_from_usize(v.len()) - 1.0) * q).round());
         v[idx.min(v.len() - 1)]
     };
     CellStats {
@@ -219,7 +248,9 @@ pub fn cell_stats(samples_ms: &[f64]) -> CellStats {
 }
 
 /// A main-effect contrast: median(a) − median(b), with a crude significance
-/// note — the difference is "clear" when the two cells' 5–95% bands do not
+/// note.
+///
+/// The difference is "clear" when the two cells' 5–95% bands do not
 /// overlap. That is deliberately conservative: a 30-rep cell on a live
 /// machine has heavy tails, and the spec's decision rule acts on the
 /// LARGEST contrast, where overlap ambiguity matters least.
@@ -261,8 +292,8 @@ mod tests {
         assert_eq!(r.calls, 2);
         assert!((r.gib_moved - 2.0).abs() < 1e-9);
         // Mean: 2 GiB over 150 ms = 14.3 GB/s; best: 1 GiB / 50 ms = 21.5.
-        assert!((r.mean_gbps - (2.0 * (1u64 << 30) as f64 / 150e6)).abs() < 0.1);
-        assert!((r.best_gbps - ((1u64 << 30) as f64 / 50e6)).abs() < 0.1);
+        assert!((r.mean_gbps - (2.0 * f64::from(1u32 << 30) / 150e6)).abs() < 0.1);
+        assert!((r.best_gbps - (f64::from(1u32 << 30) / 50e6)).abs() < 0.1);
         assert!(report().contains("5120"));
         reset();
         assert!(report().contains("no packed host GEMV"));

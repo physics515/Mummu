@@ -1,5 +1,5 @@
-//! Sparse mixture-of-experts SwiGLU feed-forward (OLMoE-style): a softmax
-//! top-k router over a bank of SwiGLU experts stored as **fused 3-D tensors**
+//! Sparse mixture-of-experts `SwiGLU` feed-forward (OLMoE-style): a softmax
+//! top-k router over a bank of `SwiGLU` experts stored as **fused 3-D tensors**
 //! — exactly the GGUF `ffn_{gate,up,down}_exps` layout, so a checkpoint's
 //! expert bank loads as one tensor per projection instead of `num_experts`
 //! separate matrices.
@@ -14,13 +14,14 @@
 use burn::module::{Module, Param};
 use burn::nn::{Linear, LinearConfig};
 use burn::tensor::{DType, Device, Distribution, Int, Tensor, TensorData, activation};
+use mummu_num::{f32_from_usize, f64_from_u64, f64_from_usize, trunc_u64};
 
-/// The expert bank: `num_experts` SwiGLU MLPs as three fused params in
+/// The expert bank: `num_experts` `SwiGLU` MLPs as three fused params in
 /// `[experts, out, in]` layout (the row-major twin of ggml's
 /// `ffn_*_exps.weight`). Forward transposes lazily; no per-expert modules.
 #[derive(Module, Debug)]
 pub struct MoeExperts {
-    /// `[num_experts, intermediate, hidden]` — SiLU branch.
+    /// `[num_experts, intermediate, hidden]` — `SiLU` branch.
     pub gate: Param<Tensor<3>>,
     /// `[num_experts, intermediate, hidden]` — multiplicative branch.
     pub up: Param<Tensor<3>>,
@@ -41,7 +42,7 @@ pub struct SparseMoe {
 #[derive(Debug, Clone)]
 pub struct SparseMoeConfig {
     pub hidden_size: usize,
-    /// Per-expert SwiGLU intermediate width (OLMoE: 1024 — each expert is
+    /// Per-expert `SwiGLU` intermediate width (`OLMoE`: 1024 — each expert is
     /// narrow; capacity comes from the count).
     pub expert_intermediate_size: usize,
     pub num_experts: usize,
@@ -50,6 +51,13 @@ pub struct SparseMoeConfig {
 
 impl SparseMoeConfig {
     /// Initialize the module (random weights; real weights come from import).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `num_experts < 2`, if `num_experts_per_tok` is not in
+    /// `1..=num_experts`, or if `hidden_size` or `expert_intermediate_size`
+    /// is 0.
+    #[must_use]
     pub fn init(&self, device: &Device) -> SparseMoe {
         assert!(
             self.num_experts >= 2,
@@ -73,7 +81,7 @@ impl SparseMoeConfig {
         );
         // Linear-style uniform init, bound by each projection's fan-in.
         let init = |out: usize, inp: usize, dev: &Device| {
-            let bound = 1.0 / (inp as f64).sqrt();
+            let bound = 1.0 / f64_from_usize(inp).sqrt();
             Param::from_tensor(Tensor::random(
                 [e, out, inp],
                 Distribution::Uniform(-bound, bound),
@@ -96,15 +104,21 @@ impl SparseMoe {
     ///
     /// Router math mirrors HF `OlmoeSparseMoeBlock`: softmax over **all**
     /// experts in f32, keep the top-`top_k` probabilities as the mixture
-    /// weights (renormalized to sum 1 iff `norm_topk_prob` — OLMoE ships
+    /// weights (renormalized to sum 1 iff `norm_topk_prob` — `OLMoE` ships
     /// `false`). The f32 island matters on f16 backends (softmax of wide
     /// logits); every cast is a no-op on f32.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `top_k` is not in `1..=num_experts`, or if `x`'s hidden
+    /// width differs from the experts' input width.
+    #[must_use]
     pub fn forward(&self, x: Tensor<3>, top_k: usize, norm_topk_prob: bool) -> Tensor<3> {
         let [b, t, h] = x.dims();
-        let [e, _inter, h_in] = self.experts.gate.dims();
+        let [n_experts, _inter, h_in] = self.experts.gate.dims();
         assert!(
-            (1..=e).contains(&top_k),
-            "MoE forward: top_k ({top_k}) must be in 1..=num_experts ({e})"
+            (1..=n_experts).contains(&top_k),
+            "MoE forward: top_k ({top_k}) must be in 1..=num_experts ({n_experts})"
         );
         assert!(
             h == h_in,
@@ -123,7 +137,10 @@ impl SparseMoe {
         // scatter is an on-device arange-compare — burn's `one_hot` reads the
         // indices back to the host, which would sync every layer.
         let logits = self.gate.forward(xt.clone()); // [bt, e]
-        debug_assert!(logits.dims() == [bt, e], "router width must be num_experts");
+        debug_assert!(
+            logits.dims() == [bt, n_experts],
+            "router width must be num_experts"
+        );
         let probs = activation::softmax(logits.cast(DType::F32), 1);
         let (vals, idx) = probs.topk_with_indices(top_k, 1); // both [bt, k]
         let vals = if norm_topk_prob {
@@ -131,16 +148,18 @@ impl SparseMoe {
         } else {
             vals
         };
-        let classes = Tensor::<1, Int>::arange(0..e as i64, &xt.device()).reshape([1, 1, e as i32]);
+        let class_end = i64::try_from(n_experts).expect("expert count fits i64");
+        let classes =
+            Tensor::<1, Int>::arange(0..class_end, &xt.device()).reshape([1, 1, n_experts]);
         let hit = idx
             .reshape([bt, top_k, 1])
-            .equal(classes.expand([bt, top_k, e])); // [bt, k, e]
+            .equal(classes.expand([bt, top_k, n_experts])); // [bt, k, e]
         let weights = hit
             .float()
             .cast(DType::F32)
             .mul(vals.reshape([bt, top_k, 1]))
             .sum_dim(1) // [bt, 1, e]
-            .reshape([bt, e])
+            .reshape([bt, n_experts])
             .cast(ambient);
 
         // Dense expert compute: one batched matmul per projection across the
@@ -151,19 +170,19 @@ impl SparseMoe {
         let up = xb.matmul(self.experts.up.val().swap_dims(1, 2));
         let acts = activation::silu(gate).mul(up);
         let out = acts.matmul(self.experts.down.val().swap_dims(1, 2)); // [e, bt, h]
-        let w_per_expert = weights.swap_dims(0, 1).reshape([e, bt, 1]);
+        let w_per_expert = weights.swap_dims(0, 1).reshape([n_experts, bt, 1]);
         out.mul(w_per_expert)
             .sum_dim(0) // [1, bt, h]
             .reshape([b, t, h])
     }
 }
 
-/// One expert's SwiGLU weights stored **separately** in Linear layout
+/// One expert's `SwiGLU` weights stored **separately** in Linear layout
 /// (`[in, out]`), so each expert quantizes independently (its own block
 /// scales) and only routed experts are touched at all.
 #[derive(Module, Debug)]
 pub struct ExpertWeights {
-    /// `[hidden, intermediate]` — SiLU branch.
+    /// `[hidden, intermediate]` — `SiLU` branch.
     pub gate: Param<Tensor<2>>,
     /// `[hidden, intermediate]` — multiplicative branch.
     pub up: Param<Tensor<2>>,
@@ -171,9 +190,10 @@ pub struct ExpertWeights {
     pub down: Param<Tensor<2>>,
 }
 
-/// The P9 MoE variant of [`SparseMoe`]: the same router, but experts as
-/// separate (typically quantized) weight triples and **routed** compute —
-/// per token only its top-k experts run, so exactly `n` experts are in
+/// The P9 `MoE` variant of [`SparseMoe`]: the same router, but experts as
+/// separate (typically quantized) weight triples and **routed** compute.
+///
+/// Per token only its top-k experts run, so exactly `n` experts are in
 /// service at a time instead of the dense-mask path's all-of-them. Routing
 /// indices are read back to the host (small: `[tokens, k]` ints); the
 /// dense path's no-readback rationale trades away here for the k/E FLOPs
@@ -190,11 +210,12 @@ impl SparseMoePerExpert {
     /// [`SparseMoe::forward`]; expert compute is gather → three 2-D
     /// matmuls (never reshaping the possibly-packed weights) →
     /// scatter-add of the weighted outputs.
+    #[must_use]
     pub fn forward(&self, x: Tensor<3>, top_k: usize, norm_topk_prob: bool) -> Tensor<3> {
         let [b, t, h] = x.dims();
         let xt = x.reshape([b * t, h]);
         let routing = self.route(xt.clone(), top_k, norm_topk_prob);
-        self.run_local(xt, &routing).reshape([b, t, h])
+        self.run_local(&xt, &routing).reshape([b, t, h])
     }
 
     /// The same layer with the experts executed by an [`ExpertPool`] — each
@@ -216,6 +237,13 @@ impl SparseMoePerExpert {
 
     /// Router: softmax → top-k → (optionally renormalized) weights, read back
     /// to the host as per-expert (token rows, weights) lists.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `top_k` is not in `1..=num_experts`, if the routing
+    /// indices or weights fail to read back from the device, or if the
+    /// router produced an index outside `0..num_experts`.
+    #[must_use]
     pub fn route(&self, xt: Tensor<2>, top_k: usize, norm_topk_prob: bool) -> Routing {
         let [bt, _h] = xt.dims();
         let e = self.experts.len();
@@ -249,7 +277,9 @@ impl SparseMoePerExpert {
             for slot in 0..top_k {
                 let expert = usize::try_from(idx_host[token * top_k + slot])
                     .expect("router indices are in 0..e");
-                routed[expert].0.push(token as i32);
+                routed[expert]
+                    .0
+                    .push(i32::try_from(token).expect("token row fits i32"));
                 routed[expert].1.push(vals_host[token * top_k + slot]);
             }
         }
@@ -262,7 +292,8 @@ impl SparseMoePerExpert {
     /// Expert compute on this module's own (same-backend) experts: gather →
     /// three 2-D matmuls (never reshaping the possibly-packed weights) →
     /// scatter-add of the weighted outputs. `[bt, h]` → `[bt, h]`.
-    pub fn run_local(&self, xt: Tensor<2>, routing: &Routing) -> Tensor<2> {
+    #[must_use]
+    pub fn run_local(&self, xt: &Tensor<2>, routing: &Routing) -> Tensor<2> {
         let [bt, h] = xt.dims();
         let ambient = xt.dtype();
         let device = xt.device();
@@ -319,7 +350,7 @@ pub trait ExpertExec: Send + Sync {
     fn tier(&self) -> crate::tier::Tier;
     /// Bytes it holds on its device.
     fn resident_bytes(&self) -> u64;
-    /// SwiGLU on `rows × hidden` f32 (row-major) → `rows × hidden`.
+    /// `SwiGLU` on `rows × hidden` f32 (row-major) → `rows × hidden`.
     ///
     /// The host-buffer form. Prefer [`Self::run_tensor`], which keeps the
     /// data on-device when the caller is already on this expert's device.
@@ -358,7 +389,7 @@ pub trait ExpertExec: Send + Sync {
         true
     }
 
-    /// SwiGLU on `[rows, hidden]` **as a tensor**: burn 0.22 has one tensor
+    /// `SwiGLU` on `[rows, hidden]` **as a tensor**: burn 0.22 has one tensor
     /// type across devices, so this moves data only when the caller's device
     /// differs from the expert's — and not at all when they match, which is
     /// the difference between a per-layer host round trip and none.
@@ -563,7 +594,11 @@ fn native_qmatmul_ok(device: &Device, dtype: DType) -> bool {
     static CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
     let key = format!("{device:?}/{dtype:?}");
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(&hit) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+    if let Some(&hit) = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+    {
         return hit;
     }
 
@@ -574,10 +609,10 @@ fn native_qmatmul_ok(device: &Device, dtype: DType) -> bool {
             burn::tensor::TensorData::new(vec![0.5f32; k], [1, k]),
             (device, crate::backend::float_dtype(device)),
         );
-        let w = Tensor::<2>::from_data(
+        let weight = Tensor::<2>::from_data(
             burn::tensor::TensorData::new(
                 (0..k * n)
-                    .map(|i| ((i % 17) as f32 - 8.0) * 0.1)
+                    .map(|i| (f32_from_usize(i % 17) - 8.0) * 0.1)
                     .collect::<Vec<f32>>(),
                 [k, n],
             ),
@@ -586,7 +621,7 @@ fn native_qmatmul_ok(device: &Device, dtype: DType) -> bool {
         let DType::QFloat(scheme) = dtype else {
             return false;
         };
-        let qw = w.clone().quantize_dynamic(&scheme);
+        let qw = weight.quantize_dynamic(&scheme);
         let native = x
             .clone()
             .matmul(qw.clone())
@@ -599,11 +634,14 @@ fn native_qmatmul_ok(device: &Device, dtype: DType) -> bool {
             .convert::<f32>()
             .try_to_vec::<f32>();
         match (native, deq) {
-            (Ok(a), Ok(b)) => {
+            (Ok(native_out), Ok(deq_out)) => {
                 // Agreement, not just absence of a panic: a native path that
                 // silently computes something else is worse than one that fails.
-                let scale = b.iter().map(|v| v.abs()).fold(1e-3, f32::max);
-                a.iter().zip(&b).all(|(x, y)| (x - y).abs() <= 0.05 * scale)
+                let scale = deq_out.iter().map(|val| val.abs()).fold(1e-3, f32::max);
+                native_out
+                    .iter()
+                    .zip(&deq_out)
+                    .all(|(nv, dv)| (nv - dv).abs() <= 0.05 * scale)
             }
             _ => false,
         }
@@ -618,7 +656,7 @@ fn native_qmatmul_ok(device: &Device, dtype: DType) -> bool {
     }
     cache
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(key, ok);
     ok
 }
@@ -649,7 +687,7 @@ pub struct StagedExpert {
 impl StagedExpert {
     /// Hold `weights` in host RAM, unstaged.
     #[must_use]
-    pub fn new(
+    pub const fn new(
         weights: ExpertWeights,
         host_device: Device,
         tier: crate::tier::Tier,
@@ -669,7 +707,10 @@ impl StagedExpert {
     /// prefetch costs a comparison rather than a transfer.
     fn stage_on(&self, device: &Device) {
         {
-            let held = self.resident.read().unwrap_or_else(|e| e.into_inner());
+            let held = self
+                .resident
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if held.as_ref().is_some_and(|(d, _)| d == device) {
                 return;
             }
@@ -679,19 +720,25 @@ impl StagedExpert {
             up: burn::module::Param::from_tensor(self.host.up.val().to_device(device)),
             down: burn::module::Param::from_tensor(self.host.down.val().to_device(device)),
         };
-        *self.resident.write().unwrap_or_else(|e| e.into_inner()) = Some((device.clone(), staged));
+        *self
+            .resident
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((device.clone(), staged));
     }
 
     /// Drop the device copy (the scheduler's eviction), freeing its memory.
     /// The host copy is untouched, so the expert stays runnable.
     fn evict_copy(&self) {
-        *self.resident.write().unwrap_or_else(|e| e.into_inner()) = None;
+        *self
+            .resident
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     fn staged(&self) -> bool {
         self.resident
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_some()
     }
 }
@@ -723,7 +770,7 @@ impl ExpertExec for StagedExpert {
         let device = self
             .resident
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .map_or_else(|| self.host_device.clone(), |(d, _)| d.clone());
         let xt = Tensor::<2>::from_data(
@@ -739,13 +786,22 @@ impl ExpertExec for StagedExpert {
 
     fn run_tensor(&self, x: Tensor<2>) -> Tensor<2> {
         let caller = x.device();
-        let held = self.resident.read().unwrap_or_else(|e| e.into_inner());
-        let (device, w) = match held.as_ref() {
-            // Staged: compute on the device the scheduler put it on.
-            Some((d, w)) => (d.clone(), w),
-            // Not staged — the overflow path. Compute on the host rather
-            // than stall waiting for a transfer that was never issued.
-            None => (self.host_device.clone(), &self.host),
+        // Resolve where to compute and with which weights, then release the
+        // lock before the matmuls: the clones are handle clones, so a staged
+        // copy stays alive for this compute even if an eviction lands
+        // meanwhile.
+        let (device, w) = {
+            let held = self
+                .resident
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match held.as_ref() {
+                // Staged: compute on the device the scheduler put it on.
+                Some((d, w)) => (d.clone(), w.clone()),
+                // Not staged — the overflow path. Compute on the host rather
+                // than stall waiting for a transfer that was never issued.
+                None => (self.host_device.clone(), self.host.clone()),
+            }
         };
         let xt = crate::backend::move_to(x, &device);
         let acts = activation::silu(xt.clone().matmul(compute_weight(&w.gate)))
@@ -803,7 +859,7 @@ impl ExpertPool {
             .iter()
             .flat_map(|l| {
                 l.iter()
-                    .map(|e| e.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e3)
+                    .map(|e| f64_from_u64(e.swap(0, std::sync::atomic::Ordering::Relaxed)) / 1e3)
             })
             .collect()
     }
@@ -836,7 +892,7 @@ impl ExpertPool {
     pub fn get(&self, layer: usize, expert: usize) -> std::sync::Arc<dyn ExpertExec> {
         self.slots[layer][expert]
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
 
@@ -894,7 +950,7 @@ impl ExpertPool {
         Some(
             self.slots[l][i]
                 .read()
-                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone(),
         )
     }
@@ -920,7 +976,7 @@ impl ExpertPool {
     ) -> std::sync::Arc<dyn ExpertExec> {
         let mut slot = self.slots[layer][expert]
             .write()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::mem::replace(&mut *slot, next)
     }
 
@@ -983,7 +1039,7 @@ pub fn trace_layer() -> Option<usize> {
 /// place). The worker needs microseconds of CPU to submit, then blocks on
 /// the fence; above-normal priority preempts one pool thread for exactly
 /// that sliver.
-fn boost_worker_priority() {
+const fn boost_worker_priority() {
     #[cfg(windows)]
     {
         #[link(name = "kernel32.dll", kind = "raw-dylib", modifiers = "+verbatim")]
@@ -1012,18 +1068,15 @@ fn run_readback_with_fallback(exec: &std::sync::Arc<dyn ExpertExec>, xt: &Tensor
     let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         exec.run_tensor_resident(xt.clone()).into_data()
     }));
-    match attempt {
-        Ok(data) => data,
-        Err(_) => {
-            eprintln!(
-                "[mummu] native quantized matmul panicked for one expert group \
-                 (cubecl kernel gap; width-dependent) — group switched to \
-                 dequantize-first and retried"
-            );
-            exec.disable_native();
-            exec.run_tensor_resident(xt.clone()).into_data()
-        }
-    }
+    attempt.unwrap_or_else(|_payload| {
+        eprintln!(
+            "[mummu] native quantized matmul panicked for one expert group \
+             (cubecl kernel gap; width-dependent) — group switched to \
+             dequantize-first and retried"
+        );
+        exec.disable_native();
+        exec.run_tensor_resident(xt.clone()).into_data()
+    })
 }
 
 /// Run one dense executor with the adaptive native fallback: a panic from
@@ -1038,18 +1091,15 @@ fn run_readback_with_fallback(exec: &std::sync::Arc<dyn ExpertExec>, xt: &Tensor
 fn run_with_native_fallback(exec: &std::sync::Arc<dyn ExpertExec>, xt: &Tensor<2>) -> Tensor<2> {
     let attempt =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| exec.run_tensor(xt.clone())));
-    match attempt {
-        Ok(y) => y,
-        Err(_) => {
-            eprintln!(
-                "[mummu] native quantized matmul panicked for one expert group \
-                 (cubecl kernel gap; width-dependent) — group switched to \
-                 dequantize-first and retried"
-            );
-            exec.disable_native();
-            exec.run_tensor(xt.clone())
-        }
-    }
+    attempt.unwrap_or_else(|_payload| {
+        eprintln!(
+            "[mummu] native quantized matmul panicked for one expert group \
+             (cubecl kernel gap; width-dependent) — group switched to \
+             dequantize-first and retried"
+        );
+        exec.disable_native();
+        exec.run_tensor(xt.clone())
+    })
 }
 
 /// One layer's remote FFN, in flight: each device's worker thread is
@@ -1069,13 +1119,13 @@ fn run_with_native_fallback(exec: &std::sync::Arc<dyn ExpertExec>, xt: &Tensor<2
 /// the code moved (worker build, join, a main-thread touch), because
 /// wgpu's `into_data` returns deferred-mapped bytes: it comes back in
 /// low ms while the FIRST CPU TOUCH of the bytes blocks on the GPU fence
-/// (`examples/mapped-wait-probe.rs` reproduces it standalone: into_data
+/// (`examples/mapped-wait-probe.rs` reproduces it standalone: `into_data`
 /// 1-4 ms, first touch 27.0-27.5 ms behind a queued GPU chain). The cost
 /// was never queues, scheduling, or allocation — it is the remote FFN's
 /// real GPU time surfacing at first byte access. So the third design
 /// makes the WORKER touch the bytes (`to_vec` in the accumulate): the
 /// fence wait lands here, concurrent with whatever the caller still has
-/// to do. The layer timeline (MUMMU_TRACE_LAYER) then showed how little
+/// to do. The layer timeline (`MUMMU_TRACE_LAYER`) then showed how little
 /// that is: remote-heavy layers keep ~1 local cluster, so the caller
 /// reaches the join ~1 ms after the enqueue and ~26 ms of GPU time is
 /// exposed with nothing to overlap against. Measured per cluster at m=1:
@@ -1137,7 +1187,13 @@ impl ExpertPool {
     /// threads outlive this call. Everything moved in is `Arc`s and owned
     /// tensors. ~2 spawns per layer is microseconds against multi-ms drains;
     /// a persistent pool is the upgrade if a profile ever says otherwise.
-    pub fn run_dense_pending(&self, layer: usize, xt: Tensor<2>) -> Option<PendingRemote> {
+    ///
+    /// # Panics
+    ///
+    /// The workers (re-raised on the caller by [`PendingRemote::resolve`])
+    /// panic if an executor's partial does not read back as f32, or if an
+    /// executor's native matmul fails again after the one-shot downgrade.
+    pub fn run_dense_pending(&self, layer: usize, xt: &Tensor<2>) -> Option<PendingRemote> {
         let n = self.row_len(layer);
         if n == 0 {
             return None;
@@ -1224,12 +1280,19 @@ impl ExpertPool {
 impl ExpertPool {
     /// Dense-model FFN path (P9 stage 3c): run **every** executor of
     /// `layer` on every row and sum — the remote clusters' share of a
-    /// partitioned SwiGLU (the local slab runs on the model's own device).
+    /// partitioned `SwiGLU` (the local slab runs on the model's own device).
     /// `None` when the layer has no remote clusters. With `skip`
     /// (`Some((tau, local_energy))`), a cluster is skipped for a row when its
     /// gate energy is below `tau` × the row's total energy (local + all
     /// remote) — the opt-in lossy mode; hit counters accumulate energy so
     /// the re-tier planner sees hot clusters.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the input fails to read back as f32 (skip mode), if an
+    /// executor's native matmul fails again after the one-shot downgrade,
+    /// or if a per-device worker thread panicked (re-raised here so a
+    /// missing partial never becomes a silently wrong sum).
     pub fn run_dense(
         &self,
         layer: usize,
@@ -1250,98 +1313,7 @@ impl ExpertPool {
         // the host. This is the path a dense model takes, and it removes the
         // per-layer round trip that dominated the 27B's decode.
         if skip.is_none() {
-            // Run the devices CONCURRENTLY, one thread per device, and sum
-            // what comes back. Sequentially the layer costs the SUM of every
-            // device's share, so adding a second GPU bought nothing: 885
-            // clusters moved from the CPU to the integrated GPU and decode
-            // measured 4.72 s/tok against 4.32 before, because an iGPU
-            // cluster (14.15 ms) is no faster than the CPU cluster it
-            // replaced (13.82 ms) and the move added a transfer. Run in
-            // parallel the layer costs the MAX instead, which is the entire
-            // reason to spread work across devices at all.
-            //
-            // One thread per DEVICE, never per executor. Thread-per-executor
-            // is what made cubecl-cuda open a stream per thread until a
-            // 64-layer forward exhausted VRAM (`CUDA_ERROR_OUT_OF_MEMORY`,
-            // "Can create a new stream"). Devices are bounded — three on this
-            // box — so the stream count is bounded with them.
-            let mut by_device: Vec<(String, Vec<usize>)> = Vec::new();
-            for (e, exec) in execs.iter().enumerate() {
-                let key = format!("{:?}", exec.tier().device);
-                match by_device.iter_mut().find(|(k, _)| *k == key) {
-                    Some((_, list)) => list.push(e),
-                    None => by_device.push((key, vec![e])),
-                }
-            }
-            for (e, _) in execs.iter().enumerate() {
-                self.hits[layer][e].fetch_add(bt as u64, std::sync::atomic::Ordering::Relaxed);
-            }
-            self.dense_rows[0].fetch_add(bt as u64, std::sync::atomic::Ordering::Relaxed);
-            self.dense_rows[1].fetch_add(bt as u64, std::sync::atomic::Ordering::Relaxed);
-
-            // One device: no threads, no join, exactly the old path.
-            if by_device.len() < 2 {
-                let mut out: Option<Tensor<2>> = None;
-                for exec in &execs {
-                    let y = run_with_native_fallback(exec, &xt);
-                    out = Some(match out {
-                        Some(acc) => acc.add(y),
-                        None => y,
-                    });
-                }
-                return out;
-            }
-
-            let partials: Vec<Tensor<2>> = std::thread::scope(|scope| {
-                let handles: Vec<_> = by_device
-                    .iter()
-                    .map(|(key, members)| {
-                        let execs = &execs;
-                        let xt = xt.clone();
-                        scope.spawn(move || {
-                            // A worker thread's stack starts empty, so this
-                            // is a new flame-graph ROOT beside the forward's
-                            // — read the widths as parallel wall time.
-                            let _w = crate::prof::scope("ffn_worker");
-                            let _d = crate::prof::scope(key.clone());
-                            let mut acc: Option<Tensor<2>> = None;
-                            for &e in members {
-                                let y = execs[e].run_tensor(xt.clone());
-                                acc = Some(match acc {
-                                    Some(a) => a.add(y),
-                                    None => y,
-                                });
-                            }
-                            acc
-                        })
-                    })
-                    .collect();
-                handles
-                    .into_iter()
-                    .filter_map(|h| match h.join() {
-                        Ok(partial) => partial,
-                        // A worker panic must never become a silently missing
-                        // partial: dropping one device's clusters from the
-                        // FFN sum produces a WRONG answer that still reads
-                        // fluently — observed in production when the iGPU's
-                        // workers OOM'd and `.ok()` discarded their share.
-                        // Re-raise on the caller so the generation fails
-                        // loudly instead of lying.
-                        Err(payload) => std::panic::resume_unwind(payload),
-                    })
-                    .collect()
-            });
-
-            // Sum the per-device partials on the caller's device.
-            let mut out: Option<Tensor<2>> = None;
-            for p in partials {
-                let p = crate::backend::move_to(p, &device);
-                out = Some(match out {
-                    Some(acc) => acc.add(p),
-                    None => p,
-                });
-            }
-            return out;
+            return self.run_dense_exact(layer, &execs, &xt);
         }
 
         let host: Vec<f32> = xt
@@ -1351,37 +1323,14 @@ impl ExpertPool {
             .expect("FFN input read back");
         // Which rows each executor runs: all, or the rows where it matters.
         let rows_per_exec: Vec<Vec<i32>> = match skip {
-            None => vec![(0..bt as i32).collect(); n],
-            Some((tau, local_energy)) => {
-                // Sequential, not one thread per executor: a fresh OS thread
-                // makes cubecl-cuda open a new CUDA stream, and a 64-layer
-                // forward would exhaust VRAM creating them (CUDA_ERROR_OUT_OF_MEMORY
-                // "Can create a new stream"). The calling thread already owns a
-                // stream; reuse it.
-                let energies: Vec<Vec<f32>> = execs
-                    .iter()
-                    .map(|exec| exec.gate_energy(&host, bt, h))
-                    .collect();
-                let mut total: Vec<f32> = local_energy.to_vec();
-                total.resize(bt, 0.0);
-                for e in &energies {
-                    for (t, &v) in total.iter_mut().zip(e) {
-                        *t += v;
-                    }
-                }
-                energies
-                    .iter()
-                    .map(|e| {
-                        (0..bt)
-                            .filter(|&r| e[r] >= tau * total[r])
-                            .map(|r| r as i32)
-                            .collect()
-                    })
-                    .collect()
+            None => {
+                let end = i32::try_from(bt).expect("token rows fit i32");
+                vec![(0..end).collect(); n]
             }
+            Some((tau, local_energy)) => Self::skip_rows(&execs, &host, bt, h, tau, local_energy),
         };
-        // Sequential per executor (see the energy path above): threads here
-        // would each open a CUDA stream and OOM the device over 64 layers.
+        // Sequential per executor (see `skip_rows`): threads here would each
+        // open a CUDA stream and OOM the device over 64 layers.
         let outputs: Vec<Vec<f32>> = execs
             .iter()
             .zip(&rows_per_exec)
@@ -1391,7 +1340,7 @@ impl ExpertPool {
                 }
                 let mut x = Vec::with_capacity(rows.len() * h);
                 for &r in rows {
-                    let r = r as usize;
+                    let r = usize::try_from(r).expect("token row is non-negative");
                     x.extend_from_slice(&host[r * h..(r + 1) * h]);
                 }
                 exec.run(&x, rows.len(), h)
@@ -1401,19 +1350,23 @@ impl ExpertPool {
         for ((e, rows), y) in rows_per_exec.iter().enumerate().zip(&outputs) {
             let mut energy = 0f32;
             for (i, &r) in rows.iter().enumerate() {
-                let dst = &mut out[r as usize * h..(r as usize + 1) * h];
+                let r = usize::try_from(r).expect("token row is non-negative");
+                let dst = &mut out[r * h..(r + 1) * h];
                 for (d, &v) in dst.iter_mut().zip(&y[i * h..(i + 1) * h]) {
                     *d += v;
-                    energy += v * v;
+                    // Two roundings on purpose (no fused multiply-add): the
+                    // energy is the same sum the calibration path reads.
+                    let sq = v * v;
+                    energy += sq;
                 }
             }
             // Energy-weighted "hits": what the planner treats as hotness.
+            let milli_energy = trunc_u64(energy * 1e3);
             self.hits[layer][e].fetch_add(
-                (energy * 1e3) as u64 + rows.len() as u64,
+                milli_energy + rows.len() as u64,
                 std::sync::atomic::Ordering::Relaxed,
             );
-            self.energy[layer][e]
-                .fetch_add((energy * 1e3) as u64, std::sync::atomic::Ordering::Relaxed);
+            self.energy[layer][e].fetch_add(milli_energy, std::sync::atomic::Ordering::Relaxed);
             self.dense_rows[0].fetch_add(rows.len() as u64, std::sync::atomic::Ordering::Relaxed);
             self.dense_rows[1].fetch_add(bt as u64, std::sync::atomic::Ordering::Relaxed);
         }
@@ -1421,6 +1374,152 @@ impl ExpertPool {
             burn::tensor::TensorData::new(out, [bt, h]),
             (&device, crate::backend::float_dtype(&device)),
         ))
+    }
+
+    /// The exact (no-skip) path of [`Self::run_dense`]: every executor of
+    /// `layer` runs on every row and the per-device partials are summed on
+    /// the caller's device.
+    fn run_dense_exact(
+        &self,
+        layer: usize,
+        execs: &[std::sync::Arc<dyn ExpertExec>],
+        xt: &Tensor<2>,
+    ) -> Option<Tensor<2>> {
+        let [bt, _h] = xt.dims();
+        let device = xt.device();
+        // Run the devices CONCURRENTLY, one thread per device, and sum
+        // what comes back. Sequentially the layer costs the SUM of every
+        // device's share, so adding a second GPU bought nothing: 885
+        // clusters moved from the CPU to the integrated GPU and decode
+        // measured 4.72 s/tok against 4.32 before, because an iGPU
+        // cluster (14.15 ms) is no faster than the CPU cluster it
+        // replaced (13.82 ms) and the move added a transfer. Run in
+        // parallel the layer costs the MAX instead, which is the entire
+        // reason to spread work across devices at all.
+        //
+        // One thread per DEVICE, never per executor. Thread-per-executor
+        // is what made cubecl-cuda open a stream per thread until a
+        // 64-layer forward exhausted VRAM (`CUDA_ERROR_OUT_OF_MEMORY`,
+        // "Can create a new stream"). Devices are bounded — three on this
+        // box — so the stream count is bounded with them.
+        let mut by_device: Vec<(String, Vec<usize>)> = Vec::new();
+        for (e, exec) in execs.iter().enumerate() {
+            let key = format!("{:?}", exec.tier().device);
+            match by_device.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, list)) => list.push(e),
+                None => by_device.push((key, vec![e])),
+            }
+        }
+        for (e, _) in execs.iter().enumerate() {
+            self.hits[layer][e].fetch_add(bt as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.dense_rows[0].fetch_add(bt as u64, std::sync::atomic::Ordering::Relaxed);
+        self.dense_rows[1].fetch_add(bt as u64, std::sync::atomic::Ordering::Relaxed);
+
+        // One device: no threads, no join, exactly the old path.
+        if by_device.len() < 2 {
+            let mut out: Option<Tensor<2>> = None;
+            for exec in execs {
+                let y = run_with_native_fallback(exec, xt);
+                out = Some(match out {
+                    Some(acc) => acc.add(y),
+                    None => y,
+                });
+            }
+            return out;
+        }
+
+        let partials: Vec<Tensor<2>> = std::thread::scope(|scope| {
+            // Spawn every device's worker BEFORE joining any: the collect is
+            // what keeps the devices running concurrently.
+            let handles: Vec<_> = by_device
+                .iter()
+                .map(|(key, members)| {
+                    let xt = xt.clone();
+                    scope.spawn(move || {
+                        // A worker thread's stack starts empty, so this
+                        // is a new flame-graph ROOT beside the forward's
+                        // — read the widths as parallel wall time.
+                        let _w = crate::prof::scope("ffn_worker");
+                        let _d = crate::prof::scope(key.clone());
+                        let mut acc: Option<Tensor<2>> = None;
+                        for &e in members {
+                            let y = execs[e].run_tensor(xt.clone());
+                            acc = Some(match acc {
+                                Some(a) => a.add(y),
+                                None => y,
+                            });
+                        }
+                        acc
+                    })
+                })
+                .collect();
+            let mut partials = Vec::with_capacity(handles.len());
+            for handle in handles {
+                match handle.join() {
+                    Ok(Some(partial)) => partials.push(partial),
+                    Ok(None) => {}
+                    // A worker panic must never become a silently missing
+                    // partial: dropping one device's clusters from the
+                    // FFN sum produces a WRONG answer that still reads
+                    // fluently — observed in production when the iGPU's
+                    // workers OOM'd and `.ok()` discarded their share.
+                    // Re-raise on the caller so the generation fails
+                    // loudly instead of lying.
+                    Err(payload) => std::panic::resume_unwind(payload),
+                }
+            }
+            partials
+        });
+
+        // Sum the per-device partials on the caller's device.
+        let mut out: Option<Tensor<2>> = None;
+        for p in partials {
+            let p = crate::backend::move_to(p, &device);
+            out = Some(match out {
+                Some(acc) => acc.add(p),
+                None => p,
+            });
+        }
+        out
+    }
+
+    /// Skip mode's row selection for [`Self::run_dense`]: per executor, the
+    /// rows whose gate energy is at least `tau` × the row's total energy
+    /// (local + every remote).
+    ///
+    /// Sequential, not one thread per executor: a fresh OS thread makes
+    /// cubecl-cuda open a new CUDA stream, and a 64-layer forward would
+    /// exhaust VRAM creating them (`CUDA_ERROR_OUT_OF_MEMORY` "Can create a
+    /// new stream"). The calling thread already owns a stream; reuse it.
+    fn skip_rows(
+        execs: &[std::sync::Arc<dyn ExpertExec>],
+        host: &[f32],
+        bt: usize,
+        h: usize,
+        tau: f32,
+        local_energy: &[f32],
+    ) -> Vec<Vec<i32>> {
+        let energies: Vec<Vec<f32>> = execs
+            .iter()
+            .map(|exec| exec.gate_energy(host, bt, h))
+            .collect();
+        let mut total: Vec<f32> = local_energy.to_vec();
+        total.resize(bt, 0.0);
+        for energy in &energies {
+            for (tot, &val) in total.iter_mut().zip(energy) {
+                *tot += val;
+            }
+        }
+        energies
+            .iter()
+            .map(|energy| {
+                (0..bt)
+                    .filter(|&r| energy[r] >= tau * total[r])
+                    .map(|r| i32::try_from(r).expect("token row fits i32"))
+                    .collect()
+            })
+            .collect()
     }
 
     /// Routing hits since the last call (token-rows served per expert),
@@ -1438,7 +1537,13 @@ impl ExpertPool {
     /// Run one layer's routed experts: gather the routed rows on the host,
     /// execute every in-service expert concurrently on its own device,
     /// scatter-add the weighted outputs, upload once. `[bt, h]` → `[bt, h]`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the input fails to read back as f32, or if an expert's
+    /// worker thread panicked.
     pub fn run_layer(&self, layer: usize, xt: Tensor<2>, routing: &Routing) -> Tensor<2> {
+        type Routed<'a> = (usize, &'a (Vec<i32>, Vec<f32>));
         let [bt, h] = xt.dims();
         let device = xt.device();
         let host: Vec<f32> = xt
@@ -1446,7 +1551,6 @@ impl ExpertPool {
             .convert::<f32>()
             .try_to_vec::<f32>()
             .expect("MoE input read back");
-        type Routed<'a> = (usize, &'a (Vec<i32>, Vec<f32>));
         let active: Vec<Routed<'_>> = routing
             .per_expert
             .iter()
@@ -1459,6 +1563,8 @@ impl ExpertPool {
             self.hits[layer][*e].fetch_add(rows.len() as u64, std::sync::atomic::Ordering::Relaxed);
         }
         let outputs: Vec<Vec<f32>> = std::thread::scope(|s| {
+            // Spawn every expert's worker BEFORE joining any: the collect is
+            // what keeps the experts running concurrently.
             let handles: Vec<_> = active
                 .iter()
                 .zip(&execs)
@@ -1467,25 +1573,30 @@ impl ExpertPool {
                     s.spawn(move || {
                         let mut x = Vec::with_capacity(rows.len() * h);
                         for &r in rows {
-                            let r = r as usize;
+                            let r = usize::try_from(r).expect("token row is non-negative");
                             x.extend_from_slice(&host[r * h..(r + 1) * h]);
                         }
                         exec.run(&x, rows.len(), h)
                     })
                 })
                 .collect();
-            handles
-                .into_iter()
-                .map(|hd| hd.join().expect("expert thread"))
-                .collect()
+            let mut outputs = Vec::with_capacity(handles.len());
+            for handle in handles {
+                outputs.push(handle.join().expect("expert thread"));
+            }
+            outputs
         });
         let mut out = vec![0f32; bt * h];
         for ((_, (rows, weights)), y) in active.iter().zip(&outputs) {
             for (i, &r) in rows.iter().enumerate() {
                 let w = weights[i];
-                let dst = &mut out[r as usize * h..(r as usize + 1) * h];
+                let r = usize::try_from(r).expect("token row is non-negative");
+                let dst = &mut out[r * h..(r + 1) * h];
                 for (d, &v) in dst.iter_mut().zip(&y[i * h..(i + 1) * h]) {
-                    *d += w * v;
+                    // Two roundings on purpose (no fused multiply-add): the
+                    // pooled path must match the local scatter-add.
+                    let scaled = w * v;
+                    *d += scaled;
                 }
             }
         }
@@ -1514,12 +1625,12 @@ mod tests {
         let fill = |seed: f32, dims: [usize; 3]| {
             let n = dims[0] * dims[1] * dims[2];
             let data: Vec<f32> = (0..n)
-                .map(|i| ((i as f32) * 0.37 + seed).sin() * 0.5)
+                .map(|i| f32_from_usize(i).mul_add(0.37, seed).sin() * 0.5)
                 .collect();
             Param::from_tensor(Tensor::<3>::from_data(TensorData::new(data, dims), device))
         };
         let router_data: Vec<f32> = (0..HIDDEN * EXPERTS)
-            .map(|i| ((i as f32) * 0.61 + 1.0).cos() * 0.5)
+            .map(|i| f32_from_usize(i).mul_add(0.61, 1.0).cos() * 0.5)
             .collect();
         let mut m = SparseMoeConfig {
             hidden_size: HIDDEN,
@@ -1540,7 +1651,7 @@ mod tests {
     }
 
     /// The per-expert routed path must equal the dense-mask path exactly
-    /// (same math, different data movement) — the P9 MoE gate.
+    /// (same math, different data movement) — the P9 `MoE` gate.
     #[test]
     fn per_expert_routed_matches_dense_mask() {
         let device = crate::backend::cpu_device();
@@ -1597,6 +1708,7 @@ mod tests {
         use crate::tier::{Precision, Tier};
         use crate::workingset::{Budget, LayerDemand, schedule};
         use std::sync::Arc;
+        const UNIT_BYTES: u64 = 1_000;
         let device = crate::backend::cpu_device();
         let dense = moe(&device);
         let split = |e: usize| -> ExpertWeights {
@@ -1617,7 +1729,6 @@ mod tests {
             device: 0,
             precision: Precision::F32,
         };
-        const UNIT_BYTES: u64 = 1_000;
 
         // One layer holding every expert, each staged-capable.
         let row: Vec<Arc<dyn ExpertExec>> = (0..EXPERTS)
@@ -1650,7 +1761,7 @@ mod tests {
         let budget = Budget {
             device_bytes: UNIT_BYTES * (EXPERTS as u64 / 2),
             unit_bytes: UNIT_BYTES,
-            stage_bytes_per_sec: (UNIT_BYTES as f64) * 2.0 / 0.010,
+            stage_bytes_per_sec: f64_from_u64(UNIT_BYTES) * 2.0 / 0.010,
             layer_compute_secs: 0.010,
         };
         let plan = schedule(&demands, &budget);
@@ -1729,7 +1840,7 @@ mod tests {
         let x = Tensor::<2>::from_data(
             TensorData::new(
                 (0..HIDDEN)
-                    .map(|i| (i as f32) * 0.25 - 0.5)
+                    .map(|i| f32_from_usize(i).mul_add(0.25, -0.5))
                     .collect::<Vec<f32>>(),
                 [1, HIDDEN],
             ),
@@ -1906,8 +2017,10 @@ mod tests {
         use crate::quant::{QuantPolicy, quantize_weight};
         use burn::tensor::TensorData;
         let device = crate::backend::cpu_device();
-        let vals: Vec<f32> = (0..32 * 64).map(|i| ((i as f32) * 0.05).sin()).collect();
-        let t = Tensor::<2>::from_data(TensorData::new(vals.clone(), [32, 64]), &device);
+        let vals: Vec<f32> = (0..32 * 64usize)
+            .map(|i| (f32_from_usize(i) * 0.05).sin())
+            .collect();
+        let t = Tensor::<2>::from_data(TensorData::new(vals, [32, 64]), &device);
 
         // Float param: returned as-is (still float, never re-quantized).
         let out_f32 = compute_weight(&Param::from_tensor(t.clone()));
@@ -1940,7 +2053,7 @@ mod tests {
     }
 
     /// On wgpu a quantized weight must come back float from
-    /// `compute_weight`: the native q_matmul panics on shapes the tier
+    /// `compute_weight`: the native `q_matmul` panics on shapes the tier
     /// planner routinely produces (m=1 decode x some group widths), so the
     /// packed tensor must never reach `matmul`. Storage stays quantized;
     /// only the multiply dequantizes. Skips without a wgpu device.
@@ -1953,7 +2066,9 @@ mod tests {
         if !is_wgpu(&device) {
             return;
         }
-        let vals: Vec<f32> = (0..64 * 64).map(|i| ((i as f32) * 0.03).sin()).collect();
+        let vals: Vec<f32> = (0..64 * 64usize)
+            .map(|i| (f32_from_usize(i) * 0.03).sin())
+            .collect();
         let t = Tensor::<2>::from_data(
             burn::tensor::TensorData::new(vals, [64, 64]),
             (&device, crate::backend::float_dtype(&device)),
@@ -1972,7 +2087,7 @@ mod tests {
 
     fn input(t: usize, seed: f32, device: &Dev) -> Tensor<3> {
         let data: Vec<f32> = (0..t * HIDDEN)
-            .map(|i| ((i as f32 + seed) * 0.9).sin())
+            .map(|i| ((f32_from_usize(i) + seed) * 0.9).sin())
             .collect();
         Tensor::<1>::from_data(TensorData::new(data, [t * HIDDEN]), device).reshape([1, t, HIDDEN])
     }
@@ -1982,18 +2097,30 @@ mod tests {
     }
 
     /// Hand-rolled f32 reference of the whole block (per token: router
-    /// softmax, top-k, sparse weighted sum of per-expert SwiGLUs).
-    fn reference(m: &SparseMoe, x: &[f32], t: usize, norm: bool) -> Vec<f32> {
-        let rw = m.gate.weight.val().into_data().try_to_vec::<f32>().unwrap(); // [h, e]
-        let gw = m
+    /// softmax, top-k, sparse weighted sum of per-expert `SwiGLUs`).
+    fn reference(model: &SparseMoe, xs: &[f32], t: usize, norm: bool) -> Vec<f32> {
+        let rw = model
+            .gate
+            .weight
+            .val()
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap(); // [h, e]
+        let gw = model
             .experts
             .gate
             .val()
             .into_data()
             .try_to_vec::<f32>()
             .unwrap(); // [e, inter, h]
-        let uw = m.experts.up.val().into_data().try_to_vec::<f32>().unwrap();
-        let dw = m
+        let uw = model
+            .experts
+            .up
+            .val()
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap();
+        let dw = model
             .experts
             .down
             .val()
@@ -2002,16 +2129,16 @@ mod tests {
             .unwrap(); // [e, h, inter]
         let mut out = vec![0f32; t * HIDDEN];
         for tok in 0..t {
-            let xrow = &x[tok * HIDDEN..][..HIDDEN];
+            let xrow = &xs[tok * HIDDEN..][..HIDDEN];
             // Router logits then softmax over all experts.
             let mut logits = [0f32; EXPERTS];
             for (e, logit) in logits.iter_mut().enumerate() {
                 *logit = (0..HIDDEN).map(|i| xrow[i] * rw[i * EXPERTS + e]).sum();
             }
-            let max = logits.iter().cloned().fold(f32::MIN, f32::max);
+            let max = logits.iter().copied().fold(f32::MIN, f32::max);
             let exps: Vec<f32> = logits.iter().map(|l| (l - max).exp()).collect();
-            let z: f32 = exps.iter().sum();
-            let probs: Vec<f32> = exps.iter().map(|v| v / z).collect();
+            let total: f32 = exps.iter().sum();
+            let probs: Vec<f32> = exps.iter().map(|v| v / total).collect();
             // Top-k expert ids by probability.
             let mut order: Vec<usize> = (0..EXPERTS).collect();
             order.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
@@ -2022,23 +2149,25 @@ mod tests {
                 1.0
             };
             for &e in picked {
-                let w = probs[e] / denom;
+                let weight = probs[e] / denom;
                 // SwiGLU of expert e.
                 let mut act = [0f32; INTER];
-                for (j, a) in act.iter_mut().enumerate() {
-                    let g: f32 = (0..HIDDEN)
+                for (j, slot) in act.iter_mut().enumerate() {
+                    let gate_v: f32 = (0..HIDDEN)
                         .map(|i| xrow[i] * gw[(e * INTER + j) * HIDDEN + i])
                         .sum();
-                    let u: f32 = (0..HIDDEN)
+                    let up_v: f32 = (0..HIDDEN)
                         .map(|i| xrow[i] * uw[(e * INTER + j) * HIDDEN + i])
                         .sum();
-                    *a = silu(g) * u;
+                    *slot = silu(gate_v) * up_v;
                 }
                 for i in 0..HIDDEN {
-                    let d: f32 = (0..INTER)
+                    let down_v: f32 = (0..INTER)
                         .map(|j| act[j] * dw[(e * HIDDEN + i) * INTER + j])
                         .sum();
-                    out[tok * HIDDEN + i] += w * d;
+                    // Two roundings, like the tensor path it checks.
+                    let scaled = weight * down_v;
+                    out[tok * HIDDEN + i] += scaled;
                 }
             }
         }
@@ -2101,17 +2230,29 @@ mod tests {
     }
 
     /// Full-mixture reference (every expert, softmax-weighted) for the k=E edge.
-    fn reference_all_experts(m: &SparseMoe, x: &[f32], t: usize) -> Vec<f32> {
-        let rw = m.gate.weight.val().into_data().try_to_vec::<f32>().unwrap();
-        let gw = m
+    fn reference_all_experts(model: &SparseMoe, xs: &[f32], t: usize) -> Vec<f32> {
+        let rw = model
+            .gate
+            .weight
+            .val()
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap();
+        let gw = model
             .experts
             .gate
             .val()
             .into_data()
             .try_to_vec::<f32>()
             .unwrap();
-        let uw = m.experts.up.val().into_data().try_to_vec::<f32>().unwrap();
-        let dw = m
+        let uw = model
+            .experts
+            .up
+            .val()
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap();
+        let dw = model
             .experts
             .down
             .val()
@@ -2120,31 +2261,33 @@ mod tests {
             .unwrap();
         let mut out = vec![0f32; t * HIDDEN];
         for tok in 0..t {
-            let xrow = &x[tok * HIDDEN..][..HIDDEN];
+            let xrow = &xs[tok * HIDDEN..][..HIDDEN];
             let mut logits = [0f32; EXPERTS];
             for (e, logit) in logits.iter_mut().enumerate() {
                 *logit = (0..HIDDEN).map(|i| xrow[i] * rw[i * EXPERTS + e]).sum();
             }
-            let max = logits.iter().cloned().fold(f32::MIN, f32::max);
+            let max = logits.iter().copied().fold(f32::MIN, f32::max);
             let exps: Vec<f32> = logits.iter().map(|l| (l - max).exp()).collect();
-            let z: f32 = exps.iter().sum();
+            let total: f32 = exps.iter().sum();
             for e in 0..EXPERTS {
-                let w = exps[e] / z;
+                let weight = exps[e] / total;
                 let mut act = [0f32; INTER];
-                for (j, a) in act.iter_mut().enumerate() {
-                    let g: f32 = (0..HIDDEN)
+                for (j, slot) in act.iter_mut().enumerate() {
+                    let gate_v: f32 = (0..HIDDEN)
                         .map(|i| xrow[i] * gw[(e * INTER + j) * HIDDEN + i])
                         .sum();
-                    let u: f32 = (0..HIDDEN)
+                    let up_v: f32 = (0..HIDDEN)
                         .map(|i| xrow[i] * uw[(e * INTER + j) * HIDDEN + i])
                         .sum();
-                    *a = silu(g) * u;
+                    *slot = silu(gate_v) * up_v;
                 }
                 for i in 0..HIDDEN {
-                    let d: f32 = (0..INTER)
+                    let down_v: f32 = (0..INTER)
                         .map(|j| act[j] * dw[(e * HIDDEN + i) * INTER + j])
                         .sum();
-                    out[tok * HIDDEN + i] += w * d;
+                    // Two roundings, like the tensor path it checks.
+                    let scaled = weight * down_v;
+                    out[tok * HIDDEN + i] += scaled;
                 }
             }
         }

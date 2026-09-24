@@ -11,6 +11,8 @@
 //! instead of panicking — an absent 111 GB fixture is a "not run", not a
 //! failure (ROADMAP has this as a standing complaint about the other gates).
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use mummu::gguf::GgufFile;
 use mummu::models::qwen4exp::Qwen4expConfig;
 

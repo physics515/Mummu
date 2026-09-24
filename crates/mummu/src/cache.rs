@@ -1,4 +1,6 @@
-//! Process-lifetime model caching. Loading a checkpoint costs seconds and
+//! Process-lifetime model caching.
+//!
+//! Loading a checkpoint costs seconds and
 //! gigabytes, so consumers keep one [`ModelSlot`] static per (model, backend)
 //! and pay the load once. Burn's `Param` is not `Sync`, so the loaded value
 //! lives behind a `Mutex` and is only reachable inside [`ModelSlot::with`] /
@@ -49,6 +51,16 @@ impl<T> ModelSlot<T> {
     /// Run `f` with the model for `key`, loading it first if the slot is
     /// empty or holds a different checkpoint (the old model is dropped
     /// before `load` runs, so peak memory stays one model per slot).
+    ///
+    /// # Errors
+    ///
+    /// Whatever `load` returns when the slot has to be (re)filled; the slot
+    /// is left empty in that case.
+    ///
+    /// # Panics
+    ///
+    /// When `key` is the empty path, or when called from inside a tokio
+    /// runtime (the lock is taken blocking).
     pub fn with<R, E>(
         &self,
         key: &Path,
@@ -66,9 +78,12 @@ impl<T> ModelSlot<T> {
                 value,
             });
         }
-        let entry = guard.as_ref().expect("slot was just filled");
-        debug_assert!(entry.key == key, "slot must hold the requested model");
-        Ok(f(&entry.value))
+        debug_assert!(
+            guard.as_ref().is_some_and(|e| e.key == key),
+            "slot must hold the requested model"
+        );
+        // The guard is held while `f` runs: that is what serializes inference.
+        Ok(f(&guard.as_ref().expect("slot was just filled").value))
     }
 
     /// Async access to the slot: loads if needed and returns a **guard**
@@ -80,6 +95,11 @@ impl<T> ModelSlot<T> {
     /// borrow. A guard says the same thing without the higher-ranked
     /// gymnastics — hold it, await through it, drop it to release the slot
     /// (which is what serializes generations and protects VRAM).
+    ///
+    /// # Errors
+    ///
+    /// Whatever `load` returns when the slot has to be (re)filled; the slot
+    /// is left empty in that case.
     pub async fn acquire<E>(
         &self,
         key: &Path,
@@ -103,6 +123,16 @@ impl<T> ModelSlot<T> {
     /// failure takes the slot in between and runs on the broken model again.
     /// Deciding inside the same critical section as the key comparison is the
     /// only way the answer and the model it describes cannot come apart.
+    ///
+    /// # Errors
+    ///
+    /// Whatever `load` returns when the slot has to be (re)filled — because
+    /// it was empty, held another key, or `still_valid` rejected the resident
+    /// model; the slot is left empty in that case.
+    ///
+    /// # Panics
+    ///
+    /// When `key` is the empty path.
     pub async fn acquire_valid<E>(
         &self,
         key: &Path,
@@ -155,13 +185,10 @@ impl<T> ModelSlot<T> {
     /// thread from within a runtime"), and waiting would park a worker behind
     /// a decode that can run for minutes. Use [`Self::clear_async`] to wait.
     pub fn clear(&self) -> bool {
-        match self.inner.try_lock() {
-            Ok(mut guard) => {
-                *guard = None;
-                true
-            }
-            Err(_) => false,
-        }
+        self.inner.try_lock().is_ok_and(|mut guard| {
+            *guard = None;
+            true
+        })
     }
 
     /// [`Self::clear`], waiting for any in-flight generation to release the
@@ -175,13 +202,11 @@ impl<T> ModelSlot<T> {
     /// process) can never claim it dropped a model when the slot was empty,
     /// or that a busy slot held one.
     pub fn try_clear(&self) -> Cleared {
-        match self.inner.try_lock() {
-            Ok(mut guard) => match guard.take() {
-                Some(entry) => Cleared::Dropped(entry.key),
-                None => Cleared::Empty,
-            },
-            Err(_) => Cleared::Busy,
-        }
+        self.inner.try_lock().map_or(Cleared::Busy, |mut guard| {
+            guard
+                .take()
+                .map_or(Cleared::Empty, |entry| Cleared::Dropped(entry.key))
+        })
     }
 
     /// Run `f` on the resident model **only if the slot is free right now**:
@@ -195,8 +220,8 @@ impl<T> ModelSlot<T> {
     /// behind a generation.
     pub fn try_with_mut<R>(&self, f: impl FnOnce(&Path, &mut T) -> R) -> Option<R> {
         let mut guard = self.inner.try_lock().ok()?;
-        let entry = guard.as_mut()?;
-        Some(f(&entry.key, &mut entry.value))
+        // The guard is held while `f` runs: nothing else may touch the model.
+        guard.as_mut().map(|entry| f(&entry.key, &mut entry.value))
     }
 
     /// The checkpoint dir currently loaded, if any — for settings UIs.
@@ -248,6 +273,12 @@ impl<T> SlotGuard<'_, T> {
     /// released and finds the key it asked for. Evicting through the guard
     /// leaves no instant in which the broken model is in an unlocked slot.
     /// Returns the evicted model's key.
+    ///
+    /// # Panics
+    ///
+    /// Only on an internal invariant that cannot fail: a `SlotGuard` is only
+    /// ever constructed over a filled slot, and it is the sole holder.
+    #[must_use]
     pub fn evict(mut self) -> PathBuf {
         let entry = self
             .guard
@@ -303,7 +334,7 @@ mod tests {
                         loads += 1;
                         Ok(k.display().to_string())
                     },
-                    |m| m.clone(),
+                    std::clone::Clone::clone,
                 )
                 .unwrap();
             assert_eq!(got, "model-a");
@@ -323,7 +354,7 @@ mod tests {
                     loads += 1;
                     Ok(k.display().to_string())
                 },
-                |m| m.clone(),
+                std::clone::Clone::clone,
             )
             .unwrap()
         };

@@ -9,7 +9,7 @@
 //! 512 per layer. So an expert is located by arithmetic — expert `e` of a
 //! bank is the byte range `[e·out·row_bytes, (e+1)·out·row_bytes)` from the
 //! bank's payload start — read with one positional read per projection
-//! (0.9 MB for a Q4_K gate/up, 1.2 MB Q5_1 down, 1.7 MB Q8_0 down), and
+//! (0.9 MB for a `Q4_K` gate/up, 1.2 MB `Q5_1` down, 1.7 MB `Q8_0` down), and
 //! multiplied row-chunk by row-chunk: each chunk of quantized rows is
 //! dequantized with [`gguf::dequantize`] (whole blocks only) and dotted with
 //! the inputs, so the f32 rows of one expert never exist all at once.
@@ -46,6 +46,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
+use mummu_num::{narrow, trunc_usize};
 use rayon::prelude::*;
 
 use crate::gguf::{self, GgmlType, GgufFile};
@@ -119,9 +120,11 @@ enum Payload {
 }
 
 /// One expert bank: `n_experts` matrices of `out_dim` rows x `in_dim`
-/// columns, stored as ggml `ne = [in_dim, out_dim, n_experts]` (the first ne
-/// varies fastest, so the bytes are expert-major, then row-major, and each
-/// row is `in_dim / block_size` whole blocks).
+/// columns.
+///
+/// Stored as ggml `ne = [in_dim, out_dim, n_experts]` (the first ne varies
+/// fastest, so the bytes are expert-major, then row-major, and each row is
+/// `in_dim / block_size` whole blocks).
 #[derive(Debug)]
 pub struct ExpertBank {
     dtype: GgmlType,
@@ -221,42 +224,42 @@ impl ExpertBank {
     }
 
     #[must_use]
-    pub fn dtype(&self) -> GgmlType {
+    pub const fn dtype(&self) -> GgmlType {
         self.dtype
     }
 
     /// ggml `ne`: `[in_dim, out_dim, n_experts]`.
     #[must_use]
-    pub fn ne(&self) -> [usize; 3] {
+    pub const fn ne(&self) -> [usize; 3] {
         [self.in_dim, self.out_dim, self.n_experts]
     }
 
     /// Columns of each expert matrix (the input width).
     #[must_use]
-    pub fn in_dim(&self) -> usize {
+    pub const fn in_dim(&self) -> usize {
         self.in_dim
     }
 
     /// Rows of each expert matrix (the output width).
     #[must_use]
-    pub fn out_dim(&self) -> usize {
+    pub const fn out_dim(&self) -> usize {
         self.out_dim
     }
 
     #[must_use]
-    pub fn n_experts(&self) -> usize {
+    pub const fn n_experts(&self) -> usize {
         self.n_experts
     }
 
     /// Bytes of one quantized row: `in_dim / block_size * bytes_per_block`.
     #[must_use]
-    pub fn row_bytes(&self) -> usize {
+    pub const fn row_bytes(&self) -> usize {
         self.row_bytes
     }
 
     /// Bytes of one expert: `out_dim * row_bytes`.
     #[must_use]
-    pub fn expert_bytes_len(&self) -> usize {
+    pub const fn expert_bytes_len(&self) -> usize {
         self.out_dim * self.row_bytes
     }
 
@@ -300,6 +303,11 @@ impl ExpertBank {
     ///
     /// # Errors
     /// As [`Self::expert_bytes`], or on a dtype without a dequantizer.
+    ///
+    /// # Panics
+    ///
+    /// Only on an internal invariant: the dequantized chunks must add up to
+    /// exactly `out_dim · in_dim` values, which whole-block rows guarantee.
     pub fn dequantize_expert(&self, e: usize) -> Result<Vec<f32>, String> {
         let bytes = self.expert_bytes(e)?;
         let chunk_rows = (CHUNK_ELEMS / self.in_dim).max(1);
@@ -377,6 +385,7 @@ fn check_len(what: &str, got: usize, n: usize, width: usize) -> Result<(), Strin
 }
 
 /// The weight rows a matvec reads: quantized bytes or dequantized f32.
+#[derive(Clone, Copy)]
 enum Rows<'a> {
     Quant {
         dtype: GgmlType,
@@ -499,8 +508,7 @@ fn softmax_row(logits: &[f32], probs: &mut [f32]) {
         sum += f64::from(v);
         *p = v;
     }
-    #[allow(clippy::cast_possible_truncation)] // f64 -> f32 is the ggml scale
-    let scale = (1.0 / sum) as f32;
+    let scale = narrow(1.0 / sum);
     for p in probs.iter_mut() {
         *p *= scale;
     }
@@ -511,8 +519,7 @@ fn softmax_row(logits: &[f32], probs: &mut [f32]) {
 /// like ggml's `sum_rows`.
 fn renormalize(top: &mut [f32]) {
     let sum: f64 = top.iter().map(|&p| f64::from(p)).sum();
-    #[allow(clippy::cast_possible_truncation)]
-    let sum = (sum as f32).max(WEIGHT_SUM_FLOOR);
+    let sum = narrow(sum).max(WEIGHT_SUM_FLOOR);
     for w in top.iter_mut() {
         *w /= sum;
     }
@@ -552,15 +559,16 @@ pub fn route(logits: &[f32], n: usize, n_experts: usize, k: usize) -> Result<Rou
     for row in logits.chunks_exact(n_experts) {
         softmax_row(row, &mut probs);
         best.clear();
-        for (id, &p) in probs.iter().enumerate() {
+        // Ids are counted in u32 directly: an expert count past u32::MAX
+        // is refused at construction ([`RoutedExperts::from_layers`]).
+        for (id, &p) in (0u32..).zip(probs.iter()) {
             // Ids arrive ascending, so a strict comparison keeps an earlier
             // (lower) id ahead of a later equal probability.
             if best.len() == k && p <= best[k - 1].0 {
                 continue;
             }
             let pos = best.partition_point(|&(q, _)| q >= p);
-            #[allow(clippy::cast_possible_truncation)] // n_experts is small
-            best.insert(pos, (p, id as u32));
+            best.insert(pos, (p, id));
             best.truncate(k);
         }
         let start = weights.len();
@@ -687,6 +695,7 @@ impl ExpertCache {
                 last_touch: now,
             },
         );
+        drop(st);
         Ok(Some(weights))
     }
 
@@ -713,13 +722,8 @@ pub fn cache_bytes_from_env() -> usize {
         .and_then(|v| v.trim().parse::<f64>().ok())
         .filter(|g| g.is_finite() && *g >= 0.0)
         .unwrap_or(DEFAULT_CACHE_GB);
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        clippy::cast_precision_loss
-    )]
-    let bytes = (gb * (1u64 << 30) as f64) as usize;
-    bytes
+
+    trunc_usize(gb * f64::from(1u32 << 30))
 }
 
 /// The three banks of one block.
@@ -732,7 +736,7 @@ pub struct LayerExperts {
 
 impl LayerExperts {
     #[must_use]
-    pub fn bank(&self, kind: BankKind) -> &ExpertBank {
+    pub const fn bank(&self, kind: BankKind) -> &ExpertBank {
         match kind {
             BankKind::Gate => &self.gate,
             BankKind::Up => &self.up,
@@ -774,7 +778,7 @@ impl ExpertWeights<'_> {
     }
 
     /// `down(silu(gate·x) · (up·x))` over `n` rows.
-    fn ffn(&self, xs: &[f32], n: usize) -> Result<Vec<f32>, String> {
+    fn ffn(&self, xs: &[f32], rows: usize) -> Result<Vec<f32>, String> {
         // Diagnostic only (`nn::refarith`, off by default): quantize the
         // activation to the bank's ggml vec_dot grid first, as llama.cpp's
         // CPU mul_mat_id does. Only the quantized banks know their dtype,
@@ -782,22 +786,22 @@ impl ExpertWeights<'_> {
         let fq = |kind: BankKind, v: &[f32]| -> Option<Vec<f32>> {
             match self {
                 Self::Quant(layer, _) if crate::nn::refarith::enabled() => {
-                    let b = layer.bank(kind);
-                    let mut o = v.to_vec();
-                    crate::nn::refarith::fake_quant_rows(&mut o, b.in_dim(), b.dtype());
-                    Some(o)
+                    let src = layer.bank(kind);
+                    let mut vals = v.to_vec();
+                    crate::nn::refarith::fake_quant_rows(&mut vals, src.in_dim(), src.dtype());
+                    Some(vals)
                 }
                 _ => None,
             }
         };
         let xg = fq(BankKind::Gate, xs);
         let xu = fq(BankKind::Up, xs);
-        let (g, u) = rayon::join(
-            || self.matvec(BankKind::Gate, xg.as_deref().unwrap_or(xs), n),
-            || self.matvec(BankKind::Up, xu.as_deref().unwrap_or(xs), n),
+        let (gate_res, up_res) = rayon::join(
+            || self.matvec(BankKind::Gate, xg.as_deref().unwrap_or(xs), rows),
+            || self.matvec(BankKind::Up, xu.as_deref().unwrap_or(xs), rows),
         );
-        let (mut h, u) = (g?, u?);
-        for (hi, &ui) in h.iter_mut().zip(&u) {
+        let (mut hidden, up_res) = (gate_res?, up_res?);
+        for (hi, &ui) in hidden.iter_mut().zip(&up_res) {
             *hi = silu(*hi) * ui;
         }
         // Q5_1 banks dot against Q8_1, whose block sum `s` ggml rounds to
@@ -805,17 +809,17 @@ impl ExpertWeights<'_> {
         // emulation adds `min · (rounded s − s)` per weight block afterwards.
         let min_rounding = match self {
             Self::Quant(layer, _)
-                if crate::nn::refarith::enabled() && layer.down.dtype() == GgmlType::Q5_1 =>
+                if crate::nn::refarith::enabled() && layer.down.dtype() == GgmlType::Q51 =>
             {
                 Some(crate::nn::refarith::q8_1_min_term_rounding(
-                    &h,
+                    &hidden,
                     layer.down.in_dim(),
                 ))
             }
             _ => None,
         };
-        let h = fq(BankKind::Down, &h).unwrap_or(h);
-        let mut y = self.matvec(BankKind::Down, &h, n)?;
+        let hidden = fq(BankKind::Down, &hidden).unwrap_or(hidden);
+        let mut down_out = self.matvec(BankKind::Down, &hidden, rows)?;
         if let (Some(delta), Self::Quant(layer, e)) = (min_rounding, self) {
             let bank = &layer.down;
             let (blocks, out) = (bank.in_dim() / 32, bank.out_dim());
@@ -826,14 +830,18 @@ impl ExpertWeights<'_> {
                 .iter()
                 .map(|blk| half::f16::from_le_bytes([blk[2], blk[3]]).to_f32())
                 .collect();
-            for (yt, dt) in y.chunks_mut(out).zip(delta.chunks(blocks)) {
+            for (yt, dt) in down_out.chunks_mut(out).zip(delta.chunks(blocks)) {
                 for (r, yr) in yt.iter_mut().enumerate() {
-                    let m = &mins[r * blocks..(r + 1) * blocks];
-                    *yr += m.iter().zip(dt).map(|(a, b)| a * b).sum::<f32>();
+                    let mins_row = &mins[r * blocks..(r + 1) * blocks];
+                    *yr += mins_row
+                        .iter()
+                        .zip(dt)
+                        .map(|(min_val, delta_val)| min_val * delta_val)
+                        .sum::<f32>();
                 }
             }
         }
-        Ok(y)
+        Ok(down_out)
     }
 }
 
@@ -941,24 +949,24 @@ impl RoutedExperts {
     }
 
     #[must_use]
-    pub fn n_layers(&self) -> usize {
+    pub const fn n_layers(&self) -> usize {
         self.layers.len()
     }
 
     #[must_use]
-    pub fn n_experts(&self) -> usize {
+    pub const fn n_experts(&self) -> usize {
         self.n_experts
     }
 
     /// Model width (expert input and output).
     #[must_use]
-    pub fn hidden_size(&self) -> usize {
+    pub const fn hidden_size(&self) -> usize {
         self.hidden
     }
 
     /// Expert intermediate width.
     #[must_use]
-    pub fn ffn_size(&self) -> usize {
+    pub const fn ffn_size(&self) -> usize {
         self.ffn
     }
 
@@ -969,7 +977,7 @@ impl RoutedExperts {
 
     /// Distinct shard files held open (0 for in-memory banks).
     #[must_use]
-    pub fn open_files(&self) -> usize {
+    pub const fn open_files(&self) -> usize {
         self.open_files
     }
 
@@ -981,7 +989,7 @@ impl RoutedExperts {
 
     /// f32 bytes of one dequantized expert (the cache's unit).
     #[must_use]
-    pub fn dense_expert_bytes(&self) -> usize {
+    pub const fn dense_expert_bytes(&self) -> usize {
         3 * self.hidden * self.ffn * std::mem::size_of::<f32>()
     }
 
@@ -1048,7 +1056,7 @@ impl RoutedExperts {
         ExpertWeights::Quant(banks, expert).ffn(xs, n)
     }
 
-    /// The routed half of the MoE block for `n` tokens: route with
+    /// The routed half of the `MoE` block for `n` tokens: route with
     /// [`route`] (`router_logits` is `[n x n_experts]`, top-`k`), then
     /// [`Self::apply_routing`]. Returns `[n x hidden]`; the integrator adds
     /// `shared · sigmoid(shared_gate)`.
@@ -1131,7 +1139,10 @@ impl RoutedExperts {
             for (i, &(t, w)) in rows.iter().enumerate() {
                 let dst = &mut out[t * e_dim..(t + 1) * e_dim];
                 for (o, &v) in dst.iter_mut().zip(&y[i * e_dim..(i + 1) * e_dim]) {
-                    *o += w * v;
+                    // Two roundings on purpose (no mul_add): the weighted
+                    // sum matches the reference's separate mul and add.
+                    let weighted = w * v;
+                    *o += weighted;
                 }
             }
         }
@@ -1141,9 +1152,13 @@ impl RoutedExperts {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
+    use mummu_num::f32_from_u32;
+
     use super::*;
 
-    /// SplitMix64: a tiny deterministic generator for synthetic quant bits.
+    /// `SplitMix64`: a tiny deterministic generator for synthetic quant bits.
     struct Rng(u64);
 
     impl Rng {
@@ -1159,8 +1174,14 @@ mod tests {
         }
         /// Uniform in `[lo, hi)`.
         fn uniform(&mut self, lo: f32, hi: f32) -> f32 {
-            let u = (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32;
-            lo + (hi - lo) * u
+            // 24 bits of randomness: the numerator is exact in f32 and so is
+            // 2^24, so the quotient is the same float the `as` casts gave.
+            let bits = (self.next_u64() >> 40) as u32;
+            let u = f32_from_u32(bits) / 16_777_216.0;
+            // Scale and offset stay separate statements: two roundings on
+            // purpose, since fusing them would move the value.
+            let span = (hi - lo) * u;
+            lo + span
         }
         fn uniform_vec(&mut self, len: usize) -> Vec<f32> {
             (0..len).map(|_| self.uniform(-1.0, 1.0)).collect()
@@ -1171,27 +1192,39 @@ mod tests {
         half::f16::from_f32(v).to_bits().to_le_bytes()
     }
 
+    /// `dtype.block_size()` as a `usize`: a GGML block holds 32 or 256
+    /// elements, so the `u64` always fits.
+    fn block_size(dtype: GgmlType) -> usize {
+        usize::try_from(dtype.block_size()).expect("a GGML block size is a small constant")
+    }
+
+    /// `dtype.bytes_per_block()` as a `usize`: a few hundred bytes at most.
+    fn bytes_per_block(dtype: GgmlType) -> usize {
+        usize::try_from(dtype.bytes_per_block())
+            .expect("a GGML block's byte size is a small constant")
+    }
+
     /// `blocks` sane blocks of `dtype`: finite, modest f16 scales and random
     /// quant bits, so dequantized weights are O(0.01-1).
     fn synth_blocks(dtype: GgmlType, blocks: usize, rng: &mut Rng) -> Vec<u8> {
         let mut out = Vec::new();
         for _ in 0..blocks {
             match dtype {
-                GgmlType::Q8_0 => {
+                GgmlType::Q80 => {
                     out.extend(f16_bytes(rng.uniform(0.002, 0.02)));
                     out.extend((0..32).map(|_| rng.byte()));
                 }
-                GgmlType::Q5_1 => {
+                GgmlType::Q51 => {
                     out.extend(f16_bytes(rng.uniform(0.005, 0.05)));
                     out.extend(f16_bytes(rng.uniform(-0.4, 0.0)));
                     out.extend((0..20).map(|_| rng.byte()));
                 }
-                GgmlType::Q4_K => {
+                GgmlType::Q4K => {
                     out.extend(f16_bytes(rng.uniform(0.0005, 0.003)));
                     out.extend(f16_bytes(rng.uniform(0.0005, 0.003)));
                     out.extend((0..140).map(|_| rng.byte()));
                 }
-                GgmlType::Q5_K => {
+                GgmlType::Q5K => {
                     out.extend(f16_bytes(rng.uniform(0.0003, 0.002)));
                     out.extend(f16_bytes(rng.uniform(0.0003, 0.002)));
                     out.extend((0..172).map(|_| rng.byte()));
@@ -1199,12 +1232,12 @@ mod tests {
                 other => panic!("no synthetic blocks for {other:?}"),
             }
         }
-        assert_eq!(out.len(), blocks * dtype.bytes_per_block() as usize);
+        assert_eq!(out.len(), blocks * bytes_per_block(dtype));
         out
     }
 
     fn synth_bank(dtype: GgmlType, ne: [usize; 3], rng: &mut Rng) -> ExpertBank {
-        let blocks = ne[0] / dtype.block_size() as usize * ne[1] * ne[2];
+        let blocks = ne[0] / block_size(dtype) * ne[1] * ne[2];
         ExpertBank::from_bytes(dtype, ne, synth_blocks(dtype, blocks, rng)).expect("sane bank")
     }
 
@@ -1241,7 +1274,7 @@ mod tests {
         let mut rng = Rng(0x5eed ^ in_dim as u64 ^ (dtype.bytes_per_block() << 20));
         // Two full production chunks plus a ragged tail.
         let out_dim = CHUNK_ELEMS / in_dim * 2 + 3;
-        let blocks_per_expert = in_dim / dtype.block_size() as usize * out_dim;
+        let blocks_per_expert = in_dim / block_size(dtype) * out_dim;
         // Each expert's bytes built on their own, so the reference does not
         // lean on the bank's own offset arithmetic.
         let per_expert: Vec<Vec<u8>> = (0..3)
@@ -1262,22 +1295,22 @@ mod tests {
 
     #[test]
     fn q8_0_matvec_equals_dequantize_then_matmul() {
-        check_matvec_against_dequantized_expert(GgmlType::Q8_0, 96);
+        check_matvec_against_dequantized_expert(GgmlType::Q80, 96);
     }
 
     #[test]
     fn q5_1_matvec_equals_dequantize_then_matmul() {
-        check_matvec_against_dequantized_expert(GgmlType::Q5_1, 64);
+        check_matvec_against_dequantized_expert(GgmlType::Q51, 64);
     }
 
     #[test]
     fn q4_k_matvec_equals_dequantize_then_matmul() {
-        check_matvec_against_dequantized_expert(GgmlType::Q4_K, 512);
+        check_matvec_against_dequantized_expert(GgmlType::Q4K, 512);
     }
 
     #[test]
     fn q5_k_matvec_equals_dequantize_then_matmul() {
-        check_matvec_against_dequantized_expert(GgmlType::Q5_K, 256);
+        check_matvec_against_dequantized_expert(GgmlType::Q5K, 256);
     }
 
     #[test]
@@ -1286,7 +1319,7 @@ mod tests {
         // `dot` of one row, whatever the chunk size or weight source.
         let mut rng = Rng(7);
         let (in_dim, out_dim, n) = (256, 37, 3);
-        let bank = synth_bank(GgmlType::Q4_K, [in_dim, out_dim, 2], &mut rng);
+        let bank = synth_bank(GgmlType::Q4K, [in_dim, out_dim, 2], &mut rng);
         let xs = rng.uniform_vec(n * in_dim);
         let bytes = bank.expert_bytes(1).unwrap();
         let run =
@@ -1294,7 +1327,7 @@ mod tests {
         let quant = |chunk| {
             run(
                 Rows::Quant {
-                    dtype: GgmlType::Q4_K,
+                    dtype: GgmlType::Q4K,
                     bytes: &bytes,
                     row_bytes: bank.row_bytes(),
                 },
@@ -1323,9 +1356,9 @@ mod tests {
     fn a_row_that_is_not_whole_blocks_is_refused() {
         // 640-wide rows cannot be K-quant (256-element blocks): slicing such
         // a bank by row would silently misalign.
-        let err = ExpertBank::from_bytes(GgmlType::Q4_K, [640, 4, 2], vec![0; 1024]).unwrap_err();
+        let err = ExpertBank::from_bytes(GgmlType::Q4K, [640, 4, 2], vec![0; 1024]).unwrap_err();
         assert!(err.contains("not whole"), "{err}");
-        let err = ExpertBank::from_bytes(GgmlType::Q8_0, [64, 4, 2], vec![0; 10]).unwrap_err();
+        let err = ExpertBank::from_bytes(GgmlType::Q80, [64, 4, 2], vec![0; 10]).unwrap_err();
         assert!(err.contains("bytes"), "{err}");
     }
 
@@ -1397,17 +1430,17 @@ mod tests {
     const TOY_FFN: usize = 32;
     const TOY_EXPERTS: usize = 8;
 
-    /// Deterministic toy layers: gate/up Q4_K (256-wide rows), down Q5_1
-    /// (32-wide rows) on layer 0 and Q8_0 on layer 1 — the real model's mix.
+    /// Deterministic toy layers: gate/up `Q4_K` (256-wide rows), down `Q5_1`
+    /// (32-wide rows) on layer 0 and `Q8_0` on layer 1 — the real model's mix.
     fn toy_layers(seed: u64) -> Vec<LayerExperts> {
         let mut rng = Rng(seed);
         let fwd = [TOY_HIDDEN, TOY_FFN, TOY_EXPERTS];
         let back = [TOY_FFN, TOY_HIDDEN, TOY_EXPERTS];
-        [GgmlType::Q5_1, GgmlType::Q8_0]
+        [GgmlType::Q51, GgmlType::Q80]
             .into_iter()
             .map(|down| LayerExperts {
-                gate: synth_bank(GgmlType::Q4_K, fwd, &mut rng),
-                up: synth_bank(GgmlType::Q4_K, fwd, &mut rng),
+                gate: synth_bank(GgmlType::Q4K, fwd, &mut rng),
+                up: synth_bank(GgmlType::Q4K, fwd, &mut rng),
                 down: synth_bank(down, back, &mut rng),
             })
             .collect()
@@ -1434,26 +1467,28 @@ mod tests {
     fn routed_moe_equals_the_dense_mask_reference() {
         let experts = RoutedExperts::from_layers(toy_layers(11), 0).unwrap();
         let mut rng = Rng(12);
-        let n = 5;
-        let xs = rng.uniform_vec(n * TOY_HIDDEN);
-        let logits: Vec<f32> = (0..n * TOY_EXPERTS)
+        let n_tokens = 5;
+        let xs = rng.uniform_vec(n_tokens * TOY_HIDDEN);
+        let logits: Vec<f32> = (0..n_tokens * TOY_EXPERTS)
             .map(|_| rng.uniform(-2.0, 2.0))
             .collect();
         for layer in 0..2 {
-            let got = experts.routed_moe(layer, &logits, &xs, n, 2).unwrap();
+            let got = experts
+                .routed_moe(layer, &logits, &xs, n_tokens, 2)
+                .unwrap();
             // Reference: EVERY expert on EVERY token, in f64 from the whole
             // dequantized matrices, masked by an independently computed
             // top-2 renormalized softmax.
             let banks = experts.layer(layer);
-            let mut want = vec![0f64; n * TOY_HIDDEN];
-            let mut mag = vec![0f64; n * TOY_HIDDEN];
-            for t in 0..n {
-                let row = &logits[t * TOY_EXPERTS..(t + 1) * TOY_EXPERTS];
-                let z: f64 = row.iter().map(|&l| f64::from(l).exp()).sum();
+            let mut want = vec![0f64; n_tokens * TOY_HIDDEN];
+            let mut mag = vec![0f64; n_tokens * TOY_HIDDEN];
+            for tok in 0..n_tokens {
+                let row = &logits[tok * TOY_EXPERTS..(tok + 1) * TOY_EXPERTS];
+                let partition: f64 = row.iter().map(|&l| f64::from(l).exp()).sum();
                 let mut order: Vec<(f64, usize)> = row
                     .iter()
                     .enumerate()
-                    .map(|(e, &l)| (f64::from(l).exp() / z, e))
+                    .map(|(e, &l)| (f64::from(l).exp() / partition, e))
                     .collect();
                 order.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
                 let top_sum = order[0].0 + order[1].0;
@@ -1461,22 +1496,32 @@ mod tests {
                 for &(p, e) in &order[..2] {
                     mask[e] = p / top_sum;
                 }
-                let x = &xs[t * TOY_HIDDEN..(t + 1) * TOY_HIDDEN];
-                #[allow(clippy::needless_range_loop)]
-                // `e` is the expert id the bank reads, not just an index
-                for e in 0..TOY_EXPERTS {
+                let x_row = &xs[tok * TOY_HIDDEN..(tok + 1) * TOY_HIDDEN];
+                let want_row = &mut want[tok * TOY_HIDDEN..(tok + 1) * TOY_HIDDEN];
+                let mag_row = &mut mag[tok * TOY_HIDDEN..(tok + 1) * TOY_HIDDEN];
+                // `e` is the expert id the bank reads, not just an index.
+                for (e, &weight) in mask.iter().enumerate() {
                     let deq = |b: &ExpertBank| b.dequantize_expert(e).unwrap();
-                    let (g, _) = ref_matvec(&deq(&banks.gate), TOY_HIDDEN, x);
-                    let (u, _) = ref_matvec(&deq(&banks.up), TOY_HIDDEN, x);
-                    let h: Vec<f32> = g
+                    let (gate, _) = ref_matvec(&deq(&banks.gate), TOY_HIDDEN, x_row);
+                    let (up, _) = ref_matvec(&deq(&banks.up), TOY_HIDDEN, x_row);
+                    let hidden: Vec<f32> = gate
                         .iter()
-                        .zip(&u)
-                        .map(|(&g, &u)| (g / (1.0 + (-g).exp()) * u) as f32)
+                        .zip(&up)
+                        .map(|(&g, &u)| narrow(g / (1.0 + (-g).exp()) * u))
                         .collect();
-                    let (y, ym) = ref_matvec(&deq(&banks.down), TOY_FFN, &h);
-                    for j in 0..TOY_HIDDEN {
-                        want[t * TOY_HIDDEN + j] += mask[e] * y[j];
-                        mag[t * TOY_HIDDEN + j] += mask[e] * ym[j];
+                    let (out, out_mag) = ref_matvec(&deq(&banks.down), TOY_FFN, &hidden);
+                    for ((w, m), (&o, &om)) in want_row
+                        .iter_mut()
+                        .zip(mag_row.iter_mut())
+                        .zip(out.iter().zip(&out_mag))
+                    {
+                        // The multiply and the add stay separate statements:
+                        // two roundings on purpose, since `mul_add` would
+                        // round once and give a different f64.
+                        let scaled = weight * o;
+                        *w += scaled;
+                        let scaled_mag = weight * om;
+                        *m += scaled_mag;
                     }
                 }
             }
@@ -1588,10 +1633,10 @@ mod tests {
     fn type_id(dtype: GgmlType) -> u32 {
         match dtype {
             GgmlType::F32 => 0,
-            GgmlType::Q5_1 => 7,
-            GgmlType::Q8_0 => 8,
-            GgmlType::Q4_K => 12,
-            GgmlType::Q5_K => 13,
+            GgmlType::Q51 => 7,
+            GgmlType::Q80 => 8,
+            GgmlType::Q4K => 12,
+            GgmlType::Q5K => 13,
             other => panic!("no test id for {other:?}"),
         }
     }
@@ -1740,42 +1785,60 @@ mod tests {
         let mut layers = toy_layers(51);
         let mut rng = Rng(52);
         // Down with the gate's orientation: [hidden, ffn] instead of [ffn, hidden].
-        layers[1].down = synth_bank(GgmlType::Q4_K, [TOY_HIDDEN, TOY_FFN, TOY_EXPERTS], &mut rng);
+        layers[1].down = synth_bank(GgmlType::Q4K, [TOY_HIDDEN, TOY_FFN, TOY_EXPERTS], &mut rng);
         let err = RoutedExperts::from_layers(layers, 0).unwrap_err();
         assert!(err.contains("blk.1.ffn_down_exps.weight"), "{err}");
     }
 
     // ---- The shipped model --------------------------------------------------
 
-    /// Real Qwen3.8-Flash-Next shards (`MUMMU_QWEN4EXP_DIR` = the directory
-    /// holding `*-00001-of-00004.gguf`; point it at NVMe). Locates all 144
-    /// banks, checks the shipped dtype mix, runs the first and last expert of
-    /// the first and last layer against a dequantize-then-matmul reference,
-    /// and times the routed path. RAM stays small: one expert at a time,
-    /// plus one 5 MB router matrix. Run with `--release` for timings.
-    #[test]
-    #[ignore = "needs the 111 GB model; set MUMMU_QWEN4EXP_DIR"]
-    fn shipped_expert_banks_route_and_time() {
-        use std::time::Instant;
-        let Some(dir) = std::env::var_os("MUMMU_QWEN4EXP_DIR") else {
-            eprintln!("skipping: MUMMU_QWEN4EXP_DIR is unset");
-            return;
-        };
-        let first_shard = std::fs::read_dir(&dir)
-            .expect("model dir")
-            .filter_map(Result::ok)
-            .map(|e| e.path())
-            .find(|p| p.to_string_lossy().ends_with("-00001-of-00004.gguf"))
-            .expect("first shard in MUMMU_QWEN4EXP_DIR");
-        let gguf = GgufFile::open_sharded(&first_shard).expect("split set");
-        let t0 = Instant::now();
-        let experts = RoutedExperts::open(&gguf, 48, 0).expect("all banks");
-        eprintln!(
-            "open: {} layers, {} shard handles, {:.1} ms",
-            experts.n_layers(),
-            experts.open_files(),
-            t0.elapsed().as_secs_f64() * 1e3
-        );
+    /// Milliseconds one call to `f` takes.
+    fn time_ms(f: &mut dyn FnMut()) -> f64 {
+        let t = Instant::now();
+        f();
+        t.elapsed().as_secs_f64() * 1e3
+    }
+
+    /// The fastest of `reps` calls to `f`, in milliseconds.
+    fn best_of(f: &mut dyn FnMut(), reps: usize) -> f64 {
+        (0..reps)
+            .map(|_| time_ms(&mut *f))
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    /// `n` random hidden rows, each rescaled to unit RMS the way the trunk's
+    /// norm leaves them.
+    fn unit_rms(rng: &mut Rng, n: usize) -> Vec<f32> {
+        let mut xs: Vec<f32> = rng.uniform_vec(n * 2560);
+        for x in xs.as_chunks_mut::<2560>().0 {
+            let rms = (x.iter().map(|v| v * v).sum::<f32>() / 2560.0).sqrt();
+            for v in x.iter_mut() {
+                *v /= rms;
+            }
+        }
+        xs
+    }
+
+    /// The layer's own router logits: one row of 512 per token of `xs`.
+    fn router_logits(router: &[f32], xs: &[f32]) -> Vec<f32> {
+        xs.as_chunks::<2560>()
+            .0
+            .iter()
+            .flat_map(|x| {
+                router
+                    .as_chunks::<2560>()
+                    .0
+                    .iter()
+                    .map(|w| dot(w, x))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// The shipped geometry and the dtype mix of all 144 banks (spec §0:
+    /// gate/up `Q4_K` on 47 layers and `Q5_K` on 1; down `Q5_1` on 43,
+    /// `Q8_0` on 5).
+    fn assert_shipped_geometry_and_dtype_mix(experts: &RoutedExperts) {
         assert_eq!(
             (
                 experts.hidden_size(),
@@ -1801,7 +1864,6 @@ mod tests {
         }
         let count = |k, d: &str| counts.get(&(k, d.to_string())).copied().unwrap_or(0);
         eprintln!("dtype mix: {counts:?}");
-        // Spec §0: gate/up Q4_K on 47 layers and Q5_K on 1; down Q5_1 on 43, Q8_0 on 5.
         assert_eq!(
             (count(BankKind::Gate, "Q4_K"), count(BankKind::Gate, "Q5_K")),
             (47, 1)
@@ -1814,50 +1876,69 @@ mod tests {
             (count(BankKind::Down, "Q5_1"), count(BankKind::Down, "Q8_0")),
             (43, 5)
         );
+    }
+
+    /// One shipped expert against a dequantize-then-matmul reference, with
+    /// what its first (cold) call cost.
+    fn check_shipped_expert(experts: &RoutedExperts, li: usize, ex: usize, x1: &[f32]) {
+        let started = Instant::now();
+        let out = experts.expert_ffn(li, ex, x1, 1).expect("expert ffn");
+        let cold = started.elapsed().as_secs_f64() * 1e3;
+        assert_eq!(out.len(), 2560);
+        assert!(
+            out.iter().all(|v| v.is_finite()),
+            "layer {li} expert {ex} finite"
+        );
+        let banks = experts.layer(li);
+        let (gate, _) = ref_matvec(&banks.gate.dequantize_expert(ex).unwrap(), 2560, x1);
+        let (up, _) = ref_matvec(&banks.up.dequantize_expert(ex).unwrap(), 2560, x1);
+        let hidden: Vec<f32> = gate
+            .iter()
+            .zip(&up)
+            .map(|(&g, &u)| narrow(g / (1.0 + (-g).exp()) * u))
+            .collect();
+        let (want, mag) = ref_matvec(&banks.down.dequantize_expert(ex).unwrap(), 640, &hidden);
+        assert_close(&out, &want, &mag, &format!("layer {li} expert {ex}"));
+        let norm = (out.iter().map(|v| v * v).sum::<f32>()).sqrt();
+        eprintln!("expert_ffn L{li} E{ex}: |y| = {norm:.4}, first call {cold:.2} ms");
+    }
+
+    /// Real Qwen3.8-Flash-Next shards (`MUMMU_QWEN4EXP_DIR` = the directory
+    /// holding `*-00001-of-00004.gguf`; point it at `NVMe`). Locates all 144
+    /// banks, checks the shipped dtype mix, runs the first and last expert of
+    /// the first and last layer against a dequantize-then-matmul reference,
+    /// and times the routed path. RAM stays small: one expert at a time,
+    /// plus one 5 MB router matrix. Run with `--release` for timings.
+    #[test]
+    #[ignore = "needs the 111 GB model; set MUMMU_QWEN4EXP_DIR"]
+    fn shipped_expert_banks_route_and_time() {
+        let Some(dir) = std::env::var_os("MUMMU_QWEN4EXP_DIR") else {
+            eprintln!("skipping: MUMMU_QWEN4EXP_DIR is unset");
+            return;
+        };
+        let first_shard = std::fs::read_dir(&dir)
+            .expect("model dir")
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .find(|p| p.to_string_lossy().ends_with("-00001-of-00004.gguf"))
+            .expect("first shard in MUMMU_QWEN4EXP_DIR");
+        let gguf = GgufFile::open_sharded(&first_shard).expect("split set");
+        let t0 = Instant::now();
+        let experts = RoutedExperts::open(&gguf, 48, 0).expect("all banks");
+        eprintln!(
+            "open: {} layers, {} shard handles, {:.1} ms",
+            experts.n_layers(),
+            experts.open_files(),
+            t0.elapsed().as_secs_f64() * 1e3
+        );
+        assert_shipped_geometry_and_dtype_mix(&experts);
 
         let mut rng = Rng(0xF1A5);
-        let unit_rms = |rng: &mut Rng, n: usize| {
-            let mut xs: Vec<f32> = rng.uniform_vec(n * 2560);
-            for x in xs.as_chunks_mut::<2560>().0 {
-                let rms = (x.iter().map(|v| v * v).sum::<f32>() / 2560.0).sqrt();
-                x.iter_mut().for_each(|v| *v /= rms);
-            }
-            xs
-        };
         let x1 = unit_rms(&mut rng, 1);
-        for (l, e) in [(0, 0), (47, 511)] {
-            let t = Instant::now();
-            let y = experts.expert_ffn(l, e, &x1, 1).expect("expert ffn");
-            let cold = t.elapsed().as_secs_f64() * 1e3;
-            assert_eq!(y.len(), 2560);
-            assert!(
-                y.iter().all(|v| v.is_finite()),
-                "layer {l} expert {e} finite"
-            );
-            let banks = experts.layer(l);
-            let (g, _) = ref_matvec(&banks.gate.dequantize_expert(e).unwrap(), 2560, &x1);
-            let (u, _) = ref_matvec(&banks.up.dequantize_expert(e).unwrap(), 2560, &x1);
-            let h: Vec<f32> = g
-                .iter()
-                .zip(&u)
-                .map(|(&g, &u)| (g / (1.0 + (-g).exp()) * u) as f32)
-                .collect();
-            let (want, mag) = ref_matvec(&banks.down.dequantize_expert(e).unwrap(), 640, &h);
-            assert_close(&y, &want, &mag, &format!("layer {l} expert {e}"));
-            let norm = (y.iter().map(|v| v * v).sum::<f32>()).sqrt();
-            eprintln!("expert_ffn L{l} E{e}: |y| = {norm:.4}, first call {cold:.2} ms");
+        for (li, ex) in [(0, 0), (47, 511)] {
+            check_shipped_expert(&experts, li, ex, &x1);
         }
 
-        fn time_ms(f: &mut dyn FnMut()) -> f64 {
-            let t = Instant::now();
-            f();
-            t.elapsed().as_secs_f64() * 1e3
-        }
-        fn best_of(f: &mut dyn FnMut(), reps: usize) -> f64 {
-            (0..reps)
-                .map(|_| time_ms(&mut *f))
-                .fold(f64::INFINITY, f64::min)
-        }
         let ffn_warm = best_of(&mut || drop(experts.expert_ffn(0, 0, &x1, 1).unwrap()), 5);
         eprintln!("TIMING expert_ffn n=1 (layer 0, Q4_K/Q5_1, warm page cache): {ffn_warm:.2} ms");
 
@@ -1867,26 +1948,12 @@ mod tests {
             .read_tensor_f32(&format!("blk.{layer}.ffn_gate_inp.weight"))
             .expect("router weight");
         assert_eq!(router.len(), 512 * 2560);
-        let logits_for = |xs: &[f32]| -> Vec<f32> {
-            xs.as_chunks::<2560>()
-                .0
-                .iter()
-                .flat_map(|x| {
-                    router
-                        .as_chunks::<2560>()
-                        .0
-                        .iter()
-                        .map(|w| dot(w, x))
-                        .collect::<Vec<_>>()
-                })
-                .collect()
-        };
         for n in [1usize, 16] {
             let xs = unit_rms(&mut rng, n);
-            let logits = logits_for(&xs);
+            let logits = router_logits(&router, &xs);
             let routing = route(&logits, n, 512, 10).unwrap();
             let distinct = {
-                let mut ids = routing.ids.clone();
+                let mut ids = routing.ids;
                 ids.sort_unstable();
                 ids.dedup();
                 ids.len()
@@ -1908,7 +1975,7 @@ mod tests {
         // Cache on: same numbers bit for bit, and what a hit costs.
         let cached = RoutedExperts::open(&gguf, 48, 512 << 20).expect("cached banks");
         let xs = unit_rms(&mut rng, 1);
-        let logits = logits_for(&xs);
+        let logits = router_logits(&router, &xs);
         let base = experts.routed_moe(layer, &logits, &xs, 1, 10).unwrap();
         let mut first = Vec::new();
         let miss = time_ms(&mut || first = cached.routed_moe(layer, &logits, &xs, 1, 10).unwrap());

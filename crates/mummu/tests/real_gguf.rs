@@ -1,10 +1,12 @@
 //! Real-file GGUF header proof: parse an actual llama.cpp-quantized model
-//! (Qwen2.5-1.5B-Instruct Q4_K_M) and check the header describes the model
+//! (Qwen2.5-1.5B-Instruct `Q4_K_M`) and check the header describes the model
 //! we know. Ignored by default; run with
 //!
 //! ```text
 //! MUMMU_GGUF_PATH=path/to/qwen2.5-1.5b-instruct-q4_k_m.gguf cargo test -p mummu --test real_gguf -- --ignored --nocapture
 //! ```
+
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 
 use std::path::PathBuf;
 
@@ -13,6 +15,7 @@ use mummu::backend::use_gpu;
 use mummu::gguf::{GgmlType, GgufFile, GgufValue};
 use mummu::models::CausalLm;
 use mummu::models::qwen2;
+use mummu_num::f64_from_u64;
 
 fn gguf_path() -> Option<PathBuf> {
     let path = PathBuf::from(std::env::var_os("MUMMU_GGUF_PATH")?);
@@ -52,7 +55,11 @@ fn real_qwen2_gguf_header_parses_and_describes_the_model() {
     // fastest-varying first — [hidden, vocab]).
     let embd = f.tensor("token_embd.weight").expect("embedding present");
     assert_eq!(embd.dims[0], 1536, "Qwen2.5-1.5B hidden size");
-    assert_eq!(embd.dims[1] as usize, tokens.len(), "vocab rows");
+    assert_eq!(
+        usize::try_from(embd.dims[1]).expect("vocab dim fits usize"),
+        tokens.len(),
+        "vocab rows"
+    );
 
     // Every tensor: known dtype (the parser guarantees it), aligned offset,
     // whole blocks; and at least one K-quant tensor is actually present.
@@ -63,16 +70,20 @@ fn real_qwen2_gguf_header_parses_and_describes_the_model() {
     let kquants = f
         .tensors
         .iter()
-        .filter(|t| matches!(t.dtype, GgmlType::Q4_K | GgmlType::Q6_K))
+        .filter(|t| matches!(t.dtype, GgmlType::Q4K | GgmlType::Q6K))
         .count();
     assert!(kquants > 0, "a q4_k_m file carries K-quant tensors");
-    let payload_bytes: u64 = f.tensors.iter().map(|t| t.byte_len()).sum();
+    let payload_bytes: u64 = f
+        .tensors
+        .iter()
+        .map(mummu::gguf::GgufTensorInfo::byte_len)
+        .sum();
     eprintln!(
         "[real_gguf] token_embd {:?} {:?} · {} K-quant tensors · payload ~{:.2} GiB",
         embd.dtype,
         embd.dims,
         kquants,
-        payload_bytes as f64 / f64::from(1u32 << 30)
+        f64_from_u64(payload_bytes) / f64::from(1u32 << 30)
     );
 }
 
@@ -151,10 +162,10 @@ fn cosine(a: &[f32], b: &[f32]) -> f64 {
 }
 
 /// Dequantization proof against the model's TRUE weights: the same
-/// checkpoint exists here as bf16 safetensors and as a Q4_K_M GGUF, so
+/// checkpoint exists here as bf16 safetensors and as a `Q4_K_M` GGUF, so
 /// - the GGUF's F32 norm tensors must equal the bf16 originals EXACTLY
 ///   (bf16 → f32 widening is lossless and that is how llama.cpp converts);
-/// - a dequantized Q4_K embedding row must land within quantization error
+/// - a dequantized `Q4_K` embedding row must land within quantization error
 ///   of the original (cosine ≈ 1; garbage layout decode would be ≈ 0).
 #[test]
 #[ignore = "needs the local GGUF (MUMMU_GGUF_PATH) + safetensors (MUMMU_QWEN2_DIR) of the same model"]
@@ -204,7 +215,7 @@ fn real_qwen2_gguf_dequant_matches_the_true_weights() {
 
 /// The tokenizer rebuilt from GGUF metadata must be **byte-identical** to the
 /// checkpoint's own `tokenizer.json` — same ids for every prompt shape we
-/// throw at it (ChatML with specials, unicode, numbers, whitespace runs), and
+/// throw at it (`ChatML` with specials, unicode, numbers, whitespace runs), and
 /// the same decoded text back.
 #[test]
 #[ignore = "needs the local GGUF (MUMMU_GGUF_PATH) + safetensors dir (MUMMU_QWEN2_DIR)"]
@@ -367,7 +378,7 @@ fn real_lfm2_gguf_tokenizer_matches_the_hf_tokenizer() {
     );
 }
 
-/// END-TO-END for the hybrid: the LFM2.5 Q4_K_M GGUF alone becomes a running
+/// END-TO-END for the hybrid: the LFM2.5 `Q4_K_M` GGUF alone becomes a running
 /// model on the GPU (conv layers, attention layers, per-head norms — all
 /// mapped from llama.cpp naming), greedy-decodes a correct answer, and its
 /// first-token logits agree with the bf16 safetensors build.
@@ -450,7 +461,7 @@ async fn real_lfm2_gguf_loads_and_decodes_on_gpu() {
     );
 }
 
-/// END-TO-END: the Q4_K_M GGUF alone (config + weights from the one file)
+/// END-TO-END: the `Q4_K_M` GGUF alone (config + weights from the one file)
 /// becomes a running model on the GPU — greedy-decodes a correct answer, and
 /// its first-token logits agree with the bf16 safetensors build of the same
 /// checkpoint (top-1 identical, high cosine; small drift IS the quantization).

@@ -1,6 +1,8 @@
 //! Dump a GGUF file's metadata and tensor inventory — the first look at any
 //! candidate import: `cargo run -p mummu --example gguf-info -- <path.gguf>`.
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use mummu::gguf::GgufFile;
 
 fn main() {

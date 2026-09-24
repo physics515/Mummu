@@ -10,38 +10,25 @@
 //! pack is built in `<out dir>.importing` and renamed on success, so an
 //! interrupted run never leaves a directory the loaders would accept.
 
-use std::path::PathBuf;
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use mummu::gguf::GgufFile;
 use mummu::models::{olmoe, qwen35};
 use mummu::pack::{ImportAction, Pack, Precision};
+use mummu_num::f64_from_u64;
 
-fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let (Some(gguf), Some(out)) = (args.first(), args.get(1)) else {
-        eprintln!("usage: pack-import <model.gguf> <out dir> [q4,q8,f16,f32]");
-        std::process::exit(2);
-    };
-    let gguf = PathBuf::from(gguf);
-    let out = PathBuf::from(out);
-    let precisions = match args.get(2) {
-        Some(list) => Precision::parse_list(list).unwrap_or_else(|e| {
-            eprintln!("{e}");
-            std::process::exit(2);
-        }),
-        None => Precision::ALL.to_vec(),
-    };
+/// The per-tensor import decision for one architecture.
+type ActionMap = Box<dyn Fn(&mummu::gguf::GgufTensorInfo) -> Option<ImportAction>>;
 
-    let header = GgufFile::open(&gguf).unwrap_or_else(|e| {
-        eprintln!("{}: {e}", gguf.display());
-        std::process::exit(1);
-    });
-    let arch = header.architecture().unwrap_or("").to_string();
-    type ActionMap = Box<dyn Fn(&mummu::gguf::GgufTensorInfo) -> Option<ImportAction>>;
-    let map: ActionMap = match arch.as_str() {
+/// The importer for the header's architecture; exits with a message for an
+/// architecture without one.
+fn action_map(arch: &str, header: &GgufFile) -> ActionMap {
+    match arch {
         "qwen35" => {
-            let cfg = qwen35::Qwen35Config::from_gguf(&header).unwrap_or_else(|e| {
+            let cfg = qwen35::Qwen35Config::from_gguf(header).unwrap_or_else(|e| {
                 eprintln!("qwen35 config: {e}");
                 std::process::exit(1);
             });
@@ -53,7 +40,65 @@ fn main() {
             eprintln!("no pack importer for architecture {other:?}");
             std::process::exit(1);
         }
+    }
+}
+
+/// P9 stage 3(c): partition the dense FFNs in place (exact; enables tiering).
+fn partition_in_place(out: &Path) {
+    let mut pack = Pack::open(out).unwrap_or_else(|e| {
+        eprintln!("reopen pack: {e}");
+        std::process::exit(1);
+    });
+    let header = pack.header().expect("pack header");
+    let trunk = qwen35::Qwen35Config::from_gguf(&header)
+        .expect("config")
+        .num_layers;
+    drop(header);
+    let t = Instant::now();
+    mummu::partition::partition_pack(
+        &mut pack,
+        &qwen35::ffn_names(trunk),
+        mummu::partition::DEFAULT_CLUSTERS,
+        |i, n| {
+            if i % 8 == 0 {
+                eprintln!(
+                    "  partition layer {i}/{n}  ({:.0}s)",
+                    t.elapsed().as_secs_f32()
+                );
+            }
+        },
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("partition failed: {e}");
+        std::process::exit(1);
+    });
+    eprintln!("  FFNs partitioned in {:.0}s", t.elapsed().as_secs_f32());
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let (Some(gguf), Some(out)) = (args.first(), args.get(1)) else {
+        eprintln!("usage: pack-import <model.gguf> <out dir> [q4,q8,f16,f32]");
+        std::process::exit(2);
     };
+    let gguf = PathBuf::from(gguf);
+    let out = PathBuf::from(out);
+    let precisions = args.get(2).map_or_else(
+        || Precision::ALL.to_vec(),
+        |list| {
+            Precision::parse_list(list).unwrap_or_else(|e| {
+                eprintln!("{e}");
+                std::process::exit(2);
+            })
+        },
+    );
+
+    let header = GgufFile::open(&gguf).unwrap_or_else(|e| {
+        eprintln!("{}: {e}", gguf.display());
+        std::process::exit(1);
+    });
+    let arch = header.architecture().unwrap_or("").to_string();
+    let map = action_map(&arch, &header);
     drop(header);
 
     let tmp = out.with_extension("importing");
@@ -103,35 +148,7 @@ fn main() {
         );
     }
     if arch == "qwen35" && !folded {
-        // P9 stage 3(c): partition the dense FFNs in place (exact; enables tiering).
-        let mut pack = Pack::open(&out).unwrap_or_else(|e| {
-            eprintln!("reopen pack: {e}");
-            std::process::exit(1);
-        });
-        let header = pack.header().expect("pack header");
-        let trunk = qwen35::Qwen35Config::from_gguf(&header)
-            .expect("config")
-            .num_layers;
-        drop(header);
-        let t = Instant::now();
-        mummu::partition::partition_pack(
-            &mut pack,
-            &qwen35::ffn_names(trunk),
-            mummu::partition::DEFAULT_CLUSTERS,
-            |i, n| {
-                if i % 8 == 0 {
-                    eprintln!(
-                        "  partition layer {i}/{n}  ({:.0}s)",
-                        t.elapsed().as_secs_f32()
-                    );
-                }
-            },
-        )
-        .unwrap_or_else(|e| {
-            eprintln!("partition failed: {e}");
-            std::process::exit(1);
-        });
-        eprintln!("  FFNs partitioned in {:.0}s", t.elapsed().as_secs_f32());
+        partition_in_place(&out);
     }
     let total: u64 = precisions
         .iter()
@@ -140,7 +157,7 @@ fn main() {
     eprintln!(
         "pack ready: {} tensors, {:.1} GiB across {precisions:?}, {:.0}s",
         manifest.tensors.len(),
-        total as f64 / f64::from(1u32 << 30),
+        f64_from_u64(total) / f64::from(1u32 << 30),
         started.elapsed().as_secs_f32()
     );
 }

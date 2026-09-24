@@ -90,10 +90,13 @@
 //!   gain on a busy one does.
 
 use crate::{Kind, QuantPolicy, rel_error};
+use mummu_num::{f64_from_u64, f64_from_usize, trunc_u64};
 
 /// One block of a layer that picks its precision as a unit: the attention
-/// projections, or the FFN. Norms and other `Fixed` weights are not parts;
-/// their bytes go into [`Layer::fixed_bytes`] at the level they always use.
+/// projections, or the FFN.
+///
+/// Norms and other `Fixed` weights are not parts; their bytes go into
+/// [`Layer::fixed_bytes`] at the level they always use.
 #[derive(Debug, Clone)]
 pub struct Part {
     /// Element count — the quality term's weight.
@@ -159,7 +162,7 @@ impl Device {
     }
 
     fn occupies(&self, part: &Part, p: QuantPolicy) -> u64 {
-        (part_bytes(part, p) as f64 * self.resident_of(p)).ceil() as u64
+        trunc_u64((f64_from_u64(part_bytes(part, p)) * self.resident_of(p)).ceil())
     }
 }
 
@@ -185,7 +188,7 @@ pub struct Problem {
 }
 
 /// Where a layer is and what precision each of its parts is at.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Choice {
     pub device: usize,
     /// Parallel to [`Layer::parts`].
@@ -193,7 +196,7 @@ pub struct Choice {
 }
 
 /// A full placement.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Assignment {
     pub layers: Vec<Choice>,
 }
@@ -211,12 +214,12 @@ pub struct Outcome {
     pub feasible: bool,
 }
 
-fn level_ok(p: QuantPolicy, floor: QuantPolicy) -> bool {
+const fn level_ok(p: QuantPolicy, floor: QuantPolicy) -> bool {
     p.bits() >= floor.bits()
 }
 
 fn part_time(part: &Part, dev: &Device, p: QuantPolicy) -> Option<f64> {
-    Some(part.bytes(p)? as f64 * dev.rate_of(p)?)
+    Some(f64_from_u64(part.bytes(p)?) * dev.rate_of(p)?)
 }
 
 fn part_bytes(part: &Part, p: QuantPolicy) -> u64 {
@@ -323,7 +326,7 @@ pub fn time_of(pb: &Problem, a: &Assignment) -> f64 {
         .zip(&a.layers)
         .map(|(l, c)| layer_time(pb, l, c))
         .sum();
-    compute + pb.crossing_s * crossings(a) as f64
+    pb.crossing_s.mul_add(f64_from_usize(crossings(a)), compute)
 }
 
 fn crossings(a: &Assignment) -> usize {
@@ -375,15 +378,15 @@ pub fn error_of(pb: &Problem, a: &Assignment) -> f64 {
     let (mut num, mut den) = (0.0, 0.0);
     for (l, c) in pb.layers.iter().zip(&a.layers) {
         for (p, &q) in l.parts.iter().zip(&c.levels) {
-            let w = sensitivity(p.kind) * p.params as f64;
-            num += w * rel_error(q);
+            let w = sensitivity(p.kind) * f64_from_usize(p.params);
+            num = w.mul_add(rel_error(q), num);
             den += w;
         }
     }
     if den == 0.0 { 0.0 } else { num / den }
 }
 
-fn sensitivity(kind: Kind) -> f64 {
+const fn sensitivity(kind: Kind) -> f64 {
     match kind {
         Kind::Attention => 2.0,
         Kind::Ffn | Kind::Fixed => 1.0,
@@ -394,7 +397,7 @@ fn sensitivity(kind: Kind) -> f64 {
 /// placement is compared against in [`replan`].
 #[must_use]
 pub fn solve(pb: &Problem) -> Outcome {
-    let n = pb.layers.len();
+    let layer_count = pb.layers.len();
     let Some(start) = pb
         .layers
         .iter()
@@ -413,11 +416,11 @@ pub fn solve(pb: &Problem) -> Outcome {
                 })
                 .collect(),
         };
-        let mut o = outcome(pb, assignment);
-        o.feasible = false;
-        return o;
+        let mut out = outcome(pb, assignment);
+        out.feasible = false;
+        return out;
     };
-    let mut a = Assignment { layers: start };
+    let mut assignment = Assignment { layers: start };
 
     // 2. Place: the change that saves the most time per byte it adds. A
     //    change is any (device, levels) for one layer — a move at ANY level
@@ -430,20 +433,20 @@ pub fn solve(pb: &Problem) -> Outcome {
     //    little faster.
     for in_place in [false, true] {
         loop {
-            let used = used_of(pb, &a);
-            let base = time_of(pb, &a);
+            let used = used_of(pb, &assignment);
+            let base = time_of(pb, &assignment);
             let mut best: Option<(f64, usize, Choice)> = None;
-            for l in 0..n {
-                for d in 0..pb.devices.len() {
-                    if in_place != (a.layers[l].device == d) {
+            for li in 0..layer_count {
+                for di in 0..pb.devices.len() {
+                    if in_place != (assignment.layers[li].device == di) {
                         continue;
                     }
-                    for c in choices(&pb.layers[l], d, &pb.devices[d], pb.floor) {
-                        if c == a.layers[l] {
+                    for choice in choices(&pb.layers[li], di, &pb.devices[di], pb.floor) {
+                        if choice == assignment.layers[li] {
                             continue;
                         }
-                        let mut trial = a.clone();
-                        trial.layers[l] = c.clone();
+                        let mut trial = assignment.clone();
+                        trial.layers[li] = choice.clone();
                         let after = used_of(pb, &trial);
                         if after
                             .iter()
@@ -460,31 +463,31 @@ pub fn solve(pb: &Problem) -> Outcome {
                         // The device's working set is charged once, by the
                         // capacity check above; counting it in the ratio would
                         // make the first layer's biggest level look cheapest.
-                        let newly = !a.layers.iter().any(|x| x.device == d);
-                        let add = after[d]
-                            .saturating_sub(used[d])
-                            .saturating_sub(if newly { pb.devices[d].fixed } else { 0 })
+                        let newly = !assignment.layers.iter().any(|c| c.device == di);
+                        let add = after[di]
+                            .saturating_sub(used[di])
+                            .saturating_sub(if newly { pb.devices[di].fixed } else { 0 })
                             .max(1);
-                        let ratio = saved / add as f64;
+                        let ratio = saved / f64_from_u64(add);
                         // Ties go to the lower layer: a prefix keeps crossings at one.
                         if best.as_ref().is_none_or(|(r, bl, _)| {
-                            ratio > *r * (1.0 + 1e-9) || (ratio >= *r * (1.0 - 1e-9) && l < *bl)
+                            ratio > *r * (1.0 + 1e-9) || (ratio >= *r * (1.0 - 1e-9) && li < *bl)
                         }) {
-                            best = Some((ratio, l, c));
+                            best = Some((ratio, li, choice));
                         }
                     }
                 }
             }
             match best {
-                Some((_, l, c)) => a.layers[l] = c,
+                Some((_, li, choice)) => assignment.layers[li] = choice,
                 None => break,
             }
         }
     }
 
     // 3. Spend: leftover capacity on precision, within the time tolerance.
-    spend(pb, &mut a);
-    outcome(pb, a)
+    spend(pb, &mut assignment);
+    outcome(pb, assignment)
 }
 
 /// Precision upgrades with what no layer move could use: most error removed
@@ -512,12 +515,13 @@ fn spend(pb: &Problem, a: &mut Assignment) {
                 if now + dt.max(0.0) > budget_s {
                     continue;
                 }
-                let gain =
-                    sensitivity(part.kind) * (rel_error(q) - rel_error(up)) * part.params as f64;
+                let gain = sensitivity(part.kind)
+                    * (rel_error(q) - rel_error(up))
+                    * f64_from_usize(part.params);
                 if gain <= 0.0 {
                     continue;
                 }
-                let ratio = gain / add.max(1) as f64;
+                let ratio = gain / f64_from_u64(add.max(1));
                 if best.as_ref().is_none_or(|(r, ..)| ratio > *r) {
                     best = Some((ratio, li, pi, up));
                 }
@@ -537,7 +541,14 @@ pub fn changed_bytes(pb: &Problem, from: &Assignment, to: &Assignment) -> u64 {
         .iter()
         .zip(from.layers.iter().zip(&to.layers))
         .map(|(l, (f, t))| {
-            if f.device != t.device {
+            if f.device == t.device {
+                l.parts
+                    .iter()
+                    .zip(f.levels.iter().zip(&t.levels))
+                    .filter(|(_, (a, b))| a != b)
+                    .map(|(p, (_, &q))| part_bytes(p, q))
+                    .sum()
+            } else {
                 // The whole layer is re-read on its new device.
                 l.parts
                     .iter()
@@ -545,13 +556,6 @@ pub fn changed_bytes(pb: &Problem, from: &Assignment, to: &Assignment) -> u64 {
                     .map(|(p, &q)| part_bytes(p, q))
                     .sum::<u64>()
                     + l.fixed_bytes
-            } else {
-                l.parts
-                    .iter()
-                    .zip(f.levels.iter().zip(&t.levels))
-                    .filter(|(_, (a, b))| a != b)
-                    .map(|(p, (_, &q))| part_bytes(p, q))
-                    .sum()
             }
         })
         .sum()
@@ -593,7 +597,7 @@ pub fn replan(pb: &Problem, current: &Assignment) -> (Verdict, Outcome) {
     }
     let target = outcome(pb, target.assignment);
     let saved = now.time_s - target.time_s;
-    let cost = changed_bytes(pb, current, &target.assignment) as f64 * pb.disk_s_per_byte;
+    let cost = f64_from_u64(changed_bytes(pb, current, &target.assignment)) * pb.disk_s_per_byte;
     if saved > 0.0 && saved * pb.horizon_tokens > cost {
         (Verdict::Improve, target)
     } else {
@@ -638,7 +642,7 @@ fn repair(pb: &Problem, mut a: Assignment) -> Outcome {
                 let freed = used[d] - used_of(pb, &trial)[d];
                 let lost = time_of(pb, &trial) - base;
                 if freed > 0 {
-                    let r = lost / freed as f64;
+                    let r = lost / f64_from_u64(freed);
                     if best.as_ref().is_none_or(|(b, _)| r < *b) {
                         best = Some((r, trial));
                     }
@@ -660,10 +664,12 @@ fn repair(pb: &Problem, mut a: Assignment) -> Outcome {
                 // Faster at fewer bits is common on a bandwidth-bound device;
                 // then only the quality is lost, and it is charged as a tiny
                 // time so the cheapest precision goes first.
-                let lost = (time_of(pb, &trial) - base).max(0.0)
-                    + 1e-12 * sensitivity(part.kind) * (rel_error(down) - rel_error(q));
+                let lost = (1e-12 * sensitivity(part.kind)).mul_add(
+                    rel_error(down) - rel_error(q),
+                    (time_of(pb, &trial) - base).max(0.0),
+                );
                 if freed > 0 {
-                    let r = lost / freed as f64;
+                    let r = lost / f64_from_u64(freed);
                     if best.as_ref().is_none_or(|(b, _)| r < *b) {
                         best = Some((r, trial));
                     }
@@ -820,7 +826,7 @@ mod tests {
             ..pb.clone()
         });
         let o = solve(&pb);
-        assert!(o.time_s <= fastest.time_s * (1.0 + pb.tolerance) + 1e-15);
+        assert!(o.time_s <= fastest.time_s.mul_add(1.0 + pb.tolerance, 1e-15));
         assert!(o.assignment.layers.iter().all(|c| c.levels == vec![Q4, Q4]));
     }
 
@@ -955,7 +961,7 @@ mod tests {
         assert_eq!(on_card(&full.assignment), 6);
         let (v, _) = replan(&pb, &full.assignment);
         assert_eq!(v, Verdict::Hold);
-        let mut five = full.assignment.clone();
+        let mut five = full.assignment;
         five.layers[5] = fastest_choice(&pb.layers[5], 0, &pb.devices[0], pb.floor).unwrap();
         let (v, _) = replan(&pb, &five);
         assert_eq!(v, Verdict::Hold, "one short of the boundary stays put");
@@ -1041,7 +1047,7 @@ mod timing {
                 Device {
                     capacity: u64::MAX / 4,
                     fixed: 0,
-                    rate: rates.clone(),
+                    rate: rates,
                     resident: vec![(Q4, 3.0)],
                 },
                 Device {

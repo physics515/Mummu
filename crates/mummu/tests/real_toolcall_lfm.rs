@@ -6,6 +6,8 @@
 //! MUMMU_LFM2_DIR=path/to/lfm2.5-1.2b cargo test -p mummu --release --test real_toolcall_lfm -- --ignored --nocapture
 //! ```
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use std::path::PathBuf;
 
 use mummu::chat::{ChatMl, ToolSpec, Turn, parse_tool_calls_lfm};

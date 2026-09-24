@@ -1,5 +1,5 @@
 //! Real-weights proof for the Qwen3 dense port: load the actual checkpoint
-//! (safetensors AND the Q4_K_M GGUF of the same weights), decode on the GPU,
+//! (safetensors AND the `Q4_K_M` GGUF of the same weights), decode on the GPU,
 //! and cross-check the two builds agree on the first token. Ignored by default;
 //! run with the paths set:
 //!
@@ -8,6 +8,8 @@
 //! MUMMU_QWEN3_GGUF_PATH=path/to/Qwen3-0.6B-Q4_K_M.gguf \
 //!   cargo test -p mummu --test real_qwen3 -- --ignored --nocapture
 //! ```
+
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 
 use std::path::PathBuf;
 
@@ -50,9 +52,9 @@ fn argmax(v: &[f32]) -> usize {
 }
 
 /// END-TO-END on the real bf16 safetensors: the Qwen3 arch (per-head q/k norm,
-/// no qkv bias, decoupled head_dim) loads real weights and greedy-decodes a
+/// no qkv bias, decoupled `head_dim`) loads real weights and greedy-decodes a
 /// coherent, correct answer on the GPU. The tokenizer is the checkpoint's own
-/// `tokenizer.json`; the prompt uses the Qwen ChatML template.
+/// `tokenizer.json`; the prompt uses the Qwen `ChatML` template.
 #[tokio::test]
 #[ignore = "needs the local Qwen3 safetensors dir (MUMMU_QWEN3_DIR) + GPU"]
 async fn real_qwen3_safetensors_loads_and_decodes_on_gpu() {
@@ -73,11 +75,14 @@ async fn real_qwen3_safetensors_loads_and_decodes_on_gpu() {
         .to_vec();
 
     let model = qwen3::load_from_dir(&dir, &device).expect("safetensors load is checked");
-    // The decoupled shape holds on the real weights.
-    assert!(
-        model.config.num_attention_heads * model.config.head_dim != model.config.hidden_size
-            || model.config.head_dim * model.config.num_attention_heads == model.config.hidden_size,
-        "config loaded"
+    // The decoupled shape holds on the real weights: Qwen3-0.6B's head_dim
+    // (128) is a config field of its own, not hidden / heads (1024 / 16 =
+    // 64), so heads x head_dim is NOT the hidden size — the shape a loader
+    // that derived head_dim would get wrong.
+    assert_ne!(
+        model.config.num_attention_heads * model.config.head_dim,
+        model.config.hidden_size,
+        "Qwen3-0.6B's head_dim is decoupled from hidden / heads"
     );
     eprintln!(
         "[real_qwen3] {} layers · hidden {} · {} heads · {} kv · head_dim {} · tied {}",
@@ -131,7 +136,7 @@ async fn real_qwen3_safetensors_loads_and_decodes_on_gpu() {
     assert!(text.contains('4'), "expected the answer 4 in: {text:?}");
 }
 
-/// END-TO-END on the Q4_K_M GGUF alone (config + tokenizer + weights from the
+/// END-TO-END on the `Q4_K_M` GGUF alone (config + tokenizer + weights from the
 /// one file), cross-checked against the bf16 safetensors build: both decode a
 /// correct answer and agree on the top first-token id (small logit drift IS the
 /// quantization; a layout/qk-norm-mapping bug reads as disagreement / ≈0 cosine).

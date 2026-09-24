@@ -5,7 +5,7 @@
 //! executes through the backend's `q_matmul` (burn-cubecl runs the mixed
 //! float×quantized matmul natively; burn-flex falls back to per-op
 //! dequantize, slower but with the same memory-resident win). Import
-//! **re-quantizes**: whatever the source stored (BF16, Q4_K, IQ4_XS, …) is
+//! **re-quantizes**: whatever the source stored (BF16, `Q4_K`, `IQ4_XS`, …) is
 //! dequantized per tensor and re-quantized into this one scheme.
 //!
 //! What stays float, deliberately:
@@ -52,10 +52,10 @@ impl SchemeExt for QuantPolicy {
         // Block width must stay in step with `QuantPolicy::eligible`, which
         // rejects rows that do not divide it.
         let value = match self {
-            QuantPolicy::Off | QuantPolicy::F16 => return None,
-            QuantPolicy::Q8 => QuantValue::Q8S,
-            QuantPolicy::Q4 => QuantValue::Q4S,
-            QuantPolicy::Q2 => QuantValue::Q2S,
+            Self::Off | Self::F16 => return None,
+            Self::Q8 => QuantValue::Q8S,
+            Self::Q4 => QuantValue::Q4S,
+            Self::Q2 => QuantValue::Q2S,
         };
         Some(
             QuantScheme::default()
@@ -68,6 +68,12 @@ impl SchemeExt for QuantPolicy {
 /// Quantize one weight tensor per `policy` (min-max calibration — weights
 /// are static, so calibration is exact). The caller has already decided
 /// eligibility; `Off` is a caller bug.
+///
+/// # Panics
+///
+/// When `policy` is a float rung ([`QuantPolicy::Off`] or
+/// [`QuantPolicy::F16`]), which denotes no quantization scheme at all.
+#[must_use]
 pub fn quantize_weight<const D: usize>(policy: QuantPolicy, tensor: Tensor<D>) -> Tensor<D> {
     let scheme = policy
         .scheme()

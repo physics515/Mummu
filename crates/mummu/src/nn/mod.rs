@@ -12,7 +12,7 @@ mod moe;
 mod rope;
 
 pub use attention::{
-    GqaAttention, GqaAttentionConfig, LayerKv, causal_mask, kv_append, kv_append_as,
+    GqaAttention, GqaAttentionConfig, HeadShape, LayerKv, causal_mask, kv_append, kv_append_as,
     kv_f16_enabled, repeat_kv,
 };
 pub use conv::{ConvState, ShortConv, ShortConvConfig};
@@ -30,6 +30,7 @@ pub use packed_gemv::{
 pub use rope::{apply_rope, rope_tables, rotate_half};
 
 /// Hard ceiling on `past + t` everywhere a sequence position is materialized.
+///
 /// Nothing in the zoo has a longer trained context; a position beyond this is
 /// a caller bug (e.g. a decode loop that forgot its stop condition), not a
 /// workload.

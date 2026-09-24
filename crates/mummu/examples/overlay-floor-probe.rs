@@ -7,10 +7,14 @@
 //! at ~4.5 bits/weight across three projections). We stage the same BYTE
 //! COUNT as f32 rows scaled down — [1925 x 17408] f32 = 134.05 MB — because
 //! the bus does not care what the bytes mean, only how many there are.
+
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use std::time::Instant;
 
 use burn::tensor::{Distribution, Tensor};
 use mummu::overlay::{LayerAction, LayerCost, OverlayModel, min_vram_bytes, plan};
+use mummu_num::{f64_from_u64, f64_from_usize};
 
 fn main() {
     // ---- staging bandwidth, measured (or skipped gracefully) -------------
@@ -33,12 +37,12 @@ fn main() {
             let _ = w.clone().to_device(&gpu).into_data();
         }
         let per_ms = t.elapsed().as_secs_f64() * 1e3 / f64::from(reps);
-        let per_byte_ms = slab_bytes as f64 / per_ms;
+        let per_byte_ms = f64_from_u64(slab_bytes) / per_ms;
         println!(
             "staging [{}x{}] f32 = {:.1} MB (Q4 layer-slab equivalent): {:.2} ms/rep over {reps} warm reps -> {:.1} GB/s",
             rows,
             cols,
-            slab_bytes as f64 / 1e6,
+            f64_from_u64(slab_bytes) / 1e6,
             per_ms,
             per_byte_ms * 1e3 / 1e9,
         );
@@ -65,17 +69,17 @@ fn main() {
         crossing_ms: 0.4, // nominal host<->device activation hop
     };
     let budget = resident_today * slab_bytes + m.ring_slots as u64 * slab_bytes;
-    let tx_layer_ms = slab_bytes as f64 / tx_bytes_per_ms;
+    let tx_layer_ms = f64_from_u64(slab_bytes) / tx_bytes_per_ms;
 
     println!(
         "\n27B decision table: {num_layers} layers x {:.1} MB Q4, gpu {gpu_ms} ms/layer, \
          tx {tx_layer_ms:.2} ms/layer ({label}), budget {:.2} GB ({resident_today} layers + ring)",
-        slab_bytes as f64 / 1e6,
-        budget as f64 / 1e9,
+        f64_from_u64(slab_bytes) / 1e6,
+        f64_from_u64(budget) / 1e9,
     );
     println!(
         "stream slot cost = max(gpu, tx) + lat/slots = {:.2} ms/layer -- the number host_ms must beat",
-        gpu_ms.max(tx_layer_ms) + m.slot_latency_ms / m.ring_slots as f64
+        gpu_ms.max(tx_layer_ms) + m.slot_latency_ms / f64_from_usize(m.ring_slots)
     );
     println!("\n  host_ms   resident  stream  host   predicted_ms   ring_MB   tail decision");
     for host_ms in [36.0, 6.0] {
@@ -104,7 +108,7 @@ fn main() {
             count(LayerAction::Stream),
             count(LayerAction::Host),
             p.predicted_token_ms,
-            p.ring_bytes as f64 / 1e6,
+            f64_from_u64(p.ring_bytes) / 1e6,
         );
     }
 
@@ -121,7 +125,7 @@ fn main() {
         "\ncapacity theorem: ring ({} x {:.1} MB) + 512 MB activations + 1 GB KV = {:.2} GB \
          streams ALL {num_layers} layers -- independent of model depth",
         m.ring_slots,
-        slab_bytes as f64 / 1e6,
-        floor as f64 / 1e9,
+        f64_from_u64(slab_bytes) / 1e6,
+        f64_from_u64(floor) / 1e9,
     );
 }

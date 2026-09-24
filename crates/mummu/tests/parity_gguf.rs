@@ -3,7 +3,7 @@
 //! container parse + dequant feed the model exactly what ggml's compute path
 //! sees. The bf16-build comparison in `real_gguf.rs` bounds quantization
 //! drift; this leg removes the quantization variable entirely by putting the
-//! identical Q4_K_M bytes on both sides.
+//! identical `Q4_K_M` bytes on both sides.
 //!
 //! Everything on our side comes from the ONE .gguf (config, weights,
 //! tokenizer); the reference is `llama-server` on the same file, raw
@@ -16,8 +16,9 @@
 //!   cargo test -p mummu --release --test parity_gguf -- --ignored --nocapture
 //! ```
 
-mod gguf_compare;
-mod llama_ref;
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
+use mummu_testkit::gguf_compare;
 
 use std::path::PathBuf;
 
@@ -27,8 +28,8 @@ use mummu::gguf::GgufFile;
 use mummu::models::{lfm2, olmoe, qwen2, qwen3};
 
 /// Max |Δlogprob| over the top-k between our load (weights dequantized to f32
-/// once, wgpu compute) and llama.cpp on the SAME Q4_K_M file (CPU kernels
-/// that also quantize the *activations* to Q8_K per integer dot product — the
+/// once, wgpu compute) and llama.cpp on the SAME `Q4_K_M` file (CPU kernels
+/// that also quantize the *activations* to `Q8_K` per integer dot product — the
 /// reference's own noise floor, absent from our f32 path and an order larger
 /// than the BF16 leg's 1.5e-2 in `parity_lfm2.rs`). Measured on the dev GPU:
 /// 2.66e-1 (Qwen2), 2.60e-1 (LFM2.5) — while the 23/24-token greedy sequences
@@ -42,10 +43,8 @@ const LOGPROB_ABS_TOLERANCE: f64 = 7.5e-1;
 const PORT_BASE: u16 = 18481;
 
 fn env_path(var: &str, what: &str) -> PathBuf {
-    let p = std::env::var_os(var)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| panic!("set {var} to {what}"));
-    assert!(p.is_file(), "{var} is not a file: {p:?}");
+    let p = std::env::var_os(var).map_or_else(|| panic!("set {var} to {what}"), PathBuf::from);
+    assert!(p.is_file(), "{var} is not a file: {}", p.display());
     p
 }
 

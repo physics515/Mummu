@@ -1,20 +1,23 @@
-//! Real-network Hub download proof: fetch a small model from HuggingFace,
+//! Real-network Hub download proof: fetch a small model from `HuggingFace`,
 //! checked-load it, and run it. Ignored by default (network + ~90 MB); run with
 //!
 //! ```text
 //! MUMMU_HUB_DEST=some/tmp/dir cargo test -p mummu --release --test real_hub -- --ignored --nocapture
 //! ```
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use std::path::PathBuf;
 
 use mummu::hub;
 use mummu::models::minilm;
+use mummu_num::f32_from_u32;
 use tokenizers::Tokenizer;
 
 /// Small enough to download in seconds, real enough to prove the pipeline.
 const REPO: &str = "sentence-transformers/all-MiniLM-L6-v2";
 
-/// The MiniLM entry from the built-in catalog (also pins the repo above).
+/// The `MiniLM` entry from the built-in catalog (also pins the repo above).
 fn minilm_spec() -> mummu::registry::ModelSpec {
     mummu::registry::catalog()
         .into_iter()
@@ -56,7 +59,11 @@ fn hub_download_then_load_then_embed() {
     let enc = tok
         .encode("Downloads that verify themselves.", true)
         .expect("encodes");
-    let mask: Vec<f32> = enc.get_attention_mask().iter().map(|&m| m as f32).collect();
+    let mask: Vec<f32> = enc
+        .get_attention_mask()
+        .iter()
+        .map(|&m| f32_from_u32(m))
+        .collect();
     let embedding = loaded
         .embed_ids(enc.get_ids(), &mask, &device)
         .expect("embeds");
@@ -241,7 +248,7 @@ async fn hub_fetches_and_runs_lfm2_230m_on_cpu() {
     );
 }
 
-/// Registry → single-file GGUF install: the catalog's LFM2.5 Q4_K_M spec
+/// Registry → single-file GGUF install: the catalog's LFM2.5 `Q4_K_M` spec
 /// downloads through `fetch` (one ~700 MB file, resumable/cache-first like
 /// every hub fetch), lands where `gguf_path` says, parses as a valid GGUF of
 /// the right architecture, and its metadata builds the tokenizer — the whole

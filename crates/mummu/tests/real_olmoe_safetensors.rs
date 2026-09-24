@@ -1,4 +1,4 @@
-//! REAL-WEIGHTS proof for the OLMoE **HF safetensors** import path (P2).
+//! REAL-WEIGHTS proof for the `OLMoE` **HF safetensors** import path (P2).
 //!
 //! The GGUF path ships the 64 experts already fused (`ffn_*_exps`); the HF
 //! checkpoint stores each expert separately across three shards. This suite
@@ -18,6 +18,8 @@
 //! MUMMU_HUB_DEST=C:\Users\me\.cache\mummu-models \
 //!   cargo test -p mummu --test real_olmoe_safetensors -- --ignored --nocapture
 //! ```
+
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 
 use std::path::PathBuf;
 
@@ -110,12 +112,13 @@ async fn olmoe_safetensors_fuses_and_decodes_on_cpu() {
 #[test]
 #[ignore = "needs 13.8 GB of weights (MUMMU_HUB_DEST)"]
 fn fused_expert_slot_is_bit_exact_against_the_raw_shard_bytes() {
+    use std::io::{Read, Seek, SeekFrom};
+    const LAYER: usize = 5;
+    const EXPERT: usize = 37;
     let Some(dir) = checkpoint_dir() else {
         eprintln!("set MUMMU_HUB_DEST to run this test");
         return;
     };
-    const LAYER: usize = 5;
-    const EXPERT: usize = 37;
     let source_name = format!("model.layers.{LAYER}.mlp.experts.{EXPERT}.gate_proj.weight");
 
     // Independent read: find the tensor in whichever shard holds it and pull
@@ -127,10 +130,9 @@ fn fused_expert_slot_is_bit_exact_against_the_raw_shard_bytes() {
             continue;
         };
         let mut file = std::fs::File::open(&shard).expect("shard opens");
-        use std::io::{Read, Seek, SeekFrom};
         file.seek(SeekFrom::Start(header.data_offset + entry.offsets.0))
             .expect("seek");
-        let mut bytes = vec![0u8; entry.byte_len() as usize];
+        let mut bytes = vec![0u8; usize::try_from(entry.byte_len()).expect("tensor fits memory")];
         file.read_exact(&mut bytes).expect("read");
         truth = Some((entry.shape.clone(), bytes));
         break;

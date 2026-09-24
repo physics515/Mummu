@@ -1,7 +1,9 @@
-//! Model-cache disk accounting (P8): report how much space each cached model
-//! takes and validate a removal target so a consumer's settings UI can
-//! reclaim disk without ever escaping the cache dir. App-agnostic and free of
-//! async/UI types; ported from laurelane's unit-tested implementation.
+//! Model-cache disk accounting (P8).
+//!
+//! Report how much space each cached model takes and validate a removal
+//! target so a consumer's settings UI can reclaim disk without ever escaping
+//! the cache dir. App-agnostic and free of async/UI types; ported from
+//! laurelane's unit-tested implementation.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -25,9 +27,11 @@ pub struct DiskReport {
     pub location: String,
 }
 
-/// Recursively sum the sizes of every regular file under `path`. Best-effort:
-/// unreadable entries are skipped and symlinked dirs are not followed (only
-/// real directories recurse), so a broken link can't send it off the rails.
+/// Recursively sum the sizes of every regular file under `path`.
+///
+/// Best-effort: unreadable entries are skipped and symlinked dirs are not
+/// followed (only real directories recurse), so a broken link can't send it
+/// off the rails.
 #[must_use]
 pub fn dir_size(path: &Path) -> u64 {
     let mut total = 0;
@@ -57,7 +61,7 @@ pub fn cached_models(models_dir: &Path) -> Vec<ModelDisk> {
         return out;
     };
     for entry in entries.flatten() {
-        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
             let name = entry.file_name().to_string_lossy().into_owned();
             out.push(ModelDisk {
                 name,
@@ -102,6 +106,12 @@ pub fn is_safe_component(name: &str) -> bool {
 
 /// Resolve the on-disk path to remove for cache subdir `name`, or an error if
 /// `name` is unsafe or absent. The returned path is always a direct child of
+/// `models_dir`.
+///
+/// # Errors
+///
+/// A message when `name` is not a safe single path component (see
+/// [`is_safe_component`]) or when no directory of that name exists under
 /// `models_dir`.
 pub fn resolve_removal(models_dir: &Path, name: &str) -> Result<PathBuf, String> {
     if !is_safe_component(name) {
@@ -183,7 +193,7 @@ mod tests {
     fn cached_models_of_missing_dir_is_empty() {
         let missing = std::env::temp_dir().join("mummu_manage_test_absent_xyz");
         let _ = fs::remove_dir_all(&missing);
-        assert!(cached_models(&missing).is_empty());
+        assert_eq!(cached_models(&missing), [] as [crate::manage::ModelDisk; 0]);
         assert_eq!(report(&missing).total_bytes, 0);
     }
 
@@ -221,11 +231,12 @@ mod tests {
     }
 }
 
-/// The settings-UI-facing management surface (P8): one object owning the
-/// models root that composes the catalog ([`crate::registry`]), downloads
-/// ([`crate::hub`], with per-chunk progress), disk accounting, and safe
-/// removal. Active-model *switching* is the consumer's `ModelSlot` keyed by
-/// [`ModelManager::model_dir`].
+/// The settings-UI-facing management surface (P8).
+///
+/// One object owning the models root that composes the catalog
+/// ([`crate::registry`]), downloads ([`crate::hub`], with per-chunk
+/// progress), disk accounting, and safe removal. Active-model *switching* is
+/// the consumer's `ModelSlot` keyed by [`ModelManager::model_dir`].
 pub struct ModelManager {
     root: PathBuf,
     catalog: Vec<crate::registry::ModelSpec>,
@@ -239,6 +250,11 @@ impl ModelManager {
     }
 
     /// Manage `root` with an app-supplied catalog (all specs must validate).
+    ///
+    /// # Panics
+    ///
+    /// When `root` is the empty path, `catalog` is empty, or any spec in it
+    /// fails [`crate::registry::ModelSpec::validate`].
     #[must_use]
     pub fn with_catalog(root: PathBuf, catalog: Vec<crate::registry::ModelSpec>) -> Self {
         assert!(
@@ -260,12 +276,20 @@ impl ModelManager {
     }
 
     /// The dir a catalog model lives in (whether or not it's installed yet).
+    ///
+    /// # Errors
+    ///
+    /// A message listing the catalog when `name` is not in it.
     pub fn model_dir(&self, name: &str) -> Result<PathBuf, String> {
         self.spec(name).map(|s| s.dir(&self.root))
     }
 
     /// Is every required artifact of `name` on disk? (config + tokenizer +
     /// single-file weights or a shard index.)
+    ///
+    /// # Errors
+    ///
+    /// A message listing the catalog when `name` is not in it.
     pub fn is_installed(&self, name: &str) -> Result<bool, String> {
         let dir = self.model_dir(name)?;
         let weights = dir.join("model.safetensors").is_file()
@@ -275,6 +299,12 @@ impl ModelManager {
 
     /// Download `name` from its spec (resumable, cache-first), reporting
     /// progress per chunk. Returns the model dir ready for `load_from_dir`.
+    ///
+    /// # Errors
+    ///
+    /// A message when `name` is not in the catalog, or the rendered
+    /// [`crate::hub::HubError`] when the download fails (transport, I/O, a
+    /// short or corrupt stream, a bad shard index).
     pub fn install(
         &self,
         name: &str,
@@ -287,6 +317,11 @@ impl ModelManager {
 
     /// Remove `name`'s files from disk (traversal-safe). The caller drops any
     /// live `ModelSlot` first — removal only touches the disk.
+    ///
+    /// # Errors
+    ///
+    /// A message when `name` is not a safe path component or names no cached
+    /// model (see [`resolve_removal`]), or when deleting the directory fails.
     pub fn remove(&self, name: &str) -> Result<(), String> {
         let target = resolve_removal(&self.root, name)?;
         std::fs::remove_dir_all(&target).map_err(|e| format!("remove {name:?}: {e}"))

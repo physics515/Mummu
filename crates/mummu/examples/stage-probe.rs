@@ -3,10 +3,14 @@
 //! The hot-swap design: weights live in host RAM, and each layer's clusters
 //! are staged into VRAM, computed, and evicted. That only wins if
 //! host->VRAM staging is fast enough that GPU compute + staging beats CPU
-//! compute. This measures the staging leg (PCIe) at real cluster sizes.
+//! compute. This measures the staging leg (`PCIe`) at real cluster sizes.
+
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use std::time::Instant;
 
 use burn::tensor::{Distribution, Tensor};
+use mummu_num::f64_from_usize;
 
 fn main() {
     let cpu = mummu::backend::cpu_device();
@@ -20,7 +24,7 @@ fn main() {
         ("layer slab   gate [5120,17408]", hidden, 17408),
     ] {
         let w_cpu = Tensor::<2>::random([rows, cols], Distribution::Default, &cpu);
-        let bytes = (rows * cols * 4) as f64;
+        let bytes = f64_from_usize(rows * cols * 4);
         // warm
         let _ = w_cpu.clone().to_device(&gpu).into_data();
         let n = 10;
@@ -58,12 +62,12 @@ fn main() {
     let stage_ms = t.elapsed().as_secs_f64() * 1e3 / f64::from(n);
 
     // And: already-resident GPU compute (no staging), the upper bound.
-    let w_gpu = w_cpu.clone().to_device(&gpu);
-    let x_gpu = x_cpu.clone().to_device(&gpu);
-    let _ = x_gpu.clone().matmul(w_gpu.clone()).into_data();
+    let w_resident = w_cpu.to_device(&gpu);
+    let x_resident = x_cpu.to_device(&gpu);
+    let _ = x_resident.clone().matmul(w_resident.clone()).into_data();
     let t = Instant::now();
     for _ in 0..n {
-        let _ = x_gpu.clone().matmul(w_gpu.clone()).into_data();
+        let _ = x_resident.clone().matmul(w_resident.clone()).into_data();
     }
     let res_ms = t.elapsed().as_secs_f64() * 1e3 / f64::from(n);
 

@@ -1,7 +1,7 @@
-//! The **autotune cache**: where CubeCL persists its kernel picks, and how to
+//! The **autotune cache**: where `CubeCL` persists its kernel picks, and how to
 //! throw them away.
 //!
-//! CubeCL benchmarks several implementations of each kernel the first time it
+//! `CubeCL` benchmarks several implementations of each kernel the first time it
 //! sees one and writes the winner to disk, keyed by (device, kernel,
 //! checksum). Later processes load those picks instead of re-tuning, which is
 //! what makes a cold start bearable — but the cache has **no invalidation and
@@ -14,7 +14,7 @@
 //!
 //! This module is the repair: report where the cache lives and delete it, so a
 //! consumer can offer a "re-tune GPU kernels" action instead of shipping a bad
-//! tune to a user forever. It reads the same configuration CubeCL reads
+//! tune to a user forever. It reads the same configuration `CubeCL` reads
 //! (`[cubecl.autotune] cache` from the `cubecl.toml` / `burn.toml` discovered
 //! by walking up from the process CWD), so the path is right by construction
 //! rather than by convention.
@@ -61,7 +61,7 @@ pub enum TuneError {
 /// Where the autotune cache lives, and how much of it there is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TuneCacheReport {
-    /// The `<root>/autotune` directory CubeCL writes to.
+    /// The `<root>/autotune` directory `CubeCL` writes to.
     pub dir: PathBuf,
     /// Number of cache files found (0 when the cache does not exist yet).
     pub files: usize,
@@ -72,18 +72,18 @@ pub struct TuneCacheReport {
 impl TuneCacheReport {
     /// Has anything been tuned and persisted yet?
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.files == 0
     }
 }
 
-/// The directory CubeCL persists autotune picks to, per the configuration it
+/// The directory `CubeCL` persists autotune picks to, per the configuration it
 /// would itself discover.
 ///
 /// **Reads the global config**, which initializes it if no one has yet — the
 /// same one-shot singleton `RuntimeConfig::set` writes to. A consumer that
 /// wants to `set` a custom config must do so *before* calling this (and before
-/// building any backend), exactly as CubeCL requires.
+/// building any backend), exactly as `CubeCL` requires.
 #[must_use]
 pub fn autotune_cache_dir() -> PathBuf {
     // cubecl 0.11 moved autotune persistence out of a per-file directory and
@@ -96,6 +96,13 @@ pub fn autotune_cache_dir() -> PathBuf {
 
 /// Measure the persisted cache without changing it. A missing directory is
 /// not an error — it means nothing has been tuned yet.
+///
+/// # Errors
+///
+/// [`TuneError::Io`] when a directory under the cache root cannot be read;
+/// [`TuneError::Implausible`] when the tree nests deeper than
+/// [`MAX_CACHE_DEPTH`] or holds more than [`MAX_CACHE_FILES`] files — the
+/// configured root is then not an autotune cache.
 pub fn autotune_cache_report() -> Result<TuneCacheReport, TuneError> {
     let dir = autotune_cache_dir();
     let (files, bytes) = measure(&dir, 0)?;
@@ -109,6 +116,12 @@ pub fn autotune_cache_report() -> Result<TuneCacheReport, TuneError> {
 /// cache into memory and will keep using and re-writing it, so a consumer
 /// should treat this as "re-tune on next launch" (or call it before building a
 /// backend). Idempotent: clearing an absent cache reports zero and succeeds.
+///
+/// # Errors
+///
+/// Everything [`autotune_cache_report`] returns, plus [`TuneError::Io`] when
+/// the root cannot be listed or an environment database file cannot be
+/// removed.
 pub fn clear_autotune_cache() -> Result<TuneCacheReport, TuneError> {
     let report = autotune_cache_report()?;
     if !report.dir.exists() {
@@ -176,7 +189,7 @@ fn measure(dir: &Path, depth: usize) -> Result<(usize, u64), TuneError> {
             bytes += b;
         } else {
             files += 1;
-            bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
+            bytes += entry.metadata().map_or(0, |m| m.len());
         }
         if files > MAX_CACHE_FILES {
             return Err(TuneError::Implausible {

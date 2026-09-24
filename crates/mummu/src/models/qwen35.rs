@@ -1,6 +1,8 @@
-//! Qwen3.5 / Qwen3.8 ("qwen35") hybrid decoder: Gated DeltaNet linear
-//! attention on three of every four layers, gated full attention (partial
-//! RoPE) on the fourth, SwiGLU MLPs, RMSNorm everywhere, tied or untied head.
+//! Qwen3.5 / Qwen3.8 ("qwen35") hybrid decoder.
+//!
+//! Gated `DeltaNet` linear attention on three of every four layers, gated
+//! full attention (partial `RoPE`) on the fourth, `SwiGLU` MLPs, `RMSNorm`
+//! everywhere, tied or untied head.
 //!
 //! Ported from llama.cpp's reference (`src/models/qwen35.cpp` +
 //! `delta-net-base.cpp`, fetched 2026-08-21), the only implementation with
@@ -9,13 +11,13 @@
 //!
 //! - **Full attention** (`(i+1) % full_attention_interval == 0`): the q
 //!   projection emits query and a per-head **output gate** interleaved
-//!   (`[q_h | gate_h]` per head); per-head q/k RMSNorm; RoPE over only the
-//!   first `rope_dim` of the 256-wide heads (the metadata's MRoPE sections
-//!   degenerate to standard RoPE for text-only inputs); softmax attention;
+//!   (`[q_h | gate_h]` per head); per-head q/k `RMSNorm`; `RoPE` over only the
+//!   first `rope_dim` of the 256-wide heads (the metadata's `MRoPE` sections
+//!   degenerate to standard `RoPE` for text-only inputs); softmax attention;
 //!   then `out ⊙ sigmoid(gate)` before the output projection.
-//! - **Gated DeltaNet** (the rest): one projection mixes q/k/v, a second
+//! - **Gated `DeltaNet`** (the rest): one projection mixes q/k/v, a second
 //!   emits the gate `z`; the mix runs through a depthwise causal conv
-//!   (kernel `conv_kernel`, rolling state) + SiLU; q/k are L2-normalized
+//!   (kernel `conv_kernel`, rolling state) + `SiLU`; q/k are L2-normalized
 //!   per head (`x / sqrt(‖x‖² + ε)`, [`Qwen35Config::gdn_l2`]) and tiled
 //!   from `n_k_heads` to
 //!   `n_v_heads`; the recurrence per head with state `S ∈ R^{d_k×d_v}`:
@@ -25,7 +27,7 @@
 //!   (`RMS(o)·silu(z)` per head) and projected back. The gate activation is
 //!   [`Qwen35Config::gdn_gate`]: qwen35 is `silu`; qwen4exp reuses these
 //!   blocks through a config adapter with `sigmoid`, its one numerical
-//!   difference in the DeltaNet.
+//!   difference in the `DeltaNet`.
 //!
 //! The NextN/MTP block some checkpoints append (`nextn_predict_layers = 1`)
 //! is a draft head for speculative decoding, unused by the main forward —
@@ -39,6 +41,7 @@ use burn::nn::{
     Embedding, EmbeddingConfig, Linear, LinearConfig, PaddingConfig1d, RmsNorm, RmsNormConfig,
 };
 use burn::tensor::{Bool, DType, Device, Int, Tensor, TensorData, activation};
+use mummu_num::{f32_from_usize, f64_from_u64, narrow};
 
 use crate::gguf::{GgufFile, GgufMap, GgufTensorInfo, GgufValue};
 use crate::import::ImportError;
@@ -69,25 +72,25 @@ pub struct Qwen35Config {
     pub intermediate_size: usize,
     pub rms_norm_eps: f64,
     pub rope_theta: f32,
-    /// How many leading dims of each head RoPE rotates (`rope.dimension_count`).
+    /// How many leading dims of each head `RoPE` rotates (`rope.dimension_count`).
     pub rope_dim: usize,
     /// Layer `i` is full attention iff `(i+1) % interval == 0`.
     pub full_attention_interval: usize,
-    /// Depthwise conv kernel length in the DeltaNet mix path.
+    /// Depthwise conv kernel length in the `DeltaNet` mix path.
     pub conv_kernel: usize,
-    /// DeltaNet value width (`ssm.inner_size` = `n_v_heads · d_state`).
+    /// `DeltaNet` value width (`ssm.inner_size` = `n_v_heads · d_state`).
     pub d_inner: usize,
     /// Per-head key/value width (`ssm.state_size`).
     pub d_state: usize,
-    /// DeltaNet key/query heads (`ssm.group_count`).
+    /// `DeltaNet` key/query heads (`ssm.group_count`).
     pub n_k_heads: usize,
-    /// DeltaNet value heads (`ssm.time_step_rank` — llama.cpp's reuse).
+    /// `DeltaNet` value heads (`ssm.time_step_rank` — llama.cpp's reuse).
     pub n_v_heads: usize,
-    /// Activation on `z` in the DeltaNet's gated output RMSNorm. Not in
+    /// Activation on `z` in the `DeltaNet`'s gated output `RMSNorm`. Not in
     /// the GGUF header — fixed by the architecture: [`GdnGate::Silu`] for
     /// qwen35, [`GdnGate::Sigmoid`] when qwen4exp drives these blocks.
     pub gdn_gate: GdnGate,
-    /// Where `rms_norm_eps` enters the DeltaNet's q/k L2 norms. Not in the
+    /// Where `rms_norm_eps` enters the `DeltaNet`'s q/k L2 norms. Not in the
     /// header either: [`GdnL2::AddEps`] for both qwen35 and qwen4exp, the
     /// form the checkpoints were trained with.
     pub gdn_l2: GdnL2,
@@ -102,23 +105,38 @@ pub struct Qwen35Config {
 
 impl Qwen35Config {
     #[must_use]
-    pub fn is_attention(&self, layer: usize) -> bool {
+    pub const fn is_attention(&self, layer: usize) -> bool {
         (layer + 1).is_multiple_of(self.full_attention_interval)
     }
 
-    /// q/k projection width in the DeltaNet mix (`n_k_heads · d_state`).
+    /// q/k projection width in the `DeltaNet` mix (`n_k_heads · d_state`).
     #[must_use]
-    pub fn key_dim(&self) -> usize {
+    pub const fn key_dim(&self) -> usize {
         self.n_k_heads * self.d_state
     }
 
-    /// Channels through the DeltaNet conv: q + k + v concatenated.
+    /// Channels through the `DeltaNet` conv: q + k + v concatenated.
     #[must_use]
-    pub fn conv_dim(&self) -> usize {
+    pub const fn conv_dim(&self) -> usize {
         2 * self.key_dim() + self.d_inner
     }
 
     /// Hyperparameters from a GGUF header's `qwen35.*` metadata.
+    ///
+    /// # Errors
+    ///
+    /// The architecture is not `qwen35`; a required `qwen35.*` key or
+    /// `tokenizer.ggml.eos_token_id` is missing; `token_embd.weight` is
+    /// absent or not 2-D; `nextn_predict_layers` is not below
+    /// `block_count`; `key_length` differs from `value_length`; the EOS id
+    /// does not fit `u32`; a layout invariant [`Self::validate`] refuses; or
+    /// a `prism.hadamard.*` contract that [`Qwen35Hadamard::from_spec`]
+    /// cannot resolve against this file.
+    ///
+    /// # Panics
+    ///
+    /// Only on a 32-bit target, when a header dimension or count does not
+    /// fit `usize`.
     pub fn from_gguf(f: &GgufFile) -> Result<Self, String> {
         let arch = f.architecture().unwrap_or("<missing>");
         if arch != "qwen35" {
@@ -243,29 +261,77 @@ impl Qwen35Config {
     }
 }
 
-/// Which of one layer's projections are Hadamard-folded — each takes the
-/// transformed input (`DeviceConsts::forward` of what it would otherwise
-/// multiply). Per projection, because the contract lists weights one by one
-/// and the fork transforms per weight; a layer's untouched projections keep
-/// reading the plain activation.
+/// One projection of a layer that a Hadamard contract may fold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fold {
+    /// `attn_q` (attention layers).
+    Q,
+    /// `attn_k`.
+    K,
+    /// `attn_v`.
+    V,
+    /// `attn_output`.
+    O,
+    /// `attn_qkv` (`DeltaNet` layers).
+    Qkv,
+    /// `attn_gate`, the `DeltaNet` gate `z`.
+    Z,
+    /// `ssm_out`.
+    Out,
+    /// `ffn_gate`.
+    Gate,
+    /// `ffn_up`.
+    Up,
+    /// `ffn_down`.
+    Down,
+}
+
+/// Which of one layer's projections are Hadamard-folded.
+///
+/// Each folded projection takes the transformed input
+/// (`DeviceConsts::forward` of what it would otherwise multiply). Per
+/// projection, because the contract lists weights one by one and the fork
+/// transforms per weight; a layer's untouched projections keep reading the
+/// plain activation. A set of [`Fold`]s, empty by default.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LayerFolds {
-    pub q: bool,
-    pub k: bool,
-    pub v: bool,
-    pub o: bool,
-    pub qkv: bool,
-    pub z: bool,
-    pub out: bool,
-    pub gate: bool,
-    pub up: bool,
-    pub down: bool,
+    bits: u16,
 }
 
 impl LayerFolds {
+    const fn bit(fold: Fold) -> u16 {
+        match fold {
+            Fold::Q => 1 << 0,
+            Fold::K => 1 << 1,
+            Fold::V => 1 << 2,
+            Fold::O => 1 << 3,
+            Fold::Qkv => 1 << 4,
+            Fold::Z => 1 << 5,
+            Fold::Out => 1 << 6,
+            Fold::Gate => 1 << 7,
+            Fold::Up => 1 << 8,
+            Fold::Down => 1 << 9,
+        }
+    }
+
+    /// Is `fold`'s projection folded?
+    #[must_use]
+    pub const fn has(self, fold: Fold) -> bool {
+        self.bits & Self::bit(fold) != 0
+    }
+
+    /// Mark `fold`'s projection as folded.
+    pub const fn insert(&mut self, fold: Fold) {
+        self.bits |= Self::bit(fold);
+    }
+
     /// Does any projection reading the block INPUT take the transform?
-    fn any_input(self) -> bool {
-        self.q || self.k || self.v || self.qkv || self.z
+    const fn any_input(self) -> bool {
+        self.has(Fold::Q)
+            || self.has(Fold::K)
+            || self.has(Fold::V)
+            || self.has(Fold::Qkv)
+            || self.has(Fold::Z)
     }
 }
 
@@ -291,6 +357,15 @@ impl Qwen35Hadamard {
     /// blocks and, in explicit sign mode, carry a sign vector; the only
     /// rotated lookup table this forward restores is the token embedding.
     /// `width_of` gives a tensor's input width (ggml's first dim).
+    ///
+    /// # Errors
+    ///
+    /// A folded weight the file does not carry, whose input width the
+    /// block does not divide, or that lacks its sign vector in explicit
+    /// sign mode ([`HadamardSpec::signs_for`]); a folded name that is not a
+    /// projection this forward transforms the input of (or a malformed
+    /// `blk.N.` name); or an inverse-listed tensor other than
+    /// `token_embd.weight`.
     pub fn from_spec(
         spec: HadamardSpec,
         cfg: &Qwen35Config,
@@ -331,20 +406,20 @@ impl Qwen35Hadamard {
                 continue; // the NextN draft block: never run here
             }
             let attn = cfg.is_attention(layer);
-            let folds = &mut layers[layer];
-            match (field, attn) {
-                ("attn_q.weight", true) => folds.q = true,
-                ("attn_k.weight", true) => folds.k = true,
-                ("attn_v.weight", true) => folds.v = true,
-                ("attn_output.weight", true) => folds.o = true,
-                ("attn_qkv.weight", false) => folds.qkv = true,
-                ("attn_gate.weight", false) => folds.z = true,
-                ("ssm_out.weight", false) => folds.out = true,
-                ("ffn_gate.weight", _) => folds.gate = true,
-                ("ffn_up.weight", _) => folds.up = true,
-                ("ffn_down.weight", _) => folds.down = true,
+            let fold = match (field, attn) {
+                ("attn_q.weight", true) => Fold::Q,
+                ("attn_k.weight", true) => Fold::K,
+                ("attn_v.weight", true) => Fold::V,
+                ("attn_output.weight", true) => Fold::O,
+                ("attn_qkv.weight", false) => Fold::Qkv,
+                ("attn_gate.weight", false) => Fold::Z,
+                ("ssm_out.weight", false) => Fold::Out,
+                ("ffn_gate.weight", _) => Fold::Gate,
+                ("ffn_up.weight", _) => Fold::Up,
+                ("ffn_down.weight", _) => Fold::Down,
                 _ => return Err(not_verified(name)),
-            }
+            };
+            layers[layer].insert(fold);
         }
         let mut embed_inverse = false;
         for name in &spec.inverses {
@@ -401,33 +476,27 @@ fn pick(on: bool, transformed: Option<&Tensor<3>>, plain: &Tensor<3>) -> Tensor<
 /// from the logical one — measured with Q4 on flex AND wgpu, 2026-08-21).
 /// Flatten the FLOAT input instead; the weight goes into the matmul as-is.
 /// All qwen35 projections are bias-free.
-pub(crate) fn qlinear(l: &Linear, x: Tensor<3>) -> Tensor<3> {
-    debug_assert!(l.bias.is_none(), "qwen35 projections are bias-free");
+pub(crate) fn qlinear(lin: &Linear, x: Tensor<3>) -> Tensor<3> {
+    debug_assert!(lin.bias.is_none(), "qwen35 projections are bias-free");
     let [b, t, d_in] = x.dims();
-    let w = l.weight.val(); // [in, out]
-    let d_out = w.dims()[1];
+    let weight = lin.weight.val(); // [in, out]
+    let d_out = weight.dims()[1];
     let x2 = crate::nn::refarith::linear_input2(x.reshape([b * t, d_in]), d_in, d_out);
     // Decode-shape quantized weights take the packed GEMV (reads the
     // stored bytes directly; on flex that is the i8 slab at 1.125 B/elem
     // against the 4 B/elem an f32 slab moves). Anything else — prefill,
     // float weights — keeps the plain matmul.
-    let y = match crate::nn::try_q4s_gemv(&x2, &w) {
-        Some(y) => y,
-        None => x2.matmul(w),
-    };
-    y.reshape([b, t, d_out])
+    let out = crate::nn::try_q4s_gemv(&x2, &weight).unwrap_or_else(|| x2.matmul(weight));
+    out.reshape([b, t, d_out])
 }
 
 /// The 2-D twin of [`qlinear`] (the lm-head path).
-pub(crate) fn qlinear2(l: &Linear, x: Tensor<2>) -> Tensor<2> {
-    debug_assert!(l.bias.is_none(), "qwen35 projections are bias-free");
-    let w = l.weight.val();
-    let [w_in, w_out] = w.dims();
+pub(crate) fn qlinear2(lin: &Linear, x: Tensor<2>) -> Tensor<2> {
+    debug_assert!(lin.bias.is_none(), "qwen35 projections are bias-free");
+    let weight = lin.weight.val();
+    let [w_in, w_out] = weight.dims();
     let x = crate::nn::refarith::linear_input2(x, w_in, w_out);
-    match crate::nn::try_q4s_gemv(&x, &w) {
-        Some(y) => y,
-        None => x.matmul(w),
-    }
+    crate::nn::try_q4s_gemv(&x, &weight).unwrap_or_else(|| x.matmul(weight))
 }
 
 /// A bias-free `Linear` — every qwen35 projection is one ([`qlinear`]
@@ -436,7 +505,7 @@ fn bias_free_linear(inp: usize, out: usize, device: &Device) -> Linear {
     LinearConfig::new(inp, out).with_bias(false).init(device)
 }
 
-/// An RMSNorm over `dim` at the model's epsilon.
+/// An `RMSNorm` over `dim` at the model's epsilon.
 fn rms_norm(cfg: &Qwen35Config, dim: usize, device: &Device) -> RmsNorm {
     RmsNormConfig::new(dim)
         .with_epsilon(cfg.rms_norm_eps)
@@ -452,7 +521,7 @@ pub struct GatedAttention {
     pub k_proj: Linear,
     pub v_proj: Linear,
     pub o_proj: Linear,
-    /// Per-head RMSNorm over `head_dim`.
+    /// Per-head `RMSNorm` over `head_dim`.
     pub q_norm: RmsNorm,
     pub k_norm: RmsNorm,
 }
@@ -488,17 +557,14 @@ impl GatedAttention {
         }
     }
 
-    /// One gated-attention block over `x` `[b, t, hidden]`. `cos`/`sin` are
-    /// [`rope_tables`] over `rope_dim` for positions `past..past+t`; `mask`
-    /// is the causal mask when `t > 1`; `kv` grows by `t`.
-    #[allow(clippy::too_many_arguments)] // mirrors the reference data flow
+    /// One gated-attention block over `x` `[b, t, hidden]`. `pos` carries
+    /// the [`rope_tables`] over `rope_dim` for positions `past..past+t` and
+    /// the causal mask when `t > 1`; `kv` grows by `t`.
     pub(crate) fn forward(
         &self,
         x: Tensor<3>,
         cfg: &Qwen35Config,
-        cos: &Tensor<4>,
-        sin: &Tensor<4>,
-        mask: Option<&Tensor<4>>,
+        pos: &PositionTables<'_>,
         kv: &mut LayerKv,
         had: Option<&LayerHadamard>,
     ) -> Tensor<3> {
@@ -509,74 +575,74 @@ impl GatedAttention {
             cfg.head_dim,
         );
         // Folded projections read the transformed input (once per block).
-        let xr = had.and_then(|h| h.input_pair(&x));
-        let folds = had.map_or(LayerFolds::default(), |h| h.folds);
+        let xr = had.and_then(|layer_had| layer_had.input_pair(&x));
+        let folds = had.map_or_else(LayerFolds::default, |layer_had| layer_had.folds);
         let (xq, xk, xv) = (
-            pick(folds.q, xr.as_ref(), &x),
-            pick(folds.k, xr.as_ref(), &x),
-            pick(folds.v, xr.as_ref(), &x),
+            pick(folds.has(Fold::Q), xr.as_ref(), &x),
+            pick(folds.has(Fold::K), xr.as_ref(), &x),
+            pick(folds.has(Fold::V), xr.as_ref(), &x),
         );
         drop(xr);
         drop(x);
 
         // Split the joint projection into q and gate: per head the layout is
         // [q (hd) | gate (hd)], so a [b, t, nh, 2, hd] view separates them.
-        let _s_qkv = crate::prof::scope("fa.qkv");
+        let prof_qkv = crate::prof::scope("fa.qkv");
         let qg = qlinear(&self.q_proj, xq).reshape([b, t, nh, 2, hd]);
-        let q = qg.clone().narrow(3, 0, 1).reshape([b, t, nh, hd]);
+        let query = qg.clone().narrow(3, 0, 1).reshape([b, t, nh, hd]);
         let gate = qg.narrow(3, 1, 1).reshape([b, t, nh, hd]);
 
-        let q = self.q_norm.forward(q).swap_dims(1, 2); // [b, nh, t, hd]
+        let query = self.q_norm.forward(query).swap_dims(1, 2); // [b, nh, t, hd]
         let k_new = qlinear(&self.k_proj, xk).reshape([b, t, nkv, hd]);
         let k_new = self.k_norm.forward(k_new).swap_dims(1, 2);
         let v_new = qlinear(&self.v_proj, xv)
             .reshape([b, t, nkv, hd])
             .swap_dims(1, 2);
 
-        drop(_s_qkv);
-        let _s_rope = crate::prof::scope("fa.rope");
+        drop(prof_qkv);
+        let prof_rope = crate::prof::scope("fa.rope");
         // Partial RoPE: rotate the first rope_dim dims, pass the rest through.
-        let rope = |x: Tensor<4>| -> Tensor<4> {
-            let rot = x.clone().narrow(3, 0, cfg.rope_dim);
-            let rest = x.narrow(3, cfg.rope_dim, hd - cfg.rope_dim);
-            let rot = crate::nn::apply_rope(rot, cos, sin);
+        let rope = |heads: Tensor<4>| -> Tensor<4> {
+            let rot = heads.clone().narrow(3, 0, cfg.rope_dim);
+            let rest = heads.narrow(3, cfg.rope_dim, hd - cfg.rope_dim);
+            let rot = crate::nn::apply_rope(rot, pos.cos, pos.sin);
             Tensor::cat(vec![rot, rest], 3)
         };
-        let q = rope(q);
+        let query = rope(query);
         let k_new = rope(k_new);
-        drop(_s_rope);
-        let _s_kv = crate::prof::scope("fa.kv");
+        drop(prof_rope);
+        let prof_cache = crate::prof::scope("fa.kv");
 
         // Storage dtype (f16 KV when enabled) is the cache helper's call;
         // scores upcast to the f32 island below and the value matmul
         // upcasts to ambient, so precision here is storage-only.
-        let ambient = q.dtype();
+        let ambient = query.dtype();
         let (k_all, v_all) = crate::nn::kv_append(kv, k_new, v_new);
 
         let group = nh / nkv;
-        let scale = 1.0 / (hd as f32).sqrt();
+        let scale = 1.0 / f32_from_usize(hd).sqrt();
         // Diagnostic only (`nn::refarith`, off by default): ggml's CPU flash
         // attention arithmetic over an f16 cache, host-side.
         let ctx = if crate::nn::refarith::enabled() {
-            drop(_s_kv);
-            crate::nn::refarith::flash_attn_f16(q, k_all, v_all, scale)
+            drop(prof_cache);
+            crate::nn::refarith::flash_attn_f16(query, k_all, v_all, scale)
         } else {
-            let k = repeat_kv(k_all, group);
-            let v = repeat_kv(v_all, group).cast(ambient);
-            drop(_s_kv);
-            let _s_scores = crate::prof::scope("fa.scores");
+            let keys = repeat_kv(k_all, group);
+            let values = repeat_kv(v_all, group).cast(ambient);
+            drop(prof_cache);
+            let prof_scores = crate::prof::scope("fa.scores");
 
             // f32 island for the scores — the same overflow guard as GqaAttention.
-            let mut scores = q
+            let mut scores = query
                 .cast(DType::F32)
-                .matmul(k.cast(DType::F32).swap_dims(2, 3))
+                .matmul(keys.cast(DType::F32).swap_dims(2, 3))
                 .mul_scalar(scale);
-            if let Some(m) = mask {
-                scores = scores.add(m.clone().cast(DType::F32));
+            if let Some(mask) = pos.mask {
+                scores = scores.add(mask.clone().cast(DType::F32));
             }
             let probs = activation::softmax(scores, 3).cast(ambient);
-            let ctx = probs.matmul(v); // [b, nh, t, hd]
-            drop(_s_scores);
+            let ctx = probs.matmul(values); // [b, nh, t, hd]
+            drop(prof_scores);
             ctx
         };
         let _s = crate::prof::scope("fa.out");
@@ -587,14 +653,24 @@ impl GatedAttention {
             .mul(activation::sigmoid(gate))
             .reshape([b, t, nh * hd]);
         let gated = match had {
-            Some(h) if h.folds.o => h.consts.forward(gated),
+            Some(layer_had) if layer_had.folds.has(Fold::O) => layer_had.consts.forward(gated),
             _ => gated,
         };
         qlinear(&self.o_proj, gated)
     }
 }
 
-/// Gated DeltaNet linear attention (see the module docs).
+/// The position-dependent inputs of one attention call: the [`rope_tables`]
+/// (`cos`/`sin`, `[1, 1, t, rope_dim]`) for positions `past..past+t`, and
+/// the causal mask when `t > 1`.
+#[derive(Clone, Copy)]
+pub struct PositionTables<'a> {
+    pub cos: &'a Tensor<4>,
+    pub sin: &'a Tensor<4>,
+    pub mask: Option<&'a Tensor<4>>,
+}
+
+/// Gated `DeltaNet` linear attention (see the module docs).
 #[derive(Module, Debug)]
 pub struct GatedDeltaNet {
     /// Mixes q/k/v: `hidden → 2·key_dim + d_inner`.
@@ -611,12 +687,12 @@ pub struct GatedDeltaNet {
     pub a: Param<Tensor<1>>,
     /// Depthwise causal conv over the q/k/v mix, kernel `conv_kernel`.
     pub conv1d: Conv1d,
-    /// Gated output RMSNorm over `d_state` (per value head).
+    /// Gated output `RMSNorm` over `d_state` (per value head).
     pub norm: RmsNorm,
     pub out_proj: Linear,
 }
 
-/// DeltaNet decode state: the rolling conv window and the recurrent memory.
+/// `DeltaNet` decode state: the rolling conv window and the recurrent memory.
 ///
 /// The state lives in exactly one of two worlds at a time: the tensor
 /// fields (prefill and the tensor decode path) or the host fields (the
@@ -641,7 +717,7 @@ pub struct DeltaState {
 impl DeltaState {
     /// An empty state (fresh generation).
     #[must_use]
-    pub fn empty() -> Self {
+    pub const fn empty() -> Self {
         Self {
             conv: None,
             state: None,
@@ -654,7 +730,7 @@ impl DeltaState {
 
 impl GatedDeltaNet {
     /// A block shaped by `cfg`, with placeholder weights until a loader
-    /// assigns the real ones. Build DeltaNets through here rather than a
+    /// assigns the real ones. Build `DeltaNets` through here rather than a
     /// struct literal: the conv carries `conv_kernel - 1` explicit padding
     /// on both sides, and [`Self::forward`]'s fresh-prefill branch reads
     /// outputs `0..t` of exactly that padded conv as the causal alignment —
@@ -680,7 +756,7 @@ impl GatedDeltaNet {
         }
     }
 
-    /// One Gated DeltaNet block over `x` `[b, t, hidden]`, advancing
+    /// One Gated `DeltaNet` block over `x` `[b, t, hidden]`, advancing
     /// `cache` (conv window + recurrent state) by `t` tokens.
     pub(crate) fn forward(
         &self,
@@ -690,10 +766,7 @@ impl GatedDeltaNet {
         had: Option<&LayerHadamard>,
     ) -> Tensor<3> {
         let [b, t, _] = x.dims();
-        let (hk, hv, ds) = (cfg.n_k_heads, cfg.n_v_heads, cfg.d_state);
-        let key_dim = cfg.key_dim();
-        let conv_dim = cfg.conv_dim();
-        let kk = cfg.conv_kernel;
+        let (hv, ds) = (cfg.n_v_heads, cfg.d_state);
         let device = x.device();
 
         // The fused host decode step (SPEC P3): one function replaces the
@@ -703,142 +776,32 @@ impl GatedDeltaNet {
         if t == 1 && b == 1 && crate::flex::gdn::enabled() && crate::backend::is_flex(&device) {
             return self.forward_fused_decode(x, cfg, cache, &device, had);
         }
-        // Entering the tensor path with host-resident state (a prefill
-        // after fused decode steps — the multi-turn shape): materialize
-        // the tensors the code below reads, and drop the host twins.
-        if let Some(hc) = cache.host_conv.take() {
-            debug_assert_eq!(hc.len(), conv_dim * (kk - 1));
-            cache.conv = Some(
-                Tensor::<1>::from_data(TensorData::new(hc, [conv_dim * (kk - 1)]), &device)
-                    .reshape([1, conv_dim, kk - 1]),
-            );
-        }
-        if let Some(hs) = cache.host_state.take() {
-            debug_assert_eq!(hs.len(), hv * ds * ds);
-            cache.state = Some(
-                Tensor::<1>::from_data(TensorData::new(hs, [hv * ds * ds]), &device)
-                    .reshape([1, hv, ds, ds]),
-            );
-        }
+        materialize_host_state(cache, cfg, &device);
 
-        let _s_proj = crate::prof::scope("delta.proj");
-        // The mix and the gate may be folded; β/α stay in the plain basis
-        // (the fork keeps the recurrent-state path at full precision,
-        // unrotated).
-        let xr = had.and_then(|h| h.input_pair(&x));
-        let folds = had.map_or(LayerFolds::default(), |h| h.folds);
-        if let Some(r) = &xr {
-            trace_tensor("gdn.x_rot", r);
-        }
-        trace_tensor("gdn.x", &x);
-        let mixed = qlinear(&self.qkv_proj, pick(folds.qkv, xr.as_ref(), &x)); // [b, t, conv_dim]
-        let z = qlinear(&self.z_proj, pick(folds.z, xr.as_ref(), &x)); // [b, t, d_inner]
-        drop(xr);
-        trace_tensor("gdn.qkv", &mixed);
-        trace_tensor("gdn.z", &z);
-        let beta = activation::sigmoid(qlinear(&self.beta_proj, x.clone())); // [b, t, hv]
-        // g = softplus(α + dt_bias) · a, with a = -exp(A_log) < 0.
-        let alpha = qlinear(&self.alpha_proj, x).add(self.dt_bias.val().reshape([1, 1, hv]));
-        let g = activation::softplus(alpha, 1.0).mul(self.a.val().reshape([1, 1, hv]));
-
-        drop(_s_proj);
+        let prof_proj = crate::prof::scope("delta.proj");
+        let DeltaProjections {
+            mixed,
+            gate: gate_z,
+            beta,
+            decay,
+        } = self.project(x, cfg, had);
+        drop(prof_proj);
         // Depthwise causal conv over the sequence, rolling the decode state
         // exactly like nn::ShortConv (algebraic equivalence proven there).
-        let _s_conv = crate::prof::scope("delta.conv");
-        let mix_cm = mixed.swap_dims(1, 2); // channel-major [b, conv_dim, t]
-        let conv_out = if t > 1 {
-            match &cache.conv {
-                // Continuation (a later prefill chunk, or a prompt after
-                // decode steps): the first kk-1 positions' windows reach
-                // into the PREVIOUS span, which the rolling cache holds.
-                // Running the conv over [cached | new] and taking the
-                // outputs aligned to the new span reproduces the
-                // uninterrupted conv exactly. The old code fell into the
-                // fresh-start branch here and convolved those positions
-                // against zero history — wrong at every chunk boundary
-                // (found by the forward_advance equivalence test; the
-                // chunked-prefill exactness claim held only for prompts
-                // within one chunk).
-                Some(prev) => {
-                    let ext = Tensor::cat(vec![prev.clone(), mix_cm.clone()], 2);
-                    self.conv1d.forward(ext).narrow(2, kk - 1, t)
-                }
-                None => self.conv1d.forward(mix_cm.clone()).narrow(2, 0, t),
-            }
-        } else {
-            let window = match &cache.conv {
-                Some(prev) => Tensor::cat(vec![prev.clone(), mix_cm.clone()], 2),
-                None => {
-                    let pad = Tensor::<3>::zeros([b, conv_dim, kk - 1], &device);
-                    Tensor::cat(vec![pad, mix_cm.clone()], 2)
-                }
-            };
-            let w = self.conv1d.weight.val().reshape([1, conv_dim, kk]);
-            window.mul(w).sum_dim(2)
-        };
-        cache.conv = Some({
-            let combined = match cache.conv.take() {
-                Some(prev) => Tensor::cat(vec![prev, mix_cm], 2),
-                None => mix_cm,
-            };
-            let len = combined.dims()[2];
-            if len >= kk - 1 {
-                combined.narrow(2, len - (kk - 1), kk - 1)
-            } else {
-                let pad = Tensor::<3>::zeros([b, conv_dim, (kk - 1) - len], &device);
-                Tensor::cat(vec![pad, combined], 2)
-            }
-        });
+        let prof_conv = crate::prof::scope("delta.conv");
+        let conv_out = self.causal_conv(mixed.swap_dims(1, 2), cache, cfg.conv_kernel, &device);
         let conv_out = activation::silu(conv_out.swap_dims(1, 2)); // [b, t, conv_dim]
         trace_tensor("gdn.conv_silu", &conv_out);
         if gdn_l2_probe::enabled() {
             gdn_l2_probe::record(&conv_out, cfg);
         }
-        drop(_s_conv);
-        let _s_split = crate::prof::scope("delta.split");
+        drop(prof_conv);
+        let prof_split = crate::prof::scope("delta.split");
+        let (query, keys, values) = split_qkv(conv_out, cfg);
+        drop(prof_split);
+        let prof_recur = crate::prof::scope("delta.recur");
 
-        // Split into q/k/v and L2-normalize q/k per head, in the family's
-        // form: x / max(‖x‖, ε) or x / sqrt(‖x‖² + ε).
-        let eps = cfg.rms_norm_eps as f32;
-        let l2_form = cfg.gdn_l2;
-        let l2 = |x: Tensor<4>| -> Tensor<4> {
-            let sum_sq = x.clone().powi_scalar(2).sum_dim(3);
-            let norm = match l2_form {
-                GdnL2::ClampNorm => sum_sq.sqrt().clamp_min(eps),
-                GdnL2::AddEps => sum_sq.add_scalar(eps).sqrt(),
-            };
-            x.div(norm)
-        };
-        let q = l2(conv_out
-            .clone()
-            .narrow(2, 0, key_dim)
-            .reshape([b, t, hk, ds]));
-        let k = l2(conv_out
-            .clone()
-            .narrow(2, key_dim, key_dim)
-            .reshape([b, t, hk, ds]));
-        let v = conv_out
-            .narrow(2, 2 * key_dim, cfg.d_inner)
-            .reshape([b, t, hv, ds]);
-
-        // Tile k-heads across the value heads (llama.cpp's ggml_repeat:
-        // head h_v reads k-head h_v % n_k_heads).
-        let tile = hv / hk;
-        let expand = |x: Tensor<4>| -> Tensor<4> {
-            if tile == 1 {
-                x
-            } else {
-                // [b, t, hk, ds] → [b, t, tile·hk, ds] tiling whole blocks.
-                x.repeat_dim(2, tile)
-            }
-        };
-        let q = expand(q).swap_dims(1, 2); // [b, hv, t, ds]
-        let k = expand(k).swap_dims(1, 2);
-        let v = v.swap_dims(1, 2);
-        drop(_s_split);
-        let _s_recur = crate::prof::scope("delta.recur");
-
-        let scale = 1.0 / (ds as f32).sqrt();
+        let scale = 1.0 / f32_from_usize(ds).sqrt();
         let s0 = cache
             .state
             .take()
@@ -855,40 +818,150 @@ impl GatedDeltaNet {
         // against 9·t sequential — even at t = 8 the chunk wins. The
         // sequential ceiling is measured-tunable (`MUMMU_GDN_SEQ_MAX`,
         // default 4); decode (t == 1) stays sequential by construction.
-        let (o, s_new) = match gdn_chunk() {
-            Some(c) if t > gdn_seq_max() => {
-                gdn_recurrence_chunked(&q, &k, &v, &g, &beta, s0, scale, c)
-            }
-            _ => gdn_recurrence_sequential(&q, &k, &v, &g, &beta, s0, scale),
+        let inputs = RecurrenceInputs {
+            q: &query,
+            k: &keys,
+            v: &values,
+            g: &decay,
+            beta: &beta,
         };
-        cache.state = Some(s_new); // [b, hv, ds, ds]; o is [b, hv, t, ds]
-        drop(_s_recur);
+        let (out_heads, s_new) = match gdn_chunk() {
+            Some(chunk) if t > gdn_seq_max() => gdn_recurrence_chunked(&inputs, s0, scale, chunk),
+            _ => gdn_recurrence_sequential(&inputs, s0, scale),
+        };
+        cache.state = Some(s_new); // [b, hv, ds, ds]; out_heads is [b, hv, t, ds]
+        drop(prof_recur);
         let _s = crate::prof::scope("delta.out");
+        self.gated_output(out_heads, gate_z, cfg, had)
+    }
 
+    /// The four projections of the block input `x` `[b, t, hidden]`.
+    fn project(
+        &self,
+        x: Tensor<3>,
+        cfg: &Qwen35Config,
+        had: Option<&LayerHadamard>,
+    ) -> DeltaProjections {
+        let hv = cfg.n_v_heads;
+        // The mix and the gate may be folded; β/α stay in the plain basis
+        // (the fork keeps the recurrent-state path at full precision,
+        // unrotated).
+        let xr = had.and_then(|layer_had| layer_had.input_pair(&x));
+        let folds = had.map_or_else(LayerFolds::default, |layer_had| layer_had.folds);
+        if let Some(rot) = &xr {
+            trace_tensor("gdn.x_rot", rot);
+        }
+        trace_tensor("gdn.x", &x);
+        let mixed = qlinear(&self.qkv_proj, pick(folds.has(Fold::Qkv), xr.as_ref(), &x)); // [b, t, conv_dim]
+        let gate = qlinear(&self.z_proj, pick(folds.has(Fold::Z), xr.as_ref(), &x)); // [b, t, d_inner]
+        drop(xr);
+        trace_tensor("gdn.qkv", &mixed);
+        trace_tensor("gdn.z", &gate);
+        let beta = activation::sigmoid(qlinear(&self.beta_proj, x.clone())); // [b, t, hv]
+        // g = softplus(α + dt_bias) · a, with a = -exp(A_log) < 0.
+        let alpha = qlinear(&self.alpha_proj, x).add(self.dt_bias.val().reshape([1, 1, hv]));
+        let decay = activation::softplus(alpha, 1.0).mul(self.a.val().reshape([1, 1, hv]));
+        DeltaProjections {
+            mixed,
+            gate,
+            beta,
+            decay,
+        }
+    }
+
+    /// The depthwise causal conv over `[cached window | mix_cm]`, channel-major
+    /// `[b, conv_dim, t]` in and out (before the `SiLU`), rolling `cache.conv`
+    /// forward by `t` columns.
+    fn causal_conv(
+        &self,
+        mix_cm: Tensor<3>,
+        cache: &mut DeltaState,
+        kk: usize,
+        device: &Device,
+    ) -> Tensor<3> {
+        let [b, conv_dim, t] = mix_cm.dims();
+        let conv_out = if t > 1 {
+            // Continuation (a later prefill chunk, or a prompt after
+            // decode steps): the first kk-1 positions' windows reach
+            // into the PREVIOUS span, which the rolling cache holds.
+            // Running the conv over [cached | new] and taking the
+            // outputs aligned to the new span reproduces the
+            // uninterrupted conv exactly. The old code fell into the
+            // fresh-start branch here and convolved those positions
+            // against zero history — wrong at every chunk boundary
+            // (found by the forward_advance equivalence test; the
+            // chunked-prefill exactness claim held only for prompts
+            // within one chunk).
+            cache.conv.as_ref().map_or_else(
+                || self.conv1d.forward(mix_cm.clone()).narrow(2, 0, t),
+                |prev| {
+                    let ext = Tensor::cat(vec![prev.clone(), mix_cm.clone()], 2);
+                    self.conv1d.forward(ext).narrow(2, kk - 1, t)
+                },
+            )
+        } else {
+            let window = cache.conv.as_ref().map_or_else(
+                || {
+                    let pad = Tensor::<3>::zeros([b, conv_dim, kk - 1], device);
+                    Tensor::cat(vec![pad, mix_cm.clone()], 2)
+                },
+                |prev| Tensor::cat(vec![prev.clone(), mix_cm.clone()], 2),
+            );
+            let taps = self.conv1d.weight.val().reshape([1, conv_dim, kk]);
+            window.mul(taps).sum_dim(2)
+        };
+        cache.conv = Some({
+            let combined = match cache.conv.take() {
+                Some(prev) => Tensor::cat(vec![prev, mix_cm], 2),
+                None => mix_cm,
+            };
+            let len = combined.dims()[2];
+            if len >= kk - 1 {
+                combined.narrow(2, len - (kk - 1), kk - 1)
+            } else {
+                let pad = Tensor::<3>::zeros([b, conv_dim, (kk - 1) - len], device);
+                Tensor::cat(vec![pad, combined], 2)
+            }
+        });
+        conv_out
+    }
+
+    /// The gated `RMSNorm` per value head over the recurrence output
+    /// `out_heads` `[b, hv, t, ds]`, the family's gate on `z`, and the
+    /// out-projection.
+    fn gated_output(
+        &self,
+        out_heads: Tensor<4>,
+        gate_z: Tensor<3>,
+        cfg: &Qwen35Config,
+        had: Option<&LayerHadamard>,
+    ) -> Tensor<3> {
+        let [b, hv, t, ds] = out_heads.dims();
+        let hk = cfg.n_k_heads;
         // Gated RMSNorm per value head, then flatten and project out. The
         // gate activation is the family's (silu for qwen35, sigmoid for
         // qwen4exp); the fused host step applies the same choice.
-        let o = self.norm.forward(o.swap_dims(1, 2)); // [b, t, hv, ds]
-        let z = z.reshape([b, t, hv, ds]);
+        let normed = self.norm.forward(out_heads.swap_dims(1, 2)); // [b, t, hv, ds]
+        let gate_z = gate_z.reshape([b, t, hv, ds]);
         let gate = match cfg.gdn_gate {
-            GdnGate::Silu => activation::silu(z),
-            GdnGate::Sigmoid => activation::sigmoid(z),
+            GdnGate::Silu => activation::silu(gate_z),
+            GdnGate::Sigmoid => activation::sigmoid(gate_z),
         };
-        let gated = o.mul(gate).reshape([b, t, cfg.d_inner]);
+        let gated = normed.mul(gate).reshape([b, t, cfg.d_inner]);
         trace_tensor("gdn.gated", &gated);
         // A folded out-projection was rotated over HF's grouped value
         // heads; this port's tiled order is permuted to match first.
         let gated = match had {
-            Some(h) if h.folds.out => {
-                let g = if h.consts.spec().gdn_v_grouped {
+            Some(layer_had) if layer_had.folds.has(Fold::Out) => {
+                let grouped = if layer_had.consts.spec().gdn_v_grouped {
                     crate::nn::hadamard::tiled_to_grouped(gated, hk, hv, ds)
                 } else {
                     gated
                 };
-                trace_tensor("gdn.gated_grouped", &g);
-                let r = h.consts.forward(g);
-                trace_tensor("gdn.gated_rot", &r);
-                r
+                trace_tensor("gdn.gated_grouped", &grouped);
+                let rot = layer_had.consts.forward(grouped);
+                trace_tensor("gdn.gated_rot", &rot);
+                rot
             }
             _ => gated,
         };
@@ -909,81 +982,85 @@ impl GatedDeltaNet {
         device: &Device,
         had: Option<&LayerHadamard>,
     ) -> Tensor<3> {
-        let _s_proj = crate::prof::scope("delta.proj");
+        let prof_proj = crate::prof::scope("delta.proj");
         // The transform on the host (O(n log n) butterflies): this path is
         // flex-only by construction, and the tensor matmul against the
         // block matrix would cost more than the step it decorates.
-        let folds = had.map_or(LayerFolds::default(), |h| h.folds);
-        let xr = had.filter(|_| folds.any_input()).map(|h| {
-            let mut v = x
+        let folds = had.map_or_else(LayerFolds::default, |layer_had| layer_had.folds);
+        let xr = had.filter(|_| folds.any_input()).map(|layer_had| {
+            let mut vals = x
                 .clone()
                 .into_data()
                 .try_to_vec::<f32>()
                 .expect("flex activations are f32");
-            h.consts
+            layer_had
+                .consts
                 .spec()
-                .forward_host(&mut v)
+                .forward_host(&mut vals)
                 .expect("folded widths were checked at load");
-            Tensor::<3>::from_data(TensorData::new(v, [1, 1, cfg.hidden_size]), device)
+            Tensor::<3>::from_data(TensorData::new(vals, [1, 1, cfg.hidden_size]), device)
         });
-        let mixed_t = qlinear(&self.qkv_proj, pick(folds.qkv, xr.as_ref(), &x)); // [1, 1, conv_dim]
-        let z_t = qlinear(&self.z_proj, pick(folds.z, xr.as_ref(), &x)); // [1, 1, d_inner]
+        let mixed_t = qlinear(&self.qkv_proj, pick(folds.has(Fold::Qkv), xr.as_ref(), &x)); // [1, 1, conv_dim]
+        let z_t = qlinear(&self.z_proj, pick(folds.has(Fold::Z), xr.as_ref(), &x)); // [1, 1, d_inner]
         drop(xr);
         let beta_t = qlinear(&self.beta_proj, x.clone()); // [1, 1, hv]
         let alpha_t = qlinear(&self.alpha_proj, x); // [1, 1, hv]
-        drop(_s_proj);
+        drop(prof_proj);
 
-        let _s = crate::prof::scope("delta.fused");
-        let middle = match &cache.middle {
-            Some(m) => std::sync::Arc::clone(m),
-            None => {
-                let m = std::sync::Arc::new(self.fused_middle(cfg));
-                cache.middle = Some(std::sync::Arc::clone(&m));
-                m
-            }
+        let prof_fused = crate::prof::scope("delta.fused");
+        let middle = if let Some(mid) = &cache.middle {
+            std::sync::Arc::clone(mid)
+        } else {
+            let mid = std::sync::Arc::new(self.fused_middle(cfg));
+            cache.middle = Some(std::sync::Arc::clone(&mid));
+            mid
         };
-        let host = |t: Tensor<3>| -> Vec<f32> {
-            t.into_data()
+        let host = |tensor: Tensor<3>| -> Vec<f32> {
+            tensor
+                .into_data()
                 .try_to_vec::<f32>()
                 .expect("flex activations are f32")
         };
-        let (mixed, z, beta, alpha) = (host(mixed_t), host(z_t), host(beta_t), host(alpha_t));
+        let (mixed, gate_z, beta, alpha) = (host(mixed_t), host(z_t), host(beta_t), host(alpha_t));
 
         // The state's host twins, converted from tensors on first use
         // (prefill ran the tensor path) or zero-initialized (no prefix).
         if cache.host_conv.is_none() {
-            cache.host_conv = Some(match cache.conv.take() {
-                Some(tc) => tc
-                    .into_data()
-                    .try_to_vec::<f32>()
-                    .expect("conv window is f32"),
-                None => vec![0f32; middle.ring_len()],
-            });
+            cache.host_conv = Some(cache.conv.take().map_or_else(
+                || vec![0f32; middle.ring_len()],
+                |tc| {
+                    tc.into_data()
+                        .try_to_vec::<f32>()
+                        .expect("conv window is f32")
+                },
+            ));
         }
         if cache.host_state.is_none() {
-            cache.host_state = Some(match cache.state.take() {
-                Some(ts) => ts.into_data().try_to_vec::<f32>().expect("state is f32"),
-                None => vec![0f32; middle.state_len()],
-            });
+            cache.host_state = Some(cache.state.take().map_or_else(
+                || vec![0f32; middle.state_len()],
+                |ts| ts.into_data().try_to_vec::<f32>().expect("state is f32"),
+            ));
         }
 
         let mut gated = vec![0f32; cfg.d_inner];
         crate::flex::gdn::gdn_step(
             &middle,
-            &mixed,
-            &z,
-            &beta,
-            &alpha,
+            crate::flex::gdn::GdnInputs {
+                mixed: &mixed,
+                z: &gate_z,
+                beta_logits: &beta,
+                alpha_logits: &alpha,
+            },
             cache.host_conv.as_mut().expect("just filled"),
             cache.host_state.as_mut().expect("just filled"),
             &mut gated,
         );
-        drop(_s);
+        drop(prof_fused);
 
         let _s_out = crate::prof::scope("delta.out");
         let gated = match had {
-            Some(h) if h.folds.out => {
-                let mut g = if h.consts.spec().gdn_v_grouped {
+            Some(layer_had) if layer_had.folds.has(Fold::Out) => {
+                let mut grouped = if layer_had.consts.spec().gdn_v_grouped {
                     crate::nn::hadamard::tiled_to_grouped_host(
                         &gated,
                         cfg.n_k_heads,
@@ -993,11 +1070,12 @@ impl GatedDeltaNet {
                 } else {
                     gated
                 };
-                h.consts
+                layer_had
+                    .consts
                     .spec()
-                    .forward_host(&mut g)
+                    .forward_host(&mut grouped)
                     .expect("folded widths were checked at load");
-                g
+                grouped
             }
             _ => gated,
         };
@@ -1027,10 +1105,10 @@ impl GatedDeltaNet {
             conv_dim: cfg.conv_dim(),
             key_dim: cfg.key_dim(),
             d_inner: cfg.d_inner,
-            l2_eps: cfg.rms_norm_eps as f32,
+            l2_eps: narrow(cfg.rms_norm_eps),
             l2: cfg.gdn_l2,
-            norm_eps: cfg.rms_norm_eps as f32,
-            scale: 1.0 / (cfg.d_state as f32).sqrt(),
+            norm_eps: narrow(cfg.rms_norm_eps),
+            scale: 1.0 / f32_from_usize(cfg.d_state).sqrt(),
             conv_w: host(conv_w),
             dt_bias: host(self.dt_bias.val()),
             a: host(self.a.val()),
@@ -1040,7 +1118,91 @@ impl GatedDeltaNet {
     }
 }
 
-/// Chunk length for the chunkwise-parallel DeltaNet prefill, `None` when
+/// The `DeltaNet` block's four projections of one input span.
+struct DeltaProjections {
+    /// The q/k/v mix, `[b, t, conv_dim]`.
+    mixed: Tensor<3>,
+    /// The gate `z`, `[b, t, d_inner]`.
+    gate: Tensor<3>,
+    /// `β = σ(x·Wβ)`, `[b, t, hv]`.
+    beta: Tensor<3>,
+    /// The decay logits `g = softplus(x·Wα + dt_bias)·a`, `[b, t, hv]`.
+    decay: Tensor<3>,
+}
+
+/// Entering the tensor path with host-resident state (a prefill after
+/// fused decode steps — the multi-turn shape): materialize the tensors the
+/// tensor path reads, and drop the host twins.
+fn materialize_host_state(cache: &mut DeltaState, cfg: &Qwen35Config, device: &Device) {
+    let (hv, ds) = (cfg.n_v_heads, cfg.d_state);
+    let conv_dim = cfg.conv_dim();
+    let kk = cfg.conv_kernel;
+    if let Some(hc) = cache.host_conv.take() {
+        debug_assert_eq!(hc.len(), conv_dim * (kk - 1));
+        cache.conv =
+            Some(
+                Tensor::<1>::from_data(TensorData::new(hc, [conv_dim * (kk - 1)]), device)
+                    .reshape([1, conv_dim, kk - 1]),
+            );
+    }
+    if let Some(hs) = cache.host_state.take() {
+        debug_assert_eq!(hs.len(), hv * ds * ds);
+        cache.state = Some(
+            Tensor::<1>::from_data(TensorData::new(hs, [hv * ds * ds]), device)
+                .reshape([1, hv, ds, ds]),
+        );
+    }
+}
+
+/// Split the conv output `[b, t, conv_dim]` into `(q, k, v)`, each
+/// `[b, hv, t, ds]`: q/k L2-normalized per head in the family's form
+/// (`x / max(‖x‖, ε)` or `x / sqrt(‖x‖² + ε)`) and tiled from `n_k_heads`
+/// to `n_v_heads` (llama.cpp's `ggml_repeat`: value head `h_v` reads
+/// key head `h_v % n_k_heads`).
+fn split_qkv(conv_out: Tensor<3>, cfg: &Qwen35Config) -> (Tensor<4>, Tensor<4>, Tensor<4>) {
+    let [b, t, _] = conv_out.dims();
+    let (hk, hv, ds) = (cfg.n_k_heads, cfg.n_v_heads, cfg.d_state);
+    let key_dim = cfg.key_dim();
+    let eps = narrow(cfg.rms_norm_eps);
+    let l2_form = cfg.gdn_l2;
+    let l2 = |heads: Tensor<4>| -> Tensor<4> {
+        let sum_sq = heads.clone().powi_scalar(2).sum_dim(3);
+        let norm = match l2_form {
+            GdnL2::ClampNorm => sum_sq.sqrt().clamp_min(eps),
+            GdnL2::AddEps => sum_sq.add_scalar(eps).sqrt(),
+        };
+        heads.div(norm)
+    };
+    let query = l2(conv_out
+        .clone()
+        .narrow(2, 0, key_dim)
+        .reshape([b, t, hk, ds]));
+    let keys = l2(conv_out
+        .clone()
+        .narrow(2, key_dim, key_dim)
+        .reshape([b, t, hk, ds]));
+    let values = conv_out
+        .narrow(2, 2 * key_dim, cfg.d_inner)
+        .reshape([b, t, hv, ds]);
+
+    // Tile k-heads across the value heads (llama.cpp's ggml_repeat:
+    // head h_v reads k-head h_v % n_k_heads).
+    let tile = hv / hk;
+    let expand = |heads: Tensor<4>| -> Tensor<4> {
+        if tile == 1 {
+            heads
+        } else {
+            // [b, t, hk, ds] → [b, t, tile·hk, ds] tiling whole blocks.
+            heads.repeat_dim(2, tile)
+        }
+    };
+    let query = expand(query).swap_dims(1, 2); // [b, hv, t, ds]
+    let keys = expand(keys).swap_dims(1, 2);
+    let values = values.swap_dims(1, 2);
+    (query, keys, values)
+}
+
+/// Chunk length for the chunkwise-parallel `DeltaNet` prefill, `None` when
 /// that path is disabled. One env read per process (mirrors
 /// [`lookahead_verify`]): `MUMMU_GDN_CHUNK` unset → the default 64; an
 /// integer overrides it; `0` or `off` disables chunking entirely (every
@@ -1048,9 +1210,8 @@ impl GatedDeltaNet {
 /// falls back to the default.
 fn gdn_chunk() -> Option<usize> {
     static CHUNK: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    *CHUNK.get_or_init(|| match std::env::var("MUMMU_GDN_CHUNK") {
-        Err(_) => Some(64),
-        Ok(v) => {
+    *CHUNK.get_or_init(|| {
+        std::env::var("MUMMU_GDN_CHUNK").map_or(Some(64), |v| {
             let v = v.trim();
             if v.eq_ignore_ascii_case("off") {
                 None
@@ -1061,30 +1222,33 @@ fn gdn_chunk() -> Option<usize> {
                     Err(_) => Some(64),
                 }
             }
-        }
+        })
     })
 }
 
-/// Diagnostic tap on the per-head ‖q‖ and ‖k‖ entering the DeltaNet's L2
-/// normalization — the numbers that decide whether the [`GdnL2`] form
-/// matters on a checkpoint: the two forms differ by `1 − ‖x‖/sqrt(‖x‖²+ε)`
-/// relative, which is 29% at ‖x‖ = 1e-3 and 5e-5 at 0.1 for ε = 1e-6.
-/// Off by default; while on, every tensor-path DeltaNet forward reads its
-/// conv output back to the host. The fused host decode step is not tapped,
-/// so probe prefills (or decode with `MUMMU_FUSED_GDN=0`).
+/// Diagnostic tap on the per-head ‖q‖ and ‖k‖ entering the `DeltaNet`'s L2
+/// normalization.
+///
+/// These are the numbers that decide whether the [`GdnL2`] form matters on
+/// a checkpoint: the two forms differ by `1 − ‖x‖/sqrt(‖x‖²+ε)` relative,
+/// which is 29% at ‖x‖ = 1e-3 and 5e-5 at 0.1 for ε = 1e-6. Off by default;
+/// while on, every tensor-path `DeltaNet` forward reads its conv output
+/// back to the host. The fused host decode step is not tapped, so probe
+/// prefills (or decode with `MUMMU_FUSED_GDN=0`).
 pub mod gdn_l2_probe {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::Qwen35Config;
     use burn::tensor::Tensor;
+    use mummu_num::narrow;
 
     static ON: AtomicBool = AtomicBool::new(false);
     static SINK: Mutex<Vec<Record>> = Mutex::new(Vec::new());
 
-    /// One tensor-path DeltaNet forward, in call order: a prefill visits
-    /// the DeltaNet layers in model order, so the `i`-th record of a single
-    /// forward is the `i`-th DeltaNet layer.
+    /// One tensor-path `DeltaNet` forward, in call order: a prefill visits
+    /// the `DeltaNet` layers in model order, so the `i`-th record of a single
+    /// forward is the `i`-th `DeltaNet` layer.
     #[derive(Debug, Clone)]
     pub struct Record {
         /// Positions in the forward (`b · t`).
@@ -1107,10 +1271,14 @@ pub mod gdn_l2_probe {
 
     /// Drain everything recorded since the last call.
     pub fn take() -> Vec<Record> {
-        std::mem::take(&mut *SINK.lock().unwrap_or_else(|e| e.into_inner()))
+        std::mem::take(
+            &mut *SINK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
-    /// Read back `conv_out` `[b, t, conv_dim]` (after conv + SiLU) and keep
+    /// Read back `conv_out` `[b, t, conv_dim]` (after conv + `SiLU`) and keep
     /// the q and k head norms, summed in f64.
     pub(super) fn record(conv_out: &Tensor<3>, cfg: &Qwen35Config) {
         let [b, t, _] = conv_out.dims();
@@ -1130,15 +1298,17 @@ pub mod gdn_l2_probe {
         for row in host.chunks_exact(2 * key_dim) {
             let (qs, ks) = row.split_at(key_dim);
             let norm = |x: &[f32]| x.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>().sqrt();
-            q.extend(qs.chunks_exact(ds).map(|h| norm(h) as f32));
-            k.extend(ks.chunks_exact(ds).map(|h| norm(h) as f32));
+            q.extend(qs.chunks_exact(ds).map(|h| narrow(norm(h))));
+            k.extend(ks.chunks_exact(ds).map(|h| narrow(norm(h))));
         }
-        SINK.lock().unwrap_or_else(|e| e.into_inner()).push(Record {
-            tokens,
-            heads,
-            q,
-            k,
-        });
+        SINK.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(Record {
+                tokens,
+                heads,
+                q,
+                k,
+            });
     }
 }
 
@@ -1157,44 +1327,58 @@ fn gdn_seq_max() -> usize {
     })
 }
 
-/// The DeltaNet recurrence, one token at a time — decode's path (`t == 1`)
+/// The per-token inputs of the `DeltaNet` recurrence: `q`/`k`/`v` are
+/// `[b, hv, t, ds]` (already conv'd, `SiLU`'d, L2-normed and tiled),
+/// `g`/`beta` are `[b, t, hv]` (per-head decay logits and update gates).
+#[derive(Clone, Copy)]
+struct RecurrenceInputs<'a> {
+    q: &'a Tensor<4>,
+    k: &'a Tensor<4>,
+    v: &'a Tensor<4>,
+    g: &'a Tensor<3>,
+    beta: &'a Tensor<3>,
+}
+
+/// The `DeltaNet` recurrence, one token at a time — decode's path (`t == 1`)
 /// and the exactness reference the chunked form is tested against. State
 /// `S[b, h, i, j]`: `i` indexes the key dim, `j` the value dim.
 ///
-/// `q`/`k`/`v` are `[b, hv, t, ds]` (already conv'd, SiLU'd, L2-normed and
-/// tiled), `g`/`beta` are `[b, t, hv]` (per-head decay logits and update
-/// gates), `s0` is the carried state `[b, hv, ds, ds]`. Returns the
-/// per-token outputs `[b, hv, t, ds]` and the final state.
+/// `s0` is the carried state `[b, hv, ds, ds]`. Returns the per-token
+/// outputs `[b, hv, t, ds]` and the final state.
 fn gdn_recurrence_sequential(
-    q: &Tensor<4>,
-    k: &Tensor<4>,
-    v: &Tensor<4>,
-    g: &Tensor<3>,
-    beta: &Tensor<3>,
+    inputs: &RecurrenceInputs<'_>,
     s0: Tensor<4>,
     scale: f32,
 ) -> (Tensor<4>, Tensor<4>) {
-    let [b, hv, t, _ds] = q.dims();
-    let mut s = s0;
+    let [batch, hv, t, _ds] = inputs.q.dims();
+    let mut state = s0;
     let mut outs: Vec<Tensor<4>> = Vec::with_capacity(t);
     for tau in 0..t {
-        let q_t = q.clone().narrow(2, tau, 1).mul_scalar(scale); // [b, hv, 1, ds]
-        let k_t = k.clone().narrow(2, tau, 1); // [b, hv, 1, ds]
-        let v_t = v.clone().narrow(2, tau, 1); // [b, hv, 1, ds]
-        let g_t = g.clone().narrow(1, tau, 1).reshape([b, hv, 1, 1]); // per-head decay logit
-        let b_t = beta.clone().narrow(1, tau, 1).reshape([b, hv, 1, 1]);
+        let q_t = inputs.q.clone().narrow(2, tau, 1).mul_scalar(scale); // [b, hv, 1, ds]
+        let k_t = inputs.k.clone().narrow(2, tau, 1); // [b, hv, 1, ds]
+        let v_t = inputs.v.clone().narrow(2, tau, 1); // [b, hv, 1, ds]
+        let g_t = inputs
+            .g
+            .clone()
+            .narrow(1, tau, 1)
+            .reshape([batch, hv, 1, 1]); // per-head decay logit
+        let b_t = inputs
+            .beta
+            .clone()
+            .narrow(1, tau, 1)
+            .reshape([batch, hv, 1, 1]);
 
-        s = s.mul(g_t.exp());
+        state = state.mul(g_t.exp());
         // v̂[j] = Σ_i S[i, j]·k[i]  — k over the key axis.
-        let v_hat = s.clone().mul(k_t.clone().swap_dims(2, 3)).sum_dim(2); // [b, hv, 1, ds]
-        let d = v_t.sub(v_hat).mul(b_t); // [b, hv, 1, ds]
+        let v_hat = state.clone().mul(k_t.clone().swap_dims(2, 3)).sum_dim(2); // [b, hv, 1, ds]
+        let delta = v_t.sub(v_hat).mul(b_t); // [b, hv, 1, ds]
         // S += k ⊗ d  (outer product over [key, value]).
-        s = s.add(k_t.swap_dims(2, 3).matmul(d.clone()));
+        state = state.add(k_t.swap_dims(2, 3).matmul(delta));
         // o[j] = Σ_i S[i, j]·q[i].
-        let o = s.clone().mul(q_t.swap_dims(2, 3)).sum_dim(2); // [b, hv, 1, ds]
-        outs.push(o);
+        let out_t = state.clone().mul(q_t.swap_dims(2, 3)).sum_dim(2); // [b, hv, 1, ds]
+        outs.push(out_t);
     }
-    (Tensor::cat(outs, 2), s) // [b, hv, t, ds]
+    (Tensor::cat(outs, 2), state) // [b, hv, t, ds]
 }
 
 /// `(I + A)⁻¹` for the chunk system `A[t, j] = β_t·exp(L_t − L_j)·(k_t·k_j)`
@@ -1219,36 +1403,44 @@ fn gdn_recurrence_sequential(
 /// of two with `β = 0` rows (zero `A` rows, identity inverse rows) and the
 /// last `L` repeated (so padded exponents stay `≤ 0`); the leading `c × c`
 /// block of the padded inverse is the answer.
-fn unit_lower_inverse(k: Tensor<4>, l: Tensor<4>, beta: Tensor<4>, device: &Device) -> Tensor<4> {
-    let [b, h, c, ds] = k.dims();
-    let p = c.next_power_of_two();
-    let bh = b * h;
-    let dtype = k.dtype();
-    let (mut k, mut l, mut beta) = (k, l, beta);
-    if p > c {
-        let pad = p - c;
-        let zeros = |w: usize| Tensor::<4>::zeros([b, h, pad, w], device).cast(dtype);
-        k = Tensor::cat(vec![k, zeros(ds)], 2);
+fn unit_lower_inverse(
+    keys: Tensor<4>,
+    logdecay: Tensor<4>,
+    beta: Tensor<4>,
+    device: &Device,
+) -> Tensor<4> {
+    // Against the doc's symbols: `len` is c, `padded` its power-of-two pad,
+    // `size` the diagonal block size s, `pairs` the (batch·head, pair) rows.
+    let [batch, heads, len, ds] = keys.dims();
+    let padded = len.next_power_of_two();
+    let bh = batch * heads;
+    let dtype = keys.dtype();
+    let (mut keys, mut logdecay, mut beta) = (keys, logdecay, beta);
+    if padded > len {
+        let pad = padded - len;
+        let zeros =
+            |width: usize| Tensor::<4>::zeros([batch, heads, pad, width], device).cast(dtype);
+        keys = Tensor::cat(vec![keys, zeros(ds)], 2);
         beta = Tensor::cat(vec![beta, zeros(1)], 2);
-        let last = l.clone().narrow(2, c - 1, 1).repeat_dim(2, pad);
-        l = Tensor::cat(vec![l, last], 2);
+        let last = logdecay.clone().narrow(2, len - 1, 1).repeat_dim(2, pad);
+        logdecay = Tensor::cat(vec![logdecay, last], 2);
     }
-    let (k, l, beta) = (
-        k.reshape([bh, p, ds]),
-        l.reshape([bh, p, 1]),
-        beta.reshape([bh, p, 1]),
+    let (keys, logdecay, beta) = (
+        keys.reshape([bh, padded, ds]),
+        logdecay.reshape([bh, padded, 1]),
+        beta.reshape([bh, padded, 1]),
     );
     // Diagonal-block inverses of size s, one row per (batch·head, block).
-    let mut inv = Tensor::<3>::ones([bh * p, 1, 1], device).cast(dtype);
-    let mut s = 1usize;
-    while s < p {
-        let n = bh * (p / (2 * s)); // (batch·head, pair) rows
-        let halves = |x: &Tensor<3>, w: usize| {
-            let x = x.clone().reshape([n, 2 * s, w]);
-            (x.clone().narrow(1, 0, s), x.narrow(1, s, s))
+    let mut inv = Tensor::<3>::ones([bh * padded, 1, 1], device).cast(dtype);
+    let mut size = 1usize;
+    while size < padded {
+        let pairs = bh * (padded / (2 * size)); // (batch·head, pair) rows
+        let halves = |x: &Tensor<3>, width: usize| {
+            let x = x.clone().reshape([pairs, 2 * size, width]);
+            (x.clone().narrow(1, 0, size), x.narrow(1, size, size))
         };
-        let (k1, k2) = halves(&k, ds);
-        let (l1, l2) = halves(&l, 1);
+        let (k1, k2) = halves(&keys, ds);
+        let (l1, l2) = halves(&logdecay, 1);
         let (_, b2) = halves(&beta, 1);
         // Every row of the second half comes after every column of the
         // first, so these exponents are ≤ 0 and need no causal mask.
@@ -1256,24 +1448,24 @@ fn unit_lower_inverse(k: Tensor<4>, l: Tensor<4>, beta: Tensor<4>, device: &Devi
             .matmul(k1.swap_dims(1, 2))
             .mul(l2.sub(l1.swap_dims(1, 2)).exp())
             .mul(b2); // [n, s, s]
-        let pair = inv.reshape([n, 2, s, s]);
-        let inv11 = pair.clone().narrow(1, 0, 1).reshape([n, s, s]);
-        let inv22 = pair.narrow(1, 1, 1).reshape([n, s, s]);
+        let pair = inv.reshape([pairs, 2, size, size]);
+        let inv11 = pair.clone().narrow(1, 0, 1).reshape([pairs, size, size]);
+        let inv22 = pair.narrow(1, 1, 1).reshape([pairs, size, size]);
         let m21 = inv22.clone().matmul(a21).matmul(inv11.clone()).neg();
-        let zeros = Tensor::<3>::zeros([n, s, s], device).cast(dtype);
+        let zeros = Tensor::<3>::zeros([pairs, size, size], device).cast(dtype);
         let top = Tensor::cat(vec![inv11, zeros], 2);
         let bottom = Tensor::cat(vec![m21, inv22], 2);
         inv = Tensor::cat(vec![top, bottom], 1); // [n, 2s, 2s]
-        s *= 2;
+        size *= 2;
     }
-    inv.reshape([bh, p, p])
-        .narrow(1, 0, c)
-        .narrow(2, 0, c)
-        .reshape([b, h, c, c])
+    inv.reshape([bh, padded, padded])
+        .narrow(1, 0, len)
+        .narrow(2, 0, len)
+        .reshape([batch, heads, len, len])
 }
 
 /// Chunkwise-parallel evaluation of the same recurrence — the Gated
-/// DeltaNet / DeltaNet WY form (Yang et al.), specialised to this
+/// `DeltaNet` / `DeltaNet` WY form (Yang et al.), specialised to this
 /// parameterization's **scalar** per-head decay. Same signature as
 /// [`gdn_recurrence_sequential`] plus the chunk length.
 ///
@@ -1331,92 +1523,88 @@ fn unit_lower_inverse(k: Tensor<4>, l: Tensor<4>, beta: Tensor<4>, device: &Devi
 /// a chunk issues ~20 chunk-level ops plus ~6 per level of the inverse
 /// (6 levels at C = 64) — ~56 launches per 64 tokens, the heavy ones
 /// batched over all heads, against ~576 for the same span sequentially.
-#[allow(clippy::too_many_arguments)] // the recurrence's natural arity
 fn gdn_recurrence_chunked(
-    q: &Tensor<4>,
-    k: &Tensor<4>,
-    v: &Tensor<4>,
-    g: &Tensor<3>,
-    beta: &Tensor<3>,
+    inputs: &RecurrenceInputs<'_>,
     s0: Tensor<4>,
     scale: f32,
     chunk: usize,
 ) -> (Tensor<4>, Tensor<4>) {
-    let [b, hv, t, _ds] = q.dims();
-    let device = q.device();
-    let ambient = q.dtype();
+    let [batch, hv, t, _ds] = inputs.q.dims();
+    let device = inputs.q.device();
+    let ambient = inputs.q.dtype();
 
     // The f32 island. q is pre-scaled once — equivalent to the sequential
     // per-token mul_scalar, which commutes through everything q touches.
-    let qf = q.clone().cast(DType::F32).mul_scalar(scale);
-    let kf = k.clone().cast(DType::F32);
-    let vf = v.clone().cast(DType::F32);
+    let qf = inputs.q.clone().cast(DType::F32).mul_scalar(scale);
+    let kf = inputs.k.clone().cast(DType::F32);
+    let vf = inputs.v.clone().cast(DType::F32);
     // [b, t, hv] → [b, hv, t, 1], ready to broadcast over ds and columns.
-    let gf = g
+    let gf = inputs
+        .g
         .clone()
         .cast(DType::F32)
         .swap_dims(1, 2)
-        .reshape([b, hv, t, 1]);
-    let bf = beta
+        .reshape([batch, hv, t, 1]);
+    let bf = inputs
+        .beta
         .clone()
         .cast(DType::F32)
         .swap_dims(1, 2)
-        .reshape([b, hv, t, 1]);
+        .reshape([batch, hv, t, 1]);
 
-    let mut s = s0.cast(DType::F32); // [b, hv, ds(key), ds(value)]
+    let mut state = s0.cast(DType::F32); // [b, hv, ds(key), ds(value)]
     let mut outs: Vec<Tensor<4>> = Vec::with_capacity(t.div_ceil(chunk));
     let mut start = 0;
     while start < t {
-        let c = chunk.min(t - start); // the final chunk may be partial
-        let qc = qf.clone().narrow(2, start, c); // [b, hv, c, ds]
-        let kc = kf.clone().narrow(2, start, c);
-        let vc = vf.clone().narrow(2, start, c);
-        let gc = gf.clone().narrow(2, start, c); // [b, hv, c, 1]
-        let bc = bf.clone().narrow(2, start, c);
+        let len = chunk.min(t - start); // the final chunk may be partial
+        let qc = qf.clone().narrow(2, start, len); // [b, hv, c, ds]
+        let kc = kf.clone().narrow(2, start, len);
+        let vc = vf.clone().narrow(2, start, len);
+        let gc = gf.clone().narrow(2, start, len); // [b, hv, c, 1]
+        let bc = bf.clone().narrow(2, start, len);
 
         // Cumulative log-decay L_t and its exponential P_t, both within
         // the chunk (g ≤ 0, so L is non-increasing and P ∈ (0, 1]).
-        let l = gc.cumsum(2); // [b, hv, c, 1]
-        let p = l.clone().exp();
+        let l_cum = gc.cumsum(2); // [b, hv, c, 1]
+        let p_t = l_cum.clone().exp();
         // decay[t, j] = P_t/P_j = exp(L_t − L_j) for j ≤ t, unit diagonal.
-        let noncausal = Tensor::<2, Bool>::tril_mask([c, c], 0, &device).unsqueeze::<4>();
-        let decay = l
+        let noncausal = Tensor::<2, Bool>::tril_mask([len, len], 0, &device).unsqueeze::<4>();
+        let decay = l_cum
             .clone()
-            .sub(l.clone().swap_dims(2, 3))
+            .sub(l_cum.clone().swap_dims(2, 3))
             .mask_fill(noncausal, f32::NEG_INFINITY)
             .exp(); // [b, hv, c, c], causal-inclusive
 
         // D = (I + A)⁻¹·B with A[t, j] = β_t·(P_t/P_j)·(k_t·k_j) strictly
         // lower; the inverse is built by stable block recursion.
-        let r = unit_lower_inverse(kc.clone(), l.clone(), bc.clone(), &device);
+        let inv = unit_lower_inverse(kc.clone(), l_cum.clone(), bc.clone(), &device);
 
         // RHS rows: B[t] = β_t·v_t − β_t·P_t·(S₀ᵀ k_t).
         let u0 = bc
             .clone()
             .mul(vc)
-            .sub(bc.mul(p.clone()).mul(kc.clone()).matmul(s.clone()));
-        let u = r.matmul(u0); // the solved pseudo-values, [b, hv, c, ds]
+            .sub(bc.mul(p_t.clone()).mul(kc.clone()).matmul(state.clone()));
+        let pseudo = inv.matmul(u0); // the solved pseudo-values, [b, hv, c, ds]
 
         // o_t = P_t·S₀ᵀq_t + Σ_{j≤t} (P_t/P_j)·(q_t·k_j)·u_j — inclusive
         // j ≤ t is exactly the unit diagonal of `decay`.
         let qk = qc.clone().matmul(kc.clone().swap_dims(2, 3)).mul(decay);
-        let o_c = p
-            .clone()
+        let o_c = p_t
             .mul(qc)
-            .matmul(s.clone())
-            .add(qk.matmul(u.clone()));
+            .matmul(state.clone())
+            .add(qk.matmul(pseudo.clone()));
         outs.push(o_c);
 
         // S_C = P_C·S₀ + Σ_j (P_C/P_j)·k_j u_jᵀ, again via log differences.
-        let l_last = l.clone().narrow(2, c - 1, 1); // [b, hv, 1, 1] = L_C
-        let to_end = l_last.clone().sub(l).exp(); // (P_C/P_j) ∈ (0, 1]
-        s = s
+        let l_last = l_cum.clone().narrow(2, len - 1, 1); // [b, hv, 1, 1] = L_C
+        let to_end = l_last.clone().sub(l_cum).exp(); // (P_C/P_j) ∈ (0, 1]
+        state = state
             .mul(l_last.exp())
-            .add(kc.mul(to_end).swap_dims(2, 3).matmul(u));
+            .add(kc.mul(to_end).swap_dims(2, 3).matmul(pseudo));
 
-        start += c;
+        start += len;
     }
-    (Tensor::cat(outs, 2).cast(ambient), s.cast(ambient))
+    (Tensor::cat(outs, 2).cast(ambient), state.cast(ambient))
 }
 
 /// One trunk layer: exactly one of `self_attn` / `linear_attn`.
@@ -1558,16 +1746,29 @@ pub(crate) fn qwen35_field(field: &str) -> Option<&'static str> {
 /// Load a qwen35 model straight from a GGUF file — the classic f32 path,
 /// which is [`load_from_gguf_quantized`] with quantization off. One import
 /// path serves every precision (P9's "single path" rule).
+///
+/// # Errors
+///
+/// As [`load_from_gguf_quantized`].
 pub fn load_from_gguf(path: &Path, device: &Device) -> Result<LoadedQwen35, ImportError> {
     load_from_gguf_quantized(path, device, QuantPolicy::Off)
 }
 
-/// **Streaming** GGUF import with optional keep-quantized weights: one
-/// tensor at a time is dequantized to f32 (whatever the source stored —
+/// **Streaming** GGUF import with optional keep-quantized weights.
+///
+/// One tensor at a time is dequantized to f32 (whatever the source stored —
 /// BF16, K-quants, IQ quants), moved to the device, **re-quantized** per
 /// `policy` when eligible, and assigned. Peak memory is the finished model
 /// plus a single f32 tensor — never the whole model at f32, which is what
 /// makes the 27B tier loadable at all (its f32 form is ~109 GB).
+///
+/// # Errors
+///
+/// An [`ImportError::Parse`] naming `path` for: a file that does not open
+/// or parse as GGUF; a header [`Qwen35Config::from_gguf`] refuses; a tensor
+/// name the architecture has no place for; a dimension that does not fit
+/// `usize`; a tensor that does not read/dequantize or whose shape its field
+/// rejects; or a trunk tensor count other than the architecture's.
 pub fn load_from_gguf_quantized(
     path: &Path,
     device: &Device,
@@ -1600,15 +1801,8 @@ pub fn load_from_gguf_quantized(
             .ok_or_else(|| parse(format!("unmapped tensor name '{}'", info.name)))?;
         let (name, shape) = match mapped {
             GgufMap::Skip => continue,
-            GgufMap::Rename(name) => (
-                name,
-                info.dims
-                    .iter()
-                    .rev()
-                    .map(|&d| d as usize)
-                    .collect::<Vec<_>>(),
-            ),
-            GgufMap::Reshape(name, shape) => (name, shape.iter().map(|&d| d as usize).collect()),
+            GgufMap::Rename(name) => (name, dims_usize(info.dims.iter().rev()).map_err(parse)?),
+            GgufMap::Reshape(name, shape) => (name, dims_usize(shape.iter()).map_err(parse)?),
         };
         let values = f
             .read_tensor_f32(&info.name)
@@ -1644,9 +1838,15 @@ pub fn load_from_gguf_quantized(
     })
 }
 
+/// GGUF `u64` dims as `usize`, or which one does not fit (a 32-bit target).
+fn dims_usize<'a>(dims: impl Iterator<Item = &'a u64>) -> Result<Vec<usize>, String> {
+    dims.map(|&d| usize::try_from(d).map_err(|_| format!("dimension {d} does not fit usize")))
+        .collect()
+}
+
 /// How many trunk tensors a checkpoint must supply (the completeness gate's
 /// other half). Per attention layer 11 (2 norms + q/k/v/o + q/k norm +
-/// 3 FFN), per DeltaNet layer 14 (2 norms + qkv/z + β/α/dt/a + conv +
+/// 3 FFN), per `DeltaNet` layer 14 (2 norms + qkv/z + β/α/dt/a + conv +
 /// ssm-norm + out + 3 FFN), plus embedding, final norm, and the untied head
 /// when present.
 fn expected_tensor_count(cfg: &Qwen35Config, untied: bool) -> usize {
@@ -1709,10 +1909,120 @@ fn take_linear(
     policy: QuantPolicy,
     device: &Device,
 ) -> Result<Tensor<2>, String> {
-    match ready {
-        Some(t) => Ok(t),
-        None => linear_weight(values, shape, policy, device),
+    ready.map_or_else(|| linear_weight(values, shape, policy, device), Ok)
+}
+
+/// One parameter's data on its way into a module field: the raw values
+/// and shape, the ready tensor when the pack supplied one, and what a
+/// linear needs to be transposed/quantized.
+struct RawParam<'a> {
+    values: Vec<f32>,
+    shape: &'a [usize],
+    ready: Option<Tensor<2>>,
+    policy: QuantPolicy,
+    device: &'a Device,
+}
+
+impl RawParam<'_> {
+    /// A 1-D parameter (norm gammas, `dt_bias`, `a`).
+    fn vector(self) -> Result<Tensor<1>, String> {
+        let &[n] = self.shape else {
+            return Err(format!("expected 1-D, got {:?}", self.shape));
+        };
+        Ok(device_tensor::<1>(self.values, [n], self.device))
     }
+
+    /// A linear weight from either source.
+    fn linear(self) -> Result<Tensor<2>, String> {
+        take_linear(
+            self.ready,
+            self.values,
+            self.shape,
+            self.policy,
+            self.device,
+        )
+    }
+}
+
+/// Route one field of an attention block.
+fn assign_attn_field(
+    attn: &mut GatedAttention,
+    field: &str,
+    raw: RawParam<'_>,
+) -> Result<(), String> {
+    match field {
+        "q_proj.weight" => attn.q_proj.weight = Param::from_tensor(raw.linear()?),
+        "k_proj.weight" => attn.k_proj.weight = Param::from_tensor(raw.linear()?),
+        "v_proj.weight" => attn.v_proj.weight = Param::from_tensor(raw.linear()?),
+        "o_proj.weight" => attn.o_proj.weight = Param::from_tensor(raw.linear()?),
+        "q_norm.weight" => attn.q_norm.gamma = Param::from_tensor(raw.vector()?),
+        "k_norm.weight" => attn.k_norm.gamma = Param::from_tensor(raw.vector()?),
+        other => return Err(format!("unknown attention field '{other}'")),
+    }
+    Ok(())
+}
+
+/// Route one field of a `DeltaNet` block.
+fn assign_delta_field(
+    delta: &mut GatedDeltaNet,
+    field: &str,
+    raw: RawParam<'_>,
+) -> Result<(), String> {
+    match field {
+        "qkv_proj.weight" => delta.qkv_proj.weight = Param::from_tensor(raw.linear()?),
+        "z_proj.weight" => delta.z_proj.weight = Param::from_tensor(raw.linear()?),
+        "beta_proj.weight" => delta.beta_proj.weight = Param::from_tensor(raw.linear()?),
+        "alpha_proj.weight" => delta.alpha_proj.weight = Param::from_tensor(raw.linear()?),
+        "out_proj.weight" => delta.out_proj.weight = Param::from_tensor(raw.linear()?),
+        "dt_bias" => delta.dt_bias = Param::from_tensor(raw.vector()?),
+        "a" => delta.a = Param::from_tensor(raw.vector()?),
+        "norm.weight" => delta.norm.gamma = Param::from_tensor(raw.vector()?),
+        "conv1d.weight" => {
+            let &[ch, one, k] = raw.shape else {
+                return Err(format!("conv kernel must be 3-D, got {:?}", raw.shape));
+            };
+            if one != 1 {
+                return Err(format!("conv kernel middle dim must be 1, got {one}"));
+            }
+            delta.conv1d.weight =
+                Param::from_tensor(device_tensor::<3>(raw.values, [ch, 1, k], raw.device));
+        }
+        other => return Err(format!("unknown DeltaNet field '{other}'")),
+    }
+    Ok(())
+}
+
+/// Route one layer field (`name` is the full path, for the error text):
+/// the norms and MLP here, the block fields on to their block.
+fn assign_layer_field(
+    layer: &mut Qwen35Layer,
+    name: &str,
+    field: &str,
+    raw: RawParam<'_>,
+) -> Result<(), String> {
+    match field {
+        "input_norm.weight" => layer.input_norm.gamma = Param::from_tensor(raw.vector()?),
+        "post_attn_norm.weight" => layer.post_attn_norm.gamma = Param::from_tensor(raw.vector()?),
+        "mlp.gate_proj.weight" => layer.mlp.gate_proj.weight = Param::from_tensor(raw.linear()?),
+        "mlp.up_proj.weight" => layer.mlp.up_proj.weight = Param::from_tensor(raw.linear()?),
+        "mlp.down_proj.weight" => layer.mlp.down_proj.weight = Param::from_tensor(raw.linear()?),
+        _ => {
+            if let Some(attn_field) = field.strip_prefix("self_attn.") {
+                let attn = layer.self_attn.as_mut().ok_or_else(|| {
+                    format!("'{name}' targets an attention block on a DeltaNet layer")
+                })?;
+                return assign_attn_field(attn, attn_field, raw);
+            }
+            if let Some(delta_field) = field.strip_prefix("linear_attn.") {
+                let delta = layer.linear_attn.as_mut().ok_or_else(|| {
+                    format!("'{name}' targets a DeltaNet block on an attention layer")
+                })?;
+                return assign_delta_field(delta, delta_field, raw);
+            }
+            return Err(format!("unknown layer field '{field}'"));
+        }
+    }
+    Ok(())
 }
 
 /// Route one mapped tensor into its module field. An unknown path is a loud
@@ -1724,38 +2034,34 @@ fn assign_param(
     policy: QuantPolicy,
     device: &Device,
 ) -> Result<(), String> {
-    use burn::module::Param;
-
     let (values, shape_vec, ready): (Vec<f32>, Vec<usize>, Option<Tensor<2>>) = match src {
         ParamSrc::F32 { values, shape } => (values, shape, None),
         ParamSrc::Ready2(t) => (Vec::new(), t.dims().to_vec(), Some(*t)),
     };
-    let shape = shape_vec.as_slice();
-
-    let expect_1d = |values: Vec<f32>, shape: &[usize]| -> Result<Tensor<1>, String> {
-        let &[n] = shape else {
-            return Err(format!("expected 1-D, got {shape:?}"));
-        };
-        Ok(device_tensor::<1>(values, [n], device))
+    let raw = RawParam {
+        values,
+        shape: shape_vec.as_slice(),
+        ready,
+        policy,
+        device,
     };
 
     match name {
         "model.embed_tokens.weight" => {
             // Embeddings stay float — token gather has no quantized kernel.
-            let t = match ready {
-                Some(t) => t,
-                None => {
-                    let &[v, h] = shape else {
-                        return Err(format!("embedding must be 2-D, got {shape:?}"));
-                    };
-                    device_tensor::<2>(values, [v, h], device)
-                }
+            let t = if let Some(t) = raw.ready {
+                t
+            } else {
+                let &[v, h] = raw.shape else {
+                    return Err(format!("embedding must be 2-D, got {:?}", raw.shape));
+                };
+                device_tensor::<2>(raw.values, [v, h], device)
             };
             model.embed_tokens.weight = Param::from_tensor(t);
             return Ok(());
         }
         "model.norm.weight" => {
-            model.norm.gamma = Param::from_tensor(expect_1d(values, shape)?);
+            model.norm.gamma = Param::from_tensor(raw.vector()?);
             return Ok(());
         }
         "lm_head.weight" => {
@@ -1763,7 +2069,7 @@ fn assign_param(
                 .lm_head
                 .as_mut()
                 .ok_or("checkpoint has output.weight but the model built a tied head")?;
-            head.weight = Param::from_tensor(take_linear(ready, values, shape, policy, device)?);
+            head.weight = Param::from_tensor(raw.linear()?);
             return Ok(());
         }
         _ => {}
@@ -1778,110 +2084,15 @@ fn assign_param(
     let layer: usize = layer
         .parse()
         .map_err(|_| format!("bad layer in '{name}'"))?;
-    let l = model
+    let layer = model
         .layers
         .get_mut(layer)
         .ok_or_else(|| format!("layer {layer} out of range"))?;
-
-    let missing_attn = || format!("'{name}' targets an attention block on a DeltaNet layer");
-    let missing_delta = || format!("'{name}' targets a DeltaNet block on an attention layer");
-
-    match field {
-        "input_norm.weight" => l.input_norm.gamma = Param::from_tensor(expect_1d(values, shape)?),
-        "post_attn_norm.weight" => {
-            l.post_attn_norm.gamma = Param::from_tensor(expect_1d(values, shape)?);
-        }
-        "mlp.gate_proj.weight" => {
-            l.mlp.gate_proj.weight =
-                Param::from_tensor(take_linear(ready, values, shape, policy, device)?);
-        }
-        "mlp.up_proj.weight" => {
-            l.mlp.up_proj.weight =
-                Param::from_tensor(take_linear(ready, values, shape, policy, device)?);
-        }
-        "mlp.down_proj.weight" => {
-            l.mlp.down_proj.weight =
-                Param::from_tensor(take_linear(ready, values, shape, policy, device)?);
-        }
-        _ => {
-            if let Some(attn_field) = field.strip_prefix("self_attn.") {
-                let attn = l.self_attn.as_mut().ok_or_else(missing_attn)?;
-                match attn_field {
-                    "q_proj.weight" => {
-                        attn.q_proj.weight =
-                            Param::from_tensor(take_linear(ready, values, shape, policy, device)?);
-                    }
-                    "k_proj.weight" => {
-                        attn.k_proj.weight =
-                            Param::from_tensor(take_linear(ready, values, shape, policy, device)?);
-                    }
-                    "v_proj.weight" => {
-                        attn.v_proj.weight =
-                            Param::from_tensor(take_linear(ready, values, shape, policy, device)?);
-                    }
-                    "o_proj.weight" => {
-                        attn.o_proj.weight =
-                            Param::from_tensor(take_linear(ready, values, shape, policy, device)?);
-                    }
-                    "q_norm.weight" => {
-                        attn.q_norm.gamma = Param::from_tensor(expect_1d(values, shape)?);
-                    }
-                    "k_norm.weight" => {
-                        attn.k_norm.gamma = Param::from_tensor(expect_1d(values, shape)?);
-                    }
-                    other => return Err(format!("unknown attention field '{other}'")),
-                }
-                return Ok(());
-            }
-            if let Some(delta_field) = field.strip_prefix("linear_attn.") {
-                let delta = l.linear_attn.as_mut().ok_or_else(missing_delta)?;
-                match delta_field {
-                    "qkv_proj.weight" => {
-                        delta.qkv_proj.weight =
-                            Param::from_tensor(take_linear(ready, values, shape, policy, device)?);
-                    }
-                    "z_proj.weight" => {
-                        delta.z_proj.weight =
-                            Param::from_tensor(take_linear(ready, values, shape, policy, device)?);
-                    }
-                    "beta_proj.weight" => {
-                        delta.beta_proj.weight =
-                            Param::from_tensor(take_linear(ready, values, shape, policy, device)?);
-                    }
-                    "alpha_proj.weight" => {
-                        delta.alpha_proj.weight =
-                            Param::from_tensor(take_linear(ready, values, shape, policy, device)?);
-                    }
-                    "out_proj.weight" => {
-                        delta.out_proj.weight =
-                            Param::from_tensor(take_linear(ready, values, shape, policy, device)?);
-                    }
-                    "dt_bias" => delta.dt_bias = Param::from_tensor(expect_1d(values, shape)?),
-                    "a" => delta.a = Param::from_tensor(expect_1d(values, shape)?),
-                    "norm.weight" => {
-                        delta.norm.gamma = Param::from_tensor(expect_1d(values, shape)?);
-                    }
-                    "conv1d.weight" => {
-                        let &[ch, one, k] = shape else {
-                            return Err(format!("conv kernel must be 3-D, got {shape:?}"));
-                        };
-                        if one != 1 {
-                            return Err(format!("conv kernel middle dim must be 1, got {one}"));
-                        }
-                        delta.conv1d.weight =
-                            Param::from_tensor(device_tensor::<3>(values, [ch, 1, k], device));
-                    }
-                    other => return Err(format!("unknown DeltaNet field '{other}'")),
-                }
-                return Ok(());
-            }
-            return Err(format!("unknown layer field '{field}'"));
-        }
-    }
-    Ok(())
+    assign_layer_field(layer, name, field, raw)
 }
 
 /// How each GGUF tensor enters a `.mummu` pack (see `crate::pack`).
+#[must_use]
 pub fn pack_actions(
     info: &GgufTensorInfo,
     trunk_layers: usize,
@@ -2006,6 +2217,13 @@ fn pack_param_path(name: &str, trunk_layers: usize) -> Option<String> {
 /// Load from a `.mummu` pack, choosing each tensor's precision through
 /// `choose` (the planner's tiering hook — per tensor, so a policy can mix
 /// levels). Quantized levels arrive pre-packed (no re-quantization).
+///
+/// # Errors
+///
+/// An [`ImportError::Parse`] naming `dir` for: a pack that does not open,
+/// or whose header [`Qwen35Config::from_gguf`] refuses; an entry with no
+/// stored precision, or one that does not read; a tensor its field rejects;
+/// or a trunk tensor count other than the architecture's.
 pub fn load_from_pack(
     dir: &Path,
     device: &Device,
@@ -2015,9 +2233,18 @@ pub fn load_from_pack(
 }
 
 /// Load a **partitioned** pack with only `local(layer)` FFN clusters in each
-/// layer's `mlp` (at the level `choose` picks for that entry); the caller
-/// attaches the remote clusters as an `ExpertPool` via [`LoadedQwen35::with_ffn_pool`].
+/// layer's `mlp`.
+///
+/// Each entry is at the level `choose` picks for it; the caller attaches the
+/// remote clusters as an `ExpertPool` via [`LoadedQwen35::with_ffn_pool`].
 /// Every layer must keep at least one local cluster.
+///
+/// # Errors
+///
+/// As [`load_from_pack`], plus: a Hadamard-folded checkpoint (its
+/// down-projection transform spans the whole FFN axis); a pack with no FFN
+/// partition; a layer whose `local` set is empty or names a cluster the
+/// partition does not have.
 pub fn load_from_pack_partitioned(
     dir: &Path,
     device: &Device,
@@ -2035,6 +2262,10 @@ pub fn load_from_pack_partitioned(
 /// and it is read once per token while a layer's weights are read 65 times.
 /// Holding it on the host frees that VRAM for weights that actually compute,
 /// at the cost of one `[1, hidden]` transfer per token.
+///
+/// # Errors
+///
+/// As [`load_from_pack_partitioned`].
 pub fn load_from_pack_partitioned_split(
     dir: &Path,
     device: &Device,
@@ -2057,8 +2288,15 @@ pub fn load_from_pack_partitioned_split(
 /// dense model: it splits each layer's FFN across devices, and since every
 /// cluster runs on every token there is no selectivity to pay for the
 /// crossing — measured at 24.7 s/tok against 4.8 for keeping layers whole.
-/// Cluster granularity stays right for a routed MoE, where only top-k
+/// Cluster granularity stays right for a routed `MoE`, where only top-k
 /// experts are touched.
+///
+/// # Errors
+///
+/// An [`ImportError::Parse`] naming `dir` for: a pack that does not open,
+/// or whose header [`Qwen35Config::from_gguf`] refuses; an entry with no
+/// stored precision, or one that does not read; a tensor its field rejects;
+/// or a trunk tensor count other than the architecture's.
 pub fn load_from_pack_layered(
     dir: &Path,
     layer_device: &dyn Fn(usize) -> Device,
@@ -2127,18 +2365,8 @@ pub fn load_from_pack_layered(
             Role::Embedding => embed_device.clone(),
             _ => layer_of_path(&path).map_or_else(|| head_device.clone(), &layer_device),
         };
-        let precision = {
-            let p = choose(entry);
-            if entry.precisions.contains_key(&p) {
-                p
-            } else {
-                *entry
-                    .precisions
-                    .keys()
-                    .max()
-                    .ok_or_else(|| parse(format!("'{}' has no stored precision", entry.name)))?
-            }
-        };
+        let precision = stored_precision(entry, choose)
+            .ok_or_else(|| parse(format!("'{}' has no stored precision", entry.name)))?;
         let src = match entry.role {
             Role::Linear | Role::Expert { .. } | Role::Embedding => ParamSrc::Ready2(Box::new(
                 pack.tensor::<2>(entry, precision, &device).map_err(parse)?,
@@ -2154,11 +2382,11 @@ pub fn load_from_pack_layered(
         // multi-megabyte disk read and a dequantize.
         crate::progress::advance(assigned as u64, pack.bytes_read());
         if last_progress.elapsed().as_secs() >= 15 {
-            let gib = pack.bytes_read() as f64 / f64::from(1u32 << 30);
+            let gib = f64_from_u64(pack.bytes_read()) / f64::from(1u32 << 30);
             let secs = load_started.elapsed().as_secs_f64();
             eprintln!(
                 "[mummu] load: {assigned}/{expected} tensors — {gib:.2} GiB off the pack in {secs:.0}s ({:.0} MB/s)",
-                pack.bytes_read() as f64 / f64::from(1u32 << 20) / secs,
+                f64_from_u64(pack.bytes_read()) / f64::from(1u32 << 20) / secs,
             );
             last_progress = std::time::Instant::now();
         }
@@ -2235,18 +2463,8 @@ pub fn relocate_layers(
         if !layer_of_path(&path).is_some_and(|l| layers.contains(&l)) {
             continue;
         }
-        let precision = {
-            let p = choose(entry);
-            if entry.precisions.contains_key(&p) {
-                p
-            } else {
-                *entry
-                    .precisions
-                    .keys()
-                    .max()
-                    .ok_or_else(|| parse(format!("'{}' has no stored precision", entry.name)))?
-            }
-        };
+        let precision = stored_precision(entry, choose)
+            .ok_or_else(|| parse(format!("'{}' has no stored precision", entry.name)))?;
         let src = match entry.role {
             Role::Linear | Role::Expert { .. } | Role::Embedding => ParamSrc::Ready2(Box::new(
                 pack.tensor::<2>(entry, precision, device).map_err(parse)?,
@@ -2289,9 +2507,22 @@ fn layer_of_path(path: &str) -> Option<usize> {
 }
 
 /// One layer's FFN restricted to `clusters` of a partitioned pack, at
-/// `precision`, in Linear layout — the local slab or a remote executor's
-/// weights. Columns of gate/up and rows of down are sliced straight from
-/// the stored bytes (no re-quantization).
+/// `precision`, in Linear layout.
+///
+/// The local slab or a remote executor's weights: columns of gate/up and
+/// rows of down are sliced straight from the stored bytes (no
+/// re-quantization).
+///
+/// # Errors
+///
+/// A pack with no FFN partition; a `layer` past it; a cluster index the
+/// layer does not have, or an empty cluster set; a gate/up/down entry the
+/// pack does not carry; or a slice that does not read.
+///
+/// # Panics
+///
+/// When a partition entry stores no precision level at all — a pack
+/// invariant the writer enforces.
 pub fn load_ffn_clusters(
     pack: &crate::pack::Pack,
     layer: usize,
@@ -2320,25 +2551,26 @@ pub fn load_ffn_clusters(
         return Err(format!("layer {layer}: empty cluster set"));
     }
     let entry = |name: &str| pack.entry(name).ok_or_else(|| format!("missing {name}"));
-    let pick = |e: &crate::pack::TensorEntry| {
-        if e.precisions.contains_key(&precision) {
-            precision
-        } else {
-            *e.precisions.keys().max().expect("stored level")
-        }
-    };
-    let g = entry(&names[0])?;
-    let u = entry(&names[1])?;
-    let d = entry(&names[2])?;
+    let level_of =
+        |e: &crate::pack::TensorEntry| stored_precision(e, &|_| precision).expect("stored level");
+    let gate = entry(&names[0])?;
+    let up = entry(&names[1])?;
+    let down = entry(&names[2])?;
     Ok(crate::nn::ExpertWeights {
-        gate: Param::from_tensor(pack.tensor_cols(g, pick(g), &ranges, device)?),
-        up: Param::from_tensor(pack.tensor_cols(u, pick(u), &ranges, device)?),
-        down: Param::from_tensor(pack.tensor_rows(d, pick(d), &ranges, device)?),
+        gate: Param::from_tensor(pack.tensor_cols(gate, level_of(gate), &ranges, device)?),
+        up: Param::from_tensor(pack.tensor_cols(up, level_of(up), &ranges, device)?),
+        down: Param::from_tensor(pack.tensor_rows(down, level_of(down), &ranges, device)?),
     })
 }
 
 impl LoadedQwen35 {
     /// Attach the remote FFN clusters (one pool row per layer, ragged).
+    ///
+    /// # Panics
+    ///
+    /// When the pool does not have exactly one row per trunk layer, or the
+    /// checkpoint is Hadamard-folded (remote clusters would split the
+    /// down-projection's transform).
     #[must_use]
     pub fn with_ffn_pool(mut self, pool: std::sync::Arc<crate::nn::ExpertPool>) -> Self {
         assert_eq!(
@@ -2356,7 +2588,7 @@ impl LoadedQwen35 {
 
     /// Opt-in cluster skipping at energy threshold `tau` (see `ffn_skip_tau`).
     #[must_use]
-    pub fn with_ffn_skip(mut self, tau: f32) -> Self {
+    pub const fn with_ffn_skip(mut self, tau: f32) -> Self {
         self.ffn_skip_tau = tau.max(0.0);
         self
     }
@@ -2369,6 +2601,78 @@ impl LoadedQwen35 {
     pub fn with_ffn_plan(mut self, plan: std::sync::Arc<crate::workingset::Plan>) -> Self {
         self.ffn_plan = Some(plan);
         self
+    }
+}
+
+/// The level `choose` picks for `entry` when the pack stores it, else the
+/// best level it does store (`None` for an entry with no level at all).
+fn stored_precision(
+    entry: &crate::pack::TensorEntry,
+    choose: &dyn Fn(&crate::pack::TensorEntry) -> crate::pack::Precision,
+) -> Option<crate::pack::Precision> {
+    let wanted = choose(entry);
+    if entry.precisions.contains_key(&wanted) {
+        Some(wanted)
+    } else {
+        entry.precisions.keys().max().copied()
+    }
+}
+
+/// Partitioned FFN entries → `(layer, proj index)`, for the local-cluster
+/// path; empty when no partitioned load was asked for.
+fn ffn_partition_index(
+    pack: &crate::pack::Pack,
+    partitioned: bool,
+) -> Result<std::collections::HashMap<&str, (usize, usize)>, String> {
+    match (partitioned, &pack.manifest.ffn_partition) {
+        (true, Some(part)) => Ok(part
+            .names
+            .iter()
+            .enumerate()
+            .flat_map(|(l, n)| {
+                n.iter()
+                    .enumerate()
+                    .map(move |(i, name)| (name.as_str(), (l, i)))
+            })
+            .collect()),
+        (true, None) => Err("partitioned load requested but the pack has no FFN partition".into()),
+        (false, _) => Ok(std::collections::HashMap::new()),
+    }
+}
+
+/// One partitioned FFN entry (`slot` = its `(layer, proj index)`) restricted
+/// to that layer's local `clusters`, at the level `choose` picks: columns of
+/// gate/up, rows of down.
+fn load_local_ffn(
+    pack: &crate::pack::Pack,
+    entry: &crate::pack::TensorEntry,
+    slot: (usize, usize),
+    clusters: &[usize],
+    choose: &dyn Fn(&crate::pack::TensorEntry) -> crate::pack::Precision,
+    device: &Device,
+) -> Result<Tensor<2>, String> {
+    let (layer, proj) = slot;
+    let part = pack.manifest.ffn_partition.as_ref().expect("checked above");
+    let spans = &part.layers[layer];
+    let ranges: Vec<(usize, usize)> = clusters
+        .iter()
+        .map(|&c| {
+            spans
+                .get(c)
+                .map(|s| (s.start, s.len))
+                .ok_or_else(|| format!("layer {layer}: cluster {c} out of range"))
+        })
+        .collect::<Result<_, _>>()?;
+    if ranges.is_empty() {
+        return Err(format!(
+            "layer {layer}: no local FFN cluster (every layer needs one)"
+        ));
+    }
+    let precision = stored_precision(entry, choose).expect("stored level");
+    if proj == 2 {
+        pack.tensor_rows(entry, precision, &ranges, device)
+    } else {
+        pack.tensor_cols(entry, precision, &ranges, device)
     }
 }
 
@@ -2400,26 +2704,7 @@ fn load_from_pack_inner(
         ));
     }
 
-    // Partitioned FFN entries → (layer, proj index) for the local-cluster path.
-    let ffn_index: std::collections::HashMap<&str, (usize, usize)> =
-        match (&local, &pack.manifest.ffn_partition) {
-            (Some(_), Some(part)) => part
-                .names
-                .iter()
-                .enumerate()
-                .flat_map(|(l, n)| {
-                    n.iter()
-                        .enumerate()
-                        .map(move |(i, name)| (name.as_str(), (l, i)))
-                })
-                .collect(),
-            (Some(_), None) => {
-                return Err(parse(
-                    "partitioned load requested but the pack has no FFN partition".into(),
-                ));
-            }
-            _ => std::collections::HashMap::new(),
-        };
+    let ffn_index = ffn_partition_index(&pack, local.is_some()).map_err(parse)?;
     // Same structured signal as the layered loader: this is the other pack
     // path a chat request can take, and a bar that only moves for one of them
     // is worse than no bar. No print here — this loader has never had one, and
@@ -2434,77 +2719,28 @@ fn load_from_pack_inner(
         let Some(path) = pack_param_path(&entry.name, trunk) else {
             continue; // NextN block members, if a pack kept any
         };
-        if let (Some(local), Some(&(layer, proj))) = (local, ffn_index.get(entry.name.as_str())) {
-            let clusters = local(layer);
-            let part = pack.manifest.ffn_partition.as_ref().expect("checked above");
-            let spans = &part.layers[layer];
-            let ranges: Vec<(usize, usize)> = clusters
-                .iter()
-                .map(|&c| {
-                    spans
-                        .get(c)
-                        .map(|s| (s.start, s.len))
-                        .ok_or_else(|| parse(format!("layer {layer}: cluster {c} out of range")))
-                })
-                .collect::<Result<_, _>>()?;
-            if ranges.is_empty() {
-                return Err(parse(format!(
-                    "layer {layer}: no local FFN cluster (every layer needs one)"
-                )));
+        let src = if let (Some(local), Some(&slot)) = (local, ffn_index.get(entry.name.as_str())) {
+            let clusters = local(slot.0);
+            let t = load_local_ffn(&pack, entry, slot, &clusters, choose, device).map_err(parse)?;
+            ParamSrc::Ready2(Box::new(t))
+        } else {
+            let precision = stored_precision(entry, choose)
+                .ok_or_else(|| parse(format!("'{}' has no stored precision", entry.name)))?;
+            match entry.role {
+                // The embedding may live somewhere else entirely — see
+                // `load_from_pack_partitioned_split`.
+                Role::Embedding => ParamSrc::Ready2(Box::new(
+                    pack.tensor::<2>(entry, precision, embed_device.unwrap_or(device))
+                        .map_err(parse)?,
+                )),
+                Role::Linear | Role::Expert { .. } => ParamSrc::Ready2(Box::new(
+                    pack.tensor::<2>(entry, precision, device).map_err(parse)?,
+                )),
+                Role::Vector | Role::Conv => ParamSrc::F32 {
+                    values: pack.read_f32(entry).map_err(parse)?,
+                    shape: entry.shape.clone(),
+                },
             }
-            let precision = {
-                let p = choose(entry);
-                if entry.precisions.contains_key(&p) {
-                    p
-                } else {
-                    *entry.precisions.keys().max().expect("stored level")
-                }
-            };
-            let t = if proj == 2 {
-                pack.tensor_rows(entry, precision, &ranges, device)
-            } else {
-                pack.tensor_cols(entry, precision, &ranges, device)
-            }
-            .map_err(parse)?;
-            assign_param(
-                &mut model,
-                &path,
-                ParamSrc::Ready2(Box::new(t)),
-                QuantPolicy::Off,
-                device,
-            )
-            .map_err(parse)?;
-            assigned += 1;
-            crate::progress::advance(assigned as u64, pack.bytes_read());
-            continue;
-        }
-        let precision = {
-            let p = choose(entry);
-            if entry.precisions.contains_key(&p) {
-                p
-            } else {
-                // Fall back to the best float level the pack stored.
-                *entry
-                    .precisions
-                    .keys()
-                    .max()
-                    .ok_or_else(|| parse(format!("'{}' has no stored precision", entry.name)))?
-            }
-        };
-        let src = match entry.role {
-            // The embedding may live somewhere else entirely — see
-            // `load_from_pack_partitioned_split`.
-            Role::Embedding => ParamSrc::Ready2(Box::new(
-                pack.tensor::<2>(entry, precision, embed_device.unwrap_or(device))
-                    .map_err(parse)?,
-            )),
-            Role::Linear | Role::Expert { .. } => ParamSrc::Ready2(Box::new(
-                pack.tensor::<2>(entry, precision, device).map_err(parse)?,
-            )),
-            Role::Vector | Role::Conv => ParamSrc::F32 {
-                values: pack.read_f32(entry).map_err(parse)?,
-                shape: entry.shape.clone(),
-            },
         };
         assign_param(&mut model, &path, src, QuantPolicy::Off, device).map_err(parse)?;
         assigned += 1;
@@ -2569,7 +2805,7 @@ impl CausalLm for LoadedQwen35 {
 
 impl LoadedQwen35 {
     /// The shared body of `forward` / `forward_advance`: runs the trunk,
-    /// and computes the final norm + lm_head only when `need_logits` —
+    /// and computes the final norm + `lm_head` only when `need_logits` —
     /// a non-final prefill chunk advances every cache without paying the
     /// head projection (~68 ms/call on the 27B's host head).
     /// Look `new_ids` up in the embedding table: `[1, t, hidden]` on
@@ -2579,6 +2815,14 @@ impl LoadedQwen35 {
     /// rows into the sequence — image tokens from the vision tower — and
     /// hand the result to [`Self::forward_embeds`]. Text-only decoding goes
     /// through exactly the same code as before.
+    ///
+    /// # Panics
+    ///
+    /// If a token id does not fit an `i32`: the gather indices are built as
+    /// `i32`, so an id at or above 2^31 has no representation. Every real
+    /// vocabulary is orders of magnitude below that, so this is a
+    /// corrupt-id guard rather than a workload condition.
+    #[must_use]
     pub fn embed(&self, new_ids: &[u32], device: &Device) -> Tensor<3> {
         let t = new_ids.len();
         // The embedding may live on a different device from the rest of the
@@ -2588,7 +2832,10 @@ impl LoadedQwen35 {
         // indices are built there and only the small `[1, t, hidden]` result
         // crosses over.
         let embed_device = self.model.embed_tokens.weight.val().device();
-        let ids32: Vec<i32> = new_ids.iter().map(|&i| i as i32).collect();
+        let ids32: Vec<i32> = new_ids
+            .iter()
+            .map(|&i| i32::try_from(i).expect("token id fits i32"))
+            .collect();
         let input = Tensor::<1, Int>::from_data(
             TensorData::new(ids32, [t]),
             (&embed_device, crate::backend::int_dtype(&embed_device)),
@@ -2622,6 +2869,12 @@ impl LoadedQwen35 {
     /// This is [`Self::forward_impl`] from the embedding onwards; the split
     /// exists so image embeddings can enter the sequence without pretending
     /// to be token ids (there is no id that means "this patch").
+    ///
+    /// # Panics
+    ///
+    /// On an empty span (`x` with no positions), a `cache` whose length is
+    /// not the layer count, or — an internal invariant — a cache entry whose
+    /// kind does not match its layer's block.
     pub fn forward_embeds(
         &self,
         x: Tensor<3>,
@@ -2659,8 +2912,7 @@ impl LoadedQwen35 {
         // would have been, which is the data that decides whether a commit
         // mode is ever legal.
         let mut spec_carry: Option<(usize, Tensor<3>)> = None;
-        let (mut la_n, mut la_max) = (0u32, 0f32);
-        let (mut la_a1, mut la_a2, mut la_a3) = (0u32, 0u32, 0u32);
+        let mut tally = LookaheadTally::default();
         for li in 0..n_layers {
             let layer = &self.model.layers[li];
             // Layers may live on different devices (the dense placement puts
@@ -2674,58 +2926,21 @@ impl LoadedQwen35 {
                 x = x.to_device(&layer_device);
             }
             let _prof_layer = crate::prof::scope("layer");
-            let h = {
-                let _s = crate::prof::scope("norm1");
-                layer.input_norm.forward(x.clone())
-            };
             // The rope tables and mask were built once on the entry device;
             // an attention layer elsewhere needs them there too.
-            let _s_glue_rope = crate::prof::scope("glue.rope");
-            let (cos_l, sin_l) = if cos.device() == layer_device {
-                (cos.clone(), sin.clone())
-            } else {
-                (
-                    cos.clone().to_device(&layer_device),
-                    sin.clone().to_device(&layer_device),
-                )
+            let (cos_l, sin_l, mask_l) = tables_on(&cos, &sin, mask.as_ref(), &layer_device);
+            let pos = PositionTables {
+                cos: &cos_l,
+                sin: &sin_l,
+                mask: mask_l.as_ref(),
             };
-            let mask_l = mask.as_ref().map(|m| {
-                if m.device() == layer_device {
-                    m.clone()
-                } else {
-                    m.clone().to_device(&layer_device)
-                }
-            });
-            drop(_s_glue_rope);
-            let kv = &mut cache[li];
             // The folded basis's constants on this layer's device (built
             // once per device, shared by every layer there).
-            let lh = self.config.hadamard.as_ref().map(|h| LayerHadamard {
-                consts: h.runtime.on(&layer_device),
-                folds: h.layers[li],
+            let lh = self.config.hadamard.as_ref().map(|had| LayerHadamard {
+                consts: had.runtime.on(&layer_device),
+                folds: had.layers[li],
             });
-            let h = match (&layer.self_attn, &layer.linear_attn, kv) {
-                (Some(attn), None, Qwen35Kv::Attn(kv_state)) => {
-                    let _s = crate::prof::scope("attn.full");
-                    attn.forward(
-                        h,
-                        cfg,
-                        &cos_l,
-                        &sin_l,
-                        mask_l.as_ref(),
-                        kv_state,
-                        lh.as_ref(),
-                    )
-                }
-                (None, Some(delta), Qwen35Kv::Delta(state)) => {
-                    let _s = crate::prof::scope("attn.delta");
-                    delta.forward(h, cfg, state, lh.as_ref())
-                }
-                _ => unreachable!("qwen35 forward: layer/cache kind mismatch"),
-            };
-            if layer_trace() {
-                trace_tensor(&format!("block_out-{li}"), &h);
-            }
+            let h = self.attn_step(li, &x, &pos, &mut cache[li], lh.as_ref());
             {
                 let _s = crate::prof::scope("glue.resid1");
                 x = x.add(h);
@@ -2740,220 +2955,26 @@ impl LoadedQwen35 {
             if let Some((idx, spec_h2)) = spec_carry.take()
                 && idx == li
             {
-                let _s = crate::prof::scope("spec.verify");
-                let read = |t: Tensor<3>| -> f32 {
-                    t.abs()
-                        .max()
-                        .into_data()
-                        .convert::<f32>()
-                        .try_to_vec::<f32>()
-                        .map(|v| v[0])
-                        .unwrap_or(f32::NAN)
-                };
-                let diff = read(spec_h2.sub(h2.clone()));
-                let scale = read(h2.clone()).max(1e-6);
-                let rel = diff / scale;
-                la_n += 1;
-                la_max = la_max.max(rel);
-                if rel < 1e-3 {
-                    la_a1 += 1;
-                }
-                if rel < 1e-2 {
-                    la_a2 += 1;
-                }
-                if rel < 5e-2 {
-                    la_a3 += 1;
-                }
+                tally.score(spec_h2, &h2);
             }
-            // ENQUEUE-FIRST: hand the remote FFN to the accelerators before
-            // the local slab runs, so they work while the host does. The
-            // profile that motivated this: the local mlp (0.67 s/token) ran
-            // serially in FRONT of a 1.59 s/token device wait, card idle.
-            // Exact-mode only — the skip path needs host energies up front
-            // and keeps the sequential call below.
-            let pending = match &self.ffn_pool {
-                Some(pool) if self.ffn_skip_tau <= 0.0 => {
-                    if let Some(plan) = &self.ffn_plan
-                        && let Some(sched) = plan.layers.get(li)
-                    {
-                        let _s = crate::prof::scope("glue.sched");
-                        pool.apply_schedule(li, sched, device);
-                    }
-                    let [b, tt, hd] = h2.dims();
-                    let _s = crate::prof::scope("ffn.enqueue");
-                    if crate::nn::trace_layer() == Some(li) && tt == 1 {
-                        eprintln!("[tl] enqueue {}", crate::nn::trace_us());
-                    }
-                    pool.run_dense_pending(li, h2.clone().reshape([b * tt, hd]))
-                }
-                _ => None,
-            };
-            // SwiGLU spelled through qlinear (the mlp's own forward would
-            // reshape a packed quantized weight — see qlinear).
-            // Three separate scopes: gate/up multiply [1,h]x[h,inter] while
-            // down multiplies [1,inter]x[inter,h] — if one shape hits a slow
-            // kernel path, the graph should say which.
-            let folds = lh.as_ref().map_or(LayerFolds::default(), |h| h.folds);
-            let h2r = lh
-                .as_ref()
-                .filter(|_| folds.gate || folds.up)
-                .map(|h| h.consts.forward(h2.clone()));
-            let gate = {
-                let _s = crate::prof::scope("mlp.gate");
-                activation::silu(qlinear(
-                    &layer.mlp.gate_proj,
-                    pick(folds.gate, h2r.as_ref(), &h2),
-                ))
-            };
-            let up = {
-                let _s = crate::prof::scope("mlp.up");
-                qlinear(&layer.mlp.up_proj, pick(folds.up, h2r.as_ref(), &h2))
-            };
-            drop(h2r);
-            let mut ffn = {
-                let _s = crate::prof::scope("mlp.down");
-                let act = gate.clone().mul(up);
-                let act = match &lh {
-                    Some(h) if folds.down => h.consts.forward(act),
-                    _ => act,
-                };
-                qlinear(&layer.mlp.down_proj, act)
-            };
+            let pending = self.enqueue_remote_ffn(li, &h2, device);
+            let (gate, mut ffn) = mlp_forward(layer, &h2, lh.as_ref());
             // RADIAL LOOKAHEAD (MUMMU_LOOKAHEAD=verify): the dGPU is still
             // draining this layer's remote FFN on its worker; the main
-            // thread's wait is the window. Run layer li+1's trunk on the
-            // known prefix a = x + local_ffn now, on SCRATCH state (tensor
-            // clones are refcounts; burn ops never mutate in place, and the
-            // real cache entry is untouched). The radial identity makes the
-            // parallel component of the late remote piece exact under a
-            // scalar; what this measures is how much the rest matters.
-            if lookahead_verify() && pending.is_some() && li + 1 < n_layers {
-                let [_, tt, _] = ffn.dims();
-                if tt == 1 {
-                    let _s = crate::prof::scope("spec.trunk");
-                    let a3 = x.clone().add(ffn.clone());
-                    let nxt = &self.model.layers[li + 1];
-                    let mut scratch = snapshot_kv(&cache[li + 1]);
-                    let sh = nxt.input_norm.forward(a3.clone());
-                    let lh_next = self.config.hadamard.as_ref().map(|h| LayerHadamard {
-                        consts: h.runtime.on(&sh.device()),
-                        folds: h.layers[li + 1],
-                    });
-                    let sh = match (&nxt.self_attn, &nxt.linear_attn, &mut scratch) {
-                        (Some(attn), None, Qwen35Kv::Attn(kv_state)) => {
-                            attn.forward(sh, cfg, &cos, &sin, None, kv_state, lh_next.as_ref())
-                        }
-                        (None, Some(delta), Qwen35Kv::Delta(state)) => {
-                            delta.forward(sh, cfg, state, lh_next.as_ref())
-                        }
-                        _ => unreachable!("qwen35 lookahead: layer/cache kind mismatch"),
-                    };
-                    let spec_x = a3.add(sh);
-                    spec_carry = Some((li + 1, nxt.post_attn_norm.forward(spec_x)));
-                }
+            // thread's wait is the window (see `lookahead_trunk`).
+            if lookahead_verify() && pending.is_some() && li + 1 < n_layers && ffn.dims()[1] == 1 {
+                let spec_pos = PositionTables {
+                    cos: &cos,
+                    sin: &sin,
+                    mask: None,
+                };
+                let spec_h2 = self.lookahead_trunk(li, &x, &ffn, &spec_pos, cache);
+                spec_carry = Some((li + 1, spec_h2));
             }
-            if let Some(pending) = pending {
-                let _s = crate::prof::scope("glue.merge");
-                let tl = crate::nn::trace_layer() == Some(li) && ffn.dims()[1] == 1;
-                if tl {
-                    eprintln!("[tl] join-start {}", crate::nn::trace_us());
-                }
-                let resolved = {
-                    let _s = crate::prof::scope("merge.resolve_call");
-                    pending.resolve()
-                };
-                if tl {
-                    eprintln!("[tl] join-done {}", crate::nn::trace_us());
-                }
-                if let Some(remote) = resolved {
-                    let [b, tt, hd] = ffn.dims();
-                    let remote = {
-                        let _s = crate::prof::scope("merge.reshape");
-                        remote.reshape([b, tt, hd])
-                    };
-                    // Residual-geometry probe (MUMMU_RESIDUAL_PROBE=1): the
-                    // radial split N(a+b) = alpha*N(a) + rstd(a+b)*(g.*b_perp)
-                    // is exact, so lookahead's commit-mode viability is the
-                    // size of b_perp against a — measured, not argued.
-                    if residual_probe() && tt == 1 {
-                        let a = x.clone().add(ffn.clone());
-                        let read = |t: Tensor<3>| -> f32 {
-                            t.sum()
-                                .into_data()
-                                .convert::<f32>()
-                                .try_to_vec::<f32>()
-                                .map(|v| v[0])
-                                .unwrap_or(f32::NAN)
-                        };
-                        let dot = read(a.clone().mul(remote.clone()));
-                        let na2 = read(a.clone().mul(a));
-                        let nb2 = read(remote.clone().mul(remote.clone()));
-                        if na2 > 0.0 {
-                            let sigma = 1.0 + dot / na2;
-                            let bperp2 = (nb2 - dot * dot / na2).max(0.0);
-                            let alpha = sigma * (na2 / (na2 + nb2 + 2.0 * dot).max(1e-12)).sqrt();
-                            eprintln!(
-                                "[residual-probe] layer={li} b_over_a={:.4} bperp_over_a={:.4} alpha_minus_1={:+.5}",
-                                (nb2 / na2).sqrt(),
-                                (bperp2 / na2).sqrt(),
-                                alpha - 1.0,
-                            );
-                        }
-                    }
-                    // Which operand carries the ~28 ms that lands on the
-                    // FIRST op after the worker cycle? Three scoped probes:
-                    // an op touching only the local ffn (ambient/first-op
-                    // effects), an op touching only the remote partial (its
-                    // first-use materialization), then the real add. The 28ms
-                    // lands in exactly one of these and names its class.
-                    {
-                        let _s = crate::prof::scope("merge.warm_local");
-                        let _ = ffn.clone().add_scalar(0.0);
-                    }
-                    {
-                        let _s = crate::prof::scope("merge.warm_remote");
-                        let _ = remote.clone().add_scalar(0.0);
-                    }
-                    {
-                        let _s = crate::prof::scope("merge.add");
-                        ffn = ffn.add(remote);
-                    }
-                }
+            if let Some(resolve) = pending {
+                ffn = merge_pending(li, &x, ffn, resolve);
             } else if let Some(pool) = &self.ffn_pool {
-                // Working set: issue THIS layer's staging decisions before
-                // its FFN runs, so the transfers for the next layer overlap
-                // this layer's compute instead of stalling in front of it.
-                // Nothing here blocks — a cluster that has not landed by the
-                // time its layer runs simply computes on the host.
-                if let Some(plan) = &self.ffn_plan
-                    && let Some(sched) = plan.layers.get(li)
-                {
-                    let _s = crate::prof::scope("glue.sched");
-                    pool.apply_schedule(li, sched, device);
-                }
-                // Remote clusters of a partitioned FFN (exact sum; skip only
-                // when a measured tau was chosen).
-                let [b, tt, hd] = ffn.dims();
-                let local_energy: Vec<f32> = if self.ffn_skip_tau > 0.0 {
-                    gate.powf_scalar(2.0)
-                        .sum_dim(2)
-                        .into_data()
-                        .convert::<f32>()
-                        .try_to_vec::<f32>()
-                        .expect("local gate energy")
-                } else {
-                    Vec::new()
-                };
-                let skip = (self.ffn_skip_tau > 0.0)
-                    .then_some((self.ffn_skip_tau, local_energy.as_slice()));
-                let remote = {
-                    let _s = crate::prof::scope("ffn.remote");
-                    pool.run_dense(li, h2.reshape([b * tt, hd]), skip)
-                };
-                if let Some(remote) = remote {
-                    let _s = crate::prof::scope("glue.merge");
-                    ffn = ffn.add(remote.reshape([b, tt, hd]));
-                }
+                ffn = self.remote_ffn_sequential(pool, li, h2, gate, ffn, device);
             }
             if layer_trace() {
                 trace_tensor(&format!("ffn_out-{li}"), &ffn);
@@ -2963,35 +2984,176 @@ impl LoadedQwen35 {
                 x = x.add(ffn);
             }
             if layer_trace() {
-                let v = x
-                    .clone()
-                    .into_data()
-                    .convert::<f32>()
-                    .try_to_vec::<f32>()
-                    .unwrap_or_default();
-                let sum: f64 = v.iter().map(|&a| f64::from(a)).sum();
-                eprintln!(
-                    "[layer-trace] l_out-{li}: sum={sum:.6} first={:?}",
-                    &v[..v.len().min(4)]
-                );
+                trace_residual(li, &x);
             }
         }
-        if la_n > 0 {
-            let pct = |k: u32| f64::from(k) * 100.0 / f64::from(la_n);
-            eprintln!(
-                "[lookahead] verified {la_n} layers: accept@1e-3 {:.0}% | @1e-2 {:.0}% | @5e-2 {:.0}% | worst rel {la_max:.4}",
-                pct(la_a1),
-                pct(la_a2),
-                pct(la_a3),
-            );
-        }
+        tally.report();
         // Advance-only calls stop here: every cache (KV, conv window,
         // recurrent state) is updated; the final norm and head are the
         // only work skipped, and nothing downstream reads them.
         if !need_logits {
             return None;
         }
-        // The final norm and head may live elsewhere than the last layer.
+        Some(self.head_logits(x, t))
+    }
+
+    /// Layer `li`'s token mixer over the residual `x`: the input norm, then
+    /// gated attention or Gated `DeltaNet` (advancing `kv`), with the block
+    /// output traced under `MUMMU_LAYER_TRACE`.
+    fn attn_step(
+        &self,
+        li: usize,
+        x: &Tensor<3>,
+        pos: &PositionTables<'_>,
+        kv: &mut Qwen35Kv,
+        lh: Option<&LayerHadamard>,
+    ) -> Tensor<3> {
+        let layer = &self.model.layers[li];
+        let cfg = &self.config;
+        let h = {
+            let _s = crate::prof::scope("norm1");
+            layer.input_norm.forward(x.clone())
+        };
+        let h = match (&layer.self_attn, &layer.linear_attn, kv) {
+            (Some(attn), None, Qwen35Kv::Attn(kv_state)) => {
+                let _s = crate::prof::scope("attn.full");
+                attn.forward(h, cfg, pos, kv_state, lh)
+            }
+            (None, Some(delta), Qwen35Kv::Delta(state)) => {
+                let _s = crate::prof::scope("attn.delta");
+                delta.forward(h, cfg, state, lh)
+            }
+            _ => unreachable!("qwen35 forward: layer/cache kind mismatch"),
+        };
+        if layer_trace() {
+            trace_tensor(&format!("block_out-{li}"), &h);
+        }
+        h
+    }
+
+    /// ENQUEUE-FIRST: hand the remote FFN to the accelerators before the
+    /// local slab runs, so they work while the host does. The profile that
+    /// motivated this: the local mlp (0.67 s/token) ran serially in FRONT of
+    /// a 1.59 s/token device wait, card idle. Exact-mode only — the skip
+    /// path needs host energies up front and keeps the sequential call
+    /// ([`Self::remote_ffn_sequential`]). Returns the join for the in-flight
+    /// partial, `None` when nothing was enqueued.
+    fn enqueue_remote_ffn(
+        &self,
+        li: usize,
+        h2: &Tensor<3>,
+        device: &Device,
+    ) -> Option<impl FnOnce() -> Option<Tensor<2>> + use<>> {
+        let pool = self
+            .ffn_pool
+            .as_ref()
+            .filter(|_| self.ffn_skip_tau <= 0.0)?;
+        if let Some(plan) = &self.ffn_plan
+            && let Some(sched) = plan.layers.get(li)
+        {
+            let _s = crate::prof::scope("glue.sched");
+            pool.apply_schedule(li, sched, device);
+        }
+        let [b, tt, hd] = h2.dims();
+        let _s = crate::prof::scope("ffn.enqueue");
+        if crate::nn::trace_layer() == Some(li) && tt == 1 {
+            eprintln!("[tl] enqueue {}", crate::nn::trace_us());
+        }
+        let pending = pool.run_dense_pending(li, &h2.clone().reshape([b * tt, hd]))?;
+        Some(move || pending.resolve())
+    }
+
+    /// RADIAL LOOKAHEAD (`MUMMU_LOOKAHEAD=verify`): while the dGPU drains
+    /// layer `li`'s remote FFN, run layer `li+1`'s trunk on the known prefix
+    /// `a = x + local_ffn` now, on SCRATCH state (tensor clones are
+    /// refcounts; burn ops never mutate in place, and the real cache entry
+    /// is untouched). The radial identity makes the parallel component of
+    /// the late remote piece exact under a scalar; what this measures is how
+    /// much the rest matters. Returns layer `li+1`'s speculative post-attn
+    /// normed state.
+    fn lookahead_trunk(
+        &self,
+        li: usize,
+        x: &Tensor<3>,
+        ffn: &Tensor<3>,
+        pos: &PositionTables<'_>,
+        cache: &[Qwen35Kv],
+    ) -> Tensor<3> {
+        let _s = crate::prof::scope("spec.trunk");
+        let cfg = &self.config;
+        let a3 = x.clone().add(ffn.clone());
+        let nxt = &self.model.layers[li + 1];
+        let mut scratch = snapshot_kv(&cache[li + 1]);
+        let sh = nxt.input_norm.forward(a3.clone());
+        let lh_next = self.config.hadamard.as_ref().map(|had| LayerHadamard {
+            consts: had.runtime.on(&sh.device()),
+            folds: had.layers[li + 1],
+        });
+        let sh = match (&nxt.self_attn, &nxt.linear_attn, &mut scratch) {
+            (Some(attn), None, Qwen35Kv::Attn(kv_state)) => {
+                attn.forward(sh, cfg, pos, kv_state, lh_next.as_ref())
+            }
+            (None, Some(delta), Qwen35Kv::Delta(state)) => {
+                delta.forward(sh, cfg, state, lh_next.as_ref())
+            }
+            _ => unreachable!("qwen35 lookahead: layer/cache kind mismatch"),
+        };
+        let spec_x = a3.add(sh);
+        nxt.post_attn_norm.forward(spec_x)
+    }
+
+    /// The working-set / skip path for the remote FFN clusters: issue THIS
+    /// layer's staging decisions before its FFN runs (so the transfers for
+    /// the next layer overlap this layer's compute instead of stalling in
+    /// front of it; nothing here blocks — a cluster that has not landed by
+    /// the time its layer runs simply computes on the host), then the
+    /// remote clusters of the partitioned FFN (exact sum; skip only when a
+    /// measured tau was chosen), added into `ffn`.
+    fn remote_ffn_sequential(
+        &self,
+        pool: &crate::nn::ExpertPool,
+        li: usize,
+        h2: Tensor<3>,
+        gate: Tensor<3>,
+        ffn: Tensor<3>,
+        device: &Device,
+    ) -> Tensor<3> {
+        if let Some(plan) = &self.ffn_plan
+            && let Some(sched) = plan.layers.get(li)
+        {
+            let _s = crate::prof::scope("glue.sched");
+            pool.apply_schedule(li, sched, device);
+        }
+        let [b, tt, hd] = ffn.dims();
+        let local_energy: Vec<f32> = if self.ffn_skip_tau > 0.0 {
+            gate.powf_scalar(2.0)
+                .sum_dim(2)
+                .into_data()
+                .convert::<f32>()
+                .try_to_vec::<f32>()
+                .expect("local gate energy")
+        } else {
+            Vec::new()
+        };
+        let skip =
+            (self.ffn_skip_tau > 0.0).then_some((self.ffn_skip_tau, local_energy.as_slice()));
+        let remote = {
+            let _s = crate::prof::scope("ffn.remote");
+            pool.run_dense(li, h2.reshape([b * tt, hd]), skip)
+        };
+        if let Some(remote) = remote {
+            let _s = crate::prof::scope("glue.merge");
+            ffn.add(remote.reshape([b, tt, hd]))
+        } else {
+            ffn
+        }
+    }
+
+    /// The final norm and head over the last of `t` positions of `x` (the
+    /// norm and head may live elsewhere than the last layer): logits
+    /// `[1, vocab]`.
+    fn head_logits(&self, x: Tensor<3>, t: usize) -> Tensor<2> {
+        let cfg = &self.config;
         let head_device = self.model.norm.gamma.val().device();
         let x = if x.device() == head_device {
             x
@@ -3008,37 +3170,260 @@ impl LoadedQwen35 {
         // A folded head (or a tied head over the rotated table) reads the
         // transformed hidden state.
         let last = match &self.config.hadamard {
-            Some(h) if h.head => h.runtime.on(&head_device).forward(last),
+            Some(had) if had.head => had.runtime.on(&head_device).forward(last),
             _ => last,
         };
         // Suspect number one for unattributed time: the tied head is a
         // [1, 5120] x [5120, 248320] f32 matmul, and it runs on whichever
         // device holds the embedding table — the HOST, for a split model.
         let _s = crate::prof::scope("lm_head");
-        Some(match &self.model.lm_head {
+        if let Some(head) = &self.model.lm_head {
             // The bounded-exact host head (SPEC P4.3/P4.4) engages when
             // serve opted in and the weight is packed on flex; every
             // consulted coordinate equals the dense head's value (see
             // `flex::head`), and the skipped rows never stream.
-            Some(head) => match crate::nn::try_q4s_head(&last, &head.weight.val()) {
-                Some(logits) => logits,
-                None => qlinear2(head, last),
-            },
-            None => {
-                // Tied head: logits = h · Eᵀ. The embedding may be on another
-                // device (host-resident gather table), and unlike the gather
-                // this IS a matmul — so run it where the big tensor lives and
-                // move only the `[1, vocab]` result, rather than dragging a
-                // multi-GB table across the bus every token.
-                let e = self.model.embed_tokens.weight.val(); // [vocab, hidden]
-                let out_device = last.device();
-                let e_device = e.device();
-                last.to_device(&e_device)
-                    .matmul(e.swap_dims(0, 1))
-                    .to_device(&out_device)
-            }
-        })
+            crate::nn::try_q4s_head(&last, &head.weight.val())
+                .unwrap_or_else(|| qlinear2(head, last))
+        } else {
+            // Tied head: logits = h · Eᵀ. The embedding may be on another
+            // device (host-resident gather table), and unlike the gather
+            // this IS a matmul — so run it where the big tensor lives and
+            // move only the `[1, vocab]` result, rather than dragging a
+            // multi-GB table across the bus every token.
+            let table = self.model.embed_tokens.weight.val(); // [vocab, hidden]
+            let out_device = last.device();
+            let table_device = table.device();
+            last.to_device(&table_device)
+                .matmul(table.swap_dims(0, 1))
+                .to_device(&out_device)
+        }
     }
+}
+
+/// The lookahead-verify tally (`MUMMU_LOOKAHEAD=verify`): how many layers'
+/// speculative post-attention states were scored, the worst relative
+/// error, and how many landed under each acceptance threshold.
+#[derive(Default)]
+struct LookaheadTally {
+    scored: u32,
+    worst: f32,
+    within_1e3: u32,
+    within_1e2: u32,
+    within_5e2: u32,
+}
+
+impl LookaheadTally {
+    /// Score one speculative `spec_h2` against the exact `h2`.
+    fn score(&mut self, spec_h2: Tensor<3>, h2: &Tensor<3>) {
+        let _s = crate::prof::scope("spec.verify");
+        let read = |t: Tensor<3>| -> f32 {
+            t.abs()
+                .max()
+                .into_data()
+                .convert::<f32>()
+                .try_to_vec::<f32>()
+                .map_or(f32::NAN, |v| v[0])
+        };
+        let diff = read(spec_h2.sub(h2.clone()));
+        let scale = read(h2.clone()).max(1e-6);
+        let rel = diff / scale;
+        self.scored += 1;
+        self.worst = self.worst.max(rel);
+        if rel < 1e-3 {
+            self.within_1e3 += 1;
+        }
+        if rel < 1e-2 {
+            self.within_1e2 += 1;
+        }
+        if rel < 5e-2 {
+            self.within_5e2 += 1;
+        }
+    }
+
+    /// Print the tally, if anything was scored.
+    fn report(&self) {
+        if self.scored == 0 {
+            return;
+        }
+        let pct = |k: u32| f64::from(k) * 100.0 / f64::from(self.scored);
+        eprintln!(
+            "[lookahead] verified {} layers: accept@1e-3 {:.0}% | @1e-2 {:.0}% | @5e-2 {:.0}% | worst rel {:.4}",
+            self.scored,
+            pct(self.within_1e3),
+            pct(self.within_1e2),
+            pct(self.within_5e2),
+            self.worst,
+        );
+    }
+}
+
+/// The rope tables and mask, built once on the entry device, as a layer on
+/// `device` needs them (a no-op for the entry device itself).
+fn tables_on(
+    cos: &Tensor<4>,
+    sin: &Tensor<4>,
+    mask: Option<&Tensor<4>>,
+    device: &Device,
+) -> (Tensor<4>, Tensor<4>, Option<Tensor<4>>) {
+    let _s = crate::prof::scope("glue.rope");
+    let (cos_l, sin_l) = if cos.device() == *device {
+        (cos.clone(), sin.clone())
+    } else {
+        (cos.clone().to_device(device), sin.clone().to_device(device))
+    };
+    let mask_l = mask.map(|m| {
+        if m.device() == *device {
+            m.clone()
+        } else {
+            m.clone().to_device(device)
+        }
+    });
+    (cos_l, sin_l, mask_l)
+}
+
+/// The layer's `SwiGLU` spelled through `qlinear` (the mlp's own forward
+/// would reshape a packed quantized weight — see `qlinear`). Three separate
+/// scopes: gate/up multiply `[1,h]x[h,inter]` while down multiplies
+/// `[1,inter]x[inter,h]` — if one shape hits a slow kernel path, the graph
+/// should say which. Returns `(silu(gate), down(silu(gate) ⊙ up))`; the
+/// gate is kept for the skip path's energies.
+fn mlp_forward(
+    layer: &Qwen35Layer,
+    h2: &Tensor<3>,
+    lh: Option<&LayerHadamard>,
+) -> (Tensor<3>, Tensor<3>) {
+    let folds = lh.map_or_else(LayerFolds::default, |had| had.folds);
+    let h2r = lh
+        .filter(|_| folds.has(Fold::Gate) || folds.has(Fold::Up))
+        .map(|had| had.consts.forward(h2.clone()));
+    let gate = {
+        let _s = crate::prof::scope("mlp.gate");
+        activation::silu(qlinear(
+            &layer.mlp.gate_proj,
+            pick(folds.has(Fold::Gate), h2r.as_ref(), h2),
+        ))
+    };
+    let up = {
+        let _s = crate::prof::scope("mlp.up");
+        qlinear(
+            &layer.mlp.up_proj,
+            pick(folds.has(Fold::Up), h2r.as_ref(), h2),
+        )
+    };
+    drop(h2r);
+    let ffn = {
+        let _s = crate::prof::scope("mlp.down");
+        let act = gate.clone().mul(up);
+        let act = match lh {
+            Some(had) if folds.has(Fold::Down) => had.consts.forward(act),
+            _ => act,
+        };
+        qlinear(&layer.mlp.down_proj, act)
+    };
+    (gate, ffn)
+}
+
+/// Join the in-flight remote FFN partial (`resolve`, from
+/// [`LoadedQwen35::enqueue_remote_ffn`]) and add it into the local `ffn`;
+/// a partial that never materialized leaves `ffn` as it is.
+fn merge_pending(
+    li: usize,
+    x: &Tensor<3>,
+    ffn: Tensor<3>,
+    resolve: impl FnOnce() -> Option<Tensor<2>>,
+) -> Tensor<3> {
+    let _s = crate::prof::scope("glue.merge");
+    let tl = crate::nn::trace_layer() == Some(li) && ffn.dims()[1] == 1;
+    if tl {
+        eprintln!("[tl] join-start {}", crate::nn::trace_us());
+    }
+    let resolved = {
+        let _s = crate::prof::scope("merge.resolve_call");
+        resolve()
+    };
+    if tl {
+        eprintln!("[tl] join-done {}", crate::nn::trace_us());
+    }
+    match resolved {
+        Some(remote) => merge_remote(li, x, ffn, remote),
+        None => ffn,
+    }
+}
+
+/// Add the resolved remote FFN partial `remote` `[b·t, hidden]` into the
+/// local `ffn`, with the residual probe and the first-op timing probes
+/// around it.
+fn merge_remote(li: usize, x: &Tensor<3>, ffn: Tensor<3>, remote: Tensor<2>) -> Tensor<3> {
+    let [b, tt, hd] = ffn.dims();
+    let remote = {
+        let _s = crate::prof::scope("merge.reshape");
+        remote.reshape([b, tt, hd])
+    };
+    if residual_probe() && tt == 1 {
+        let a = x.clone().add(ffn.clone());
+        residual_probe_report(li, a, &remote);
+    }
+    // Which operand carries the ~28 ms that lands on the FIRST op after
+    // the worker cycle? Three scoped probes: an op touching only the
+    // local ffn (ambient/first-op effects), an op touching only the
+    // remote partial (its first-use materialization), then the real add.
+    // The 28ms lands in exactly one of these and names its class.
+    {
+        let _s = crate::prof::scope("merge.warm_local");
+        let _ = ffn.clone().add_scalar(0.0);
+    }
+    {
+        let _s = crate::prof::scope("merge.warm_remote");
+        let _ = remote.clone().add_scalar(0.0);
+    }
+    let _s = crate::prof::scope("merge.add");
+    ffn.add(remote)
+}
+
+/// Residual-geometry probe (`MUMMU_RESIDUAL_PROBE=1`): the radial split
+/// `N(a+b) = alpha*N(a) + rstd(a+b)*(g.*b_perp)` is exact, so lookahead's
+/// commit-mode viability is the size of `b_perp` against `a` — measured,
+/// not argued. `a` is the local prefix `x + ffn`, `remote` the late piece.
+fn residual_probe_report(li: usize, a: Tensor<3>, remote: &Tensor<3>) {
+    let read = |t: Tensor<3>| -> f32 {
+        t.sum()
+            .into_data()
+            .convert::<f32>()
+            .try_to_vec::<f32>()
+            .map_or(f32::NAN, |v| v[0])
+    };
+    let dot = read(a.clone().mul(remote.clone()));
+    let na2 = read(a.clone().mul(a));
+    let nb2 = read(remote.clone().mul(remote.clone()));
+    if na2 > 0.0 {
+        let sigma = 1.0 + dot / na2;
+        let bperp2 = (nb2 - dot * dot / na2).max(0.0);
+        // Separate multiply and add (no mul_add): the same arithmetic as
+        // the split it measures.
+        let twice_dot = 2.0 * dot;
+        let alpha = sigma * (na2 / (na2 + nb2 + twice_dot).max(1e-12)).sqrt();
+        eprintln!(
+            "[residual-probe] layer={li} b_over_a={:.4} bperp_over_a={:.4} alpha_minus_1={:+.5}",
+            (nb2 / na2).sqrt(),
+            (bperp2 / na2).sqrt(),
+            alpha - 1.0,
+        );
+    }
+}
+
+/// `MUMMU_LAYER_TRACE`: the residual after layer `li`.
+fn trace_residual(li: usize, x: &Tensor<3>) {
+    let v = x
+        .clone()
+        .into_data()
+        .convert::<f32>()
+        .try_to_vec::<f32>()
+        .unwrap_or_default();
+    let sum: f64 = v.iter().map(|&a| f64::from(a)).sum();
+    eprintln!(
+        "[layer-trace] l_out-{li}: sum={sum:.6} first={:?}",
+        &v[..v.len().min(4)]
+    );
 }
 
 #[cfg(test)]
@@ -3048,7 +3433,7 @@ mod tests {
     use super::*;
 
     /// A toy config exercising both layer kinds: layer 1 is full attention
-    /// (`(1+1) % 2 == 0`), layers 0 and 2 are DeltaNet.
+    /// (`(1+1) % 2 == 0`), layers 0 and 2 are `DeltaNet`.
     fn toy_config() -> Qwen35Config {
         Qwen35Config {
             vocab_size: 64,
@@ -3089,7 +3474,7 @@ mod tests {
     }
 
     /// The load-bearing invariant for BOTH caches (attention KV and the
-    /// DeltaNet conv window + recurrent state): prefill + one-token decode
+    /// `DeltaNet` conv window + recurrent state): prefill + one-token decode
     /// steps must produce exactly the logits of a single full prefill.
     #[test]
     fn cached_decode_matches_full_prefill() {
@@ -3120,7 +3505,7 @@ mod tests {
         }
     }
 
-    /// DeltaNet state actually carries information: the same final token
+    /// `DeltaNet` state actually carries information: the same final token
     /// after different prefixes must produce different logits.
     #[test]
     fn recurrent_state_carries_the_prefix() {
@@ -3169,6 +3554,115 @@ mod tests {
         lin.weight = Param::from_tensor(Tensor::from_data(TensorData::new(v, [inp, out]), &device));
     }
 
+    /// The toy fold contract: every folded projection of every layer except
+    /// `unfolded`, the untied head, and the token table as a rotated
+    /// lookup; block 4 divides every folded width (16, 24, 16).
+    fn toy_fold_spec(cfg: &Qwen35Config, unfolded: &[&str]) -> HadamardSpec {
+        use std::collections::{BTreeMap, BTreeSet};
+        let block = 4;
+        let mut signs = BTreeMap::new();
+        for w in [cfg.hidden_size, cfg.d_inner, cfg.intermediate_size] {
+            signs.insert(w, mummu_mix::hadamard::sign_diagonal(w as u64 * 11 + 3, w));
+        }
+        let mut weights = BTreeSet::new();
+        weights.insert("output.weight".to_string());
+        for l in 0..cfg.num_layers {
+            let fields: Vec<&str> = if cfg.is_attention(l) {
+                vec!["attn_q", "attn_k", "attn_v", "attn_output"]
+            } else {
+                vec!["attn_qkv", "attn_gate", "ssm_out"]
+            };
+            for f in fields.into_iter().chain(["ffn_gate", "ffn_up", "ffn_down"]) {
+                let name = format!("blk.{l}.{f}.weight");
+                if !unfolded.contains(&name.as_str()) {
+                    weights.insert(name);
+                }
+            }
+        }
+        HadamardSpec {
+            block,
+            signs,
+            weights,
+            inverses: std::iter::once("token_embd.weight".to_string()).collect(),
+            gdn_v_grouped: true,
+        }
+    }
+
+    /// Fold a model's weights in place the way Prism's converter folds
+    /// them: every weight `spec` names through [`fold_linear`] (`ssm_out`
+    /// through the grouped-head permutation), and the token table stored
+    /// as `R e_v`.
+    fn fold_model(model: &mut Qwen35, cfg: &Qwen35Config, spec: &HadamardSpec, device: &Device) {
+        let grouped = Some((cfg.n_k_heads, cfg.n_v_heads, cfg.d_state));
+        for (l, layer) in model.layers.iter_mut().enumerate() {
+            let on = |f: &str| spec.folds(&format!("blk.{l}.{f}.weight"));
+            if let Some(a) = layer.self_attn.as_mut() {
+                for (f, lin) in [
+                    ("attn_q", &mut a.q_proj),
+                    ("attn_k", &mut a.k_proj),
+                    ("attn_v", &mut a.v_proj),
+                    ("attn_output", &mut a.o_proj),
+                ] {
+                    if on(f) {
+                        fold_linear(lin, spec, None);
+                    }
+                }
+            }
+            if let Some(d) = layer.linear_attn.as_mut() {
+                if on("attn_qkv") {
+                    fold_linear(&mut d.qkv_proj, spec, None);
+                }
+                if on("attn_gate") {
+                    fold_linear(&mut d.z_proj, spec, None);
+                }
+                if on("ssm_out") {
+                    fold_linear(&mut d.out_proj, spec, grouped);
+                }
+            }
+            for (f, lin) in [
+                ("ffn_gate", &mut layer.mlp.gate_proj),
+                ("ffn_up", &mut layer.mlp.up_proj),
+                ("ffn_down", &mut layer.mlp.down_proj),
+            ] {
+                if on(f) {
+                    fold_linear(lin, spec, None);
+                }
+            }
+        }
+        fold_linear(model.lm_head.as_mut().expect("untied head"), spec, None);
+        let e = model.embed_tokens.weight.val();
+        let [vocab, hidden] = e.dims();
+        let mut v = e.into_data().try_to_vec::<f32>().expect("f32 table");
+        for row in v.chunks_mut(hidden) {
+            spec.forward_host(row).expect("hidden cuts into blocks");
+        }
+        model.embed_tokens.weight = Param::from_tensor(Tensor::from_data(
+            TensorData::new(v, [vocab, hidden]),
+            device,
+        ));
+    }
+
+    /// A 4-token prefill and then single tokens (which on flex take the
+    /// fused host decode step): the logits of every step.
+    fn step_logits(m: &LoadedQwen35, ids: &[u32], device: &Device) -> Vec<Vec<f32>> {
+        let mut cache = m.new_cache();
+        let mut out = vec![
+            m.forward(&ids[..4], 0, &mut cache, device)
+                .into_data()
+                .try_to_vec::<f32>()
+                .unwrap(),
+        ];
+        for (i, &id) in ids.iter().enumerate().skip(4) {
+            out.push(
+                m.forward(&[id], i, &mut cache, device)
+                    .into_data()
+                    .try_to_vec::<f32>()
+                    .unwrap(),
+            );
+        }
+        out
+    }
+
     /// A checkpoint folded the way Prism's converter folds it must give the
     /// unfolded model's logits: every folded weight's input axis rotated by
     /// `R = H·S` per block (signs, then the transform), `ssm_out` through
@@ -3180,8 +3674,9 @@ mod tests {
     /// deliberately left unfolded: the contract is per weight.
     #[test]
     fn hadamard_folded_weights_reproduce_the_unfolded_logits() {
-        use std::collections::{BTreeMap, BTreeSet};
-        let _serial = FUSED_TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = FUSED_TOGGLE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let device = crate::backend::cpu_device();
         // Two key heads tiled over six value heads, so the permutation moves
         // something; block 4 divides every folded width (16, 24, 16).
@@ -3200,87 +3695,11 @@ mod tests {
             ffn_skip_tau: 0.0,
             ffn_plan: None,
         };
-
-        let block = 4;
-        let mut signs = BTreeMap::new();
-        for w in [cfg.hidden_size, cfg.d_inner, cfg.intermediate_size] {
-            signs.insert(w, mummu_mix::hadamard::sign_diagonal(w as u64 * 11 + 3, w));
-        }
-        let unfolded = ["blk.1.attn_k.weight", "blk.2.attn_gate.weight"];
-        let mut weights = BTreeSet::new();
-        weights.insert("output.weight".to_string());
-        for l in 0..cfg.num_layers {
-            let fields: Vec<&str> = if cfg.is_attention(l) {
-                vec!["attn_q", "attn_k", "attn_v", "attn_output"]
-            } else {
-                vec!["attn_qkv", "attn_gate", "ssm_out"]
-            };
-            for f in fields.into_iter().chain(["ffn_gate", "ffn_up", "ffn_down"]) {
-                let name = format!("blk.{l}.{f}.weight");
-                if !unfolded.contains(&name.as_str()) {
-                    weights.insert(name);
-                }
-            }
-        }
-        let spec = HadamardSpec {
-            block,
-            signs,
-            weights,
-            inverses: ["token_embd.weight".to_string()].into_iter().collect(),
-            gdn_v_grouped: true,
-        };
+        let spec = toy_fold_spec(&cfg, &["blk.1.attn_k.weight", "blk.2.attn_gate.weight"]);
 
         // Fold a copy of the weights.
         let mut model = plain.model.clone();
-        let grouped = Some((cfg.n_k_heads, cfg.n_v_heads, cfg.d_state));
-        for (l, layer) in model.layers.iter_mut().enumerate() {
-            let on = |f: &str| spec.folds(&format!("blk.{l}.{f}.weight"));
-            if let Some(a) = layer.self_attn.as_mut() {
-                for (f, lin) in [
-                    ("attn_q", &mut a.q_proj),
-                    ("attn_k", &mut a.k_proj),
-                    ("attn_v", &mut a.v_proj),
-                    ("attn_output", &mut a.o_proj),
-                ] {
-                    if on(f) {
-                        fold_linear(lin, &spec, None);
-                    }
-                }
-            }
-            if let Some(d) = layer.linear_attn.as_mut() {
-                if on("attn_qkv") {
-                    fold_linear(&mut d.qkv_proj, &spec, None);
-                }
-                if on("attn_gate") {
-                    fold_linear(&mut d.z_proj, &spec, None);
-                }
-                if on("ssm_out") {
-                    fold_linear(&mut d.out_proj, &spec, grouped);
-                }
-            }
-            for (f, lin) in [
-                ("ffn_gate", &mut layer.mlp.gate_proj),
-                ("ffn_up", &mut layer.mlp.up_proj),
-                ("ffn_down", &mut layer.mlp.down_proj),
-            ] {
-                if on(f) {
-                    fold_linear(lin, &spec, None);
-                }
-            }
-        }
-        fold_linear(model.lm_head.as_mut().expect("untied head"), &spec, None);
-        {
-            let e = model.embed_tokens.weight.val();
-            let [vocab, hidden] = e.dims();
-            let mut v = e.into_data().try_to_vec::<f32>().expect("f32 table");
-            for row in v.chunks_mut(hidden) {
-                spec.forward_host(row).expect("hidden cuts into blocks");
-            }
-            model.embed_tokens.weight = Param::from_tensor(Tensor::from_data(
-                TensorData::new(v, [vocab, hidden]),
-                &device,
-            ));
-        }
+        fold_model(&mut model, &cfg, &spec, &device);
         let width_of = |name: &str| -> Option<usize> {
             Some(match name.rsplit('.').nth(1)? {
                 "ssm_out" => cfg.d_inner,
@@ -3295,8 +3714,14 @@ mod tests {
         ));
         let had = cfg_folded.hadamard.as_ref().unwrap();
         assert!(had.head && had.embed_inverse);
-        assert!(had.layers[1].q && !had.layers[1].k && had.layers[1].v);
-        assert!(had.layers[2].qkv && !had.layers[2].z && had.layers[2].out);
+        assert!(
+            had.layers[1].has(Fold::Q) && !had.layers[1].has(Fold::K) && had.layers[1].has(Fold::V)
+        );
+        assert!(
+            had.layers[2].has(Fold::Qkv)
+                && !had.layers[2].has(Fold::Z)
+                && had.layers[2].has(Fold::Out)
+        );
         let folded = LoadedQwen35 {
             model,
             config: cfg_folded,
@@ -3307,26 +3732,10 @@ mod tests {
         };
 
         let ids: Vec<u32> = vec![3, 17, 42, 9, 60, 11];
-        let logits = |m: &LoadedQwen35| -> Vec<Vec<f32>> {
-            let mut cache = m.new_cache();
-            let mut out = vec![
-                m.forward(&ids[..4], 0, &mut cache, &device)
-                    .into_data()
-                    .try_to_vec::<f32>()
-                    .unwrap(),
-            ];
-            // Single tokens on flex take the fused host decode step.
-            for (i, &id) in ids.iter().enumerate().skip(4) {
-                out.push(
-                    m.forward(&[id], i, &mut cache, &device)
-                        .into_data()
-                        .try_to_vec::<f32>()
-                        .unwrap(),
-                );
-            }
-            out
-        };
-        let (a, b) = (logits(&plain), logits(&folded));
+        let (a, b) = (
+            step_logits(&plain, &ids, &device),
+            step_logits(&folded, &ids, &device),
+        );
         for (step, (pa, pb)) in a.iter().zip(&b).enumerate() {
             let worst = pa
                 .iter()
@@ -3342,14 +3751,14 @@ mod tests {
         // And the fold is not a no-op: the folded weights run WITHOUT the
         // contract would be wrong.
         let bare = LoadedQwen35 {
-            model: folded.model.clone(),
+            model: folded.model,
             config: cfg,
             tokenizer_config: None,
             ffn_pool: None,
             ffn_skip_tau: 0.0,
             ffn_plan: None,
         };
-        let c = logits(&bare);
+        let c = step_logits(&bare, &ids, &device);
         let worst = a[0]
             .iter()
             .zip(&c[0])
@@ -3375,7 +3784,6 @@ mod tests {
     /// are L2-normalized per position like the model's are — unit ‖k‖ is
     /// what keeps the delta-rule map `γ(I − βkkᵀ)` contractive, so long
     /// test sequences stay O(1) instead of drifting past an abs tolerance.
-    #[allow(clippy::type_complexity)]
     fn random_recurrence_inputs(
         t: usize,
         g_range: (f64, f64),
@@ -3407,31 +3815,42 @@ mod tests {
     /// one chunk; 100 = one full + one partial; 129 = two full + a final
     /// chunk of ONE token), each from both a zero and a random carried
     /// state (`None` vs `Some(S)` in the cache).
+    /// The five recurrence inputs as the borrowed bundle the kernels take.
+    fn inputs_of(
+        (q, k, v, g, beta): &(Tensor<4>, Tensor<4>, Tensor<4>, Tensor<3>, Tensor<3>),
+    ) -> RecurrenceInputs<'_> {
+        RecurrenceInputs { q, k, v, g, beta }
+    }
+
     #[test]
     fn chunked_recurrence_matches_sequential() {
         let device = crate::backend::cpu_device();
-        let (b, hv, ds) = (1, 3, 4);
-        let scale = 1.0 / (ds as f32).sqrt();
-        for &t in &[5usize, 64, 100, 129] {
+        let (batch, hv, ds) = (1, 3, 4);
+        let scale = 1.0 / f32_from_usize(ds).sqrt();
+        for &len in &[5usize, 64, 100, 129] {
             for random_state in [false, true] {
-                let (q, k, v, g, beta) = random_recurrence_inputs(t, (-1.0, 0.0), &device);
+                let inputs = random_recurrence_inputs(len, (-1.0, 0.0), &device);
+                let inputs = inputs_of(&inputs);
                 let s0 = if random_state {
-                    Tensor::<4>::random([b, hv, ds, ds], Distribution::Uniform(-1.0, 1.0), &device)
+                    Tensor::<4>::random(
+                        [batch, hv, ds, ds],
+                        Distribution::Uniform(-1.0, 1.0),
+                        &device,
+                    )
                 } else {
-                    Tensor::<4>::zeros([b, hv, ds, ds], &device)
+                    Tensor::<4>::zeros([batch, hv, ds, ds], &device)
                 };
-                let (o_seq, s_seq) =
-                    gdn_recurrence_sequential(&q, &k, &v, &g, &beta, s0.clone(), scale);
-                let (o_chk, s_chk) = gdn_recurrence_chunked(&q, &k, &v, &g, &beta, s0, scale, 64);
+                let (o_seq, s_seq) = gdn_recurrence_sequential(&inputs, s0.clone(), scale);
+                let (o_chk, s_chk) = gdn_recurrence_chunked(&inputs, s0, scale, 64);
                 let od = max_abs_diff(o_seq, o_chk);
                 let sd = max_abs_diff(s_seq, s_chk);
                 assert!(
                     od < 1e-4,
-                    "outputs diverge at t={t} (random_state={random_state}): {od}"
+                    "outputs diverge at t={len} (random_state={random_state}): {od}"
                 );
                 assert!(
                     sd < 1e-4,
-                    "final state diverges at t={t} (random_state={random_state}): {sd}"
+                    "final state diverges at t={len} (random_state={random_state}): {sd}"
                 );
             }
         }
@@ -3439,18 +3858,23 @@ mod tests {
 
     /// γ-underflow stress: decay near 0.5/step over t = 128 puts the raw
     /// cumulative product at ~0.5¹²⁸ ≈ 3e-39 — below f32's smallest
-    /// normal — so any P_t/P_j formed as a ratio of products dies. The
+    /// normal — so any `P_t/P_j` formed as a ratio of products dies. The
     /// exp-of-cumsum-difference form must keep the chunked path on top of
     /// the sequential reference anyway.
     #[test]
     fn chunked_recurrence_survives_gamma_underflow() {
         let device = crate::backend::cpu_device();
-        let (b, hv, ds) = (1, 3, 4);
-        let scale = 1.0 / (ds as f32).sqrt();
-        let (q, k, v, g, beta) = random_recurrence_inputs(128, (-0.8, -0.6), &device);
-        let s0 = Tensor::<4>::random([b, hv, ds, ds], Distribution::Uniform(-1.0, 1.0), &device);
-        let (o_seq, s_seq) = gdn_recurrence_sequential(&q, &k, &v, &g, &beta, s0.clone(), scale);
-        let (o_chk, s_chk) = gdn_recurrence_chunked(&q, &k, &v, &g, &beta, s0, scale, 64);
+        let (batch, hv, ds) = (1, 3, 4);
+        let scale = 1.0 / f32_from_usize(ds).sqrt();
+        let inputs = random_recurrence_inputs(128, (-0.8, -0.6), &device);
+        let inputs = inputs_of(&inputs);
+        let s0 = Tensor::<4>::random(
+            [batch, hv, ds, ds],
+            Distribution::Uniform(-1.0, 1.0),
+            &device,
+        );
+        let (o_seq, s_seq) = gdn_recurrence_sequential(&inputs, s0.clone(), scale);
+        let (o_chk, s_chk) = gdn_recurrence_chunked(&inputs, s0, scale, 64);
         let od = max_abs_diff(o_seq, o_chk);
         let sd = max_abs_diff(s_seq, s_chk);
         assert!(od < 1e-4, "outputs diverge under strong decay: {od}");
@@ -3469,26 +3893,38 @@ mod tests {
     #[test]
     fn chunked_recurrence_survives_repeated_keys() {
         let device = crate::backend::cpu_device();
-        let (b, hv, ds, t) = (1, 3, 4, 192);
-        let scale = 1.0 / (ds as f32).sqrt();
-        let (q, _, v, _, _) = random_recurrence_inputs(t, (-1.0, 0.0), &device);
+        let (batch, hv, ds, len) = (1, 3, 4, 192);
+        let scale = 1.0 / f32_from_usize(ds).sqrt();
+        let (query, _, values, _, _) = random_recurrence_inputs(len, (-1.0, 0.0), &device);
         // One unit key per head, repeated at every position, with a tiny
         // per-token wobble so the keys are parallel but not bit-identical.
-        let base = Tensor::<4>::random([b, hv, 1, ds], Distribution::Uniform(-1.0, 1.0), &device)
-            .repeat_dim(2, t)
-            .add(Tensor::<4>::random(
-                [b, hv, t, ds],
-                Distribution::Uniform(-1e-3, 1e-3),
-                &device,
-            ));
-        let k = base
+        let base = Tensor::<4>::random(
+            [batch, hv, 1, ds],
+            Distribution::Uniform(-1.0, 1.0),
+            &device,
+        )
+        .repeat_dim(2, len)
+        .add(Tensor::<4>::random(
+            [batch, hv, len, ds],
+            Distribution::Uniform(-1e-3, 1e-3),
+            &device,
+        ));
+        let keys = base
             .clone()
             .div(base.powi_scalar(2).sum_dim(3).sqrt().clamp_min(1e-6));
-        let g = Tensor::<3>::random([b, t, hv], Distribution::Uniform(-1e-3, 0.0), &device);
-        let beta = Tensor::<3>::random([b, t, hv], Distribution::Uniform(0.9, 0.99), &device);
-        let s0 = Tensor::<4>::zeros([b, hv, ds, ds], &device);
-        let (o_seq, s_seq) = gdn_recurrence_sequential(&q, &k, &v, &g, &beta, s0.clone(), scale);
-        let (o_chk, s_chk) = gdn_recurrence_chunked(&q, &k, &v, &g, &beta, s0, scale, 64);
+        let decay =
+            Tensor::<3>::random([batch, len, hv], Distribution::Uniform(-1e-3, 0.0), &device);
+        let beta = Tensor::<3>::random([batch, len, hv], Distribution::Uniform(0.9, 0.99), &device);
+        let inputs = RecurrenceInputs {
+            q: &query,
+            k: &keys,
+            v: &values,
+            g: &decay,
+            beta: &beta,
+        };
+        let s0 = Tensor::<4>::zeros([batch, hv, ds, ds], &device);
+        let (o_seq, s_seq) = gdn_recurrence_sequential(&inputs, s0.clone(), scale);
+        let (o_chk, s_chk) = gdn_recurrence_chunked(&inputs, s0, scale, 64);
         let od = max_abs_diff(o_seq, o_chk);
         let sd = max_abs_diff(s_seq, s_chk);
         assert!(od < 1e-3, "outputs diverge under repeated keys: {od}");
@@ -3588,10 +4024,12 @@ mod tests {
     /// The fused host decode step (SPEC P3) against the tensor path it
     /// replaces: same prefix, same decode tokens, logits equal to fold
     /// order. This is the oracle for the whole fused middle — conv ring,
-    /// L2 norms, gates, two-pass recurrence, gated RMSNorm.
+    /// L2 norms, gates, two-pass recurrence, gated `RMSNorm`.
     #[test]
     fn fused_gdn_decode_matches_tensor_decode() {
-        let _serial = FUSED_TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = FUSED_TOGGLE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let m = toy_model();
         let tensor = oracle_decode_steps(&m, false);
         let fused = oracle_decode_steps(&m, true);
@@ -3639,7 +4077,7 @@ mod tests {
     }
 
     /// The same oracle under qwen4exp's gate, `sigmoid(z)` in the gated
-    /// RMSNorm: the fused host step and the tensor path must agree at every
+    /// `RMSNorm`: the fused host step and the tensor path must agree at every
     /// carried-state decode step. Agreement alone would also hold if both
     /// paths ignored `gdn_gate`, so the gate must visibly reach them — the
     /// sigmoid model's logits differ from the silu logits of the SAME
@@ -3649,7 +4087,9 @@ mod tests {
     /// step.
     #[test]
     fn fused_gdn_decode_matches_tensor_decode_with_sigmoid_gate() {
-        let _serial = FUSED_TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = FUSED_TOGGLE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let silu = toy_model();
         let sigmoid = LoadedQwen35 {
             model: silu.model.clone(),
@@ -3711,7 +4151,9 @@ mod tests {
     /// logits on the same weights, so a `gdn_l2` that is ignored cannot pass.
     #[test]
     fn fused_gdn_decode_matches_tensor_decode_with_add_eps_l2() {
-        let _serial = FUSED_TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = FUSED_TOGGLE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let cfg = Qwen35Config {
             rms_norm_eps: 0.25,
             gdn_gate: GdnGate::Sigmoid,
@@ -3782,7 +4224,9 @@ mod tests {
     /// losing the carried recurrence.
     #[test]
     fn fused_decode_then_prefill_round_trips_state() {
-        let _serial = FUSED_TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = FUSED_TOGGLE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let m = toy_model();
         let device = crate::backend::cpu_device();
 

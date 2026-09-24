@@ -132,8 +132,12 @@ fn teach_values(t: &Teacher, label: &str, ours: Tensor<3>, reference: &[f32]) ->
     let (mut d2, mut r2, mut dmax, mut rmax) = (0f64, 0f64, 0f64, 0f64);
     for (o, r) in vals[start..].iter().zip(reference) {
         let d = f64::from(*o) - f64::from(*r);
-        d2 += d * d;
-        r2 += f64::from(*r) * f64::from(*r);
+        // Separate multiply and add (no fused mul_add): the printed error
+        // stays comparable across builds with and without hardware FMA.
+        let d_sq = d * d;
+        d2 += d_sq;
+        let r_sq = f64::from(*r) * f64::from(*r);
+        r2 += r_sq;
         dmax = dmax.max(d.abs());
         rmax = rmax.max(f64::from(*r).abs());
     }

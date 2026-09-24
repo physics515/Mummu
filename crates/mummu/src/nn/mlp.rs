@@ -1,4 +1,4 @@
-//! SwiGLU feed-forward block: `down(silu(gate(x)) * up(x))`. Field names
+//! `SwiGLU` feed-forward block: `down(silu(gate(x)) * up(x))`. Field names
 //! mirror the HF Qwen2 layout (`gate_proj`/`up_proj`/`down_proj`); LFM2's
 //! `w1`/`w3`/`w2` remap onto these at load time.
 
@@ -6,10 +6,10 @@ use burn::module::Module;
 use burn::nn::{Linear, LinearConfig};
 use burn::tensor::{Device, Tensor, activation};
 
-/// SwiGLU MLP, no biases (both proven architectures ship it bias-free).
+/// `SwiGLU` MLP, no biases (both proven architectures ship it bias-free).
 #[derive(Module, Debug)]
 pub struct SwiGluMlp {
-    /// SiLU branch (LFM2: `w1`).
+    /// `SiLU` branch (LFM2: `w1`).
     pub gate_proj: Linear,
     /// Multiplicative branch (LFM2: `w3`).
     pub up_proj: Linear,
@@ -26,6 +26,11 @@ pub struct SwiGluMlpConfig {
 
 impl SwiGluMlpConfig {
     /// Initialize the module (random weights; real weights come from import).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `hidden_size` or `intermediate_size` is 0.
+    #[must_use]
     pub fn init(&self, device: &Device) -> SwiGluMlp {
         assert!(self.hidden_size >= 1, "SwiGLU: hidden_size must be >= 1");
         assert!(
@@ -48,6 +53,7 @@ impl SwiGluMlpConfig {
 
 impl SwiGluMlp {
     /// `[b, t, hidden]` → `[b, t, hidden]`.
+    #[must_use]
     pub fn forward(&self, x: Tensor<3>) -> Tensor<3> {
         let gate = activation::silu(self.gate_proj.forward(x.clone()));
         let up = self.up_proj.forward(x);

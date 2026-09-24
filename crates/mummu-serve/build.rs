@@ -24,6 +24,8 @@
 //! compiles under `cfg(test)`. Nothing `cargo test` runs executes a build
 //! script, so anything decided here and only here is decided untested.
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use std::path::Path;
 use std::process::Command;
 

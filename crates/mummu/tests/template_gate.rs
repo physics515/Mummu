@@ -13,6 +13,8 @@
 //!   cargo test -p mummu --test template_gate -- --ignored --nocapture
 //! ```
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use std::path::{Path, PathBuf};
 
 use hf_chat_template::{ChatTemplate, Message, RenderInput};
@@ -45,17 +47,17 @@ fn first_diff(a: &str, b: &str) -> Option<usize> {
 }
 
 fn diff_context(label: &str, ours: &str, reference: &str) -> String {
-    match first_diff(ours, reference) {
-        None => format!("{label}: byte-identical ({} B)", ours.len()),
-        Some(pos) => {
+    first_diff(ours, reference).map_or_else(
+        || format!("{label}: byte-identical ({} B)", ours.len()),
+        |pos| {
             let lo = pos.saturating_sub(60);
             format!(
                 "{label}: DIVERGES at byte {pos}\n  ours     …{:?}\n  reference…{:?}",
                 &ours[lo..(pos + 60).min(ours.len())],
                 &reference[lo..(pos + 60).min(reference.len())],
             )
-        }
-    }
+        },
+    )
 }
 
 /// The plain conversation leg: system + user + generation prompt must render
@@ -380,10 +382,10 @@ fn qwen2_renders_byte_match_the_imported_template() {
 #[test]
 #[ignore = "needs the local Qwen2.5 checkpoint dir (MUMMU_QWEN2_DIR)"]
 fn qwen2_no_system_defaults_diverge_only_by_the_documented_preamble() {
-    let dir = dir_from("MUMMU_QWEN2_DIR").expect("set MUMMU_QWEN2_DIR");
-    let template = imported_template(&dir);
     const QWEN_PREAMBLE: &str =
         "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.";
+    let dir = dir_from("MUMMU_QWEN2_DIR").expect("set MUMMU_QWEN2_DIR");
+    let template = imported_template(&dir);
 
     // With tools: both sides synthesize a system turn; preambles differ.
     let reference = template
@@ -598,7 +600,7 @@ fn lfm2_tools_renders_byte_match_the_imported_template() {
 }
 
 /// LFM2.5 history semantics: past assistant turns lose their `</think>`
-/// reasoning on BOTH sides (keep_past_thinking=false), the LAST assistant
+/// reasoning on BOTH sides (`keep_past_thinking=false`), the LAST assistant
 /// turn keeps it; pythonic call turns + real `tool` role turns round-trip.
 #[test]
 #[ignore = "needs the local LFM2.5 checkpoint dir (MUMMU_LFM2_DIR) with chat_template.jinja"]

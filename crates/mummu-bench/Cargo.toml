@@ -18,6 +18,7 @@ vulkan-spirv = ["mummu/vulkan-spirv"]
 
 [dependencies]
 mummu = { path = "../mummu", default-features = false }
+mummu-num = { workspace = true }
 burn = { workspace = true }
 
 [dev-dependencies]

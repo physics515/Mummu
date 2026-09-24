@@ -1,4 +1,4 @@
-//! PLE: the n-gram row hash, the on-demand IQ4_NL row gather, and the gated
+//! PLE: the n-gram row hash, the on-demand `IQ4_NL` row gather, and the gated
 //! key/value + dilated depthwise conv block.
 //!
 //! qwen4exp adds one "per-layer embedding" block (at layer 1 in the shipped
@@ -12,7 +12,7 @@
 //!    shared table: heads `0..per_gram` are the BIGRAM heads, the next
 //!    `per_gram` the TRIGRAM heads.
 //! 2. **The table** ([`PleTable`]) — `per_layer_token_embd.weight`, 320 M rows
-//!    of 160 at IQ4_NL (28.8 GB). It is never loaded: each token's 16 rows are
+//!    of 160 at `IQ4_NL` (28.8 GB). It is never loaded: each token's 16 rows are
 //!    positional reads of 90 bytes each, dequantized on the host.
 //! 3. **The block** ([`PleBlock`]) — `res + gated + silu(conv(norm(gated)))`
 //!    with a per-stream signed-sqrt sigmoid gate and a kernel-4, dilation-3
@@ -37,6 +37,7 @@ use std::sync::Arc;
 use burn::module::{Module, Param};
 use burn::nn::Linear;
 use burn::tensor::{Device, Tensor, TensorData, activation};
+use mummu_num::f32_from_usize;
 
 use super::hc::{grouped_rms, linear_from, linear3};
 use crate::gguf::{GgmlType, GgufFile, GgufValue};
@@ -55,14 +56,30 @@ const MAX_PLE_HEADS: usize = 1024;
 
 // ---- 1. Row ids ------------------------------------------------------------
 
+/// The hash's parameters as borrowed slices — what [`ple_row_ids`] reads.
+/// [`PleHash`] owns validated copies and hands them over per call.
+#[derive(Debug, Clone, Copy)]
+pub struct PleHashParams<'a> {
+    /// One multiplier per n-gram position, so `n_gram` is its length.
+    pub multipliers: &'a [u64],
+    /// Vocabulary (a distinct prime) per head, head order.
+    pub head_vocab_sizes: &'a [u64],
+    /// Start of each head's slice of the table.
+    pub head_offsets: &'a [u64],
+    /// Heads per n-gram order.
+    pub per_gram: usize,
+    /// The window-reset token.
+    pub eos: u32,
+}
+
 /// The PLE table rows for ONE token, written to `out`
 /// (`(n_gram-1)·per_gram` entries, head order).
 ///
 /// * `prev[s-1]` is the token `s` positions back in the SEQUENCE (earlier
 ///   calls count), `None` or absent when that position is before the
 ///   sequence start. Entries beyond `n_gram-1` are ignored.
-/// * `multipliers` has one entry per n-gram position, so `n_gram` is its
-///   length.
+/// * `params.multipliers` has one entry per n-gram position, so `n_gram` is
+///   its length.
 ///
 /// Exactly llama.cpp's `set_input`:
 ///
@@ -86,17 +103,14 @@ const MAX_PLE_HEADS: usize = 1024;
 /// [`MAX_NGRAM`], or `head_vocab_sizes`/`head_offsets`/`out` not
 /// `(n_gram-1)·per_gram` long) or a head vocabulary is zero. [`PleHash::new`]
 /// validates all of these once for the hot path.
-#[allow(clippy::too_many_arguments)] // the hash's parameters, one per header array
-pub fn ple_row_ids(
-    token: u32,
-    prev: &[Option<u32>],
-    multipliers: &[u64],
-    head_vocab_sizes: &[u64],
-    head_offsets: &[u64],
-    per_gram: usize,
-    eos: u32,
-    out: &mut [u64],
-) {
+pub fn ple_row_ids(token: u32, prev: &[Option<u32>], params: &PleHashParams<'_>, out: &mut [u64]) {
+    let PleHashParams {
+        multipliers,
+        head_vocab_sizes,
+        head_offsets,
+        per_gram,
+        eos,
+    } = *params;
     let n_gram = multipliers.len();
     assert!(
         (2..=MAX_NGRAM).contains(&n_gram),
@@ -161,6 +175,15 @@ pub struct PleHash {
 
 impl PleHash {
     /// Validate and build.
+    ///
+    /// # Errors
+    ///
+    /// `ngram_size` below 2 or above [`MAX_NGRAM`]; a multiplier count other
+    /// than `ngram_size`; a head count `(ngram_size-1)·heads_per_ngram` of
+    /// zero or over the header bound; vocab-size or offset arrays not one
+    /// entry per head; an empty head vocabulary; head vocabularies whose
+    /// sum overflows `u64`; or a head slice `offset + vocab` past that sum
+    /// (it could address a padding row).
     pub fn new(
         ngram_size: usize,
         heads_per_ngram: usize,
@@ -225,6 +248,12 @@ impl PleHash {
     /// key is an error — falling back to the tokenizer EOS would pick a
     /// different id (248046 vs 248044 in the shipped file) and silently hash
     /// wrong rows after every EOS.
+    ///
+    /// # Errors
+    ///
+    /// A `qwen4exp.ple.*` key or array that is missing, not a non-negative
+    /// integer, past the header bound, or (for the reset token) not a
+    /// `u32`; then everything [`Self::new`] refuses.
     pub fn from_gguf(f: &GgufFile) -> Result<Self, String> {
         let uint = |key: &str| -> Result<u64, String> {
             let v = f
@@ -270,14 +299,14 @@ impl PleHash {
 
     /// Rows gathered per token (16).
     #[must_use]
-    pub fn n_heads(&self) -> usize {
+    pub const fn n_heads(&self) -> usize {
         self.head_vocab_sizes.len()
     }
 
     /// Predecessor tokens the hash reads (`n_gram - 1` = 2) — what a cache
     /// must keep between calls.
     #[must_use]
-    pub fn context_len(&self) -> usize {
+    pub const fn context_len(&self) -> usize {
         self.ngram_size - 1
     }
 
@@ -290,16 +319,19 @@ impl PleHash {
 
     /// [`ple_row_ids`] with these parameters.
     pub fn row_ids(&self, token: u32, prev: &[Option<u32>], out: &mut [u64]) {
-        ple_row_ids(
-            token,
-            prev,
-            &self.multipliers,
-            &self.head_vocab_sizes,
-            &self.head_offsets,
-            self.heads_per_ngram,
-            self.eos,
-            out,
-        );
+        ple_row_ids(token, prev, &self.params(), out);
+    }
+
+    /// These parameters as the borrowed bundle [`ple_row_ids`] reads.
+    #[must_use]
+    pub fn params(&self) -> PleHashParams<'_> {
+        PleHashParams {
+            multipliers: &self.multipliers,
+            head_vocab_sizes: &self.head_vocab_sizes,
+            head_offsets: &self.head_offsets,
+            per_gram: self.heads_per_ngram,
+            eos: self.eos,
+        }
     }
 
     /// Rows for a span of `tokens` that follows `history` (the sequence's
@@ -388,6 +420,10 @@ struct PayloadShard {
 
 impl GgufPayloadFiles {
     /// Open every payload file of `f` once.
+    ///
+    /// # Errors
+    ///
+    /// A payload file (the single file, or any shard) that cannot be opened.
     pub fn open(f: &GgufFile) -> Result<Self, String> {
         let open = |path: &std::path::Path| {
             std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))
@@ -483,7 +519,7 @@ pub struct PleTable {
     dtype: GgmlType,
     /// Elements per row (160).
     row_width: usize,
-    /// Bytes per row (90 at IQ4_NL: 5 blocks of 18).
+    /// Bytes per row (90 at `IQ4_NL`: 5 blocks of 18).
     row_bytes: usize,
     /// Rows the table stores (320,001,536 — padded).
     rows: u64,
@@ -494,11 +530,23 @@ pub struct PleTable {
 impl PleTable {
     /// Locate [`PLE_TABLE_TENSOR`] in `f` and open its payload files.
     /// `row_bound` is the summed head vocabulary ([`PleHash::total_rows`]).
+    ///
+    /// # Errors
+    ///
+    /// A payload file that cannot be opened ([`GgufPayloadFiles::open`]),
+    /// then everything [`Self::open_with`] refuses.
     pub fn open(f: &GgufFile, row_bound: u64) -> Result<Self, String> {
         Self::open_with(f, Arc::new(GgufPayloadFiles::open(f)?), row_bound)
     }
 
     /// [`Self::open`] on handles shared with another reader.
+    ///
+    /// # Errors
+    ///
+    /// No [`PLE_TABLE_TENSOR`] in `f`, or one that is not 2-D; a row width
+    /// that does not fit `usize` or is not whole blocks of its dtype; a
+    /// tensor that belongs to no open shard, or whose shard is shorter than
+    /// its payload claims; or a `row_bound` of zero or past the stored rows.
     pub fn open_with(
         f: &GgufFile,
         files: Arc<GgufPayloadFiles>,
@@ -531,6 +579,12 @@ impl PleTable {
 
     /// A table over in-memory bytes: `rows` rows of `dtype`, row width
     /// inferred from the byte count.
+    ///
+    /// # Errors
+    ///
+    /// Zero rows, no bytes, a row count that does not fit `usize`, a byte
+    /// count that is not whole rows, or a row that is not whole blocks of
+    /// `dtype`.
     pub fn from_bytes(bytes: Vec<u8>, dtype: GgmlType, rows: u64) -> Result<Self, String> {
         let rows_usize = usize::try_from(rows).map_err(|_| "row count does not fit usize")?;
         if rows == 0 || bytes.is_empty() || !bytes.len().is_multiple_of(rows_usize) {
@@ -560,6 +614,10 @@ impl PleTable {
     /// Restrict lookups to rows below `bound` (must not exceed the stored
     /// rows). The shipped table is padded to a multiple of 128 rows; the pad
     /// rows are never valid hash outputs, so addressing one is a bug upstream.
+    ///
+    /// # Errors
+    ///
+    /// A `bound` of zero or past the stored rows.
     pub fn with_row_bound(mut self, bound: u64) -> Result<Self, String> {
         if bound == 0 || bound > self.rows {
             return Err(format!(
@@ -573,24 +631,31 @@ impl PleTable {
 
     /// Elements per row.
     #[must_use]
-    pub fn row_width(&self) -> usize {
+    pub const fn row_width(&self) -> usize {
         self.row_width
     }
 
     /// Rows a lookup may address.
     #[must_use]
-    pub fn row_bound(&self) -> u64 {
+    pub const fn row_bound(&self) -> u64 {
         self.row_bound
     }
 
     /// The stored dtype.
     #[must_use]
-    pub fn dtype(&self) -> GgmlType {
+    pub const fn dtype(&self) -> GgmlType {
         self.dtype
     }
 
     /// Dequantized rows, concatenated in `rows` order into `out`
     /// (`rows.len() · row_width`). A row at or past the bound is an error.
+    ///
+    /// # Errors
+    ///
+    /// An `out` that is not `rows.len() · row_width` long; a row at or past
+    /// the row bound; a positional read that fails or comes up short; a row
+    /// offset that does not fit `usize` (in-memory tables); or a dtype
+    /// without a dequantizer.
     pub fn gather(&self, rows: &[u64], out: &mut [f32]) -> Result<(), String> {
         if out.len() != rows.len() * self.row_width {
             return Err(format!(
@@ -636,6 +701,11 @@ impl PleTable {
     /// row_width` values, token-major, head-major within a token (head 0's
     /// row first — ggml `get_rows` + reshape and transformers' `flatten(-2)`
     /// agree on that order).
+    ///
+    /// # Errors
+    ///
+    /// A hash that addresses more rows than this table allows, or anything
+    /// [`Self::gather`] refuses.
     pub fn embed(
         &self,
         hash: &PleHash,
@@ -657,6 +727,10 @@ impl PleTable {
 
     /// [`Self::embed`] as a `[1, T, n_heads·row_width]` tensor in the
     /// device's float dtype.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::embed`].
     pub fn embed_tensor(
         &self,
         hash: &PleHash,
@@ -751,8 +825,24 @@ pub struct PleBlock {
     pub kernel: usize,
     /// Conv dilation — the n-gram size (3) in both references.
     pub dilation: usize,
-    /// RMSNorm epsilon.
+    /// `RMSNorm` epsilon.
     pub eps: f64,
+}
+
+/// The six tensors of one PLE block, ready for [`PleBlock::from_weights`]:
+/// linear weights are burn `[in, out]` and may be packed; the vectors are
+/// float.
+pub struct PleWeights {
+    /// `E_ple → H·E` (GGUF `ple_key`).
+    pub key: Tensor<2>,
+    /// `E_ple → E` (GGUF `ple_value`).
+    pub value: Tensor<2>,
+    /// Grouped-norm gammas `[H·E]`, stream-major, already `1 + w`.
+    pub norm_key: Tensor<1>,
+    pub norm_query: Tensor<1>,
+    pub norm_conv: Tensor<1>,
+    /// Depthwise conv kernel `[kernel·H·E]` in the GGUF's flat order.
+    pub conv: Tensor<1>,
 }
 
 impl PleBlock {
@@ -763,20 +853,22 @@ impl PleBlock {
     ///
     /// On any shape that disagrees with `hidden`/`streams`/`kernel`.
     #[must_use]
-    #[allow(clippy::too_many_arguments)] // one argument per GGUF tensor + the scalars
     pub fn from_weights(
-        key: Tensor<2>,
-        value: Tensor<2>,
-        norm_key: Tensor<1>,
-        norm_query: Tensor<1>,
-        norm_conv: Tensor<1>,
-        conv: Tensor<1>,
+        weights: PleWeights,
         hidden: usize,
         streams: usize,
         kernel: usize,
         dilation: usize,
         eps: f64,
     ) -> Self {
+        let PleWeights {
+            key,
+            value,
+            norm_key,
+            norm_query,
+            norm_conv,
+            conv,
+        } = weights;
         let width = hidden * streams;
         let [e_ple, key_out] = key.dims();
         assert_eq!(key_out, width, "ple key maps E_ple -> H*E");
@@ -807,7 +899,7 @@ impl PleBlock {
 
     /// Columns of history the conv carries: `(kernel-1)·dilation` (9).
     #[must_use]
-    pub fn history_len(&self) -> usize {
+    pub const fn history_len(&self) -> usize {
         (self.kernel - 1) * self.dilation
     }
 
@@ -859,7 +951,7 @@ impl PleBlock {
             .mul(query_n)
             .reshape([b, t, h, e])
             .sum_dim(3) // [b, t, H, 1]
-            .mul_scalar(1.0 / (e as f32).sqrt());
+            .mul_scalar(1.0 / f32_from_usize(e).sqrt());
         let magnitude = score.clone().abs().clamp_min(1e-6_f32).sqrt();
         let gate = activation::sigmoid(score.sign().mul(magnitude));
         let gated = value
@@ -875,72 +967,80 @@ impl PleBlock {
     /// `t` is a prompt chunk or one decode token, and the kernel is 40 K
     /// floats, so a host loop is cheaper than assembling the equivalent
     /// cat/narrow graph — and it keeps the carried state in plain memory.
-    fn conv_host(&self, x: Tensor<3>, state: &mut PleConvState, device: &Device) -> Tensor<3> {
-        let [b, t, c] = x.dims();
+    fn conv_host(&self, input: Tensor<3>, state: &mut PleConvState, device: &Device) -> Tensor<3> {
+        let [batch, tokens, chans] = input.dims();
         let (kern, dil, cols) = (self.kernel, self.dilation, self.history_len());
         assert_eq!(
             (state.batch, state.channels, state.cols),
-            (b, c, cols),
+            (batch, chans, cols),
             "PLE conv state is [batch, channels, cols]"
         );
-        let dtype = x.dtype();
-        let xs = x
+        let dtype = input.dtype();
+        let xs = input
             .into_data()
             .convert::<f32>()
             .try_into_vec::<f32>()
             .expect("converted to f32");
-        let w = self
+        let taps = self
             .conv
             .val()
             .into_data()
             .convert::<f32>()
             .try_into_vec::<f32>()
             .expect("PLE conv kernel is float storage");
-        debug_assert_eq!(w.len(), kern * c);
+        debug_assert_eq!(taps.len(), kern * chans);
 
-        // padded(bi, ch, j): column j of [history (cols) | x (t)].
-        let padded = |hist: &[f32], bi: usize, ch: usize, j: usize| -> f32 {
-            if j < cols {
-                hist[(bi * c + ch) * cols + j]
+        // padded(bi, ch, col): column col of [history (cols) | input (tokens)].
+        let padded = |hist: &[f32], bi: usize, ch: usize, col: usize| -> f32 {
+            if col < cols {
+                hist[(bi * chans + ch) * cols + col]
             } else {
-                xs[(bi * t + (j - cols)) * c + ch]
+                xs[(bi * tokens + (col - cols)) * chans + ch]
             }
         };
-        let mut out = vec![0f32; b * t * c];
-        for bi in 0..b {
-            for ti in 0..t {
-                let row = &mut out[(bi * t + ti) * c..(bi * t + ti + 1) * c];
+        let mut out = vec![0f32; batch * tokens * chans];
+        for bi in 0..batch {
+            for ti in 0..tokens {
+                let row = &mut out[(bi * tokens + ti) * chans..(bi * tokens + ti + 1) * chans];
                 // Tap k reads (kern-1-k)·dil columns back; taps are summed in
                 // k order as llama.cpp's graph does.
                 for k in 0..kern {
-                    let j = cols + ti - (kern - 1 - k) * dil;
+                    let col = cols + ti - (kern - 1 - k) * dil;
                     for (ch, acc) in row.iter_mut().enumerate() {
-                        *acc += w[k + kern * ch] * padded(&state.hist, bi, ch, j);
+                        // Two roundings on purpose (no mul_add): each tap
+                        // is a separate multiply and add, as in the graph.
+                        let tap = taps[k + kern * ch] * padded(&state.hist, bi, ch, col);
+                        *acc += tap;
                     }
                 }
             }
         }
         // The new history is the last `cols` columns of the padded input.
-        let mut next = vec![0f32; b * c * cols];
-        for bi in 0..b {
-            for ch in 0..c {
-                for j in 0..cols {
-                    next[(bi * c + ch) * cols + j] = padded(&state.hist, bi, ch, t + j);
+        let mut next = vec![0f32; batch * chans * cols];
+        for bi in 0..batch {
+            for ch in 0..chans {
+                for col in 0..cols {
+                    next[(bi * chans + ch) * cols + col] =
+                        padded(&state.hist, bi, ch, tokens + col);
                 }
             }
         }
         state.hist = next;
-        Tensor::from_data(TensorData::new(out, [b, t, c]), (device, dtype))
+        Tensor::from_data(
+            TensorData::new(out, [batch, tokens, chans]),
+            (device, dtype),
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mummu_num::{f32_from_u64, f64_from_usize};
 
     // ---- row ids ---------------------------------------------------------
 
-    /// Toy parameters small enough to hash by hand: n_gram 3, 2 heads per
+    /// Toy parameters small enough to hash by hand: `n_gram` 3, 2 heads per
     /// order, EOS = 9.
     fn toy_hash() -> PleHash {
         PleHash::new(
@@ -980,29 +1080,18 @@ mod tests {
             assert_eq!(&rows[i * 4..(i + 1) * 4], w, "position {i}");
         }
         // The free function agrees, with an explicit missing predecessor.
+        let params = PleHashParams {
+            multipliers: &[3, 5, 7],
+            head_vocab_sizes: &[7, 11, 13, 17],
+            head_offsets: &[0, 7, 18, 31],
+            per_gram: 2,
+            eos: 9,
+        };
         let mut out = [0u64; 4];
-        ple_row_ids(
-            4,
-            &[Some(2), None],
-            &[3, 5, 7],
-            &[7, 11, 13, 17],
-            &[0, 7, 18, 31],
-            2,
-            9,
-            &mut out,
-        );
+        ple_row_ids(4, &[Some(2), None], &params, &mut out);
         assert_eq!(out, [6, 13, 23, 37]);
         // A shorter prev slice is the same as trailing Nones.
-        ple_row_ids(
-            4,
-            &[Some(2)],
-            &[3, 5, 7],
-            &[7, 11, 13, 17],
-            &[0, 7, 18, 31],
-            2,
-            9,
-            &mut out,
-        );
+        ple_row_ids(4, &[Some(2)], &params, &mut out);
         assert_eq!(out, [6, 13, 23, 37]);
     }
 
@@ -1010,18 +1099,15 @@ mod tests {
     /// debug build or saturate.
     #[test]
     fn the_hash_multiply_wraps_like_uint64() {
-        let m = [u64::MAX, 3, 1];
         let mut out = [0u64; 2];
-        ple_row_ids(
-            3,
-            &[None, None],
-            &m,
-            &[1_000_003, 7],
-            &[0, 1_000_003],
-            1,
-            0,
-            &mut out,
-        );
+        let params = PleHashParams {
+            multipliers: &[u64::MAX, 3, 1],
+            head_vocab_sizes: &[1_000_003, 7],
+            head_offsets: &[0, 1_000_003],
+            per_gram: 1,
+            eos: 0,
+        };
+        ple_row_ids(3, &[None, None], &params, &mut out);
         // ctx = [3, 0, 0]: bigram = 3·(2^64-1) mod 2^64 = 2^64-3; trigram equal.
         let mixed = u64::MAX - 2;
         assert_eq!(out, [mixed % 1_000_003, mixed % 7 + 1_000_003]);
@@ -1105,7 +1191,12 @@ mod tests {
 
     fn f32_table_bytes(rows: usize, width: usize) -> Vec<u8> {
         (0..rows * width)
-            .flat_map(|i| ((i / width) as f32 * 1000.0 + (i % width) as f32).to_le_bytes())
+            .flat_map(|i| {
+                // Two separate roundings on purpose: fusing the multiply and
+                // the add would change these fixture bytes.
+                let row = f32_from_usize(i / width) * 1000.0;
+                (row + f32_from_usize(i % width)).to_le_bytes()
+            })
             .collect()
     }
 
@@ -1141,7 +1232,7 @@ mod tests {
         );
     }
 
-    /// Deterministic IQ4_NL rows (5 blocks = 90 bytes = 160 elements each)
+    /// Deterministic `IQ4_NL` rows (5 blocks = 90 bytes = 160 elements each)
     /// with a sane f16 scale in every block.
     fn iq4nl_table_bytes(rows: usize, seed: u64) -> Vec<u8> {
         let mut s = seed;
@@ -1154,7 +1245,7 @@ mod tests {
         let mut bytes = Vec::with_capacity(rows * 90);
         for _ in 0..rows * 5 {
             // f16 scale in [0.01, ~0.3): exponent bits well below inf/NaN.
-            let d = half::f16::from_f32(0.01 + (next() % 1000) as f32 / 3500.0);
+            let d = half::f16::from_f32(0.01 + f32_from_u64(next() % 1000) / 3500.0);
             bytes.extend_from_slice(&d.to_le_bytes());
             for _ in 0..16 {
                 bytes.push((next() & 0xFF) as u8);
@@ -1163,17 +1254,17 @@ mod tests {
         bytes
     }
 
-    /// 90-byte IQ4_NL rows are addressed at `row · 90` and decode exactly as
+    /// 90-byte `IQ4_NL` rows are addressed at `row · 90` and decode exactly as
     /// `gguf::dequantize` decodes that slice.
     #[test]
     fn iq4nl_rows_decode_as_their_byte_slices() {
         let bytes = iq4nl_table_bytes(6, 42);
-        let table = PleTable::from_bytes(bytes.clone(), GgmlType::IQ4_NL, 6).expect("table");
+        let table = PleTable::from_bytes(bytes.clone(), GgmlType::Iq4Nl, 6).expect("table");
         assert_eq!(table.row_width(), 160);
         let mut out = vec![0f32; 2 * 160];
         table.gather(&[4, 1], &mut out).expect("gather");
-        let want4 = crate::gguf::dequantize(GgmlType::IQ4_NL, &bytes[4 * 90..5 * 90]).expect("dq");
-        let want1 = crate::gguf::dequantize(GgmlType::IQ4_NL, &bytes[90..180]).expect("dq");
+        let want4 = crate::gguf::dequantize(GgmlType::Iq4Nl, &bytes[4 * 90..5 * 90]).expect("dq");
+        let want1 = crate::gguf::dequantize(GgmlType::Iq4Nl, &bytes[90..180]).expect("dq");
         assert_eq!(&out[..160], want4.as_slice());
         assert_eq!(&out[160..], want1.as_slice());
     }
@@ -1217,11 +1308,11 @@ mod tests {
             metadata: Vec::new(),
             tensors: vec![
                 info("junk.weight", vec![8], GgmlType::F32, 0),
-                info("other.weight", vec![32], GgmlType::Q8_0, 0),
+                info("other.weight", vec![32], GgmlType::Q80, 0),
                 info(
                     PLE_TABLE_TENSOR,
                     vec![160, rows as u64],
-                    GgmlType::IQ4_NL,
+                    GgmlType::Iq4Nl,
                     64,
                 ),
             ],
@@ -1242,7 +1333,7 @@ mod tests {
         };
         let file_table = PleTable::open(&f, rows as u64 - 1).expect("table opens");
         let mem_table =
-            PleTable::from_bytes(table_bytes, GgmlType::IQ4_NL, rows as u64).expect("mem");
+            PleTable::from_bytes(table_bytes, GgmlType::Iq4Nl, rows as u64).expect("mem");
         let ask = [5u64, 0, 3];
         let mut a = vec![0f32; ask.len() * 160];
         let mut b = vec![0f32; ask.len() * 160];
@@ -1274,7 +1365,11 @@ mod tests {
                 *seed ^= *seed << 13;
                 *seed ^= *seed >> 7;
                 *seed ^= *seed << 17;
-                ((*seed >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0) * scale
+                // 1 << 24 is exact in f32; the scale-to-[-1,1) step stays two
+                // roundings, so the pseudo-random stream is unchanged.
+                let unit = f32_from_u64(*seed >> 40) / 16_777_216.0;
+                let doubled = unit * 2.0;
+                (doubled - 1.0) * scale
             })
             .collect()
     }
@@ -1287,7 +1382,7 @@ mod tests {
         x * sigmoid(x)
     }
 
-    /// Toy block dims: E = 4, H = 3, E_ple = 8 (distinct from E so a swapped
+    /// Toy block dims: E = 4, H = 3, `E_ple` = 8 (distinct from E so a swapped
     /// projection cannot pass), kernel 4, dilation 3 (history 9).
     struct Toy {
         e: usize,
@@ -1334,12 +1429,14 @@ mod tests {
         };
         let v1 = |v: &[f32]| Tensor::<1>::from_data(TensorData::new(v.to_vec(), [v.len()]), device);
         PleBlock::from_weights(
-            w(&t.key, t.h * t.e, t.ep),
-            w(&t.value, t.e, t.ep),
-            v1(&t.nk),
-            v1(&t.nq),
-            v1(&t.nc),
-            v1(&t.conv),
+            PleWeights {
+                key: w(&t.key, t.h * t.e, t.ep),
+                value: w(&t.value, t.e, t.ep),
+                norm_key: v1(&t.nk),
+                norm_query: v1(&t.nq),
+                norm_conv: v1(&t.nc),
+                conv: v1(&t.conv),
+            },
             t.e,
             t.h,
             t.kern,
@@ -1359,7 +1456,8 @@ mod tests {
         let mut out = vec![0f32; h * e];
         for s in 0..h {
             let g = &v[s * e..(s + 1) * e];
-            let inv = 1.0 / (g.iter().map(|x| x * x).sum::<f32>() / e as f32 + 1e-6).sqrt();
+            let inv =
+                1.0 / (g.iter().map(|x| x * x).sum::<f32>() / f32_from_usize(e) + 1e-6).sqrt();
             for i in 0..e {
                 out[s * e + i] = g[i] * inv * gamma[s * e + i];
             }
@@ -1372,22 +1470,28 @@ mod tests {
     fn ref_forward(t: &Toy, res: &[f32], emb: &[f32], n: usize) -> Vec<f32> {
         let (e, h, ep) = (t.e, t.h, t.ep);
         let hd = h * e;
-        let matvec = |w: &[f32], x: &[f32], out: usize| -> Vec<f32> {
+        let matvec = |weights: &[f32], input: &[f32], out: usize| -> Vec<f32> {
             (0..out)
-                .map(|o| (0..x.len()).map(|i| w[o * x.len() + i] * x[i]).sum())
+                .map(|row| {
+                    (0..input.len())
+                        .map(|col| weights[row * input.len() + col] * input[col])
+                        .sum()
+                })
                 .collect()
         };
         let mut gated_all = vec![0f32; n * hd];
         let mut normed_all = vec![0f32; n * hd];
         for tok in 0..n {
             let em = &emb[tok * ep..(tok + 1) * ep];
-            let r = &res[tok * hd..(tok + 1) * hd];
+            let res_tok = &res[tok * hd..(tok + 1) * hd];
             let keyn = grouped(&matvec(&t.key, em, hd), &t.nk, e, h);
             let value = matvec(&t.value, em, e);
-            let qn = grouped(r, &t.nq, e, h);
-            for s in 0..h {
-                let score: f32 = (0..e).map(|i| keyn[s * e + i] * qn[s * e + i]).sum::<f32>()
-                    / (e as f32).sqrt();
+            let qn = grouped(res_tok, &t.nq, e, h);
+            for stream in 0..h {
+                let score: f32 = (0..e)
+                    .map(|i| keyn[stream * e + i] * qn[stream * e + i])
+                    .sum::<f32>()
+                    / f32_from_usize(e).sqrt();
                 let sign = if score > 0.0 {
                     1.0
                 } else if score < 0.0 {
@@ -1397,7 +1501,7 @@ mod tests {
                 };
                 let gate = sigmoid(sign * score.abs().max(1e-6).sqrt());
                 for i in 0..e {
-                    gated_all[tok * hd + s * e + i] = value[i] * gate;
+                    gated_all[tok * hd + stream * e + i] = value[i] * gate;
                 }
             }
             let nrm = grouped(&gated_all[tok * hd..(tok + 1) * hd], &t.nc, e, h);
@@ -1405,20 +1509,23 @@ mod tests {
         }
         let mut out = vec![0f32; n * hd];
         for tok in 0..n {
-            for c in 0..hd {
+            for ch in 0..hd {
                 let mut acc = 0f32;
                 for k in 0..t.kern {
                     // Tap k reads (kern-1-k)·dil tokens back; before the
                     // sequence start that is the zero history.
                     let back = (t.kern - 1 - k) * t.dil;
-                    let x = if tok >= back {
-                        normed_all[(tok - back) * hd + c]
+                    let tap_in = if tok >= back {
+                        normed_all[(tok - back) * hd + ch]
                     } else {
                         0.0
                     };
-                    acc += t.conv[k + t.kern * c] * x;
+                    // Multiply then accumulate, never fused: the reference
+                    // has to round exactly where the tensor path does.
+                    let tap = t.conv[k + t.kern * ch] * tap_in;
+                    acc += tap;
                 }
-                out[tok * hd + c] = res[tok * hd + c] + gated_all[tok * hd + c] + silu(acc);
+                out[tok * hd + ch] = res[tok * hd + ch] + gated_all[tok * hd + ch] + silu(acc);
             }
         }
         out
@@ -1430,7 +1537,7 @@ mod tests {
     #[test]
     fn ple_block_matches_the_scalar_reference() {
         let device = crate::backend::cpu_device();
-        let t = toy(0xC0FFEE);
+        let t = toy(0x00C0_FFEE);
         let block = build(&t, &device);
         assert_eq!(block.history_len(), 9);
         let n = 15;
@@ -1488,7 +1595,7 @@ mod tests {
     #[test]
     fn chunked_conv_equals_one_shot() {
         let device = crate::backend::cpu_device();
-        let t = toy(0xBADC0DE);
+        let t = toy(0x0BAD_C0DE);
         let block = build(&t, &device);
         let n = 15;
         let hd = t.h * t.e;
@@ -1538,7 +1645,99 @@ mod tests {
 
     // ---- the shipped table ---------------------------------------------------
 
-    /// Gather PLE embeddings from the REAL shards (NVMe copy!) and time
+    /// The row ids the numpy transformers transcription
+    /// (`tools/qwen4exp_ple_rows.py`) derives for token 9707 with no
+    /// predecessors. Pinned to an independent read of the same shard, so this
+    /// proves the payload base, the 90-byte row stride and the head
+    /// concatenation order on the real file, not just on synthetic bytes.
+    const SHIPPED_TOKEN0_ROWS: [u64; 16] = [
+        16_410_909,
+        39_682_429,
+        55_103_279,
+        60_931_720,
+        87_006_904,
+        116_506_179,
+        131_512_017,
+        152_932_897,
+        169_641_436,
+        182_022_480,
+        209_277_433,
+        237_891_023,
+        256_841_529,
+        277_007_269,
+        290_665_954,
+        300_984_276,
+    ];
+
+    /// Per token: the first four head-0 values and the last value of the
+    /// 2560-wide embedding, printed by a hand-written numpy `IQ4_NL` decode at
+    /// full f32 precision (2026-09-16). They are compared with `assert_eq!`,
+    /// so the digits past f32's own are deliberate.
+    const SHIPPED_PINNED_VALUES: [([f32; 4], f32); 3] = [
+        (
+            [
+                -0.001_728_534_7,
+                0.004_321_336_7,
+                -0.011_235_476,
+                0.004_321_336_7,
+            ],
+            -0.008_677_84,
+        ),
+        (
+            [
+                0.007_189_035_4,
+                -0.008_647_68,
+                -0.005_105_257,
+                0.002_604_723,
+            ],
+            -0.010_248_899,
+        ),
+        (
+            [0.006_341_934, 0.014_853_477_5, 0.008_845_329, 0.008_845_329],
+            -0.005_594_492,
+        ),
+    ];
+
+    /// 1000 random single-token gathers (16 preads + dequant each), with
+    /// random predecessors so the rows spread over the whole table. The seed
+    /// comes from the clock so the first pass really is cold (a fixed seed
+    /// would find its rows in the page cache on every rerun); the second pass
+    /// re-reads the same rows warm.
+    fn time_random_gathers(hash: &PleHash, table: &PleTable) {
+        let mut s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0x5EED, |d| {
+                // Seed material: the low 64 bits of the nanosecond clock.
+                u64::try_from(d.as_nanos() & u128::from(u64::MAX)).expect("masked to 64 bits")
+            })
+            | 1;
+        println!("gather seed {s:#x}");
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let toks: Vec<[u32; 3]> = (0..1000)
+            .map(|_| std::array::from_fn(|_| (next() % 248_000) as u32))
+            .collect();
+        let mut out = vec![0f32; 2560];
+        for pass in ["first pass, cold", "second pass, warm"] {
+            let start = std::time::Instant::now();
+            for t in &toks {
+                let rows = hash.rows_for_span(&t[..2], &t[2..]);
+                table.gather(&rows, &mut out).expect("gather");
+            }
+            let ms = start.elapsed().as_secs_f64() * 1e3 / f64_from_usize(toks.len());
+            assert!(out.iter().all(|v| v.is_finite()));
+            println!(
+                "PLE gather ({pass} page cache): {ms:.4} ms/token over {} tokens",
+                toks.len()
+            );
+        }
+    }
+
+    /// Gather PLE embeddings from the REAL shards (`NVMe` copy!) and time
     /// random-token gathers.
     ///
     /// ```text
@@ -1567,7 +1766,7 @@ mod tests {
         assert_eq!(hash.n_heads(), 16);
         assert_eq!(hash.total_rows(), 320_001_446);
         let table = PleTable::open(&f, hash.total_rows()).expect("table opens");
-        assert_eq!(table.dtype(), GgmlType::IQ4_NL);
+        assert_eq!(table.dtype(), GgmlType::Iq4Nl);
         assert_eq!(table.row_width(), 160);
 
         // Three tokens, the middle one the PLE EOS.
@@ -1578,68 +1777,14 @@ mod tests {
         let sum_abs: f64 = emb.iter().map(|v| f64::from(v.abs())).sum();
         println!(
             "3-token PLE embedding: mean |x| = {:.5}, sum |x| = {sum_abs:.6}",
-            sum_abs / emb.len() as f64
+            sum_abs / f64_from_usize(emb.len())
         );
-        // Pinned to an independent read of the same shard: the numpy
-        // transformers transcription (tools/qwen4exp_ple_rows.py) for the row
-        // ids, a hand-written numpy IQ4_NL decode for the values (2026-09-16).
-        // This proves the payload base, the 90-byte row stride and the head
-        // concatenation order on the real file, not just on synthetic bytes.
         assert_eq!(
             hash.rows_for_span(&[], &tokens[..1]),
-            [
-                16_410_909,
-                39_682_429,
-                55_103_279,
-                60_931_720,
-                87_006_904,
-                116_506_179,
-                131_512_017,
-                152_932_897,
-                169_641_436,
-                182_022_480,
-                209_277_433,
-                237_891_023,
-                256_841_529,
-                277_007_269,
-                290_665_954,
-                300_984_276
-            ],
+            SHIPPED_TOKEN0_ROWS,
             "token 0 rows"
         );
-        // Printed by the independent numpy decode at full f32 precision, and
-        // compared with assert_eq!, so the digits past f32's are deliberate.
-        #[allow(clippy::excessive_precision)]
-        let want: [([f32; 4], f32); 3] = [
-            (
-                [
-                    -0.001_728_534_698_486_328,
-                    0.004_321_336_746_215_82,
-                    -0.011_235_475_540_161_133,
-                    0.004_321_336_746_215_82,
-                ],
-                -0.008_677_840_232_849_121,
-            ),
-            (
-                [
-                    0.007_189_035_415_649_414,
-                    -0.008_647_680_282_592_773,
-                    -0.005_105_257_034_301_758,
-                    0.002_604_722_976_684_570_3,
-                ],
-                -0.010_248_899_459_838_867,
-            ),
-            (
-                [
-                    0.006_341_934_204_101_562_5,
-                    0.014_853_477_478_027_344,
-                    0.008_845_329_284_667_969,
-                    0.008_845_329_284_667_969,
-                ],
-                -0.005_594_491_958_618_164,
-            ),
-        ];
-        for (tok, (first, last)) in want.iter().enumerate() {
+        for (tok, (first, last)) in SHIPPED_PINNED_VALUES.iter().enumerate() {
             assert_eq!(
                 &emb[tok * 2560..tok * 2560 + 4],
                 first,
@@ -1653,38 +1798,6 @@ mod tests {
         }
         assert!((sum_abs - 47.667_745).abs() < 1e-4, "sum |x| = {sum_abs}");
 
-        // 1000 random single-token gathers (16 preads + dequant each), with
-        // random predecessors so the rows spread over the whole table. The
-        // seed comes from the clock so the first pass really is cold (a fixed
-        // seed would find its rows in the page cache on every rerun); the
-        // second pass re-reads the same rows warm.
-        let mut s = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0x5EED, |d| d.as_nanos() as u64)
-            | 1;
-        println!("gather seed {s:#x}");
-        let mut next = move || {
-            s ^= s << 13;
-            s ^= s >> 7;
-            s ^= s << 17;
-            s
-        };
-        let toks: Vec<[u32; 3]> = (0..1000)
-            .map(|_| std::array::from_fn(|_| (next() % 248_000) as u32))
-            .collect();
-        let mut out = vec![0f32; 2560];
-        for pass in ["first pass, cold", "second pass, warm"] {
-            let start = std::time::Instant::now();
-            for t in &toks {
-                let rows = hash.rows_for_span(&t[..2], &t[2..]);
-                table.gather(&rows, &mut out).expect("gather");
-            }
-            let ms = start.elapsed().as_secs_f64() * 1e3 / toks.len() as f64;
-            assert!(out.iter().all(|v| v.is_finite()));
-            println!(
-                "PLE gather ({pass} page cache): {ms:.4} ms/token over {} tokens",
-                toks.len()
-            );
-        }
+        time_random_gathers(&hash, &table);
     }
 }

@@ -8,8 +8,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
-# Deliberately dependency-free. Dividing work across devices is arithmetic
-# over throughputs and capacities — it needs no tensor library, and keeping
+# Deliberately dependency-free but for `mummu-num`, which is itself
+# dependency-free. Dividing work across devices is arithmetic over
+# throughputs and capacities — it needs no tensor library, and keeping
 # burn out means this compiles and tests in a second and can be reasoned
 # about (and fuzzed, and reused) without a GPU anywhere in sight.
 [dependencies]
+mummu-num = { workspace = true }

@@ -60,6 +60,7 @@ cubecl = { workspace = true }
 burn-fusion = { workspace = true, optional = true }
 burn-ir = { workspace = true, optional = true }
 derive-new = { workspace = true, optional = true }
+mummu-num = { workspace = true }
 mummu-mix = { workspace = true }
 mummu-schedule = { workspace = true }
 hf-chat-template = { workspace = true, optional = true }
@@ -80,6 +81,10 @@ burn-store = { workspace = true }
 cubecl-runtime = { workspace = true }
 
 [dev-dependencies]
+# The shared integration-test fixtures (llama.cpp harness, parity verdict,
+# recorded qwen4exp reference) as a library, so no test binary carries dead
+# halves of a `#[path]`-shared module.
+mummu-testkit = { path = "../mummu-testkit" }
 # Test-only reference renderer for the imported `chat_template` Jinja: claims
 # byte-identical output to `transformers.apply_chat_template`. Powers the
 # template-vs-renderer BYTE gate (tests/template_gate.rs); production prompt

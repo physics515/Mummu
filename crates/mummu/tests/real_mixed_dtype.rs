@@ -20,6 +20,8 @@
 //!   cargo test -p mummu --release --test real_mixed_dtype -- --ignored --nocapture
 //! ```
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use std::path::PathBuf;
 
 use burn::tensor::DType;

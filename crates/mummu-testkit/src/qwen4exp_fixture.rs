@@ -10,12 +10,8 @@
 //! [`compare_leg`], which hands the verdict to the SAME
 //! `gguf_compare::assert_matches_reference` the live legs use.
 //!
-//! A binary using this module declares `mod gguf_compare; mod llama_ref;
-//! mod qwen4exp_fixture;` (the verdict and `logprobs_at` live there).
-
-// The recorder uses the writing half and the gate the replay half; each sees
-// the other's items as dead.
-#![allow(dead_code)]
+//! A binary using this module takes it from `mummu_testkit` (the verdict
+//! and `logprobs_at` live in its sibling modules).
 
 use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer;
@@ -26,7 +22,7 @@ use crate::llama_ref::logprobs_at;
 /// Where the committed fixture lives.
 pub const FIXTURE_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/qwen4exp_ud_q4kxl_parity.json"
+    "/../mummu/tests/fixtures/qwen4exp_ud_q4kxl_parity.json"
 );
 
 /// The recorded long-prompt reference: one ~560-token leg whose prefill
@@ -34,7 +30,7 @@ pub const FIXTURE_PATH: &str = concat!(
 /// positions, which the two short legs never exercise.
 pub const LONG_FIXTURE_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/qwen4exp_long_prompt_reference.json"
+    "/../mummu/tests/fixtures/qwen4exp_long_prompt_reference.json"
 );
 
 /// Greedy tokens recorded (and compared id for id) on the long leg.
@@ -57,10 +53,12 @@ pub const FORMAT: u32 = 1;
 pub const N_PROBS: usize = 10;
 
 /// Max |Δlogprob| over the top-k — the quantized-reference bound from
-/// `parity_gguf.rs` (llama.cpp's CPU kernels quantize ACTIVATIONS per dot
-/// product on a K-quant file; our path dequantizes weights to f32 once). The
-/// Flash-Next file is the same K-quant/Q8_0 regime, so the same bound applies
-/// until a measurement on this model says otherwise.
+/// `parity_gguf.rs`.
+///
+/// (llama.cpp's CPU kernels quantize ACTIVATIONS per dot product on a
+/// K-quant file; our path dequantizes weights to f32 once.) The Flash-Next
+/// file is the same K-quant/Q8_0 regime, so the same bound applies until a
+/// measurement on this model says otherwise.
 ///
 /// That measurement now exists and says the bound (with the strict top-3
 /// order) is tighter than llama.cpp's own spread on this model:
@@ -159,12 +157,26 @@ pub struct TopEntry {
 
 impl Fixture {
     /// Read and parse the committed fixture, refusing a stale format.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::load_from`]: the fixture at [`FIXTURE_PATH`] cannot be
+    /// read, is not the expected JSON, or carries a `format` other than
+    /// [`FORMAT`].
+    #[must_use]
     pub fn load() -> Self {
         Self::load_from(FIXTURE_PATH)
     }
 
     /// [`Self::load`] for another recorded fixture of the same shape
     /// (e.g. [`LONG_FIXTURE_PATH`]).
+    ///
+    /// # Panics
+    ///
+    /// When `path` cannot be read, when its contents do not parse as a
+    /// [`Fixture`], or when its `format` is not [`FORMAT`] (a stale
+    /// recording must be re-recorded, not replayed half-filled).
+    #[must_use]
     pub fn load_from(path: &str) -> Self {
         let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
         let f: Self = serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {path}: {e}"));
@@ -177,6 +189,11 @@ impl Fixture {
     }
 
     /// The leg called `name`.
+    ///
+    /// # Panics
+    ///
+    /// When the fixture has no leg of that name.
+    #[must_use]
     pub fn leg(&self, name: &str) -> &Leg {
         self.legs
             .iter()
@@ -187,6 +204,11 @@ impl Fixture {
 
 impl Leg {
     /// The reference's first-forward top-[`TOP_K`], best first.
+    ///
+    /// # Panics
+    ///
+    /// When the leg recorded no generated positions at all.
+    #[must_use]
     pub fn first_forward_top(&self) -> Vec<(u32, f64)> {
         let first = self.steps.first().expect("fixture leg has no steps");
         first
@@ -199,8 +221,15 @@ impl Leg {
 }
 
 /// Render `prompt` as a single user turn with `ChatMl::qwen3()` and tokenize
-/// it without re-adding specials — exactly `tests/parity_qwen35.rs`'s path,
-/// shared by the recorder and the replay so the ids cannot drift apart.
+/// it without re-adding specials.
+///
+/// Exactly `tests/parity_qwen35.rs`'s path, shared by the recorder and the
+/// replay so the ids cannot drift apart.
+///
+/// # Panics
+///
+/// When the tokenizer fails to encode the rendered turn, or when it yields
+/// fewer than 8 ids (a template that rendered nothing).
 pub fn render_prompt_ids(tok: &Tokenizer, prompt: &str) -> (String, Vec<u32>) {
     let rendered = mummu::chat::ChatMl::qwen3().render(&[mummu::chat::Turn::user(prompt)]);
     let ids = tok
@@ -212,14 +241,23 @@ pub fn render_prompt_ids(tok: &Tokenizer, prompt: &str) -> (String, Vec<u32>) {
     (rendered, ids)
 }
 
-/// The gate for one recorded leg: `logits` is OUR first forward over
-/// `leg.prompt_ids` (the full vocab row for the last prompt token),
-/// `greedy_ids` OUR generated ids (prompt excluded, as `greedy_generate`
-/// returns them, `gguf_compare::MAX_TOKENS` requested). Applies the
-/// `gguf_compare` policy verbatim — top-3 strict order, top-5 overlap >= 4,
-/// rank-aligned max |Δlogprob| <= [`LOGPROB_ABS_TOLERANCE`], decoded greedy
-/// text byte-equal over the common trimmed prefix (>= 8 bytes) — and panics
-/// on divergence.
+/// The gate for one recorded leg.
+///
+/// `logits` is OUR first forward over `leg.prompt_ids` (the full vocab row
+/// for the last prompt token), `greedy_ids` OUR generated ids (prompt
+/// excluded, as `greedy_generate` returns them, `gguf_compare::MAX_TOKENS`
+/// requested). Applies the `gguf_compare` policy verbatim — top-3 strict
+/// order, top-5 overlap >= 4, rank-aligned max |Δlogprob| <=
+/// [`LOGPROB_ABS_TOLERANCE`], decoded greedy text byte-equal over the common
+/// trimmed prefix (>= 8 bytes) — and panics on divergence.
+///
+/// # Panics
+///
+/// When `ChatMl::qwen3()` no longer renders `leg.prompt` to the recorded
+/// text or the tokenizer no longer yields the recorded ids (the replay has
+/// no server to catch a drifted prompt), when `logits` is shorter than the
+/// reference's vocab, when `greedy_ids` fail to decode, and on every
+/// divergence `gguf_compare::assert_matches_reference` rejects.
 pub fn compare_leg(leg: &Leg, logits: &[f32], greedy_ids: &[u32], tok: &Tokenizer) {
     // A tokenizer or template change would silently make "our" forward run on
     // different ids than the reference saw; the replay has no server to

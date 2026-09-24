@@ -18,6 +18,7 @@ use mummu::decode::SamplerOptions;
 use mummu::gguf::GgufFile;
 use mummu::models::{lfm2, olmoe, qwen2, qwen3, qwen35};
 use mummu::registry::{Architecture, ModelSpec, WeightFormat};
+use mummu_num::{f64_from_u64, f64_from_usize, trunc_u64};
 use tokenizers::Tokenizer;
 
 use crate::recovery::{self, ChatError, DeviceKey};
@@ -181,6 +182,7 @@ pub fn backend_choice() -> BackendChoice {
 }
 
 /// Human label for where generation runs, honoring the env overrides.
+#[must_use]
 pub fn device_label() -> &'static str {
     match backend_choice() {
         #[cfg(feature = "cuda")]
@@ -206,13 +208,17 @@ static RESIDENT: std::sync::Mutex<Vec<(BackendChoice, std::path::PathBuf, u64)>>
     std::sync::Mutex::new(Vec::new());
 
 fn note_resident(backend: BackendChoice, dir: std::path::PathBuf, bytes: u64) {
-    let mut r = RESIDENT.lock().unwrap_or_else(|e| e.into_inner());
+    let mut r = RESIDENT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     r.retain(|(b, _, _)| *b != backend);
     r.push((backend, dir, bytes));
 }
 
 fn resident_in(backend: BackendChoice) -> Option<(std::path::PathBuf, u64)> {
-    let r = RESIDENT.lock().unwrap_or_else(|e| e.into_inner());
+    let r = RESIDENT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     r.iter()
         .find(|(b, _, _)| *b == backend)
         .map(|(_, d, n)| (d.clone(), *n))
@@ -238,14 +244,18 @@ impl LoadInFlight {
         backend: BackendChoice,
         policy: mummu::quant::QuantPolicy,
     ) -> Self {
-        *LOADING.lock().unwrap_or_else(|e| e.into_inner()) = Some((dir, backend, policy));
+        *LOADING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((dir, backend, policy));
         Self
     }
 }
 
 impl Drop for LoadInFlight {
     fn drop(&mut self) {
-        *LOADING.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *LOADING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 }
 
@@ -277,7 +287,9 @@ impl LoadProgress {
     /// A poisoned cell still holds a live guard, and dropping a progress bar
     /// because a *bar* lock was poisoned would be absurd.
     fn cell(&self) -> std::sync::MutexGuard<'_, Option<mummu::progress::Load>> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner())
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// A load for `model` is starting. Called from inside the slot's load
@@ -315,7 +327,7 @@ impl LoadProgress {
 pub fn load_in_flight() -> Option<std::path::PathBuf> {
     LOADING
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .as_ref()
         .map(|(d, _, _)| d.clone())
 }
@@ -332,7 +344,10 @@ pub fn unload_all() -> bool {
     clear_tiers();
     let freed = SLOT.clear();
     if freed {
-        RESIDENT.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        RESIDENT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         mummu::progress::evicted();
     }
     freed
@@ -355,18 +370,24 @@ pub fn unload_all() -> bool {
 ///   holder may be a load that began after the failure, so its tiers and
 ///   notes are not touched, and whatever it holds that was loaded before
 ///   the failure is refused by the fault stamp at its next acquire.
-pub(crate) fn evict_after_device_failure() -> mummu::cache::Cleared {
+pub fn evict_after_device_failure() -> mummu::cache::Cleared {
     let outcome = SLOT.try_clear();
     match &outcome {
         mummu::cache::Cleared::Dropped(_) => {
             clear_tiers();
-            RESIDENT.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            RESIDENT
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
             mummu::progress::evicted();
         }
         mummu::cache::Cleared::Empty => {
             // Nothing resident, so any tier runtime or note is an orphan.
             clear_tiers();
-            RESIDENT.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            RESIDENT
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
         }
         mummu::cache::Cleared::Busy => {}
     }
@@ -375,7 +396,7 @@ pub(crate) fn evict_after_device_failure() -> mummu::cache::Cleared {
 }
 
 /// The one sentence [`evict_after_device_failure`] prints for what it found.
-pub(crate) fn eviction_line(outcome: &mummu::cache::Cleared) -> String {
+pub fn eviction_line(outcome: &mummu::cache::Cleared) -> String {
     match outcome {
         mummu::cache::Cleared::Dropped(dir) => format!(
             "dropped the resident model ({}) — it was loaded before the failure and is not used \
@@ -422,7 +443,7 @@ impl Drop for ForgetResidentUnlessLoaded {
 fn forget_resident(dir: &Path) {
     RESIDENT
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .retain(|(_, d, _)| d != dir);
 }
 
@@ -438,7 +459,7 @@ fn forget_resident(dir: &Path) {
 /// runner thread is named `DS{U|D}-{type_id}-{index_id}` from that id
 /// (`cubecl-common device/handle/channel.rs:898-907`). burn-flex has no
 /// device server and no threads: the host.
-pub(crate) fn device_key(backend: BackendChoice) -> DeviceKey {
+pub fn device_key(backend: BackendChoice) -> DeviceKey {
     let key = match backend {
         #[cfg(feature = "cuda")]
         BackendChoice::Cuda => DeviceKey::Cubecl {
@@ -461,7 +482,7 @@ pub(crate) fn device_key(backend: BackendChoice) -> DeviceKey {
 
 /// Name every device this build can hand out, so the panic hook reports a
 /// device-thread failure by name even before the first request.
-pub(crate) fn register_devices() {
+pub fn register_devices() {
     for backend in [
         #[cfg(feature = "cuda")]
         BackendChoice::Cuda,
@@ -479,12 +500,15 @@ pub(crate) fn register_devices() {
 /// load touched.
 fn devices_of(backend: BackendChoice) -> Vec<BackendChoice> {
     let mut out = vec![backend];
-    let tiers = TIERS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(rt) = tiers.as_ref().filter(|rt| rt.main == backend) {
-        for (b, _) in &rt.devices {
-            if !out.contains(b) {
-                out.push(*b);
-            }
+    let tiered: Vec<BackendChoice> = TIERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .filter(|rt| rt.main == backend)
+        .map_or_else(Vec::new, |rt| rt.devices.iter().map(|(b, _)| *b).collect());
+    for b in tiered {
+        if !out.contains(&b) {
+            out.push(b);
         }
     }
     out
@@ -562,107 +586,9 @@ fn load_any(
                 Architecture::Lfm2 => {
                     AnyLm::Lfm2(lfm2::load_from_gguf(&path, device).map_err(|e| e.to_string())?)
                 }
-                Architecture::Olmoe => {
-                    if let Some(pack_dir) = ensure_pack(&dir, &path, spec)? {
-                        if let Some(cpu_only) = tiers_mode() {
-                            // P9 stage 3b: trunk on this backend, experts
-                            // tiered across every device present.
-                            clear_tiers();
-                            let pool = build_tiered_experts(&pack_dir, backend, cpu_only)?;
-                            AnyLm::OlmoeQ(
-                                olmoe::load_trunk_from_pack(&pack_dir, device)
-                                    .map_err(|e| e.to_string())?
-                                    .with_pool(pool),
-                            )
-                        } else {
-                            // Pack path: experts pre-quantized per member, all
-                            // on this backend at the planned level.
-                            let level = precision_for(policy);
-                            AnyLm::OlmoeQ(
-                                olmoe::load_from_pack(&pack_dir, device, &|_| level)
-                                    .map_err(|e| e.to_string())?,
-                            )
-                        }
-                    } else if policy == mummu::quant::QuantPolicy::Off {
-                        AnyLm::Olmoe(
-                            olmoe::load_from_gguf(&path, device).map_err(|e| e.to_string())?,
-                        )
-                    } else {
-                        // P9 MoE: per-expert quantized experts, routed compute.
-                        AnyLm::OlmoeQ(
-                            olmoe::load_from_gguf_quantized(&path, device, policy)
-                                .map_err(|e| e.to_string())?,
-                        )
-                    }
-                }
+                Architecture::Olmoe => load_olmoe_gguf(&dir, &path, spec, device, policy, backend)?,
                 Architecture::Qwen35 => {
-                    if let Some(pack_dir) = ensure_pack(&dir, &path, spec)? {
-                        let level = precision_for(policy);
-                        let (partitioned, folded) =
-                            mummu::pack::Pack::open(&pack_dir)
-                                .ok()
-                                .map_or((false, false), |p| {
-                                    (
-                                        p.manifest.ffn_partition.is_some(),
-                                        mummu::partition::pack_is_hadamard_folded(&p)
-                                            .unwrap_or(false),
-                                    )
-                                });
-                        match tiers_mode() {
-                            // qwen35 is DENSE: every FFN cluster runs on every
-                            // token, so splitting a layer across devices buys
-                            // nothing and costs a crossing. Place whole layers
-                            // instead (`MUMMU_TIERS=clusters` restores the
-                            // cluster-granular path for experimenting). A
-                            // Hadamard-folded pack is never partitioned and
-                            // takes the whole-layer path unconditionally.
-                            Some(_) if (partitioned && !cluster_granular()) || folded => {
-                                clear_tiers();
-                                AnyLm::Qwen35(build_layered_qwen35(&pack_dir, backend, policy)?)
-                            }
-                            Some(cpu_only) if partitioned => {
-                                // P9 stage 3c: trunk + local FFN clusters here,
-                                // the other clusters tiered across devices.
-                                clear_tiers();
-                                AnyLm::Qwen35(build_partitioned_qwen35(
-                                    &pack_dir, device, backend, cpu_only, policy,
-                                )?)
-                            }
-                            _ => {
-                                // Per-tensor precision rather than one level
-                                // for the whole model — see `mixed_precision`.
-                                // The fit planner's policy is the *lowest*
-                                // precision that fits wholesale; the mix
-                                // starts from the best a pack stores and
-                                // demotes only as far as the budget forces,
-                                // so spare VRAM is spent rather than left.
-                                let ceiling = match policy {
-                                    mummu::quant::QuantPolicy::Off => {
-                                        mummu::quant::QuantPolicy::Off
-                                    }
-                                    _ => mummu::quant::QuantPolicy::Q8,
-                                };
-                                let mix = mummu::pack::Pack::open(&pack_dir)
-                                    .ok()
-                                    .map(|p| mixed_precision(&p, backend, ceiling, &|_| true));
-                                let choose = |e: &mummu::pack::TensorEntry| {
-                                    mix.as_ref()
-                                        .and_then(|m| m.get(&e.name).copied())
-                                        .unwrap_or(level)
-                                };
-                                AnyLm::Qwen35(
-                                    qwen35::load_from_pack(&pack_dir, device, &choose)
-                                        .map_err(|e| e.to_string())?,
-                                )
-                            }
-                        }
-                    } else {
-                        // Streaming importer with the fit-planned policy.
-                        AnyLm::Qwen35(
-                            qwen35::load_from_gguf_quantized(&path, device, policy)
-                                .map_err(|e| e.to_string())?,
-                        )
-                    }
+                    load_qwen35_gguf(&dir, &path, spec, device, policy, backend)?
                 }
                 Architecture::MiniLm => {
                     return Err("all-MiniLM is an embedding model — not chat-servable".into());
@@ -671,6 +597,121 @@ fn load_any(
             Ok((lm, tokenizer))
         }
     }
+}
+
+/// An `OLMoE` GGUF: from its pack (experts tiered across every device, or
+/// all on this backend at the planned level), else the streaming importer.
+fn load_olmoe_gguf(
+    dir: &Path,
+    path: &Path,
+    spec: &ModelSpec,
+    device: &Device,
+    policy: mummu::quant::QuantPolicy,
+    backend: BackendChoice,
+) -> Result<AnyLm, String> {
+    let lm = if let Some(pack_dir) = ensure_pack(dir, path, spec)? {
+        if let Some(cpu_only) = tiers_mode() {
+            // P9 stage 3b: trunk on this backend, experts
+            // tiered across every device present.
+            clear_tiers();
+            let pool = build_tiered_experts(&pack_dir, backend, cpu_only)?;
+            AnyLm::OlmoeQ(
+                olmoe::load_trunk_from_pack(&pack_dir, device)
+                    .map_err(|e| e.to_string())?
+                    .with_pool(pool),
+            )
+        } else {
+            // Pack path: experts pre-quantized per member, all
+            // on this backend at the planned level.
+            let level = precision_for(policy);
+            AnyLm::OlmoeQ(
+                olmoe::load_from_pack(&pack_dir, device, &|_| level).map_err(|e| e.to_string())?,
+            )
+        }
+    } else if policy == mummu::quant::QuantPolicy::Off {
+        AnyLm::Olmoe(olmoe::load_from_gguf(path, device).map_err(|e| e.to_string())?)
+    } else {
+        // P9 MoE: per-expert quantized experts, routed compute.
+        AnyLm::OlmoeQ(
+            olmoe::load_from_gguf_quantized(path, device, policy).map_err(|e| e.to_string())?,
+        )
+    };
+    Ok(lm)
+}
+
+/// A qwen35 GGUF: from its pack — whole layers placed live, partitioned FFN
+/// clusters tiered, or one device at a per-tensor precision mix — else the
+/// streaming importer at the fit-planned policy.
+fn load_qwen35_gguf(
+    dir: &Path,
+    path: &Path,
+    spec: &ModelSpec,
+    device: &Device,
+    policy: mummu::quant::QuantPolicy,
+    backend: BackendChoice,
+) -> Result<AnyLm, String> {
+    let Some(pack_dir) = ensure_pack(dir, path, spec)? else {
+        // Streaming importer with the fit-planned policy.
+        return Ok(AnyLm::Qwen35(
+            qwen35::load_from_gguf_quantized(path, device, policy).map_err(|e| e.to_string())?,
+        ));
+    };
+    let level = precision_for(policy);
+    let (partitioned, folded) =
+        mummu::pack::Pack::open(&pack_dir)
+            .ok()
+            .map_or((false, false), |p| {
+                (
+                    p.manifest.ffn_partition.is_some(),
+                    mummu::partition::pack_is_hadamard_folded(&p).unwrap_or(false),
+                )
+            });
+    let lm = match tiers_mode() {
+        // qwen35 is DENSE: every FFN cluster runs on every
+        // token, so splitting a layer across devices buys
+        // nothing and costs a crossing. Place whole layers
+        // instead (`MUMMU_TIERS=clusters` restores the
+        // cluster-granular path for experimenting). A
+        // Hadamard-folded pack is never partitioned and
+        // takes the whole-layer path unconditionally.
+        Some(_) if (partitioned && !cluster_granular()) || folded => {
+            clear_tiers();
+            AnyLm::Qwen35(build_layered_qwen35(&pack_dir, backend, policy)?)
+        }
+        Some(cpu_only) if partitioned => {
+            // P9 stage 3c: trunk + local FFN clusters here,
+            // the other clusters tiered across devices.
+            clear_tiers();
+            AnyLm::Qwen35(build_partitioned_qwen35(
+                &pack_dir, device, backend, cpu_only, policy,
+            )?)
+        }
+        _ => {
+            // Per-tensor precision rather than one level
+            // for the whole model — see `mixed_precision`.
+            // The fit planner's policy is the *lowest*
+            // precision that fits wholesale; the mix
+            // starts from the best a pack stores and
+            // demotes only as far as the budget forces,
+            // so spare VRAM is spent rather than left.
+            let ceiling = match policy {
+                mummu::quant::QuantPolicy::Off => mummu::quant::QuantPolicy::Off,
+                _ => mummu::quant::QuantPolicy::Q8,
+            };
+            let mix = mummu::pack::Pack::open(&pack_dir)
+                .ok()
+                .map(|p| mixed_precision(&p, backend, ceiling, &|_| true));
+            let choose = |e: &mummu::pack::TensorEntry| {
+                mix.as_ref()
+                    .and_then(|m| m.get(&e.name).copied())
+                    .unwrap_or(level)
+            };
+            AnyLm::Qwen35(
+                qwen35::load_from_pack(&pack_dir, device, &choose).map_err(|e| e.to_string())?,
+            )
+        }
+    };
+    Ok(lm)
 }
 
 /// Lifts every call out of a whole answer, with the prose around them.
@@ -720,7 +761,7 @@ const LFM: CallSyntax = CallSyntax {
 /// capabilities, and each surface's check on a request that carries tools —
 /// so what a model is advertised to do is what a request to it gets.
 struct Template {
-    /// mummu's byte-verified ChatML renderer, or `None` for OLMoE-Instruct's
+    /// mummu's byte-verified `ChatML` renderer, or `None` for OLMoE-Instruct's
     /// Tulu template, spelled out in [`render_prompt_with_tools`].
     chatml: Option<ChatMl>,
     /// How the model's tool calls are read back. `None` means the family is
@@ -740,10 +781,9 @@ fn template(arch: Architecture) -> Result<Template, String> {
     };
     Ok(match arch {
         Architecture::Qwen2 => chatml(ChatMl::qwen2(), Some(HERMES), false),
-        Architecture::Qwen3 => chatml(ChatMl::qwen3(), Some(HERMES), true),
         // qwen35's imported chat template is ChatML with Qwen3's think
         // conventions (its vision macros never fire on text-only turns).
-        Architecture::Qwen35 => chatml(ChatMl::qwen3(), Some(HERMES), true),
+        Architecture::Qwen3 | Architecture::Qwen35 => chatml(ChatMl::qwen3(), Some(HERMES), true),
         Architecture::Lfm2 => chatml(ChatMl::lfm2(), Some(LFM), false),
         Architecture::Olmoe => Template {
             chatml: None,
@@ -814,7 +854,7 @@ fn decode_answer(tok: &Tokenizer, ids: &[u32], keep: &[u32]) -> tokenizers::Resu
     }
 }
 
-/// Render `turns` into the family's prompt string. The ChatML families are
+/// Render `turns` into the family's prompt string. The `ChatML` families are
 /// mummu's byte-verified renderers; OLMoE-Instruct speaks the Tulu template
 /// (`<|user|>` / `<|assistant|>` behind an `<|endoftext|>` BOS), which has no
 /// hardcoded renderer in the library yet, so it is spelled out here in the
@@ -891,7 +931,7 @@ pub struct ChatResult {
     pub text: String,
     pub tokens: usize,
     pub device: &'static str,
-    pub elapsed_ms: u128,
+    pub elapsed_ms: u64,
     /// Where the time went, phase by phase (see `crate::trace`).
     pub timings: crate::trace::Timings,
     /// The calls lifted out of the answer when the request offered tools,
@@ -901,6 +941,22 @@ pub struct ChatResult {
     pub tool_calls: Vec<ToolCall>,
 }
 
+/// One chat completion as a surface hands it to the engine: the model, the
+/// conversation, and everything the request asked for. The images and the
+/// tools are the request's own; the rest is borrowed for its whole life.
+pub struct GenerationRequest<'a> {
+    pub spec: &'a ModelSpec,
+    pub models_root: &'a Path,
+    pub turns: &'a [Turn],
+    pub opts: &'a SamplerOptions,
+    pub max_tokens: usize,
+    pub format: Option<crate::OutputFormat>,
+    /// Show the model's `<think>` block rather than withholding it.
+    pub think: bool,
+    pub images: Vec<mummu::vision::Patches>,
+    pub tools: Vec<mummu::chat::ToolSpec>,
+}
+
 /// Run one chat completion, streaming decoded-text deltas through `on_delta`
 /// (return `Break` to cancel cooperatively). Loads the model into the
 /// backend's slot on first use; generations are serialized by the slot mutex.
@@ -908,19 +964,11 @@ pub struct ChatResult {
 /// Callers run this under [`crate::recovery::contain`], which is what turns a
 /// panic in here — a GPU failure surfacing as a failed read, say — into an
 /// error the client is actually sent.
-#[allow(clippy::too_many_arguments)] // one request's worth of parameters, for every surface
 pub async fn run_chat(
-    spec: &ModelSpec,
-    models_root: &Path,
-    turns: &[Turn],
-    opts: &SamplerOptions,
-    max_tokens: usize,
-    format: Option<crate::OutputFormat>,
-    think: bool,
-    images: Vec<mummu::vision::Patches>,
-    tools: Vec<mummu::chat::ToolSpec>,
+    req: &GenerationRequest<'_>,
     on_delta: impl FnMut(&str) -> ControlFlow<()>,
 ) -> Result<ChatResult, ChatError> {
+    let (spec, models_root) = (req.spec, req.models_root);
     // No `restarting` check here. The entry points refuse a NEW chat during a
     // restart (`start_chat`, the shim's `run`), and a chat that got past them
     // before the decision is refused where it would first touch the device —
@@ -934,23 +982,23 @@ pub async fn run_chat(
     // Only a request that brings an image needs the tower, and only a tower
     // that is not already resident needs room made for it: held back for
     // every text request, it cost 6 of the 27B's layers.
-    let needs_tower = !images.is_empty();
+    let needs_tower = !req.images.is_empty();
     set_vision_reserve(if needs_tower && !tower_resident() {
         vision_reserve_bytes(spec, models_root)
     } else {
         0
     });
-    let prompt = render_prompt_with_tools(spec.architecture, &tools, turns)?;
+    let prompt = render_prompt_with_tools(spec.architecture, &req.tools, req.turns)?;
     // The context a load must provision for, before the tokenizer is at
     // hand: ~3 bytes per token over-counts English, which is the safe side
     // of a fit. `drive` replaces it with the exact count once loaded.
     // Pre-merge patch count: an upper bound on the tokens an image becomes.
-    let image_tokens: usize = images.iter().map(|p| p.grid_h * p.grid_w).sum();
+    let image_tokens: usize = req.images.iter().map(|p| p.grid_h * p.grid_w).sum();
     placement::set_request(
-        prompt.len().div_ceil(3) + image_tokens + max_tokens,
+        prompt.len().div_ceil(3) + image_tokens + req.max_tokens,
         needs_tower,
     );
-    let offered_tools = !tools.is_empty();
+    let offered_tools = !req.tools.is_empty();
     // Land a line in the log the moment a request enters the engine: the fit
     // planning below can legitimately take minutes on a busy disk, and a
     // request that logs nothing until it finishes reads as a hang (it did,
@@ -967,38 +1015,25 @@ pub async fn run_chat(
         }
         _ => plan_fit(spec, models_root)?,
     };
-    #[allow(clippy::cast_possible_truncation)]
-    let plan_ms = plan_started.elapsed().as_millis() as u64;
+    let plan_ms = crate::millis(plan_started.elapsed());
     eprintln!(
         "[mummu-serve] fit plan for {}: {:?} @ {:?}",
         spec.name, plan.backend, plan.policy
     );
     // One slot, one device value: the plan picks *where*, not *which type*.
-    drive(
-        &SLOT,
-        spec,
-        models_root,
-        &prompt,
-        opts,
-        max_tokens,
-        plan,
-        format,
-        think,
-        images,
-        on_delta,
-    )
-    .await
-    .map(|mut r| {
-        r.timings.plan_ms = plan_ms;
-        if offered_tools {
-            lift_tool_calls(spec.architecture, &mut r);
-        }
-        r
-    })
+    drive(&SLOT, req, &prompt, plan, on_delta)
+        .await
+        .map(|mut r| {
+            r.timings.plan_ms = plan_ms;
+            if offered_tools {
+                lift_tool_calls(spec.architecture, &mut r);
+            }
+            r
+        })
 }
 
 /// The device a backend choice denotes (burn 0.22 selects at runtime).
-pub(crate) fn device_of(backend: BackendChoice) -> Device {
+pub fn device_of(backend: BackendChoice) -> Device {
     match backend {
         #[cfg(feature = "cuda")]
         BackendChoice::Cuda => mummu::backend::cuda_device(),
@@ -1009,7 +1044,7 @@ pub(crate) fn device_of(backend: BackendChoice) -> Device {
 }
 
 /// Human label for a backend choice.
-pub(crate) fn label_of(backend: BackendChoice) -> &'static str {
+pub const fn label_of(backend: BackendChoice) -> &'static str {
     match backend {
         #[cfg(feature = "cuda")]
         BackendChoice::Cuda => "GPU (cuda)",
@@ -1017,6 +1052,11 @@ pub(crate) fn label_of(backend: BackendChoice) -> &'static str {
         BackendChoice::IntegratedGpu => "iGPU (wgpu)",
         BackendChoice::Cpu => "CPU (flex)",
     }
+}
+
+/// `bytes` in GiB, for the log lines.
+fn gib(bytes: u64) -> f64 {
+    f64_from_u64(bytes) / f64::from(1u32 << 30)
 }
 
 // ===========================================================================
@@ -1058,21 +1098,25 @@ static ALLOC_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 /// Called after every request, which is the natural observation window: it is
 /// exactly one placement's worth of real work, measured the way the user
 /// experiences it (tokens per second), rather than a synthetic probe.
-fn observe_placement(tokens: usize, elapsed_ms: u128) {
+fn observe_placement(tokens: usize, elapsed_ms: u64) {
     use mummu::adapt::{Adjust, Sample};
     if tokens == 0 || elapsed_ms == 0 {
         return; // nothing to learn from
     }
-    let mut guard = PLACEMENT.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = PLACEMENT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(controller) = guard.as_mut() else {
         return;
     };
     let sample = Sample {
-        tokens_per_sec: tokens as f64 / (elapsed_ms as f64 / 1000.0),
+        tokens_per_sec: f64_from_usize(tokens) / (f64_from_u64(elapsed_ms) / 1000.0),
         device_alloc_failed: ALLOC_FAILED.swap(false, std::sync::atomic::Ordering::SeqCst),
         host_available_bytes: mem_available_bytes(),
         device_bytes_in_use: {
-            let g = TIERS.lock().unwrap_or_else(|e| e.into_inner());
+            let g = TIERS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             g.as_ref().map_or(0, |rt| {
                 let used = rt.pool.used_bytes(rt.devices.len());
                 rt.devices
@@ -1100,7 +1144,9 @@ fn observe_placement(tokens: usize, elapsed_ms: u128) {
             // bounded hot-swap machinery move what it can. Never blocks the
             // request that produced the observation.
             {
-                let mut g = TIERS.lock().unwrap_or_else(|e| e.into_inner());
+                let mut g = TIERS
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(rt) = g.as_mut() {
                     for (backend, dev) in &mut rt.devices {
                         if *backend != BackendChoice::Cpu {
@@ -1130,12 +1176,16 @@ fn tiers_mode() -> Option<bool> {
 }
 
 fn clear_tiers() {
-    *TIERS.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *TIERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 }
 
 /// Drop the tier runtime if its trunk lives in `backend`'s slot.
 fn clear_tiers_if_slot(backend: BackendChoice) {
-    let mut g = TIERS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = TIERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if g.as_ref().is_some_and(|r| r.main == backend) {
         *g = None;
     }
@@ -1145,7 +1195,7 @@ fn clear_tiers_if_slot(backend: BackendChoice) {
 fn tiers_pack_in(dir: &Path) -> Option<()> {
     TIERS
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .as_ref()
         .filter(|r| r.pack_dir.parent() == Some(dir))
         .map(|_| ())
@@ -1154,15 +1204,19 @@ fn tiers_pack_in(dir: &Path) -> Option<()> {
 /// Expert bytes the tiered model holds on `backend` (the fit planner
 /// subtracts them from that backend's budget).
 fn tier_used_bytes(backend: BackendChoice) -> u64 {
-    let g = TIERS.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(rt) = g.as_ref() else { return 0 };
-    let used = rt.pool.used_bytes(rt.devices.len());
-    rt.devices
-        .iter()
-        .zip(&used)
-        .filter(|((b, _), _)| *b == backend)
-        .map(|(_, &u)| u)
-        .sum()
+    TIERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .map_or(0, |rt| {
+            let used = rt.pool.used_bytes(rt.devices.len());
+            rt.devices
+                .iter()
+                .zip(&used)
+                .filter(|((b, _), _)| *b == backend)
+                .map(|(_, &u)| u)
+                .sum()
+        })
 }
 
 /// The devices experts may live on, with their precision ladders and the
@@ -1238,10 +1292,13 @@ fn tier_devices(
             .ok()
             .as_deref()
             .is_some_and(|v| v.eq_ignore_ascii_case("cpu-first"));
-        let measured = match backend {
-            BackendChoice::Cpu => 72,
-            BackendChoice::IntegratedGpu => 71,
-            _ => 629,
+        // The discrete card, whichever driver reaches it, is the third rate.
+        let measured = if backend == BackendChoice::Cpu {
+            72
+        } else if backend == BackendChoice::IntegratedGpu {
+            71
+        } else {
+            629
         };
         // The override exists for a host whose GPU genuinely is the slow one;
         // invert the ordering without pretending to know its ratios.
@@ -1341,7 +1398,7 @@ fn tier_devices(
     out
 }
 
-/// One OLMoE expert from the pack onto `backend`'s device at `tier`.
+/// One `OLMoE` expert from the pack onto `backend`'s device at `tier`.
 fn load_expert_on(
     backend: BackendChoice,
     pack: &mummu::pack::Pack,
@@ -1417,7 +1474,7 @@ fn cluster_granular() -> bool {
 /// needed every layer, so streaming them all costs the whole model across
 /// the bus per token — which the module header of `mummu::workingset`
 /// shows cannot beat the CPU reading the same bytes from DDR. It earns its
-/// keep on selective (routed MoE) workloads and where staging overlaps
+/// keep on selective (routed `MoE`) workloads and where staging overlaps
 /// compute. Until that is measured on a given host, the tier design stays
 /// the default.
 fn working_set_enabled() -> bool {
@@ -1468,8 +1525,14 @@ fn ffn_skip_tau(part: &mummu::pack::FfnPartition, name: &str) -> f32 {
                 .partial_cmp(&b.tau)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-    match pick {
-        Some(m) => {
+    pick.map_or_else(
+        || {
+            eprintln!(
+                "[mummu-serve] {name}: no measured skip point within tolerance {tol} — staying exact"
+            );
+            0.0
+        },
+        |m| {
             eprintln!(
                 "[mummu-serve] {name}: FFN skip tau={} within tolerance {tol} (measured max |Δlogprob| {:.3}, argmax agreement {:.1}%, {:.0}% clusters kept)",
                 m.tau,
@@ -1478,14 +1541,8 @@ fn ffn_skip_tau(part: &mummu::pack::FfnPartition, name: &str) -> f32 {
                 m.kept_fraction * 100.0
             );
             m.tau
-        }
-        None => {
-            eprintln!(
-                "[mummu-serve] {name}: no measured skip point within tolerance {tol} — staying exact"
-            );
-            0.0
-        }
-    }
+        },
+    )
 }
 
 /// Trunk bytes of a pack on `level`: every non-expert, non-FFN-cluster
@@ -1493,17 +1550,16 @@ fn ffn_skip_tau(part: &mummu::pack::FfnPartition, name: &str) -> f32 {
 /// 1 GiB workspace. What must fit the main backend when the units tier out.
 fn pack_trunk_bytes(pack: &mummu::pack::Pack, level: mummu::pack::Precision) -> u64 {
     use mummu::pack::{Precision, Role};
-    let ffn: std::collections::HashSet<&str> = pack
-        .manifest
-        .ffn_partition
-        .as_ref()
-        .map(|p| {
-            p.names
-                .iter()
-                .flat_map(|n| n.iter().map(String::as_str))
-                .collect()
-        })
-        .unwrap_or_default();
+    let ffn: std::collections::HashSet<&str> =
+        pack.manifest
+            .ffn_partition
+            .as_ref()
+            .map_or_else(std::collections::HashSet::new, |p| {
+                p.names
+                    .iter()
+                    .flat_map(|n| n.iter().map(String::as_str))
+                    .collect()
+            });
     let mut bytes = 0u64;
     for t in &pack.manifest.tensors {
         if matches!(t.role, Role::Expert { .. }) || ffn.contains(t.name.as_str()) {
@@ -1539,7 +1595,7 @@ fn pack_trunk_bytes(pack: &mummu::pack::Pack, level: mummu::pack::Precision) -> 
 /// Whole layers, not FFN clusters: every cluster of a dense model runs on
 /// every token, so splitting a layer across devices buys nothing and costs a
 /// crossing (measured 24.7 s/tok split, 4.8 whole). Cluster granularity
-/// stays right for a routed MoE.
+/// stays right for a routed `MoE`.
 fn build_layered_qwen35(
     pack_dir: &Path,
     main: BackendChoice,
@@ -1608,13 +1664,13 @@ fn build_layered_qwen35(
 /// effect; float-precision host layers and the accelerator's tensors
 /// decline and cost nothing. `MUMMU_VNNI_WARM=off` skips.
 fn warm_host_twins(model: &qwen35::LoadedQwen35, from_layer: usize) {
+    use burn::tensor::Tensor;
     if !mummu::flex::registry::enabled()
         || std::env::var("MUMMU_VNNI_WARM").is_ok_and(|v| v.eq_ignore_ascii_case("off"))
         || from_layer >= model.model.layers.len()
     {
         return;
     }
-    use burn::tensor::Tensor;
     let started = Instant::now();
     let mut built = 0usize;
     let mut warm = |l: &burn::nn::Linear| {
@@ -1733,55 +1789,7 @@ fn build_partitioned_qwen35(
         level
     };
     devices[main_idx].1.ladder = vec![slab_level];
-    let planner_devices: Vec<mummu::tier::TierDevice> =
-        devices.iter().map(|(_, d)| d.clone()).collect();
-    let hotness: Vec<f64> =
-        if part.hotness.len() == layers && part.hotness.iter().all(|h| h.len() == epl) {
-            part.hotness
-                .iter()
-                .flatten()
-                .map(|&h| f64::from(h))
-                .collect()
-        } else {
-            let g = TIERS.lock().unwrap_or_else(|e| e.into_inner());
-            g.as_ref()
-                .filter(|r| r.pack_dir == pack_dir && r.hotness.len() == costs.len())
-                .map(|r| r.hotness.clone())
-                .unwrap_or_default()
-        };
-    let mut plan = mummu::tier::plan_tiers(&planner_devices, &costs, &hotness)?;
-    // Every layer keeps at least one local cluster (its mlp must exist).
-    let mut forced = 0usize;
-    for l in 0..layers {
-        if !(0..epl).any(|c| plan.tiers[l * epl + c].device == main_idx) {
-            let c = (0..epl)
-                .max_by(|&a, &b| {
-                    let ha = hotness.get(l * epl + a).copied().unwrap_or(0.0);
-                    let hb = hotness.get(l * epl + b).copied().unwrap_or(0.0);
-                    ha.partial_cmp(&hb).unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .unwrap_or(0);
-            plan.tiers[l * epl + c] = mummu::tier::Tier {
-                device: main_idx,
-                precision: slab_level,
-            };
-            forced += 1;
-        }
-    }
-    if forced > 0 {
-        eprintln!(
-            "[mummu-serve] tiers: forced one local FFN cluster on {} layers (budget was full)",
-            forced
-        );
-    }
-    for ((d, p), n) in plan.histogram() {
-        eprintln!(
-            "[mummu-serve] tiers: {n} FFN clusters on {} @ {p:?} ({:.1} GiB budget there{})",
-            devices[d].1.name,
-            devices[d].1.budget_bytes as f64 / f64::from(1u32 << 30),
-            if d == main_idx { ", local slab" } else { "" }
-        );
-    }
+    let plan = plan_partitioned_tiers(&devices, &costs, &part, pack_dir, main_idx, slab_level)?;
     let local: Vec<Vec<usize>> = (0..layers)
         .map(|l| {
             (0..epl)
@@ -1810,6 +1818,124 @@ fn build_partitioned_qwen35(
         &|l| local[l].clone(),
     )
     .map_err(|e| e.to_string())?;
+    // The trunk and the local clusters are down; the remote clusters are a
+    // second pass over the pack, layer by layer. Counted in LAYERS, because
+    // that is the loop's own unit — a cluster count would be a number that
+    // moves in jumps of 30 whenever one group covers a whole layer. The unit
+    // is passed rather than assumed: the trunk pass above counted tensors,
+    // and a bar that restarts at 0/64 under the word "tensors" is not a
+    // rounding error, it is a different quantity (`progress::Unit`).
+    mummu::progress::begin(
+        mummu::progress::Phase::Loading,
+        layers as u64,
+        mummu::progress::Unit::Layers,
+    );
+    let rows = load_remote_ffn_rows(&pack, &plan, &costs, &devices, main_idx, layers, epl)?;
+    let pool = std::sync::Arc::new(mummu::nn::ExpertPool::new(rows));
+    // The cubecl device-server threads exist now (the load used every
+    // device); lift them above the gemm pools or every remote drain waits
+    // out scheduler quanta instead of GPU time.
+    mummu::backend::boost_device_server_threads();
+    let used = pool.used_bytes(devices.len());
+    eprintln!(
+        "[mummu-serve] partitioned FFN resident in {:.0}s — remote {}",
+        started.elapsed().as_secs_f32(),
+        devices
+            .iter()
+            .zip(&used)
+            .filter(|((b, _), _)| *b != main)
+            .map(|((_, d), u)| format!("{} {:.2} GiB", d.name, gib(*u)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    arm_placement_controller(&devices, main_idx);
+    let tau = ffn_skip_tau(&part, &pack.manifest.source_file);
+    // A dense model's placement is static — every cluster runs each token in
+    // exact mode, so there is nothing to re-tier at runtime (the calibrated
+    // hotness already steered the plan). Leave no TierRuntime; the pool is
+    // owned by the model.
+    clear_tiers();
+    Ok(model.with_ffn_pool(pool).with_ffn_skip(tau))
+}
+
+/// The FFN-cluster plan for a partitioned pack: `plan_tiers` over the
+/// calibrated hotness (or the last runtime's, when the shapes match), with
+/// every layer forced to keep at least one local cluster — its mlp must
+/// exist — and the histogram logged.
+fn plan_partitioned_tiers(
+    devices: &[(BackendChoice, mummu::tier::TierDevice)],
+    costs: &[mummu::tier::ExpertCost],
+    part: &mummu::pack::FfnPartition,
+    pack_dir: &Path,
+    main_idx: usize,
+    slab_level: mummu::pack::Precision,
+) -> Result<mummu::tier::TierPlan, String> {
+    let layers = part.layers.len();
+    let epl = part.layers.first().map_or(0, Vec::len);
+    let planner_devices: Vec<mummu::tier::TierDevice> =
+        devices.iter().map(|(_, d)| d.clone()).collect();
+    let hotness: Vec<f64> =
+        if part.hotness.len() == layers && part.hotness.iter().all(|h| h.len() == epl) {
+            part.hotness
+                .iter()
+                .flatten()
+                .map(|&h| f64::from(h))
+                .collect()
+        } else {
+            TIERS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .filter(|r| r.pack_dir == pack_dir && r.hotness.len() == costs.len())
+                .map_or_else(Vec::new, |r| r.hotness.clone())
+        };
+    let mut plan = mummu::tier::plan_tiers(&planner_devices, costs, &hotness)?;
+    // Every layer keeps at least one local cluster (its mlp must exist).
+    let mut forced = 0usize;
+    for l in 0..layers {
+        if !(0..epl).any(|c| plan.tiers[l * epl + c].device == main_idx) {
+            let c = (0..epl)
+                .max_by(|&a, &b| {
+                    let ha = hotness.get(l * epl + a).copied().unwrap_or(0.0);
+                    let hb = hotness.get(l * epl + b).copied().unwrap_or(0.0);
+                    ha.partial_cmp(&hb).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .unwrap_or(0);
+            plan.tiers[l * epl + c] = mummu::tier::Tier {
+                device: main_idx,
+                precision: slab_level,
+            };
+            forced += 1;
+        }
+    }
+    if forced > 0 {
+        eprintln!(
+            "[mummu-serve] tiers: forced one local FFN cluster on {forced} layers (budget was full)"
+        );
+    }
+    for ((d, p), n) in plan.histogram() {
+        eprintln!(
+            "[mummu-serve] tiers: {n} FFN clusters on {} @ {p:?} ({:.1} GiB budget there{})",
+            devices[d].1.name,
+            gib(devices[d].1.budget_bytes),
+            if d == main_idx { ", local slab" } else { "" }
+        );
+    }
+    Ok(plan)
+}
+
+/// The remote FFN clusters, layer by layer: every cluster the plan put on a
+/// device other than `main_idx`, grouped by (device, PRECISION) into one
+/// executor per group — bounded on accelerators, see the loop.
+fn load_remote_ffn_rows(
+    pack: &mummu::pack::Pack,
+    plan: &mummu::tier::TierPlan,
+    costs: &[mummu::tier::ExpertCost],
+    devices: &[(BackendChoice, mummu::tier::TierDevice)],
+    main_idx: usize,
+    layers: usize,
+    epl: usize,
+) -> Result<Vec<Vec<std::sync::Arc<dyn mummu::nn::ExpertExec>>>, String> {
     // Remote clusters grouped by (device, PRECISION): one executor per group,
     // covering every cluster the plan put there at that rung.
     // `load_ffn_clusters` concatenates their ranges, so a group is one matmul
@@ -1824,18 +1950,6 @@ fn build_partitioned_qwen35(
     // loaded the whole group at it, so 107 clusters were silently materialized
     // at a precision the planner never chose, while the byte total added up
     // costs for rungs that were never loaded.
-    // The trunk and the local clusters are down; the remote clusters are a
-    // second pass over the pack, layer by layer. Counted in LAYERS, because
-    // that is the loop's own unit — a cluster count would be a number that
-    // moves in jumps of 30 whenever one group covers a whole layer. The unit
-    // is passed rather than assumed: the trunk pass above counted tensors,
-    // and a bar that restarts at 0/64 under the word "tensors" is not a
-    // rounding error, it is a different quantity (`progress::Unit`).
-    mummu::progress::begin(
-        mummu::progress::Phase::Loading,
-        layers as u64,
-        mummu::progress::Unit::Layers,
-    );
     let mut rows: Vec<Vec<std::sync::Arc<dyn mummu::nn::ExpertExec>>> = Vec::with_capacity(layers);
     for l in 0..layers {
         let mut by_slot: std::collections::BTreeMap<
@@ -1894,7 +2008,7 @@ fn build_partitioned_qwen35(
                 let chunk_bytes = per_cluster * chunk.len() as u64;
                 row.push(load_ffn_group_on(
                     devices[dev].0,
-                    &pack,
+                    pack,
                     l,
                     chunk,
                     tier,
@@ -1905,49 +2019,29 @@ fn build_partitioned_qwen35(
         rows.push(row);
         mummu::progress::advance(rows.len() as u64, pack.bytes_read());
     }
-    let pool = std::sync::Arc::new(mummu::nn::ExpertPool::new(rows));
-    // The cubecl device-server threads exist now (the load used every
-    // device); lift them above the gemm pools or every remote drain waits
-    // out scheduler quanta instead of GPU time.
-    mummu::backend::boost_device_server_threads();
-    let used = pool.used_bytes(devices.len());
-    eprintln!(
-        "[mummu-serve] partitioned FFN resident in {:.0}s — remote {}",
-        started.elapsed().as_secs_f32(),
-        devices
-            .iter()
-            .zip(&used)
-            .filter(|((b, _), _)| *b != main)
-            .map(|((_, d), u)| format!("{} {:.2} GiB", d.name, *u as f64 / f64::from(1u32 << 30)))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    // Arm the placement controller for this model: start where the planner
-    // put us, and let it adapt from measured throughput from here on.
-    {
-        let total = mummu::backend::inventory()
-            .gpus
-            .iter()
-            .filter_map(|g| g.vram_bytes)
-            .max()
-            .unwrap_or(devices[main_idx].1.budget_bytes);
-        // Leave the desktop (and anything else sharing the card) its share.
-        let policy = mummu::adapt::Policy::for_device(total, 2 << 30);
-        *PLACEMENT.lock().unwrap_or_else(|e| e.into_inner()) = Some(mummu::adapt::Controller::new(
-            policy,
-            devices[main_idx].1.budget_bytes,
-        ));
-    }
-    let tau = ffn_skip_tau(&part, &pack.manifest.source_file);
-    // A dense model's placement is static — every cluster runs each token in
-    // exact mode, so there is nothing to re-tier at runtime (the calibrated
-    // hotness already steered the plan). Leave no TierRuntime; the pool is
-    // owned by the model.
-    clear_tiers();
-    Ok(model.with_ffn_pool(pool).with_ffn_skip(tau))
+    Ok(rows)
 }
 
-/// Plan and load every expert of the OLMoE pack at `pack_dir` across the
+/// Arm the placement controller for this model: start where the planner
+/// put us, and let it adapt from measured throughput from here on.
+fn arm_placement_controller(devices: &[(BackendChoice, mummu::tier::TierDevice)], main_idx: usize) {
+    let total = mummu::backend::inventory()
+        .gpus
+        .iter()
+        .filter_map(|g| g.vram_bytes)
+        .max()
+        .unwrap_or(devices[main_idx].1.budget_bytes);
+    // Leave the desktop (and anything else sharing the card) its share.
+    let policy = mummu::adapt::Policy::for_device(total, 2 << 30);
+    *PLACEMENT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(mummu::adapt::Controller::new(
+        policy,
+        devices[main_idx].1.budget_bytes,
+    ));
+}
+
+/// Plan and load every expert of the `OLMoE` pack at `pack_dir` across the
 /// tier devices; records the runtime for re-tiering. The trunk is the
 /// caller's (it goes on `main`).
 fn build_tiered_experts(
@@ -1999,13 +2093,12 @@ fn build_tiered_experts(
     cap_ladders_at_source(&mut devices, &pack);
     charge_trunk_to_its_device(&mut devices, main, trunk, &costs);
     let devices = devices;
-    let hotness = {
-        let g = TIERS.lock().unwrap_or_else(|e| e.into_inner());
-        g.as_ref()
-            .filter(|r| r.pack_dir == pack_dir && r.hotness.len() == costs.len())
-            .map(|r| r.hotness.clone())
-            .unwrap_or_default()
-    };
+    let hotness: Vec<f64> = TIERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .filter(|r| r.pack_dir == pack_dir && r.hotness.len() == costs.len())
+        .map_or_else(Vec::new, |r| r.hotness.clone());
     let planner_devices: Vec<mummu::tier::TierDevice> =
         devices.iter().map(|(_, d)| d.clone()).collect();
     let plan = mummu::tier::plan_tiers(&planner_devices, &costs, &hotness)?;
@@ -2013,10 +2106,48 @@ fn build_tiered_experts(
         eprintln!(
             "[mummu-serve] tiers: {n} experts on {} @ {p:?} ({:.1} GiB budget there)",
             devices[d].1.name,
-            devices[d].1.budget_bytes as f64 / f64::from(1u32 << 30)
+            gib(devices[d].1.budget_bytes)
         );
     }
     let started = Instant::now();
+    let slots = load_expert_rows(&pack, &plan, &devices, layers, epl)?;
+    let pool = std::sync::Arc::new(mummu::nn::ExpertPool::new(slots));
+    let used = pool.used_bytes(devices.len());
+    eprintln!(
+        "[mummu-serve] {} experts resident in {:.0}s — {}",
+        layers * epl,
+        started.elapsed().as_secs_f32(),
+        devices
+            .iter()
+            .zip(&used)
+            .map(|((_, d), u)| format!("{} {:.2} GiB", d.name, gib(*u)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    *TIERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(TierRuntime {
+        pack_dir: pack_dir.to_path_buf(),
+        main,
+        pool: pool.clone(),
+        devices,
+        costs,
+        hotness,
+        plan,
+        experts_per_layer: epl,
+    });
+    Ok(pool)
+}
+
+/// Every expert of the pack, layer by layer, onto the device and at the
+/// tier the plan gave it.
+fn load_expert_rows(
+    pack: &mummu::pack::Pack,
+    plan: &mummu::tier::TierPlan,
+    devices: &[(BackendChoice, mummu::tier::TierDevice)],
+    layers: usize,
+    epl: usize,
+) -> Result<Vec<Vec<std::sync::Arc<dyn mummu::nn::ExpertExec>>>, String> {
     // 64 experts x 16 layers is over a thousand separate reads off the pack;
     // counting them is the only thing that makes this phase determinate.
     // Bytes come from the pack's own read counter, same as the trunk loader's.
@@ -2035,7 +2166,7 @@ fn build_tiered_experts(
             let tier = plan.tiers[layer * epl + index];
             row.push(load_expert_on(
                 devices[tier.device].0,
-                &pack,
+                pack,
                 layer,
                 index,
                 tier,
@@ -2045,30 +2176,7 @@ fn build_tiered_experts(
         }
         slots.push(row);
     }
-    let pool = std::sync::Arc::new(mummu::nn::ExpertPool::new(slots));
-    let used = pool.used_bytes(devices.len());
-    eprintln!(
-        "[mummu-serve] {} experts resident in {:.0}s — {}",
-        layers * epl,
-        started.elapsed().as_secs_f32(),
-        devices
-            .iter()
-            .zip(&used)
-            .map(|((_, d), u)| format!("{} {:.2} GiB", d.name, *u as f64 / f64::from(1u32 << 30)))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    *TIERS.lock().unwrap_or_else(|e| e.into_inner()) = Some(TierRuntime {
-        pack_dir: pack_dir.to_path_buf(),
-        main,
-        pool: pool.clone(),
-        devices,
-        costs,
-        hotness,
-        plan,
-        experts_per_layer: epl,
-    });
-    Ok(pool)
+    Ok(slots)
 }
 
 /// After a request: fold the routing hits into the hotness, re-plan, and
@@ -2088,34 +2196,65 @@ fn rebalance_tiers() {
     });
 }
 
-fn rebalance_inner() -> Result<(), String> {
+/// One bounded batch of expert moves, decided under the tier lock and
+/// applied outside it.
+struct ExpertMoves {
+    pack_dir: std::path::PathBuf,
+    pool: std::sync::Arc<mummu::nn::ExpertPool>,
+    devices: Vec<(BackendChoice, mummu::tier::TierDevice)>,
+    experts_per_layer: usize,
+    moves: Vec<(usize, mummu::tier::Tier)>,
+    /// Moves the bound left for the following passes.
+    pending: usize,
+}
+
+/// Fold the routing hits into the hotness, re-plan, and take the first
+/// [`MAX_MOVES`] moves onto the runtime's plan. `None` when nothing moves.
+fn plan_expert_moves(rt: &mut TierRuntime) -> Result<Option<ExpertMoves>, String> {
     const MAX_MOVES: usize = 16;
     const ALPHA: f64 = 0.3;
-    let (pack_dir, pool, devices, epl, moves, pending) = {
-        let mut g = TIERS.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(rt) = g.as_mut() else { return Ok(()) };
-        let hits = rt.pool.take_hits();
-        mummu::tier::smooth_hotness(&mut rt.hotness, &hits, ALPHA);
-        let planner_devices: Vec<mummu::tier::TierDevice> =
-            rt.devices.iter().map(|(_, d)| d.clone()).collect();
-        let next = mummu::tier::plan_tiers(&planner_devices, &rt.costs, &rt.hotness)?;
-        let mut moves = rt.plan.diff(&next);
-        if moves.is_empty() {
-            return Ok(());
-        }
-        let pending = moves.len().saturating_sub(MAX_MOVES);
-        moves.truncate(MAX_MOVES);
-        for &(i, t) in &moves {
-            rt.plan.tiers[i] = t;
-        }
-        (
-            rt.pack_dir.clone(),
-            rt.pool.clone(),
-            rt.devices.clone(),
-            rt.experts_per_layer,
-            moves,
-            pending,
-        )
+    let hits = rt.pool.take_hits();
+    mummu::tier::smooth_hotness(&mut rt.hotness, &hits, ALPHA);
+    let planner_devices: Vec<mummu::tier::TierDevice> =
+        rt.devices.iter().map(|(_, d)| d.clone()).collect();
+    let next = mummu::tier::plan_tiers(&planner_devices, &rt.costs, &rt.hotness)?;
+    let mut moves = rt.plan.diff(&next);
+    if moves.is_empty() {
+        return Ok(None);
+    }
+    let pending = moves.len().saturating_sub(MAX_MOVES);
+    moves.truncate(MAX_MOVES);
+    for &(i, t) in &moves {
+        rt.plan.tiers[i] = t;
+    }
+    Ok(Some(ExpertMoves {
+        pack_dir: rt.pack_dir.clone(),
+        pool: rt.pool.clone(),
+        devices: rt.devices.clone(),
+        experts_per_layer: rt.experts_per_layer,
+        moves,
+        pending,
+    }))
+}
+
+fn rebalance_inner() -> Result<(), String> {
+    let planned = TIERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_mut()
+        .map(plan_expert_moves)
+        .transpose()?
+        .flatten();
+    let Some(ExpertMoves {
+        pack_dir,
+        pool,
+        devices,
+        experts_per_layer: epl,
+        moves,
+        pending,
+    }) = planned
+    else {
+        return Ok(());
     };
     let pack = mummu::pack::Pack::open(&pack_dir)?;
     let started = Instant::now();
@@ -2230,8 +2369,8 @@ fn mixed_precision(
         "[mummu-serve] precision mix on {}: {} — {:.2} GiB of {:.2} GiB budget{}",
         label_of(backend),
         summary.join(", "),
-        plan.bytes as f64 / f64::from(1u32 << 30),
-        budget as f64 / f64::from(1u32 << 30),
+        gib(plan.bytes),
+        gib(budget),
         if plan.over_budget {
             " (OVER — will spill)"
         } else {
@@ -2304,7 +2443,7 @@ fn charge_trunk_to_its_device(
     if cluster_bytes == 0 {
         return;
     }
-    let units = (trunk_bytes / cluster_bytes) as usize;
+    let units = usize::try_from(trunk_bytes / cluster_bytes).unwrap_or(usize::MAX);
     for (backend, dev) in devices.iter_mut() {
         if *backend == main {
             dev.preload_units = units;
@@ -2333,7 +2472,7 @@ fn source_bits_per_param(pack: &mummu::pack::Pack) -> f64 {
     if params == 0 {
         f64::INFINITY
     } else {
-        pack.manifest.source_bytes as f64 * 8.0 / params as f64
+        f64_from_u64(pack.manifest.source_bytes) * 8.0 / f64_from_u64(params)
     }
 }
 
@@ -2432,10 +2571,7 @@ fn probe_projection_ms(
     let w = pack.tensor::<2>(entry, precision, device).ok()?;
     let k = w.dims()[0];
     let x = Tensor::<2>::zeros([1, k], device);
-    let gemv = || match mummu::nn::try_q4s_gemv(&x, &w) {
-        Some(y) => y,
-        None => x.clone().matmul(w.clone()),
-    };
+    let gemv = || mummu::nn::try_q4s_gemv(&x, &w).unwrap_or_else(|| x.clone().matmul(w.clone()));
     let touch = |y: burn::tensor::Tensor<2>| {
         // Force the device to finish; wgpu readbacks are deferred-mapped, so
         // the fence surfaces at the first touch of the bytes, not here.
@@ -2479,7 +2615,7 @@ fn host_dram_gbps() -> f64 {
             std::hint::black_box(s);
             best = best.min(t0.elapsed().as_secs_f64());
         }
-        (words * 8) as f64 / best / 1e9
+        f64_from_usize(words * 8) / best / 1e9
     })
 }
 
@@ -2495,12 +2631,13 @@ fn host_probe_floor_ms(pack: &mummu::pack::Pack, precision: mummu::pack::Precisi
     let &[k, n] = entry.shape.as_slice() else {
         return None;
     };
+    let numel = f64_from_usize(k * n);
     let bytes = match precision {
         // Packed nibbles + f16 scales per 32-group (the VNNI twin's stream).
-        mummu::pack::Precision::Q4 => (k * n) as f64 * (0.5 + 2.0 / 32.0),
-        mummu::pack::Precision::Q8 => (k * n) as f64 * (1.0 + 4.0 / 32.0),
+        mummu::pack::Precision::Q4 => numel * (0.5 + 2.0 / 32.0),
+        mummu::pack::Precision::Q8 => numel * (1.0 + 4.0 / 32.0),
         // flex widens a half blob to f32 on load.
-        mummu::pack::Precision::F16 | mummu::pack::Precision::F32 => (k * n) as f64 * 4.0,
+        mummu::pack::Precision::F16 | mummu::pack::Precision::F32 => numel * 4.0,
     };
     Some(bytes / (host_dram_gbps() * 1e6))
 }
@@ -2610,7 +2747,6 @@ fn residency_line(planned: u64, before: u64, after: u64, label: &str) -> String 
     if observed * 2 < planned {
         return residency_suspect_line(planned, observed, label);
     }
-    let gib = |b: u64| b as f64 / f64::from(1u32 << 30);
     format!(
         "[mummu-serve] residency ok: {:.2} GiB planned, {:.2} GiB resident on {label}",
         gib(planned),
@@ -2627,7 +2763,6 @@ fn residency_line(planned: u64, before: u64, after: u64, label: &str) -> String 
 /// the operator in red — `logs::classify` guesses severity from the text, so
 /// a line that stops reading as an error stops being seen.
 fn residency_suspect_line(planned: u64, observed: u64, label: &str) -> String {
-    let gib = |b: u64| b as f64 / f64::from(1u32 << 30);
     format!(
         "[mummu-serve] RESIDENCY SUSPECT: planned {:.2} GiB on {label}, card grew {:.2} GiB. \
          Either the placement failed and decode is running on the host, which makes the \
@@ -2640,7 +2775,7 @@ fn residency_suspect_line(planned: u64, observed: u64, label: &str) -> String {
 }
 
 /// The pack precision a fit policy denotes.
-fn precision_for(policy: mummu::quant::QuantPolicy) -> mummu::pack::Precision {
+const fn precision_for(policy: mummu::quant::QuantPolicy) -> mummu::pack::Precision {
     use mummu::pack::Precision;
     use mummu::quant::QuantPolicy;
     match policy {
@@ -2649,15 +2784,14 @@ fn precision_for(policy: mummu::quant::QuantPolicy) -> mummu::pack::Precision {
         // loading the smallest thing on disk and demoting from there.
         QuantPolicy::Q2 | QuantPolicy::Q4 => Precision::Q4,
         QuantPolicy::Q8 => Precision::Q8,
-        QuantPolicy::F16 => Precision::F16,
-        // Float placements read the HALF-WIDTH blob: `read_floats` widens it
-        // to the same f32 tensor in RAM, and the disk read halves — the pack
-        // lives on an HDD RAID that pegs at 100% for the whole 8-10 minute
-        // load, and the trunk alone is 37 GB at f32 against 18.5 at f16.
-        // Numerically: f16 rounding is ~1e-3 relative against the f32 blob,
-        // an order below the Q8 rung's measured 5.8e-3 — and both blobs are
-        // upcasts of the same 4.57 bits/param source.
-        QuantPolicy::Off => Precision::F16,
+        // Float placements (`Off`) read the HALF-WIDTH blob, like `F16`:
+        // `read_floats` widens it to the same f32 tensor in RAM, and the disk
+        // read halves — the pack lives on an HDD RAID that pegs at 100% for
+        // the whole 8-10 minute load, and the trunk alone is 37 GB at f32
+        // against 18.5 at f16. Numerically: f16 rounding is ~1e-3 relative
+        // against the f32 blob, an order below the Q8 rung's measured 5.8e-3
+        // — and both blobs are upcasts of the same 4.57 bits/param source.
+        QuantPolicy::F16 | QuantPolicy::Off => Precision::F16,
     }
 }
 
@@ -2672,6 +2806,7 @@ fn ensure_pack(
     spec: &ModelSpec,
 ) -> Result<Option<std::path::PathBuf>, String> {
     use mummu::pack::{Pack, Precision};
+    type ActionMap = Box<dyn Fn(&mummu::gguf::GgufTensorInfo) -> Option<mummu::pack::ImportAction>>;
     if std::env::var("MUMMU_PACK").is_ok_and(|v| v.eq_ignore_ascii_case("off") || v == "0") {
         return Ok(None);
     }
@@ -2691,7 +2826,6 @@ fn ensure_pack(
     );
     let started = Instant::now();
     let header = GgufFile::open(gguf_path).map_err(|e| e.to_string())?;
-    type ActionMap = Box<dyn Fn(&mummu::gguf::GgufTensorInfo) -> Option<mummu::pack::ImportAction>>;
     let map: ActionMap = match spec.architecture {
         Architecture::Qwen35 => {
             let cfg = qwen35::Qwen35Config::from_gguf(&header)?;
@@ -2805,7 +2939,7 @@ fn ensure_partition(pack_dir: &Path, spec: &ModelSpec) -> Result<(), String> {
         .iter()
         .find(|(k, _)| k.ends_with(".block_count"))
         .and_then(|(_, v)| v.as_u64())
-        .map(|n| n as usize)
+        .and_then(|n| usize::try_from(n).ok())
         .ok_or("pack header has no <arch>.block_count")?;
     drop(header);
     eprintln!(
@@ -2878,7 +3012,13 @@ fn estimate_resident_bytes(f: &GgufFile, policy: mummu::quant::QuantPolicy) -> u
     let mut bytes = 0u64;
     for t in &f.tensors {
         let n = t.element_count();
-        let dims_rev: Vec<usize> = t.dims.iter().rev().map(|&d| d as usize).collect();
+        // A dimension past `usize` could not be loaded anyway; saturate.
+        let dims_rev: Vec<usize> = t
+            .dims
+            .iter()
+            .rev()
+            .map(|&d| usize::try_from(d).unwrap_or(usize::MAX))
+            .collect();
         // 3-D expert banks quantize per member; other 2-D weights (minus the
         // embedding) quantize whole. The loaders quantize TRANSPOSED views,
         // so eligibility checks [in, out].
@@ -2914,13 +3054,13 @@ fn estimate_resident_bytes(f: &GgufFile, policy: mummu::quant::QuantPolicy) -> u
         .map(|t| t.element_count() * 4)
         .max()
         .unwrap_or(0);
-    (bytes as f64 * 1.35) as u64 + largest_f32
+    trunc_u64(f64_from_u64(bytes) * 1.35) + largest_f32
 }
 
 /// Make sure `need` bytes of host RAM are free before a load that lands on
 /// the host: when `MemAvailable` is short and the CPU slot holds some other
 /// model, evict it (the alternative is the VM's OOM killer taking the whole
-/// server down — which is exactly what a resident 27B plus a tiered OLMoE
+/// server down — which is exactly what a resident 27B plus a tiered `OLMoE`
 /// did on 2026-08-22). `keep` is the backend the new model's trunk goes to;
 /// its own slot is evicted by `ModelSlot::with` anyway.
 /// How often the host-pressure watcher samples. Reading `MemAvailable` is a
@@ -3034,7 +3174,7 @@ fn ensure_host_room(need: u64, keep: BackendChoice) {
         if SLOT.clear() {
             RESIDENT
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .retain(|(b, _, _)| *b != BackendChoice::Cpu);
             // The model this state called `ready` is the one just evicted;
             // same reason as `unload_all`, and this path reaches it without
@@ -3062,7 +3202,7 @@ static VISION_RESERVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 
 /// Tell the planner how much to keep back for a vision tower. Set per
 /// request in [`run_chat`]; zero for a text-only model.
-pub(crate) fn set_vision_reserve(bytes: u64) {
+pub fn set_vision_reserve(bytes: u64) {
     VISION_RESERVE.store(bytes, SeqCst);
 }
 
@@ -3112,25 +3252,29 @@ fn backend_budget_gross(backend: BackendChoice) -> u64 {
                 ram
             }
         }
-        // A card's budget is measured, never configured: what this process
-        // may occupy under the guard on everyone else's usage, less what it
-        // already holds (`placement::free_for_new`, whose module docs carry
-        // the equations). A configured number was right on one day on one
-        // box — 9 GiB less a vision reserve held for text traffic put 27 of
-        // 64 layers on a card with room for more — and an OOM on any day a
-        // co-tenant grew.
-        _ => {
-            static SAID: std::sync::Once = std::sync::Once::new();
-            SAID.call_once(|| {
-                if std::env::var_os("MUMMU_GPU_BUDGET_GB").is_some() {
-                    eprintln!(
-                        "[mummu-serve] MUMMU_GPU_BUDGET_GB is ignored: the card's budget is measured live (see placement)"
-                    );
-                }
-            });
-            placement::free_for_new(backend)
-        }
+        BackendChoice::Wgpu => measured_card_budget(BackendChoice::Wgpu),
+        #[cfg(feature = "cuda")]
+        BackendChoice::Cuda => measured_card_budget(BackendChoice::Cuda),
     }
+}
+
+/// A card's budget is measured, never configured: what this process may
+/// occupy under the guard on everyone else's usage, less what it already
+/// holds (`placement::free_for_new`, whose module docs carry the equations).
+///
+/// A configured number was right on one day on one box — 9 GiB less a vision
+/// reserve held for text traffic put 27 of 64 layers on a card with room for
+/// more — and an OOM on any day a co-tenant grew.
+fn measured_card_budget(backend: BackendChoice) -> u64 {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| {
+        if std::env::var_os("MUMMU_GPU_BUDGET_GB").is_some() {
+            eprintln!(
+                "[mummu-serve] MUMMU_GPU_BUDGET_GB is ignored: the card's budget is measured live (see placement)"
+            );
+        }
+    });
+    placement::free_for_new(backend)
 }
 
 /// Pick where and how `spec` runs: start from the global backend choice and
@@ -3168,6 +3312,22 @@ fn plan_fit(spec: &ModelSpec, models_root: &Path) -> Result<FitPlan, String> {
     plan_fresh(spec, models_root)
 }
 
+/// The pack under `dir` when tiering is on and its units tier out across
+/// devices: `MoE` experts, partitioned FFN clusters, or a Hadamard-folded
+/// pack, which is never partitioned but places whole layers exactly like a
+/// partitioned dense pack does.
+fn tiered_pack_at(dir: &Path) -> Option<mummu::pack::Pack> {
+    tiers_mode()?;
+    mummu::pack::Pack::open(&dir.join("pack")).ok().filter(|p| {
+        p.manifest.ffn_partition.is_some()
+            || p.manifest
+                .tensors
+                .iter()
+                .any(|t| matches!(t.role, mummu::pack::Role::Expert { .. }))
+            || mummu::partition::pack_is_hadamard_folded(p).unwrap_or(false)
+    })
+}
+
 /// [`plan_fit`] without the "already resident" shortcut: a plan a load can
 /// actually run under.
 fn plan_fresh(spec: &ModelSpec, models_root: &Path) -> Result<FitPlan, String> {
@@ -3201,7 +3361,9 @@ fn plan_fresh(spec: &ModelSpec, models_root: &Path) -> Result<FitPlan, String> {
     // observed live 2026-08-28).
     let dir = spec.dir(models_root);
     {
-        let g = LOADING.lock().unwrap_or_else(|e| e.into_inner());
+        let g = LOADING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some((d, backend, policy)) = g.as_ref()
             && *d == dir
         {
@@ -3217,20 +3379,7 @@ fn plan_fresh(spec: &ModelSpec, models_root: &Path) -> Result<FitPlan, String> {
     let mut gguf: Option<GgufFile> = None;
     // Units that tier out across devices (MoE experts, partitioned FFN
     // clusters) leave only the trunk to fit the preferred backend.
-    let tiered_pack = if tiers_mode().is_some() {
-        mummu::pack::Pack::open(&dir.join("pack")).ok().filter(|p| {
-            p.manifest.ffn_partition.is_some()
-                || p.manifest
-                    .tensors
-                    .iter()
-                    .any(|t| matches!(t.role, mummu::pack::Role::Expert { .. }))
-                // A folded pack is never partitioned but places whole layers
-                // exactly like a partitioned dense pack does.
-                || mummu::partition::pack_is_hadamard_folded(p).unwrap_or(false)
-        })
-    } else {
-        None
-    };
+    let tiered_pack = tiered_pack_at(&dir);
 
     let ladder = |from: QuantPolicy| -> Vec<QuantPolicy> {
         match from {
@@ -3287,14 +3436,13 @@ fn plan_fresh(spec: &ModelSpec, models_root: &Path) -> Result<FitPlan, String> {
         // packed bytes from the pack onto the device, then multiplied — Q4 on
         // wgpu is correct and bit-identical across repeated rounds at this
         // model's dimensions. See `examples/pack-precision-probe.rs`.)
-        let need = match &tiered_pack {
-            Some(pack) => pack_trunk_bytes(pack, precision_for(policy)),
-            None => {
-                if gguf.is_none() {
-                    gguf = Some(GgufFile::open(&path).map_err(|e| e.to_string())?);
-                }
-                estimate_resident_bytes(gguf.as_ref().expect("just opened"), policy)
+        let need = if let Some(pack) = &tiered_pack {
+            pack_trunk_bytes(pack, precision_for(policy))
+        } else {
+            if gguf.is_none() {
+                gguf = Some(GgufFile::open(&path).map_err(|e| e.to_string())?);
             }
+            estimate_resident_bytes(gguf.as_ref().expect("just opened"), policy)
         };
         // Loading evicts the slot's current occupant first — its bytes come
         // back to the budget.
@@ -3308,36 +3456,32 @@ fn plan_fresh(spec: &ModelSpec, models_root: &Path) -> Result<FitPlan, String> {
             evictable >> 30
         );
         if need <= budget {
-            note_resident(backend, dir.clone(), need);
+            note_resident(backend, dir, need);
             return Ok(plan(backend, policy));
         }
     }
     let est = gguf
         .or_else(|| GgufFile::open(&path).ok())
         .map(|f| estimate_resident_bytes(&f, QuantPolicy::Q4) >> 30);
-    Err(match est {
-        Some(gib) => format!(
-            "{} does not fit any backend even at Q4 (needs ~{gib} GiB quantized)",
-            spec.name
-        ),
-        None => format!("{} does not fit any backend even at Q4", spec.name),
-    })
+    Err(est.map_or_else(
+        || format!("{} does not fit any backend even at Q4", spec.name),
+        |gib| {
+            format!(
+                "{} does not fit any backend even at Q4 (needs ~{gib} GiB quantized)",
+                spec.name
+            )
+        },
+    ))
 }
 
-#[allow(clippy::too_many_arguments)] // one call site: one request's worth of parameters
 async fn drive(
     slot: &ModelSlot<Loaded>,
-    spec: &ModelSpec,
-    models_root: &Path,
+    req: &GenerationRequest<'_>,
     prompt: &str,
-    opts: &SamplerOptions,
-    max_tokens: usize,
     plan: FitPlan,
-    format: Option<crate::OutputFormat>,
-    think: bool,
-    images: Vec<mummu::vision::Patches>,
-    mut on_delta: impl FnMut(&str) -> ControlFlow<()>,
+    on_delta: impl FnMut(&str) -> ControlFlow<()>,
 ) -> Result<ChatResult, ChatError> {
+    let (spec, models_root) = (req.spec, req.models_root);
     let key = spec.dir(models_root);
     // Is this request likely to pay for a load? `loaded_key_async` waits for
     // the slot rather than reporting busy, so the answer is the truth and not
@@ -3422,21 +3566,20 @@ async fn drive(
                     flag_key,
                     found_stale.load(SeqCst),
                 );
-                #[allow(clippy::cast_possible_truncation)]
-                load_ms_ref.store(t.elapsed().as_millis() as u64, SeqCst);
+                load_ms_ref.store(crate::millis(t.elapsed()), SeqCst);
                 r
             },
         )
         .await?;
-    #[allow(clippy::cast_possible_truncation)]
-    let acquire_ms = acquire_started.elapsed().as_millis() as u64;
+    let acquire_ms = crate::millis(acquire_started.elapsed());
     let load_ms = load_ms.load(SeqCst);
     let queue_ms = acquire_ms.saturating_sub(load_ms);
     resident_note.loaded = true;
     // DECLARATION ORDER IS DROP ORDER HERE, reversed: the last binding
     // declared is the first one dropped. The progress guard must be declared
     // AFTER the slot guard `m`, so it settles the phase while the slot is
-    // still held.
+    // still held — and it is handed to `serve_held` after `m`, whose
+    // parameters drop in that same reverse order.
     //
     // The other order is a real, if sub-microsecond, window. `m` dropping
     // first frees the slot; the `Load` guard has not run its `Drop` yet, so
@@ -3454,6 +3597,31 @@ async fn drive(
     // no ordering in between. Not an incidental property of where two `let`s
     // happen to sit: this rebinding is the mechanism, and moving it breaks it.
     let progress = armed;
+    serve_held(m, progress, req, prompt, &key, on_delta)
+        .await
+        .map(|mut result| {
+            result.timings.queue_ms = queue_ms;
+            result.timings.load_ms = load_ms;
+            result
+        })
+}
+
+/// The request's own span on a model the slot handed out: warm it, generate,
+/// and — while this request still holds the slot — decide any device failure
+/// and evict the model through the guard.
+///
+/// `m` then `progress`, in that order, because PARAMETER ORDER IS DROP ORDER
+/// HERE, reversed: the progress guard settles the phase before the slot is
+/// released (see `drive`, which hands them over).
+async fn serve_held(
+    mut m: mummu::cache::SlotGuard<'_, Loaded>,
+    progress: LoadProgress,
+    req: &GenerationRequest<'_>,
+    prompt: &str,
+    key: &Path,
+    mut on_delta: impl FnMut(&str) -> ControlFlow<()>,
+) -> Result<ChatResult, ChatError> {
+    let spec = req.spec;
     // The slot handed back a model, so the LOAD is over and it succeeded —
     // said here, at the one line that proves it, rather than inferred later
     // from the first decoded token. Between this point and that token there
@@ -3485,67 +3653,63 @@ async fn drive(
     let mark = recovery::mark();
     // The context this request will actually hold: its prompt, its images'
     // tokens and its budget. Exact now that the tokenizer is at hand.
-    let needs_tower = !images.is_empty();
+    let needs_tower = !req.images.is_empty();
     let ctx = m
         .tokenizer
         .encode(prompt, false)
-        .map_or(prompt.len().div_ceil(3), |e| e.len())
-        + images.iter().map(|p| p.grid_h * p.grid_w).sum::<usize>()
-        + max_tokens;
-    let mut m = m;
+        .map_or_else(|_| prompt.len().div_ceil(3), |e| e.len())
+        + req
+            .images
+            .iter()
+            .map(|p| p.grid_h * p.grid_w)
+            .sum::<usize>()
+        + req.max_tokens;
     // Inside the same catch as the generation: making room for this request
     // moves layers, and a device that fails under a move is decided exactly
     // like one that fails under a token.
     let outcome = AssertUnwindSafe(async {
-        let before = placement::before_request(&mut m, &key, ctx, needs_tower);
-        let r = generate_on(
-            &m,
-            spec,
-            prompt,
-            opts,
-            max_tokens,
-            format,
-            think,
-            &images,
-            models_root,
-            &device,
-            label,
-            &progress,
-            &mut on_delta,
-        )
-        .await;
+        let before = placement::before_request(&mut m, key, ctx, needs_tower);
+        let r = generate_on(&m, req, prompt, &device, label, &progress, &mut on_delta).await;
         (r, before)
     })
     .catch_unwind()
     .await;
     let failure = match outcome {
-        Ok((Ok(mut result), before)) => {
+        Ok((Ok(result), before)) => {
             placement::after_request(ctx, result.tokens, before);
-            result.timings.queue_ms = queue_ms;
-            result.timings.load_ms = load_ms;
             return Ok(result);
         }
         Ok((Err(e), _)) if e.needs_decision() => e.message,
         Ok((Err(e), _)) => return Err(e),
-        Err(payload) => {
-            let message = recovery::payload_text(&*payload);
-            if !(mark.moved() || recovery::is_device_failure(&message)) {
-                // An ordinary bug, not the device's: it unwinds on exactly as
-                // before — the slot is released with the model still in it,
-                // and `recovery::contain` reports an internal error.
-                std::panic::resume_unwind(payload);
-            }
-            message
-        }
+        Err(payload) => device_failure_or_resume(payload, &mark),
     };
     let failed = recovery::attribute(&mark, &m.devices);
     placement::note_device_failure(&failure);
-    let decided = recovery::record_failure(&spec.name, &failed, &recovery::summarize(&failure));
-    // The progress guard settles first (see the declaration order above),
+    let decided = Err(recovery::record_failure(
+        &spec.name,
+        &failed,
+        &recovery::summarize(&failure),
+    ));
+    // The progress guard settles first (see the parameter order above),
     // then the model goes, under the lock.
     drop(progress);
-    evict_held(m, &key, &spec.name);
-    Err(decided)
+    evict_held(m, key, &spec.name);
+    decided
+}
+
+/// The text of a panic the generation raised, when it is the device's
+/// failure; an ordinary bug unwinds on exactly as before — the slot is
+/// released with the model still in it, and `recovery::contain` reports an
+/// internal error.
+fn device_failure_or_resume(
+    payload: Box<dyn std::any::Any + Send>,
+    mark: &recovery::EpochMark,
+) -> String {
+    let message = recovery::payload_text(&*payload);
+    if !(mark.moved() || recovery::is_device_failure(&message)) {
+        std::panic::resume_unwind(payload);
+    }
+    message
 }
 
 /// Head width for a constrained request. The bounded head only guarantees
@@ -3567,7 +3731,9 @@ static TOKEN_BYTES: Mutex<Option<(String, Arc<mummu::constrain::TokenBytes>)>> =
 /// The table for `model`, building it if the cached one is for another
 /// model. One slot, because one model is resident at a time.
 fn token_bytes_for(model: &str, tok: &Tokenizer) -> Arc<mummu::constrain::TokenBytes> {
-    let mut slot = TOKEN_BYTES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut slot = TOKEN_BYTES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some((cached, table)) = slot.as_ref()
         && cached == model
     {
@@ -3584,37 +3750,55 @@ fn token_bytes_for(model: &str, tok: &Tokenizer) -> Arc<mummu::constrain::TokenB
     table
 }
 
-/// The generation itself, on a model the slot handed out. Everything that
-/// can fail here is decided by `drive`, which runs this under
-/// `catch_unwind` while it holds the slot.
-#[allow(clippy::too_many_arguments)] // `drive`'s body, split out to be caught whole
-async fn generate_on(
-    m: &Loaded,
-    spec: &ModelSpec,
-    prompt: &str,
-    opts: &SamplerOptions,
-    max_tokens: usize,
-    format: Option<crate::OutputFormat>,
-    think: bool,
-    images: &[mummu::vision::Patches],
-    models_root: &Path,
-    device: &Device,
-    label: &'static str,
-    progress: &LoadProgress,
-    on_delta: &mut impl FnMut(&str) -> ControlFlow<()>,
-) -> Result<ChatResult, ChatError> {
-    // ChatML renderers leave specials to the tokenizer; the Tulu
-    // render already embeds its own BOS (the real_olmoe.rs pattern).
+/// How many candidates the bounded head must keep for one request.
+///
+/// Greedy reads only the argmax (`k = 1`, where the norm bound prunes
+/// hardest — the first live run measured `k = 1024` evaluating ~91% of the
+/// vocab), sampling reads its `top_k`, and a constrained decode needs a
+/// window wide enough for the grammar to find an admissible token.
+/// Overlapping requests combine via `fetch_max`, and the drop falls back to
+/// the safe env default.
+fn head_k_for(req: &GenerationRequest<'_>) -> usize {
+    match req.format {
+        Some(_) => CONSTRAINED_HEAD_K,
+        None if req.opts.temperature == 0.0 => 1,
+        None => req.opts.top_k,
+    }
+}
+
+/// The rendered prompt, tokenized for `spec`'s family.
+///
+/// `ChatML` renderers leave specials to the tokenizer; the Tulu render already
+/// embeds its own BOS (the `real_olmoe.rs` pattern), so Olmoe is the one
+/// family that does not ask for them again.
+fn encode_prompt(m: &Loaded, spec: &ModelSpec, prompt: &str) -> Result<Vec<u32>, ChatError> {
     let add_special = spec.architecture != Architecture::Olmoe;
-    let prompt_ids = m
+    let ids = m
         .tokenizer
         .encode(prompt, add_special)
         .map_err(|e| format!("prompt encode: {e}"))?
         .get_ids()
         .to_vec();
-    if prompt_ids.is_empty() {
+    if ids.is_empty() {
         return Err("prompt encoded to zero tokens".into());
     }
+    Ok(ids)
+}
+
+/// The generation itself, on a model the slot handed out. Everything that
+/// can fail here is decided by `drive`, which runs this under
+/// `catch_unwind` while it holds the slot.
+async fn generate_on(
+    m: &Loaded,
+    req: &GenerationRequest<'_>,
+    prompt: &str,
+    device: &Device,
+    label: &'static str,
+    progress: &LoadProgress,
+    on_delta: &mut impl FnMut(&str) -> ControlFlow<()>,
+) -> Result<ChatResult, ChatError> {
+    let (spec, opts, max_tokens) = (req.spec, req.opts, req.max_tokens);
+    let prompt_ids = encode_prompt(m, spec, prompt)?;
     // Where the incident's read failed: the first forward over a model
     // whose weights the device never initialized.
     #[cfg(feature = "fault-injection")]
@@ -3631,59 +3815,23 @@ async fn generate_on(
     // caller sees, and the blank line after it goes with it. `think` passes
     // it through untouched. What the filter still holds when the model stops
     // goes out in `conclude`.
-    let mut thinking = (!think).then(crate::think::Filter::default);
-    // Tell the bounded head how many candidates THIS request's
-    // sampler will consult: greedy reads only the argmax (k = 1,
-    // where the norm bound prunes hardest — the first live run
-    // measured k = 1024 evaluating ~91% of the vocab), sampling
-    // reads its top_k. Overlapping requests combine via fetch_max
-    // and the drop falls back to the safe env default.
-    let _head_k = mummu::flex::head::RequestTopK::set(match format {
-        Some(_) => CONSTRAINED_HEAD_K,
-        None if opts.temperature == 0.0 => 1,
-        None => opts.top_k,
-    });
+    let mut thinking = (!req.think).then(crate::think::Filter::default);
+    // Tell the bounded head how many candidates THIS request's sampler will
+    // consult; the guard must outlive the decode, so it is bound here.
+    let _head_k = mummu::flex::head::RequestTopK::set(head_k_for(req));
     // The grammar, if one was asked for. Held here so it outlives the
     // borrow the decode loop takes on it.
-    let mut constraint = format.map(|f| match f {
+    let mut constraint = req.format.map(|f| match f {
         crate::OutputFormat::Json => {
             mummu::constrain::JsonConstraint::new(token_bytes_for(&spec.name, &m.tokenizer))
         }
     });
-    // Images, if any: run the tower and match its tokens to the placeholder
-    // runs the prompt reserved. Both halves refuse loudly on a mismatch —
-    // a misaligned splice is not an error anywhere downstream, it is an
-    // answer about a different picture.
     let vision_started = Instant::now();
-    let placed = if images.is_empty() {
-        Vec::new()
-    } else {
-        let AnyLm::Qwen35(_) = &m.lm else {
-            return Err(format!(
-                "{} is loaded as a text-only architecture and cannot take images",
-                spec.name
-            )
-            .into());
-        };
-        let tower = tower_for(spec, models_root, device)?;
-        let tokens = mummu::vision::VisionTokens::resolve(&m.tokenizer)?;
-        let started = Instant::now();
-        let rows = images
-            .iter()
-            .map(|p| tower.forward(p.to_tensor(device), p.grid_h, p.grid_w, device))
-            .collect::<Result<Vec<_>, _>>()?;
-        eprintln!(
-            "[mummu-serve] vision: {} image(s) encoded in {:?}",
-            rows.len(),
-            started.elapsed()
-        );
-        mummu::vision::place(&prompt_ids, tokens.pad, rows)?
-    };
-    #[allow(clippy::cast_possible_truncation)]
-    let vision_ms = if images.is_empty() {
+    let placed = encode_images(m, req, device, &prompt_ids)?;
+    let vision_ms = if req.images.is_empty() {
         0
     } else {
-        vision_started.elapsed().as_millis() as u64
+        crate::millis(vision_started.elapsed())
     };
     let image_tokens: usize = placed.iter().map(|p| p.rows.dims()[0]).sum();
     // The first token is the boundary between prefill and decode; stamped
@@ -3694,56 +3842,49 @@ async fn generate_on(
     // generation with an error naming the whole future.
     let mut first_token_at: Option<Instant> = None;
     let generation_started = Instant::now();
-
+    // One callback for both decode paths: the text one and the multimodal
+    // one see exactly the same tokens.
+    let mut on_token = |id: u32| {
+        // The first token is where warming ends and the wait the bar
+        // exists for is over. Said here rather than after `generate`
+        // returns, because the rest of a 512-token decode is not a
+        // load and must not keep a progress bar on screen.
+        if ids.is_empty() {
+            progress.ready();
+            // The model's devices computed and read back: whatever
+            // failed on THEM before is behind us (see
+            // `recovery::decide`). Only on them — a token on the host
+            // vouches for nothing on the card.
+            recovery::generation_succeeded(&m.devices);
+        }
+        if first_token_at.is_none() {
+            first_token_at = Some(Instant::now());
+        }
+        ids.push(id);
+        emit_delta(
+            &m.tokenizer,
+            &ids,
+            &keep,
+            &mut emitted,
+            thinking.as_mut(),
+            on_delta,
+        )
+    };
+    let constraint = constraint
+        .as_mut()
+        .map(|c| c as &mut dyn mummu::constrain::Constraint);
     let out = if let (AnyLm::Qwen35(vlm), false) = (&m.lm, placed.is_empty()) {
         mummu::models::generate_multimodal(
             vlm,
-            &prompt_ids,
-            &placed,
-            max_tokens,
-            opts,
-            device,
-            |id| {
-                // The first token is where warming ends and the wait the bar
-                // exists for is over. Said here rather than after `generate`
-                // returns, because the rest of a 512-token decode is not a
-                // load and must not keep a progress bar on screen.
-                if ids.is_empty() {
-                    progress.ready();
-                    // The model's devices computed and read back: whatever
-                    // failed on THEM before is behind us (see
-                    // `recovery::decide`). Only on them — a token on the host
-                    // vouches for nothing on the card.
-                    recovery::generation_succeeded(&m.devices);
-                }
-                if first_token_at.is_none() {
-                    first_token_at = Some(Instant::now());
-                }
-                ids.push(id);
-                // Incremental decode: re-decode the whole tail and emit the
-                // suffix beyond what was already streamed. A trailing U+FFFD
-                // means we're mid-way through a multi-byte char — hold the
-                // delta until the next token completes it.
-                let Ok(text) = decode_answer(&m.tokenizer, &ids, &keep) else {
-                    return ControlFlow::Continue(());
-                };
-                if text.ends_with('\u{FFFD}') || text.len() <= emitted.len() {
-                    return ControlFlow::Continue(());
-                }
-                let delta = text[emitted.len()..].to_string();
-                emitted = text;
-                let visible = match thinking.as_mut() {
-                    Some(f) => f.push(&delta),
-                    None => delta,
-                };
-                if visible.is_empty() {
-                    return ControlFlow::Continue(());
-                }
-                on_delta(&visible)
+            &mummu::models::MultimodalPrompt {
+                ids: &prompt_ids,
+                placed: &placed,
+                max_tokens,
+                opts,
+                device,
             },
-            constraint
-                .as_mut()
-                .map(|c| c as &mut dyn mummu::constrain::Constraint),
+            &mut on_token,
+            constraint,
         )
         .await?
     } else {
@@ -3752,63 +3893,22 @@ async fn generate_on(
             max_tokens,
             opts,
             device,
-            |id| {
-                if ids.is_empty() {
-                    progress.ready();
-                    recovery::generation_succeeded(&m.devices);
-                }
-                if first_token_at.is_none() {
-                    first_token_at = Some(Instant::now());
-                }
-                ids.push(id);
-                let Ok(text) = decode_answer(&m.tokenizer, &ids, &keep) else {
-                    return ControlFlow::Continue(());
-                };
-                if text.ends_with('\u{FFFD}') || text.len() <= emitted.len() {
-                    return ControlFlow::Continue(());
-                }
-                let delta = text[emitted.len()..].to_string();
-                emitted = text;
-                let visible = match thinking.as_mut() {
-                    Some(f) => f.push(&delta),
-                    None => delta,
-                };
-                if visible.is_empty() {
-                    return ControlFlow::Continue(());
-                }
-                on_delta(&visible)
-            },
-            constraint
-                .as_mut()
-                .map(|c| c as &mut dyn mummu::constrain::Constraint),
+            &mut on_token,
+            constraint,
         )
         .await?
     };
 
     let text = decode_answer(&m.tokenizer, &out, &keep).map_err(|e| format!("decode: {e}"))?;
     let text = conclude(thinking, text, max_tokens, on_delta)?;
-    let elapsed_ms = start.elapsed().as_millis();
-    // Every completed generation is one placement's worth of evidence.
-    observe_placement(out.len(), elapsed_ms);
-    // The in-situ bandwidth ledger (SPEC P1.1): per-shape
-    // beta_hat = bytes/dt on the production GEMV/GEMM path — the
-    // instrument for the live ~2-3x inflation over the quiet
-    // microbench. Per-request so the numbers attribute to a
-    // workload, reset so requests do not smear together.
-    if std::env::var("MUMMU_INSITU_REPORT").is_ok_and(|v| v != "0") {
-        eprint!("{}", mummu::flex::insitu::report());
-        mummu::flex::insitu::reset();
-    }
-    if matches!(&m.lm, AnyLm::OlmoeQ(q) if q.pool.is_some()) {
-        rebalance_tiers();
-    }
+    let elapsed_ms = crate::millis(start.elapsed());
+    after_generation(m, out.len(), elapsed_ms);
     let generation_done = Instant::now();
     let first = first_token_at.unwrap_or(generation_done);
-    #[allow(clippy::cast_possible_truncation)]
     let timings = crate::trace::Timings {
         vision_ms,
-        prefill_ms: first.duration_since(generation_started).as_millis() as u64,
-        decode_ms: generation_done.duration_since(first).as_millis() as u64,
+        prefill_ms: crate::millis(first.duration_since(generation_started)),
+        decode_ms: crate::millis(generation_done.duration_since(first)),
         prompt_tokens: prompt_ids.len(),
         image_tokens,
         completion_tokens: out.len(),
@@ -3822,6 +3922,92 @@ async fn generate_on(
         timings,
         tool_calls: Vec::new(),
     })
+}
+
+/// Stream what a new token adds. Incremental decode: re-decode the whole
+/// tail and emit the suffix beyond what was already streamed. A trailing
+/// U+FFFD means we're mid-way through a multi-byte char — hold the delta
+/// until the next token completes it. Through the think filter when the
+/// request did not ask to see the thinking.
+fn emit_delta(
+    tok: &Tokenizer,
+    ids: &[u32],
+    keep: &[u32],
+    emitted: &mut String,
+    thinking: Option<&mut crate::think::Filter>,
+    on_delta: &mut impl FnMut(&str) -> ControlFlow<()>,
+) -> ControlFlow<()> {
+    let Ok(text) = decode_answer(tok, ids, keep) else {
+        return ControlFlow::Continue(());
+    };
+    if text.ends_with('\u{FFFD}') || text.len() <= emitted.len() {
+        return ControlFlow::Continue(());
+    }
+    let delta = text[emitted.len()..].to_string();
+    *emitted = text;
+    let visible = match thinking {
+        Some(f) => f.push(&delta),
+        None => delta,
+    };
+    if visible.is_empty() {
+        return ControlFlow::Continue(());
+    }
+    on_delta(&visible)
+}
+
+/// Images, if any: run the tower and match its tokens to the placeholder
+/// runs the prompt reserved. Both halves refuse loudly on a mismatch — a
+/// misaligned splice is not an error anywhere downstream, it is an answer
+/// about a different picture.
+fn encode_images(
+    m: &Loaded,
+    req: &GenerationRequest<'_>,
+    device: &Device,
+    prompt_ids: &[u32],
+) -> Result<Vec<mummu::vision::Placed>, ChatError> {
+    if req.images.is_empty() {
+        return Ok(Vec::new());
+    }
+    let AnyLm::Qwen35(_) = &m.lm else {
+        return Err(format!(
+            "{} is loaded as a text-only architecture and cannot take images",
+            req.spec.name
+        )
+        .into());
+    };
+    let tower = tower_for(req.spec, req.models_root, device)?;
+    let tokens = mummu::vision::VisionTokens::resolve(&m.tokenizer)?;
+    let started = Instant::now();
+    let rows = req
+        .images
+        .iter()
+        .map(|p| tower.forward(p.to_tensor(device), p.grid_h, p.grid_w, device))
+        .collect::<Result<Vec<_>, _>>()?;
+    eprintln!(
+        "[mummu-serve] vision: {} image(s) encoded in {:?}",
+        rows.len(),
+        started.elapsed()
+    );
+    Ok(mummu::vision::place(prompt_ids, tokens.pad, rows)?)
+}
+
+/// What every completed generation owes: one placement sample, the in-situ
+/// bandwidth ledger, and a re-tier for a tiered `MoE`.
+fn after_generation(m: &Loaded, tokens: usize, elapsed_ms: u64) {
+    // Every completed generation is one placement's worth of evidence.
+    observe_placement(tokens, elapsed_ms);
+    // The in-situ bandwidth ledger (SPEC P1.1): per-shape
+    // beta_hat = bytes/dt on the production GEMV/GEMM path — the
+    // instrument for the live ~2-3x inflation over the quiet
+    // microbench. Per-request so the numbers attribute to a
+    // workload, reset so requests do not smear together.
+    if std::env::var("MUMMU_INSITU_REPORT").is_ok_and(|v| v != "0") {
+        eprint!("{}", mummu::flex::insitu::report());
+        mummu::flex::insitu::reset();
+    }
+    if matches!(&m.lm, AnyLm::OlmoeQ(q) if q.pool.is_some()) {
+        rebalance_tiers();
+    }
 }
 
 /// The answer, once the model has stopped: the stream is sent what its
@@ -4010,7 +4196,8 @@ fn evict_held(m: mummu::cache::SlotGuard<'_, Loaded>, dir: &Path, model: &str) {
     clear_tiers_if_slot(m.backend);
     placement::forget(None);
     forget_resident(dir);
-    m.evict();
+    // The evicted key is `dir`, which the line below already names.
+    let _evicted = m.evict();
     mummu::progress::evicted();
     eprintln!(
         "[mummu-serve] recovery: dropped {model} from the model slot — it was loaded before this \
@@ -4046,7 +4233,7 @@ mod plan_fit_tests {
     fn a_load_in_flight_answers_plan_fit_without_disk() {
         // `LOADING` is one process-wide flag, and the tests that drive the
         // real engine set and clear it with every load they run.
-        let _serial = crate::progress_serial();
+        let _serial = crate::progress_serial_blocking();
         let spec = ModelSpec {
             name: "qwen35-test-loading".into(),
             repo: "test/loading".into(),
@@ -4084,13 +4271,13 @@ mod plan_fit_tests {
     fn a_load_that_did_not_land_takes_its_resident_note_back() {
         // Serialized with the tests that evict (which clear every note), and
         // a backend and dir no other test notes.
-        let _serial = crate::progress_serial();
+        let _serial = crate::progress_serial_blocking();
         let backend = BackendChoice::IntegratedGpu;
         let dir = std::path::PathBuf::from("resident-note-test-dir");
         let noted = || {
             RESIDENT
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .iter()
                 .any(|(b, d, _)| *b == backend && *d == dir)
         };
@@ -4110,14 +4297,14 @@ mod plan_fit_tests {
         assert!(noted(), "a load that landed must stay noted");
         RESIDENT
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|(b, d, _)| !(*b == backend && *d == dir));
     }
 }
 
 /// The 27B this project actually serves, for tests of its placement terms.
 #[cfg(test)]
-fn cfg_27b_for_tests() -> qwen35::Qwen35Config {
+const fn cfg_27b_for_tests() -> qwen35::Qwen35Config {
     qwen35::Qwen35Config {
         vocab_size: 248_320,
         hidden_size: 5120,
@@ -4151,7 +4338,9 @@ mod host_watch_tests {
 
     #[test]
     fn the_floor_defaults_and_is_overridable_in_gib() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // SAFETY: single-threaded within this test, serialized by ENV_LOCK.
         unsafe { std::env::remove_var("MUMMU_HOST_FLOOR_GB") };
         assert_eq!(host_floor_bytes(), HOST_FLOOR_BYTES, "default floor");
@@ -4289,7 +4478,7 @@ mod observability_tests {
     /// the phase must be exactly what it was.
     #[test]
     fn a_progress_cell_that_was_never_armed_touches_nothing() {
-        let _serial = crate::progress_serial();
+        let _serial = crate::progress_serial_blocking();
         mummu::progress::idle();
         let before = snapshot();
         {
@@ -4343,7 +4532,7 @@ mod observability_tests {
     /// returns to Idle when the cell drops.
     #[test]
     fn an_armed_progress_cell_covers_the_load_and_resets_on_drop() {
-        let _serial = crate::progress_serial();
+        let _serial = crate::progress_serial_blocking();
         {
             let p = LoadProgress::default();
             p.begin("qwen3.5-2b");
@@ -4374,7 +4563,7 @@ mod observability_tests {
     /// the guard drops — so one of them stands for all three.
     #[test]
     fn a_load_that_lands_without_a_token_still_reports_the_model_it_holds() {
-        let _serial = crate::progress_serial();
+        let _serial = crate::progress_serial_blocking();
         {
             let p = LoadProgress::default();
             p.begin("qwen3.5-2b");
@@ -4402,7 +4591,7 @@ mod observability_tests {
     /// Ready, which survives the drop.
     #[test]
     fn a_progress_cell_that_reached_a_token_settles_on_ready() {
-        let _serial = crate::progress_serial();
+        let _serial = crate::progress_serial_blocking();
         {
             let p = LoadProgress::default();
             p.begin("qwen3.5-2b");
@@ -4418,7 +4607,7 @@ mod observability_tests {
     /// `ready — qwen3.5-2b` next to a RAM gauge 7 GiB lighter.
     #[test]
     fn an_unload_retracts_the_ready_claim() {
-        let _serial = crate::progress_serial();
+        let _serial = crate::progress_serial_blocking();
         {
             let p = LoadProgress::default();
             p.begin("qwen3.5-2b");
@@ -4494,29 +4683,32 @@ mod observability_tests {
 /// (At the end of the file with the other test modules: a test above reads
 /// this file's code up to its first `#[cfg(test)]`.)
 #[cfg(all(test, feature = "fault-injection"))]
-pub(crate) mod test_support {
+pub mod test_support {
     use super::*;
 
     /// Nothing resident and nothing noted. (`LOADING` is left alone: its
-    /// guard clears it, and a plan_fit test that does not hold
+    /// guard clears it, and a `plan_fit` test that does not hold
     /// `progress_serial` relies on it while it runs.)
-    pub(crate) fn reset() {
+    pub fn reset() {
         clear_tiers();
         SLOT.clear();
-        RESIDENT.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        RESIDENT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
 
     /// Note `dir` resident on `backend`, exactly as `plan_fit`'s GGUF ladder
     /// does when it plans a load.
-    pub(crate) fn note(backend: BackendChoice, dir: &Path) {
+    pub fn note(backend: BackendChoice, dir: &Path) {
         note_resident(backend, dir.to_path_buf(), 1 << 20);
     }
 
     /// Is `dir` noted resident anywhere?
-    pub(crate) fn noted(dir: &Path) -> bool {
+    pub fn noted(dir: &Path) -> bool {
         RESIDENT
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .any(|(_, d, _)| d == dir)
     }
@@ -4538,7 +4730,10 @@ static TOWER: Mutex<Option<(std::path::PathBuf, Arc<mummu::vision::VisionTower>)
 /// Is a vision tower resident? Its bytes are then already in our pool's
 /// in-use count, so a request that needs it needs no room made.
 fn tower_resident() -> bool {
-    TOWER.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    TOWER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some()
 }
 
 /// Drop the resident tower, if any (the placement watch does this after it
@@ -4547,7 +4742,7 @@ fn tower_resident() -> bool {
 fn drop_tower() -> bool {
     TOWER
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take()
         .is_some()
 }
@@ -4562,7 +4757,9 @@ fn mmproj_path(spec: &ModelSpec, models_root: &Path) -> Option<std::path::PathBu
         .filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("mmproj") && n.ends_with(".gguf"))
+                .is_some_and(|n| n.starts_with("mmproj"))
+                && p.extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
         })
         .collect();
     // Deterministic when a directory holds both an F16 and a BF16 tower.
@@ -4617,7 +4814,9 @@ fn tower_for(
         )
     })?;
     placement::note_tower_use();
-    let mut slot = TOWER.lock().unwrap_or_else(|e| e.into_inner());
+    let mut slot = TOWER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some((cached, tower)) = slot.as_ref()
         && cached == &path
     {
@@ -4631,6 +4830,7 @@ fn tower_for(
         started.elapsed()
     );
     *slot = Some((path, Arc::clone(&tower)));
+    drop(slot);
     Ok(tower)
 }
 
@@ -4755,7 +4955,7 @@ mod template_tests {
         // A family with no reader is never lifted, whatever the text says.
         let mut r = answered("<tool_call>{\"name\": \"x\"}</tool_call>");
         lift_tool_calls(Architecture::Olmoe, &mut r);
-        assert!(r.tool_calls.is_empty());
+        assert_eq!(r.tool_calls, [] as [mummu::chat::ToolCall; 0]);
     }
 
     const LFM_CALL: &str = "<|tool_call_start|>[get_weather(city=\"Paris\")]<|tool_call_end|>";
@@ -4858,8 +5058,8 @@ mod template_tests {
             "Checking. [get_weather(city=\"Paris\")]"
         );
         // A family whose tags are not these keeps nothing extra.
-        assert!(preserved_tokens(&tok, Architecture::Qwen3).is_empty());
-        assert!(preserved_tokens(&tok, Architecture::Olmoe).is_empty());
+        assert_eq!(preserved_tokens(&tok, Architecture::Qwen3), [] as [u32; 0]);
+        assert_eq!(preserved_tokens(&tok, Architecture::Olmoe), [] as [u32; 0]);
     }
 
     /// A request that asked to see the thinking gets it in `text`, and a
@@ -4886,7 +5086,7 @@ mod template_tests {
         let only = format!("{drafted}I'd need a city.");
         let mut r = answered(&only);
         lift_tool_calls(Architecture::Qwen3, &mut r);
-        assert!(r.tool_calls.is_empty());
+        assert_eq!(r.tool_calls, [] as [mummu::chat::ToolCall; 0]);
         assert_eq!(r.text, only);
     }
 }
@@ -4910,10 +5110,9 @@ mod conclude_tests {
         };
         let mut thinking = (!think).then(Filter::default);
         for d in deltas {
-            let visible = match thinking.as_mut() {
-                Some(f) => f.push(d),
-                None => (*d).to_owned(),
-            };
+            let visible = thinking
+                .as_mut()
+                .map_or_else(|| (*d).to_owned(), |f| f.push(d));
             if !visible.is_empty() {
                 let _ = on_delta(&visible);
             }

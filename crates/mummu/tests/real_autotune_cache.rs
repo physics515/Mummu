@@ -1,8 +1,8 @@
-//! Real-GPU proof for `mummu::tune`: CubeCL really does persist autotune
+//! Real-GPU proof for `mummu::tune`: `CubeCL` really does persist autotune
 //! picks to the directory we report, and clearing it really does remove them.
 //!
 //! This test deliberately deletes the cache — its own crate's, never the
-//! benchmark crate's. CubeCL resolves the cache root by walking up from the
+//! benchmark crate's. `CubeCL` resolves the cache root by walking up from the
 //! process CWD for a `Cargo.toml`, and cargo runs these tests with CWD =
 //! `crates/mummu`, so the tree touched here is `crates/mummu/target/autotune`
 //! while the recorded benchmark numbers keep tuning out of
@@ -12,13 +12,16 @@
 //! cargo test -p mummu --release --test real_autotune_cache -- --ignored --nocapture
 //! ```
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use std::time::{Duration, Instant};
 
 use burn::tensor::Tensor;
 use mummu::backend::use_gpu;
 use mummu::tune::{autotune_cache_report, clear_autotune_cache};
+use mummu_num::f32_from_usize;
 
-/// Square matmul side. Big enough that CubeCL autotunes it (and small enough
+/// Square matmul side. Big enough that `CubeCL` autotunes it (and small enough
 /// to stay well inside any GPU's memory).
 const N: usize = 512;
 /// Matmuls run to provoke tuning.
@@ -54,7 +57,7 @@ fn autotune_picks_are_persisted_where_we_report_and_clearing_removes_them() {
     // back so the work is actually executed rather than queued.
     let device = mummu::backend::gpu_device();
     for round in 0..ROUNDS {
-        let a = Tensor::<2>::ones([N, N], &device).mul_scalar(1.0 + round as f32);
+        let a = Tensor::<2>::ones([N, N], &device).mul_scalar(1.0 + f32_from_usize(round));
         let b = Tensor::<2>::ones([N, N], &device);
         let sum = a
             .matmul(b)

@@ -10,6 +10,8 @@
 //! Exact: the model is unchanged (neurons reordered), every stored level
 //! rewritten from the permuted f32. Crash-safe per layer via a journal.
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use std::path::PathBuf;
 use std::time::Instant;
 

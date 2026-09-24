@@ -22,90 +22,87 @@
 //! cargo run --release -p mummu --features cuda --example qmatmul-probe   # + cuda
 //! ```
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use std::time::Instant;
 
 use burn::tensor::{Device, Distribution, Tensor};
 use mummu::quant::{QuantPolicy, quantize_weight};
 
+/// Timed runs per quantized arm. Timing discipline: warm once (autotune +
+/// kernel compile land there, and a cold call reads ~20x its steady cost),
+/// then average this many runs. A single-shot number measures launch
+/// latency, not throughput.
+const RUNS: u32 = 20;
+
+/// One quantized arm: warm once and read the result back, then time `RUNS`
+/// matmuls of `act` against `qw` — dequantized on-device first when
+/// `dequantize` is set. Returns the warm result and seconds per run.
+fn timed_arm(act: &Tensor<2>, qw: &Tensor<2>, dequantize: bool) -> (Vec<f32>, f64) {
+    let rhs = || {
+        if dequantize {
+            qw.clone().dequantize()
+        } else {
+            qw.clone()
+        }
+    };
+    let warm = act.clone().matmul(rhs()).into_data();
+    let out = warm.convert::<f32>().try_to_vec::<f32>().expect("readback");
+    let started = Instant::now();
+    for _ in 0..RUNS {
+        let _ = act.clone().matmul(rhs()).into_data();
+    }
+    (out, started.elapsed().as_secs_f64() / f64::from(RUNS))
+}
+
 fn probe(label: &str, device: &Device) {
     println!("\n=== {label} ===");
     // Decode shape: one token against a 27B-sized projection.
     let (m, k, n) = (1usize, 5120usize, 6144usize);
-    let x = Tensor::<2>::random([m, k], Distribution::Default, device);
-    let w = Tensor::<2>::random([k, n], Distribution::Default, device);
+    let act = Tensor::<2>::random([m, k], Distribution::Default, device);
+    let weight = Tensor::<2>::random([k, n], Distribution::Default, device);
 
     // Reference: plain f32 matmul.
-    let want = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        x.clone()
-            .matmul(w.clone())
+    let Ok(want) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        act.clone()
+            .matmul(weight.clone())
             .into_data()
             .convert::<f32>()
             .try_to_vec::<f32>()
             .expect("f32 readback")
-    })) {
-        Ok(v) => v,
-        Err(_) => {
-            println!("  f32 matmul PANICKED — backend unusable here");
-            return;
-        }
+    })) else {
+        println!("  f32 matmul PANICKED — backend unusable here");
+        return;
     };
 
     // The floor: same shape, plain f32, warm + averaged.
     {
-        let _ = x.clone().matmul(w.clone()).into_data();
-        let t = Instant::now();
+        let _ = act.clone().matmul(weight.clone()).into_data();
+        let started = Instant::now();
         for _ in 0..20 {
-            let _ = x.clone().matmul(w.clone()).into_data();
+            let _ = act.clone().matmul(weight.clone()).into_data();
         }
         println!(
             "  f32 matmul (floor): {:.2} ms",
-            t.elapsed().as_secs_f64() * 1e3 / 20.0
+            started.elapsed().as_secs_f64() * 1e3 / 20.0
         );
     }
 
     for policy in [QuantPolicy::Q8, QuantPolicy::Q4] {
-        let qw = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            quantize_weight(policy, w.clone())
-        })) {
-            Ok(q) => q,
-            Err(_) => {
-                println!("  {policy:?}: quantize PANICKED");
-                continue;
-            }
+        let Ok(qw) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            quantize_weight(policy, weight.clone())
+        })) else {
+            println!("  {policy:?}: quantize PANICKED");
+            continue;
         };
 
-        // Timing discipline: warm once (autotune + kernel compile land here,
-        // and a cold call reads ~20x its steady cost), then average N runs.
-        // A single-shot number measures launch latency, not throughput.
-        const N: u32 = 20;
-
         // (1) does a QUANTIZED matmul run at all?
-        let direct = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let warm = x.clone().matmul(qw.clone()).into_data();
-            let out = warm
-                .convert::<f32>()
-                .try_to_vec::<f32>()
-                .expect("q readback");
-            let t = Instant::now();
-            for _ in 0..N {
-                let _ = x.clone().matmul(qw.clone()).into_data();
-            }
-            (out, t.elapsed().as_secs_f64() / f64::from(N))
-        }));
+        let direct =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| timed_arm(&act, &qw, false)));
 
         // The workaround we ship today: dequantize on-device, then matmul.
-        let deq = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let warm = x.clone().matmul(qw.clone().dequantize()).into_data();
-            let out = warm
-                .convert::<f32>()
-                .try_to_vec::<f32>()
-                .expect("deq readback");
-            let t = Instant::now();
-            for _ in 0..N {
-                let _ = x.clone().matmul(qw.clone().dequantize()).into_data();
-            }
-            (out, t.elapsed().as_secs_f64() / f64::from(N))
-        }));
+        let deq =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| timed_arm(&act, &qw, true)));
 
         match (direct, deq) {
             (Ok((dv, dt)), Ok((qv, qt))) => {

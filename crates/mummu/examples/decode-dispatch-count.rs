@@ -12,8 +12,8 @@
 //!     dispatches_per_token = (count_hi - count_lo) / (tokens_hi - tokens_lo)
 //!
 //! and every fixed cost cancels instead of having to be modelled. The count
-//! itself comes from CubeCL's own profiling logger at `minimal`, which logs
-//! exactly the kernels that run and no timing — so this is CubeCL's count, not
+//! itself comes from `CubeCL`'s own profiling logger at `minimal`, which logs
+//! exactly the kernels that run and no timing — so this is `CubeCL`'s count, not
 //! an inference of ours.
 //!
 //! Run (one process per token count, so each gets a clean log):
@@ -23,6 +23,9 @@
 //!   cargo run --release -p mummu --example decode-dispatch-count -- 8
 //! ```
 //! then again with a different count, and subtract.
+
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use std::path::PathBuf;
 
 use mummu::models::CausalLm;
@@ -66,7 +69,7 @@ fn main() {
 
     // A fixed prompt, so the prefill is byte-identical between the two runs
     // whose counts get subtracted.
-    let prompt: Vec<u32> = vec![151644, 872, 198, 9707, 151645, 198, 151644, 77091, 198];
+    let prompt: Vec<u32> = vec![151_644, 872, 198, 9707, 151_645, 198, 151_644, 77091, 198];
 
     let out = pollster::block_on(loaded.greedy_generate(&prompt, tokens, &device));
     match out {

@@ -14,12 +14,14 @@
 //!   cargo test -p mummu --release --test real_qwen35_partition -- --ignored --nocapture
 //! ```
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use burn::tensor::Tensor;
+use burn::tensor::{Device, Tensor};
 use mummu::models::CausalLm;
-use mummu::models::qwen35;
+use mummu::models::qwen35::{self, LoadedQwen35};
 use mummu::nn::{DeviceExpert, ExpertExec, ExpertPool};
 use mummu::pack::{Pack, Precision};
 use mummu::partition::{FfnNames, partition_pack};
@@ -37,12 +39,14 @@ fn argmax(t: &Tensor<2>) -> u32 {
         .convert::<f32>()
         .try_to_vec::<f32>()
         .unwrap();
-    v.iter()
+    let best = v
+        .iter()
         .enumerate()
         .fold((0usize, f32::NEG_INFINITY), |m, (i, &x)| {
             if x > m.1 { (i, x) } else { m }
         })
-        .0 as u32
+        .0;
+    u32::try_from(best).expect("vocab index fits u32")
 }
 
 fn max_abs(a: &Tensor<2>, b: &Tensor<2>) -> f32 {
@@ -63,7 +67,7 @@ fn remote_pool(
     layers: usize,
     local: usize,
     precision: Precision,
-    device: &burn::tensor::Device,
+    device: &Device,
 ) -> Arc<ExpertPool> {
     let part = pack.manifest.ffn_partition.as_ref().unwrap();
     let rows: Vec<Vec<Arc<dyn ExpertExec>>> = (0..layers)
@@ -87,6 +91,84 @@ fn remote_pool(
         })
         .collect();
     Arc::new(ExpertPool::new(rows))
+}
+
+/// A partitioned copy of the `pack-gate` import at `dst`, made once.
+fn partition_copy_once(src: &Path, dst: &Path, num_layers: usize) {
+    if Pack::is_pack(dst) && Pack::open(dst).unwrap().manifest.ffn_partition.is_some() {
+        return;
+    }
+    let _ = std::fs::remove_dir_all(dst);
+    copy_dir(src, dst);
+    let mut pack = Pack::open(dst).unwrap();
+    let names: Vec<FfnNames> = (0..num_layers)
+        .map(|l| FfnNames {
+            gate: format!("blk.{l}.ffn_gate.weight"),
+            up: format!("blk.{l}.ffn_up.weight"),
+            down: format!("blk.{l}.ffn_down.weight"),
+        })
+        .collect();
+    let t = std::time::Instant::now();
+    partition_pack(
+        &mut pack,
+        &names,
+        mummu::partition::DEFAULT_CLUSTERS,
+        |i, n| {
+            if i % 8 == 0 {
+                eprintln!("[partition-gate] layer {i}/{n}");
+            }
+        },
+    )
+    .expect("partition");
+    eprintln!(
+        "[partition-gate] partitioned in {:.0}s",
+        t.elapsed().as_secs_f32()
+    );
+}
+
+/// The partitioned pack with the first `local` clusters of every layer
+/// local at f32 and the rest remote at `remote` through the pool.
+fn tiered_model(
+    dst: &Path,
+    pack: &Pack,
+    num_layers: usize,
+    local: usize,
+    remote: Precision,
+    device: &Device,
+) -> LoadedQwen35 {
+    let choose_local = |_l: usize| (0..local).collect::<Vec<_>>();
+    qwen35::load_from_pack_partitioned(dst, device, &|_| Precision::F32, &choose_local)
+        .unwrap()
+        .with_ffn_pool(remote_pool(pack, num_layers, local, remote, device))
+}
+
+/// Greedy-decode the prompt through `model` and require the answer to
+/// mention 4.
+async fn assert_answers_four(
+    model: &LoadedQwen35,
+    prompt: &[u32],
+    tok: &tokenizers::Tokenizer,
+    device: &Device,
+) {
+    let ids = model
+        .generate(
+            prompt,
+            64,
+            &mummu::decode::SamplerOptions::greedy(),
+            device,
+            |_| std::ops::ControlFlow::Continue(()),
+        )
+        .await
+        .unwrap();
+    let text = tok.decode(&ids, true).unwrap();
+    eprintln!(
+        "[partition-gate] mixed answer ({} tokens): {text:?}",
+        ids.len()
+    );
+    assert!(
+        text.contains('4'),
+        "expected the answer to mention 4: {text:?}"
+    );
 }
 
 #[tokio::test]
@@ -115,34 +197,7 @@ async fn qwen35_partitioned_ffn_is_exact_when_every_cluster_runs() {
         "run real_qwen35_pack first (creates pack-gate)"
     );
     let dst = path.parent().unwrap().join("pack-gate-part");
-    if !Pack::is_pack(&dst) || Pack::open(&dst).unwrap().manifest.ffn_partition.is_none() {
-        let _ = std::fs::remove_dir_all(&dst);
-        copy_dir(&src, &dst);
-        let mut pack = Pack::open(&dst).unwrap();
-        let names: Vec<FfnNames> = (0..cfg.num_layers)
-            .map(|l| FfnNames {
-                gate: format!("blk.{l}.ffn_gate.weight"),
-                up: format!("blk.{l}.ffn_up.weight"),
-                down: format!("blk.{l}.ffn_down.weight"),
-            })
-            .collect();
-        let t = std::time::Instant::now();
-        partition_pack(
-            &mut pack,
-            &names,
-            mummu::partition::DEFAULT_CLUSTERS,
-            |i, n| {
-                if i % 8 == 0 {
-                    eprintln!("[partition-gate] layer {i}/{n}");
-                }
-            },
-        )
-        .expect("partition");
-        eprintln!(
-            "[partition-gate] partitioned in {:.0}s",
-            t.elapsed().as_secs_f32()
-        );
-    }
+    partition_copy_once(&src, &dst, cfg.num_layers);
     let pack = Pack::open(&dst).unwrap();
     let part = pack.manifest.ffn_partition.as_ref().unwrap();
     let clusters = part.layers[0].len();
@@ -152,7 +207,7 @@ async fn qwen35_partitioned_ffn_is_exact_when_every_cluster_runs() {
         part.layers[0][0].len
     );
 
-    let logits_of = |m: &qwen35::LoadedQwen35| {
+    let logits_of = |m: &LoadedQwen35| {
         let mut cache = m.new_cache();
         m.forward(&prompt, 0, &mut cache, &device)
     };
@@ -175,16 +230,7 @@ async fn qwen35_partitioned_ffn_is_exact_when_every_cluster_runs() {
 
     // 2. Half local / half remote at f32 through the pool: exact.
     let local = clusters / 2;
-    let choose_local = |_l: usize| (0..local).collect::<Vec<_>>();
-    let m = qwen35::load_from_pack_partitioned(&dst, &device, &|_| Precision::F32, &choose_local)
-        .unwrap()
-        .with_ffn_pool(remote_pool(
-            &pack,
-            cfg.num_layers,
-            local,
-            Precision::F32,
-            &device,
-        ));
+    let m = tiered_model(&dst, &pack, cfg.num_layers, local, Precision::F32, &device);
     let tiered = logits_of(&m);
     let d = max_abs(&reference, &tiered);
     eprintln!(
@@ -198,15 +244,7 @@ async fn qwen35_partitioned_ffn_is_exact_when_every_cluster_runs() {
     drop(m);
 
     // 3. Remote half at int8: placement-exact, quantization-noisy.
-    let m = qwen35::load_from_pack_partitioned(&dst, &device, &|_| Precision::F32, &choose_local)
-        .unwrap()
-        .with_ffn_pool(remote_pool(
-            &pack,
-            cfg.num_layers,
-            local,
-            Precision::Q8,
-            &device,
-        ));
+    let m = tiered_model(&dst, &pack, cfg.num_layers, local, Precision::Q8, &device);
     let mixed = logits_of(&m);
     let d = max_abs(&reference, &mixed);
     eprintln!(
@@ -218,25 +256,7 @@ async fn qwen35_partitioned_ffn_is_exact_when_every_cluster_runs() {
         ref_top,
         "int8 remote tier changed the first token"
     );
-    let ids = m
-        .generate(
-            &prompt,
-            64,
-            &mummu::decode::SamplerOptions::greedy(),
-            &device,
-            |_| std::ops::ControlFlow::Continue(()),
-        )
-        .await
-        .unwrap();
-    let text = tok.decode(&ids, true).unwrap();
-    eprintln!(
-        "[partition-gate] mixed answer ({} tokens): {text:?}",
-        ids.len()
-    );
-    assert!(
-        text.contains('4'),
-        "expected the answer to mention 4: {text:?}"
-    );
+    assert_answers_four(&m, &prompt, &tok, &device).await;
 
     // 4. Skipping at a small tau: report the trade honestly (no hard bound —
     // the calibrate tool stores the measured table the planner reads).

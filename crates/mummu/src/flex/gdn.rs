@@ -1,10 +1,10 @@
 //! **The fused host GDN decode step (SPEC P3): one function where nine
 //! dispatches were.**
 //!
-//! A host-resident Gated DeltaNet layer at decode (`t == 1`) spends more on
+//! A host-resident Gated `DeltaNet` layer at decode (`t == 1`) spends more on
 //! *op plumbing* than on arithmetic: the tensor path issues ~9 small Burn
-//! ops (conv window cat/mul/sum, SiLU, three narrows, two L2 norms, a
-//! repeat, the recurrence's five ops, the gated RMSNorm) per layer per
+//! ops (conv window cat/mul/sum, `SiLU`, three narrows, two L2 norms, a
+//! repeat, the recurrence's five ops, the gated `RMSNorm`) per layer per
 //! token, each with dispatch overhead and fresh allocations, over tensors
 //! of a few kilobytes. The information-theoretic floor is two passes over
 //! the recurrent state `S` (~64 KiB/head — L2-resident) plus one sweep
@@ -14,7 +14,7 @@
 //! between the input projections and the output projection — as one
 //! host function on plain `f32` slices:
 //!
-//! 1. **Conv + SiLU + split, one sweep** (P3.3): the depthwise causal conv
+//! 1. **Conv + `SiLU` + split, one sweep** (P3.3): the depthwise causal conv
 //!    at decode is a `kk`-tap FIR against a rolling ring of the last
 //!    `kk-1` mix columns; evaluated per channel with the ring update in
 //!    the same pass, and "split" is an offset, not an op.
@@ -27,10 +27,10 @@
 //!    the decay and the rank-1 update — two passes over state where the
 //!    naive order takes three. Heads are independent and run across the
 //!    rayon pool.
-//! 4. **Gated RMSNorm fused into the head epilogue**: `RMS(o) * gamma *
+//! 4. **Gated `RMSNorm` fused into the head epilogue**: `RMS(o) * gamma *
 //!    act(z)` per head, written straight into the output slice. `act` is
 //!    the layer's [`GdnGate`]: `silu` for qwen35, `sigmoid` for qwen4exp —
-//!    the one numerical difference between the two families' DeltaNets.
+//!    the one numerical difference between the two families' `DeltaNets`.
 //!
 //! The projections stay OUTSIDE this function on purpose: they already run
 //! as single packed-GEMV dispatches (the VNNI twin path), and keeping them
@@ -44,10 +44,11 @@
 //! standard downgrade contract); [`force_disable`] is the programmatic
 //! kill switch tests use.
 
+use mummu_num::f32_from_usize;
 use rayon::prelude::*;
 
-/// The activation applied to the gate `z` in the DeltaNet's gated output
-/// RMSNorm (`RMS(o) * gamma * act(z)`).
+/// The activation applied to the gate `z` in the `DeltaNet`'s gated output
+/// `RMSNorm` (`RMS(o) * gamma * act(z)`).
 ///
 /// Two families share every other line of the GDN block and differ only
 /// here: llama.cpp's `qwen35` graph builds `ggml_silu(z)`, its `qwen4exp`
@@ -64,11 +65,11 @@ pub enum GdnGate {
     Sigmoid,
 }
 
-/// How the DeltaNet L2-normalizes each q and k head before the recurrence.
+/// How the `DeltaNet` L2-normalizes each q and k head before the recurrence.
 ///
 /// The two forms agree to ~ε/(2‖x‖²) relative, which is invisible at unit
 /// norm but not on real checkpoints: Flash-Next's keys reach ‖k‖ ≈ 1e-3
-/// after conv + SiLU (layers 16, 28, 34, 38 of the parity prompt), where
+/// after conv + `SiLU` (layers 16, 28, 34, 38 of the parity prompt), where
 /// `max(‖x‖, 1e-6)` and `sqrt(‖x‖² + 1e-6)` differ by up to 40% per head
 /// and the block output by 1.5e-2 relative. Measured against a
 /// full-precision llama.cpp b10991 dump (teacher-forced, same inputs):
@@ -77,7 +78,7 @@ pub enum GdnGate {
 /// for [`GdnGate`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GdnL2 {
-    /// `x / max(‖x‖, ε)` — `ggml_l2_norm`, which llama.cpp's DeltaNet graphs
+    /// `x / max(‖x‖, ε)` — `ggml_l2_norm`, which llama.cpp's `DeltaNet` graphs
     /// used before PR #28068 (b10760 and older, e.g. ollama 0.34.0's bundled
     /// llama-server) and qwen35 here used until 2026-09-16. Kept to reproduce
     /// those references.
@@ -141,7 +142,7 @@ pub struct GdnMiddle {
     pub l2_eps: f32,
     /// Where that epsilon enters the q/k L2 norms.
     pub l2: GdnL2,
-    /// Epsilon inside the gated RMSNorm.
+    /// Epsilon inside the gated `RMSNorm`.
     pub norm_eps: f32,
     /// `1 / sqrt(ds)`, folded into the normalized q.
     pub scale: f32,
@@ -151,9 +152,9 @@ pub struct GdnMiddle {
     pub dt_bias: Vec<f32>,
     /// `-exp(A_log)` per value head (negative).
     pub a: Vec<f32>,
-    /// Gated RMSNorm gain over `ds`.
+    /// Gated `RMSNorm` gain over `ds`.
     pub gamma: Vec<f32>,
-    /// Activation on `z` in the gated RMSNorm epilogue.
+    /// Activation on `z` in the gated `RMSNorm` epilogue.
     pub gate: GdnGate,
 }
 
@@ -161,14 +162,14 @@ impl GdnMiddle {
     /// Ring length in floats: `conv_dim * (kk - 1)`, channel-major,
     /// position 0 = oldest.
     #[must_use]
-    pub fn ring_len(&self) -> usize {
+    pub const fn ring_len(&self) -> usize {
         self.conv_dim * (self.kk - 1)
     }
 
     /// State length in floats: `hv * ds * ds`, head-major, each head's
     /// `S[i_key][j_value]` row-major.
     #[must_use]
-    pub fn state_len(&self) -> usize {
+    pub const fn state_len(&self) -> usize {
         self.hv * self.ds * self.ds
     }
 }
@@ -223,75 +224,117 @@ fn silu(x: f32) -> f32 {
     x * sigmoid(x)
 }
 
-/// One fused GDN decode step (batch 1, one token). See the module doc for
-/// the pass structure. Slices:
+/// This token's activations, bundled so [`gdn_step`] stays inside the
+/// argument budget.
 ///
-/// - `mixed`: the qkv projection's output, `[conv_dim]`, PRE-conv.
-/// - `z`: the gate projection's output, `[d_inner]`.
-/// - `beta_logits`, `alpha_logits`: `[hv]`.
+/// Every field is a borrowed slice, so the struct is `Copy` and passing it
+/// by value moves four fat pointers — the callee destructures it back into
+/// the same four bindings it always had.
+#[derive(Clone, Copy, Debug)]
+pub struct GdnInputs<'a> {
+    /// The qkv projection's output, `[conv_dim]`, PRE-conv.
+    pub mixed: &'a [f32],
+    /// The gate projection's output, `[d_inner]`.
+    pub z: &'a [f32],
+    /// Per-v-head β logits, `[hv]`.
+    pub beta_logits: &'a [f32],
+    /// Per-v-head α logits, `[hv]`.
+    pub alpha_logits: &'a [f32],
+}
+
+/// Every length [`gdn_step`] depends on, in one place so the step itself
+/// stays inside the line budget.
+///
+/// The assertions, their order and their messages are exactly the ones that
+/// used to open the step.
+#[inline]
+fn assert_shapes(
+    mid: &GdnMiddle,
+    input: GdnInputs<'_>,
+    ring: &[f32],
+    state: &[f32],
+    gated: &[f32],
+) {
+    let (hv, ds, kk) = (mid.hv, mid.ds, mid.kk);
+    assert_eq!(input.mixed.len(), mid.conv_dim, "mixed width");
+    assert_eq!(input.z.len(), mid.d_inner, "z width");
+    assert_eq!(input.beta_logits.len(), hv, "beta width");
+    assert_eq!(input.alpha_logits.len(), hv, "alpha width");
+    assert_eq!(ring.len(), mid.ring_len(), "ring length");
+    assert_eq!(state.len(), mid.state_len(), "state length");
+    assert_eq!(gated.len(), mid.d_inner, "output length");
+    assert_eq!(mid.conv_w.len(), mid.conv_dim * kk, "conv taps");
+    assert_eq!(mid.gamma.len(), ds, "norm gain");
+}
+
+/// One fused GDN decode step (batch 1, one token). See the module doc for
+/// the pass structure. Arguments:
+///
+/// - `input`: this token's activations — see [`GdnInputs`].
 /// - `ring`: the rolling conv window, `[conv_dim * (kk-1)]` (mutated).
 /// - `state`: the recurrent memory, `[hv * ds * ds]` (mutated).
 /// - `gated`: the output, `[d_inner]` — the vector the out projection
 ///   consumes (already RMS-normed and z-gated).
 ///
+/// Every multiply-then-add below is written as two statements on purpose:
+/// two roundings, matching the tensor path and the 1e-5 oracle in
+/// `models/qwen35.rs` — a fused multiply-add would round once and drift.
+/// Names: `q`, `k`, `z` are the paper's symbols; `stq`/`stk` are `Sᵀq` /
+/// `Sᵀk`, `s_mat` the head's state `S`.
+///
 /// # Panics
 /// On any slice length mismatch — a wiring bug, never a workload.
-#[allow(clippy::too_many_arguments)] // the layer's natural arity
 pub fn gdn_step(
-    p: &GdnMiddle,
-    mixed: &[f32],
-    z: &[f32],
-    beta_logits: &[f32],
-    alpha_logits: &[f32],
+    mid: &GdnMiddle,
+    input: GdnInputs<'_>,
     ring: &mut [f32],
     state: &mut [f32],
     gated: &mut [f32],
 ) {
-    let (hk, hv, ds, kk) = (p.hk, p.hv, p.ds, p.kk);
-    assert_eq!(mixed.len(), p.conv_dim, "mixed width");
-    assert_eq!(z.len(), p.d_inner, "z width");
-    assert_eq!(beta_logits.len(), hv, "beta width");
-    assert_eq!(alpha_logits.len(), hv, "alpha width");
-    assert_eq!(ring.len(), p.ring_len(), "ring length");
-    assert_eq!(state.len(), p.state_len(), "state length");
-    assert_eq!(gated.len(), p.d_inner, "output length");
-    assert_eq!(p.conv_w.len(), p.conv_dim * kk, "conv taps");
-    assert_eq!(p.gamma.len(), ds, "norm gain");
+    assert_shapes(mid, input, ring, state, gated);
+    let GdnInputs {
+        mixed,
+        z,
+        beta_logits,
+        alpha_logits,
+    } = input;
+    let (hk, ds, kk) = (mid.hk, mid.ds, mid.kk);
 
     // Pass 1: FIR + ring roll + SiLU, one sweep over the mix.
     let taps = kk - 1;
-    let mut conv_out = vec![0f32; p.conv_dim];
-    for c in 0..p.conv_dim {
-        let w = &p.conv_w[c * kk..(c + 1) * kk];
-        let r = &mut ring[c * taps..(c + 1) * taps];
-        let mut y = mixed[c] * w[taps];
-        for t in 0..taps {
-            y += r[t] * w[t];
+    let mut conv_out = vec![0f32; mid.conv_dim];
+    for ch in 0..mid.conv_dim {
+        let taps_w = &mid.conv_w[ch * kk..(ch + 1) * kk];
+        let ring_ch = &mut ring[ch * taps..(ch + 1) * taps];
+        let mut acc = mixed[ch] * taps_w[taps];
+        for tap in 0..taps {
+            let tap_term = ring_ch[tap] * taps_w[tap];
+            acc += tap_term;
         }
         // Roll: drop the oldest, append this token's mix value.
-        for t in 0..taps - 1 {
-            r[t] = r[t + 1];
+        for tap in 0..taps - 1 {
+            ring_ch[tap] = ring_ch[tap + 1];
         }
-        r[taps - 1] = mixed[c];
-        conv_out[c] = silu(y);
+        ring_ch[taps - 1] = mixed[ch];
+        conv_out[ch] = silu(acc);
     }
 
     // Split is an offset.
-    let (q_raw, rest) = conv_out.split_at(p.key_dim);
-    let (k_raw, v) = rest.split_at(p.key_dim);
+    let (q_raw, rest) = conv_out.split_at(mid.key_dim);
+    let (k_raw, v_all) = rest.split_at(mid.key_dim);
 
     // L2-normalize q and k per k-head; the attention scale folds into q.
-    let mut qn = vec![0f32; p.key_dim];
-    let mut kn = vec![0f32; p.key_dim];
-    for h in 0..hk {
-        let seg = h * ds..(h + 1) * ds;
-        let sum_sq = |x: &[f32]| x.iter().map(|x| x * x).sum::<f32>();
-        let nq = p.l2.norm(sum_sq(&q_raw[seg.clone()]), p.l2_eps);
-        let nk = p.l2.norm(sum_sq(&k_raw[seg.clone()]), p.l2_eps);
-        let (sq, sk) = (p.scale / nq, 1.0 / nk);
-        for i in seg {
-            qn[i] = q_raw[i] * sq;
-            kn[i] = k_raw[i] * sk;
+    let mut qn = vec![0f32; mid.key_dim];
+    let mut kn = vec![0f32; mid.key_dim];
+    for head in 0..hk {
+        let seg = head * ds..(head + 1) * ds;
+        let sum_sq = |xs: &[f32]| xs.iter().map(|e| e * e).sum::<f32>();
+        let nq = mid.l2.norm(sum_sq(&q_raw[seg.clone()]), mid.l2_eps);
+        let nk = mid.l2.norm(sum_sq(&k_raw[seg.clone()]), mid.l2_eps);
+        let (sq, sk) = (mid.scale / nq, 1.0 / nk);
+        for idx in seg {
+            qn[idx] = q_raw[idx] * sq;
+            kn[idx] = k_raw[idx] * sk;
         }
     }
 
@@ -301,46 +344,53 @@ pub fn gdn_step(
         .par_chunks_mut(ds * ds)
         .zip(gated.par_chunks_mut(ds))
         .enumerate()
-        .for_each(|(h, (s, out))| {
-            let kh = h % hk;
+        .for_each(|(head, (s_mat, out))| {
+            let kh = head % hk;
             let q = &qn[kh * ds..(kh + 1) * ds];
             let k = &kn[kh * ds..(kh + 1) * ds];
-            let vh = &v[h * ds..(h + 1) * ds];
-            let zh = &z[h * ds..(h + 1) * ds];
-            let beta = sigmoid(beta_logits[h]);
-            let g = softplus(alpha_logits[h] + p.dt_bias[h]) * p.a[h];
-            let gamma = g.exp();
+            let vh = &v_all[head * ds..(head + 1) * ds];
+            let zh = &z[head * ds..(head + 1) * ds];
+            let beta = sigmoid(beta_logits[head]);
+            let decay_log = softplus(alpha_logits[head] + mid.dt_bias[head]) * mid.a[head];
+            let gamma = decay_log.exp();
 
             let mut scratch = vec![0f32; 2 * ds];
-            let (u, w) = scratch.split_at_mut(ds);
-            // Read pass: u = S^T q, w = S^T k — one stream over S.
-            for i in 0..ds {
-                let row = &s[i * ds..(i + 1) * ds];
-                let (qi, ki) = (q[i], k[i]);
-                for j in 0..ds {
-                    u[j] += row[j] * qi;
-                    w[j] += row[j] * ki;
+            let (stq, stk) = scratch.split_at_mut(ds);
+            // Read pass: stq = S^T q, stk = S^T k — one stream over S.
+            for ri in 0..ds {
+                let row = &s_mat[ri * ds..(ri + 1) * ds];
+                let (qi, ki) = (q[ri], k[ri]);
+                for cj in 0..ds {
+                    let q_term = row[cj] * qi;
+                    stq[cj] += q_term;
+                    let k_term = row[cj] * ki;
+                    stk[cj] += k_term;
                 }
             }
-            let qk: f32 = q.iter().zip(k).map(|(a, b)| a * b).sum();
+            let qk: f32 = q.iter().zip(k).map(|(qa, kb)| qa * kb).sum();
 
             // dv = beta * (v - gamma * S^T k); o = gamma * S^T q + (q.k) dv.
             // (q is pre-scaled, so (q.k) carries the attention scale too —
             // exactly the sequential order, which scales q before both the
             // output read and the correction term.)
             let mut o_and_dv = vec![0f32; 2 * ds];
-            let (o, dv) = o_and_dv.split_at_mut(ds);
-            for j in 0..ds {
-                dv[j] = beta * (vh[j] - gamma * w[j]);
-                o[j] = gamma * u[j] + qk * dv[j];
+            let (o_head, dv) = o_and_dv.split_at_mut(ds);
+            for cj in 0..ds {
+                let decayed_k = gamma * stk[cj];
+                dv[cj] = beta * (vh[cj] - decayed_k);
+                let decayed_q = gamma * stq[cj];
+                let correction = qk * dv[cj];
+                o_head[cj] = decayed_q + correction;
             }
 
             // Write pass: S = gamma * S + k (x) dv.
-            for i in 0..ds {
-                let row = &mut s[i * ds..(i + 1) * ds];
-                let ki = k[i];
-                for j in 0..ds {
-                    row[j] = gamma * row[j] + ki * dv[j];
+            for ri in 0..ds {
+                let row = &mut s_mat[ri * ds..(ri + 1) * ds];
+                let ki = k[ri];
+                for cj in 0..ds {
+                    let decayed = gamma * row[cj];
+                    let update = ki * dv[cj];
+                    row[cj] = decayed + update;
                 }
             }
 
@@ -348,17 +398,17 @@ pub fn gdn_step(
             // gate match sits outside the loop so each arm stays a plain
             // inlined scalar loop — the qwen35 (silu) arm is the loop that
             // was here before the gate became a parameter.
-            let ms = o.iter().map(|x| x * x).sum::<f32>() / ds as f32;
-            let inv = 1.0 / (ms + p.norm_eps).sqrt();
-            match p.gate {
+            let ms = o_head.iter().map(|e| e * e).sum::<f32>() / f32_from_usize(ds);
+            let inv = 1.0 / (ms + mid.norm_eps).sqrt();
+            match mid.gate {
                 GdnGate::Silu => {
-                    for j in 0..ds {
-                        out[j] = o[j] * inv * p.gamma[j] * silu(zh[j]);
+                    for cj in 0..ds {
+                        out[cj] = o_head[cj] * inv * mid.gamma[cj] * silu(zh[cj]);
                     }
                 }
                 GdnGate::Sigmoid => {
-                    for j in 0..ds {
-                        out[j] = o[j] * inv * p.gamma[j] * sigmoid(zh[j]);
+                    for cj in 0..ds {
+                        out[cj] = o_head[cj] * inv * mid.gamma[cj] * sigmoid(zh[cj]);
                     }
                 }
             }
@@ -404,10 +454,12 @@ mod tests {
         let mut out = vec![0.0f32];
         gdn_step(
             &p,
-            &[3.0, 1.0, 1.0],
-            &[1.0],
-            &[0.0],
-            &[0.0],
+            GdnInputs {
+                mixed: &[3.0, 1.0, 1.0],
+                z: &[1.0],
+                beta_logits: &[0.0],
+                alpha_logits: &[0.0],
+            },
             &mut ring,
             &mut state,
             &mut out,
@@ -426,11 +478,12 @@ mod tests {
     /// random data: decay-then-read-then-update vs the fused identity.
     #[test]
     fn output_correction_matches_naive_order() {
+        use mummu_num::f32_from_u64;
         let ds = 16;
         let mut lcg = 12345u64;
         let mut rand = move || {
-            lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1);
-            ((lcg >> 33) as f32 / (1u64 << 31) as f32) - 0.5
+            lcg = lcg.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            (f32_from_u64(lcg >> 33) / f32_from_u64(1u64 << 31)) - 0.5
         };
         for _ in 0..20 {
             let s0: Vec<f32> = (0..ds * ds).map(|_| rand()).collect();
@@ -440,53 +493,62 @@ mod tests {
             let (gamma, beta) = (0.9f32, 0.7f32);
 
             // Naive: S' = gamma S; vhat = S'^T k; dv = beta (v - vhat);
-            // S1 = S' + k dv^T; o = S1^T q.
+            // S1 = S' + k dv^T; o = S1^T q. Products and sums stay separate
+            // statements so this reference rounds the way the kernel does.
             let sp: Vec<f32> = s0.iter().map(|x| gamma * x).collect();
             let mut vhat = vec![0f32; ds];
-            for i in 0..ds {
-                for j in 0..ds {
-                    vhat[j] += sp[i * ds + j] * k[i];
+            for ri in 0..ds {
+                for cj in 0..ds {
+                    let term = sp[ri * ds + cj] * k[ri];
+                    vhat[cj] += term;
                 }
             }
-            let dv: Vec<f32> = (0..ds).map(|j| beta * (v[j] - vhat[j])).collect();
-            let mut s1 = sp.clone();
-            for i in 0..ds {
-                for j in 0..ds {
-                    s1[i * ds + j] += k[i] * dv[j];
+            let dv: Vec<f32> = (0..ds).map(|cj| beta * (v[cj] - vhat[cj])).collect();
+            let mut s1 = sp;
+            for ri in 0..ds {
+                for cj in 0..ds {
+                    let update = k[ri] * dv[cj];
+                    s1[ri * ds + cj] += update;
                 }
             }
             let mut o_naive = vec![0f32; ds];
-            for i in 0..ds {
-                for j in 0..ds {
-                    o_naive[j] += s1[i * ds + j] * q[i];
+            for ri in 0..ds {
+                for cj in 0..ds {
+                    let term = s1[ri * ds + cj] * q[ri];
+                    o_naive[cj] += term;
                 }
             }
 
-            // Fused: u = S0^T q; w = S0^T k; dv = beta (v - gamma w);
-            // o = gamma u + (q.k) dv.
-            let mut u = vec![0f32; ds];
-            let mut w = vec![0f32; ds];
-            for i in 0..ds {
-                for j in 0..ds {
-                    u[j] += s0[i * ds + j] * q[i];
-                    w[j] += s0[i * ds + j] * k[i];
+            // Fused: stq = S0^T q; stk = S0^T k; dv = beta (v - gamma stk);
+            // o = gamma stq + (q.k) dv.
+            let mut stq = vec![0f32; ds];
+            let mut stk = vec![0f32; ds];
+            for ri in 0..ds {
+                for cj in 0..ds {
+                    let q_term = s0[ri * ds + cj] * q[ri];
+                    stq[cj] += q_term;
+                    let k_term = s0[ri * ds + cj] * k[ri];
+                    stk[cj] += k_term;
                 }
             }
-            let qk: f32 = q.iter().zip(&k).map(|(a, b)| a * b).sum();
-            for j in 0..ds {
-                let dvj = beta * (v[j] - gamma * w[j]);
-                let of = gamma * u[j] + qk * dvj;
+            let qk: f32 = q.iter().zip(&k).map(|(qa, kb)| qa * kb).sum();
+            for cj in 0..ds {
+                let decayed_k = gamma * stk[cj];
+                let dvj = beta * (v[cj] - decayed_k);
+                let decayed_q = gamma * stq[cj];
+                let correction = qk * dvj;
+                let of = decayed_q + correction;
                 assert!(
-                    (of - o_naive[j]).abs() < 1e-4,
-                    "fused {of} vs naive {} at {j}",
-                    o_naive[j]
+                    (of - o_naive[cj]).abs() < 1e-4,
+                    "fused {of} vs naive {} at {cj}",
+                    o_naive[cj]
                 );
-                assert!((dvj - dv[j]).abs() < 1e-5);
+                assert!((dvj - dv[cj]).abs() < 1e-5);
             }
         }
     }
 
-    /// The gated RMSNorm epilogue applies the configured gate and nothing
+    /// The gated `RMSNorm` epilogue applies the configured gate and nothing
     /// else: with a zero state, no decay, β = ½ and q = k (so q·k = 1), the
     /// head output is `o = ½·silu(v_mix)` exactly, and the step must write
     /// `RMS(o)·gamma·sigmoid(z)` for [`GdnGate::Sigmoid`] and
@@ -527,10 +589,12 @@ mod tests {
             let mut out = vec![0.0f32; p.d_inner];
             gdn_step(
                 &p,
-                &mixed,
-                &z,
-                &[0.0],
-                &[0.0],
+                GdnInputs {
+                    mixed: &mixed,
+                    z: &z,
+                    beta_logits: &[0.0],
+                    alpha_logits: &[0.0],
+                },
                 &mut ring,
                 &mut state,
                 &mut out,
@@ -607,10 +671,12 @@ mod tests {
             let mut out = vec![0.0f32; p.d_inner];
             gdn_step(
                 &p,
-                &mixed,
-                &[0.0, 0.0],
-                &[0.0],
-                &[0.0],
+                GdnInputs {
+                    mixed: &mixed,
+                    z: &[0.0, 0.0],
+                    beta_logits: &[0.0],
+                    alpha_logits: &[0.0],
+                },
                 &mut ring,
                 &mut state,
                 &mut out,

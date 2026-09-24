@@ -7,6 +7,8 @@
 //!   cargo test -p mummu --release --test real_qwen35 -- --ignored --nocapture
 //! ```
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use std::path::PathBuf;
 
 use mummu::backend::use_gpu;

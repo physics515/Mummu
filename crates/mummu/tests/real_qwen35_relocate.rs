@@ -16,6 +16,8 @@
 //! is the card (four 2B layers, a few hundred MB); otherwise both are the
 //! host and the test covers the precision change and the replacement.
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use std::path::PathBuf;
 
 use burn::tensor::Tensor;

@@ -8,6 +8,8 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
-# Dependency-free: see the crate docs. The burn binding for a rung lives in
+# Only `mummu-num` (exact, `as`-free numeric conversions), which is itself
+# dependency-free: see the crate docs. The burn binding for a rung lives in
 # `mummu::quant`, which depends on THIS crate rather than the other way round.
 [dependencies]
+mummu-num = { workspace = true }

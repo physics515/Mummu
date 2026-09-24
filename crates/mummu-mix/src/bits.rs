@@ -27,7 +27,9 @@
 //! And the checklist number: [`amgm_ratio`], the predicted uniform-vs-mixed
 //! gain `J_uniform / J* = am(c)/gm(c)`. If it is under ~1.2, mixed
 //! precision cannot pay for its complexity on this model — skip it (the
-//! RateQuant checklist, adopted as arithmetic).
+//! `RateQuant` checklist, adopted as arithmetic).
+
+use mummu_num::f64_from_u64;
 
 /// Continuous reverse water-filling under `sum N_l b_l <= total_bits`,
 /// `b_l >= 0`. Returns per-tensor bits (fractional — the planning target,
@@ -56,12 +58,12 @@ pub fn waterfill_bits(sensitivity: &[f64], counts: &[u64], total_bits: f64) -> V
     let mut active: Vec<usize> = (0..n).collect();
     let mut bits = vec![0.0f64; n];
     loop {
-        let total_n: f64 = active.iter().map(|&i| counts[i] as f64).sum();
+        let total_n: f64 = active.iter().map(|&i| f64_from_u64(counts[i])).sum();
         let b_bar = total_bits / total_n;
         // N-weighted geometric mean of sensitivities over the active set.
         let log_gm: f64 = active
             .iter()
-            .map(|&i| counts[i] as f64 * sensitivity[i].ln())
+            .map(|&i| f64_from_u64(counts[i]) * sensitivity[i].ln())
             .sum::<f64>()
             / total_n;
         let mut any_negative = false;
@@ -97,15 +99,17 @@ pub fn distortion(sensitivity: &[f64], counts: &[u64], bits: &[u32]) -> f64 {
         .iter()
         .zip(counts)
         .zip(bits)
-        .map(|((&c, &m), &b)| c * m as f64 * (-2.0 * f64::from(b)).exp2())
+        .map(|((&c, &m), &b)| c * f64_from_u64(m) * (-2.0 * f64::from(b)).exp2())
         .sum()
 }
 
-/// Whole-bit allocation by greedy marginal gain: start every tensor at
-/// `min_bits`, then, while budget remains, give one more bit to the tensor
-/// whose distortion drop per budget bit is largest (`c_l N_l (2^-2b -
-/// 2^-2(b+1)) / N_l = c_l * 3/4 * 2^-2b` — counts cancel in the density, so
-/// the rule is "most sensitive at its current precision wins").
+/// Whole-bit allocation by greedy marginal gain.
+///
+/// Start every tensor at `min_bits`, then, while budget remains, give one
+/// more bit to the tensor whose distortion drop per budget bit is largest
+/// (`c_l N_l (2^-2b - 2^-2(b+1)) / N_l = c_l * 3/4 * 2^-2b` — counts cancel
+/// in the density, so the rule is "most sensitive at its current precision
+/// wins").
 ///
 /// Optimality is conditional, and the tests hold the claim to exactly its
 /// shape: with **equal parameter counts** every step costs the same budget
@@ -120,6 +124,9 @@ pub fn distortion(sensitivity: &[f64], counts: &[u64], bits: &[u32]) -> f64 {
 ///
 /// `bit_budget` is total bits ON TOP of the `min_bits` floor
 /// (`sum N_l * (b_l - min_bits) <= bit_budget`); `max_bits` caps any tensor.
+///
+/// # Panics
+/// If `counts` and `sensitivity` differ in length, or `min_bits > max_bits`.
 #[must_use]
 pub fn allocate_bits_integer(
     sensitivity: &[f64],
@@ -155,23 +162,28 @@ pub fn allocate_bits_integer(
 
 /// Predicted gain of mixed precision over uniform at the same budget:
 /// `J_uniform / J* = am(c) / gm(c)` (N-weighted), which is `>= 1` by
-/// AM/GM with equality iff every sensitivity is equal. Under ~1.2 the
-/// spread does not pay for per-tensor bit plumbing — skip mixed precision.
+/// AM/GM with equality iff every sensitivity is equal.
+///
+/// Under ~1.2 the spread does not pay for per-tensor bit plumbing — skip
+/// mixed precision.
+///
+/// # Panics
+/// If `sensitivity` is empty or `counts` differs from it in length.
 #[must_use]
 pub fn amgm_ratio(sensitivity: &[f64], counts: &[u64]) -> f64 {
-    assert!(!sensitivity.is_empty());
+    assert_ne!(sensitivity, []);
     assert_eq!(sensitivity.len(), counts.len());
-    let total: f64 = counts.iter().map(|&m| m as f64).sum();
+    let total: f64 = counts.iter().map(|&m| f64_from_u64(m)).sum();
     let am: f64 = sensitivity
         .iter()
         .zip(counts)
-        .map(|(&c, &m)| c * m as f64)
+        .map(|(&c, &m)| c * f64_from_u64(m))
         .sum::<f64>()
         / total;
     let log_gm: f64 = sensitivity
         .iter()
         .zip(counts)
-        .map(|(&c, &m)| m as f64 * c.ln())
+        .map(|(&c, &m)| f64_from_u64(m) * c.ln())
         .sum::<f64>()
         / total;
     am / log_gm.exp()
@@ -191,11 +203,15 @@ mod tests {
         let budget = 1200.0; // b_bar = 4
         let b = waterfill_bits(&c, &n, budget);
         // Budget exact.
-        let spent: f64 = b.iter().zip(&n).map(|(bi, &ni)| bi * ni as f64).sum();
+        let spent: f64 = b
+            .iter()
+            .zip(&n)
+            .map(|(bi, &ni)| bi * f64_from_u64(ni))
+            .sum();
         assert!((spent - budget).abs() < 1e-9);
         // b_i - b_j = 0.5 log2(c_i / c_j).
-        assert!((b[0] - b[1] - 0.5 * (8.0f64 / 2.0).log2()).abs() < 1e-9);
-        assert!((b[1] - b[2] - 0.5 * (2.0f64 / 0.5).log2()).abs() < 1e-9);
+        assert!(0.5f64.mul_add(-(8.0f64 / 2.0).log2(), b[0] - b[1]).abs() < 1e-9);
+        assert!(0.5f64.mul_add(-(2.0f64 / 0.5).log2(), b[1] - b[2]).abs() < 1e-9);
         // Marginal distortion c_i 2^{-2 b_i} equal across active tensors.
         let m0 = c[0] * (-2.0 * b[0]).exp2();
         for i in 1..3 {
@@ -212,7 +228,11 @@ mod tests {
         let n = [10u64, 10, 10];
         let b = waterfill_bits(&c, &n, 60.0);
         assert_eq!(b[2], 0.0, "insensitive tensor must be dropped to zero");
-        let spent: f64 = b.iter().zip(&n).map(|(bi, &ni)| bi * ni as f64).sum();
+        let spent: f64 = b
+            .iter()
+            .zip(&n)
+            .map(|(bi, &ni)| bi * f64_from_u64(ni))
+            .sum();
         assert!((spent - 60.0).abs() < 1e-9, "freed budget must be re-spent");
         assert!((b[0] - b[1]).abs() < 1e-9);
     }
@@ -309,7 +329,7 @@ mod tests {
             let max_step: f64 = c
                 .iter()
                 .zip(&counts)
-                .map(|(&ci, &mi)| ci * mi as f64 * 0.75 * (-2.0 * f64::from(lo)).exp2())
+                .map(|(&ci, &mi)| ci * f64_from_u64(mi) * 0.75 * (-2.0 * f64::from(lo)).exp2())
                 .fold(0.0, f64::max);
             assert!(
                 got_d <= best + max_step + 1e-9,

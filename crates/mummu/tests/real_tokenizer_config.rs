@@ -9,6 +9,8 @@
 //!   cargo test -p mummu --test real_tokenizer_config -- --ignored --nocapture
 //! ```
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use std::path::PathBuf;
 
 use mummu::tok_config::{TokenizerConfig, ToolCallConvention};
@@ -77,10 +79,15 @@ fn qwen3_config_special_ids_agree_with_the_tokenizer() {
         serde_json::from_slice(&std::fs::read(dir.join("config.json")).expect("config.json"))
             .expect("config.json parses");
     let config_eos: Vec<u32> = match &config_json["eos_token_id"] {
-        serde_json::Value::Number(n) => vec![n.as_u64().unwrap() as u32],
+        serde_json::Value::Number(n) => {
+            vec![u32::try_from(n.as_u64().unwrap()).expect("eos id fits u32")]
+        }
         serde_json::Value::Array(a) => a
             .iter()
-            .filter_map(|v| v.as_u64().map(|x| x as u32))
+            .filter_map(|v| {
+                v.as_u64()
+                    .map(|x| u32::try_from(x).expect("eos id fits u32"))
+            })
             .collect(),
         _ => Vec::new(),
     };

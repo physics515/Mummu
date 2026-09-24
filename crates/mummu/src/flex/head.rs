@@ -1,4 +1,4 @@
-//! **Norm-bounded exact top-k for the host lm_head (SPEC P4.3/P4.4/P4.5).**
+//! **Norm-bounded exact top-k for the host `lm_head` (SPEC P4.3/P4.4/P4.5).**
 //!
 //! The head is a `[hidden, vocab]` GEMV whose consumer needs *ordering*,
 //! not the full vector: greedy reads the argmax, and the sampler
@@ -37,7 +37,7 @@
 //! candidate list only when the sampler asks for more candidates than
 //! [`head_k`], where its softmax weight underflows to zero — the
 //! documented boundary: exact for greedy and for `top_k <= MUMMU_HEAD_TOPK`
-//! sampling; larger sampler top_k truncates to the computed candidates).
+//! sampling; larger sampler `top_k` truncates to the computed candidates).
 //! Anything that reads the FULL softmax (the parity harness's logprob
 //! legs) must keep the dense head: this path defaults OFF in the library
 //! and is switched on by serve ([`set_enabled`]), `MUMMU_HEAD_BOUND`
@@ -58,19 +58,45 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
+use mummu_num::{f64_from_i64, narrow};
+use rayon::prelude::*;
+
 use super::kernels::{GROUP, PackedQ4, Q8Acts};
 
 /// Rows per bound tile — one cache-friendly block of packed rows.
 pub const TILE: usize = 32;
 
+/// [`TILE`] in the `u32` the tile ids are typed in.
+const TILE_U32: u32 = 32;
+const _: () = assert!(TILE_U32 as usize == TILE);
+
+/// Widest batch of tiles one parallel evaluation round takes.
+///
+/// Tiles evaluate in PARALLEL batches: the first live run measured the
+/// serial walk at 469 ms against the dense head's rayon-wide 68 — a
+/// bound that isn't pruning must never cost more than the evaluation it
+/// failed to skip. A batch runs across the pool, its results merge into
+/// the heap serially, and the threshold advances between batches. The
+/// stop rule is unchanged (a tile is skipped only when its bound is
+/// below the threshold AT CHECK TIME, and the threshold only rises), so
+/// exactness is preserved; a batch may evaluate up to its own size past
+/// the serial stopping point — bounded extra work, never a wrong
+/// answer. Batch size RAMPS: the first batch is exactly big enough to
+/// fill the heap (so a real threshold exists before anything wider
+/// launches — a flat 64-tile first batch was measured evaluating an
+/// entire small vocab before pruning could begin), then doubles to this
+/// cap for parallel width.
+const BATCH: usize = 64;
+
 /// Fill value for coordinates the bounded head proved out of the top-k.
 /// Far below any real logit; softmax weight underflows to exactly 0.
 pub const SENTINEL: f32 = -1.0e30;
 
-/// Is the bounded head enabled? Default OFF in the library (the parity
-/// harness reads full-vocab logprobs, which sentinels would perturb);
-/// serve calls [`set_enabled`] at startup. `MUMMU_HEAD_BOUND=1/0` forces
-/// either way.
+/// Is the bounded head enabled?
+///
+/// Default OFF in the library (the parity harness reads full-vocab
+/// logprobs, which sentinels would perturb); serve calls [`set_enabled`] at
+/// startup. `MUMMU_HEAD_BOUND=1/0` forces either way.
 #[must_use]
 pub fn enabled() -> bool {
     static ENV: OnceLock<Option<bool>> = OnceLock::new();
@@ -116,7 +142,9 @@ pub fn head_k() -> usize {
 static REQUEST_TOPK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// RAII scope for a per-request head k (serve sets 1 for greedy requests,
-/// the request's own `top_k` for sampled ones). Concurrency contract:
+/// the request's own `top_k` for sampled ones).
+///
+/// Concurrency contract:
 /// overlapping requests combine via `fetch_max`, and the drop resets to
 /// "no override", which falls back to [`head_k`]'s SAFE default — a
 /// concurrent request can therefore only ever see a k at least as large
@@ -166,7 +194,6 @@ impl HeadMeta {
     /// the dequantized twin.
     #[must_use]
     pub fn build(w: &PackedQ4) -> Self {
-        use rayon::prelude::*;
         let groups = w.k / GROUP;
         let rows: Vec<(f32, f32)> = (0..w.n)
             .into_par_iter()
@@ -181,11 +208,14 @@ impl HeadMeta {
                         l1 += qi.abs();
                         s2 += i64::from(qi * qi);
                     }
-                    sq += f64::from(scale) * f64::from(scale) * s2 as f64;
-                    act += f64::from(scale) * f64::from(l1);
+                    // Two roundings on purpose: these bounds decide which
+                    // rows are pruned and must not move by an ulp.
+                    let sq_term = f64::from(scale) * f64::from(scale) * f64_from_i64(s2);
+                    sq += sq_term;
+                    let act_term = f64::from(scale) * f64::from(l1);
+                    act += act_term;
                 });
-                #[allow(clippy::cast_possible_truncation)]
-                (sq.sqrt() as f32, act as f32)
+                (narrow(sq.sqrt()), narrow(act))
             })
             .collect();
         let norms: Vec<f32> = rows.iter().map(|r| r.0).collect();
@@ -208,7 +238,7 @@ impl HeadMeta {
 
     /// Bytes this metadata holds resident.
     #[must_use]
-    pub fn bytes(&self) -> usize {
+    pub const fn bytes(&self) -> usize {
         (self.norms.len() + self.act_l1.len() + self.tile_norm.len() + self.tile_act.len()) * 4
     }
 }
@@ -222,7 +252,7 @@ pub struct HeadTopK {
     pub vals: Vec<f32>,
     /// Rows actually evaluated (vs `vocab`): the pruning ratio.
     pub evaluated_rows: usize,
-    /// Tiles whose bound survived (== evaluated_rows / TILE, up to the
+    /// Tiles whose bound survived (== `evaluated_rows` / TILE, up to the
     /// ragged last tile).
     pub evaluated_tiles: usize,
 }
@@ -295,9 +325,60 @@ impl TopK {
     }
 }
 
+/// What evaluating a tile needs, shared by every batch of one token: the
+/// head, the activations (raw and quantized) and the dispatch decision.
+struct TileEval<'a> {
+    w: &'a PackedQ4,
+    acts: &'a Q8Acts,
+    x: &'a [f32],
+    integer_ok: bool,
+}
+
+/// The bound walk's mutable state: the running top-k, which tiles have
+/// been evaluated, and the audit counters.
+struct WalkState {
+    top: TopK,
+    evaluated: Vec<bool>,
+    evaluated_tiles: usize,
+    evaluated_rows: usize,
+}
+
+impl TileEval<'_> {
+    /// Evaluate one batch of tiles across the pool, then merge the results
+    /// into the heap serially (see [`BATCH`] for why batches).
+    fn eval_batch(&self, batch: &[u32], state: &mut WalkState) {
+        let results: Vec<(usize, usize, Vec<f32>)> = batch
+            .par_iter()
+            .map(|&t| {
+                let t = t as usize;
+                let n0 = t * TILE;
+                let n1 = ((t + 1) * TILE).min(self.w.n);
+                let mut vals = vec![0.0f32; n1 - n0];
+                self.w
+                    .dot_rows(n0, n1, self.acts, self.x, self.integer_ok, &mut vals);
+                (t, n0, vals)
+            })
+            .collect();
+        for (t, n0, vals) in results {
+            state.evaluated[t] = true;
+            state.evaluated_tiles += 1;
+            state.evaluated_rows += vals.len();
+            for (i, &y) in vals.iter().enumerate() {
+                state
+                    .top
+                    .push(y, u32::try_from(n0 + i).expect("vocab fits u32"));
+            }
+        }
+    }
+}
+
 /// Exact top-k of the packed head's computed logits by tile-bounded
 /// branch and bound. `seed_tiles` (from a [`HotSet`]) are evaluated first
 /// to establish a high threshold; pass `&[]` without one.
+///
+/// # Panics
+/// If `x.len() != w.k`, if `k == 0`, or if the head has more rows than
+/// `u32` can index (token ids are `u32`).
 #[must_use]
 pub fn head_topk(
     w: &PackedQ4,
@@ -319,53 +400,25 @@ pub fn head_topk(
     let eps_c = if integer_ok { 0.5 * sx_max } else { 0.0 };
 
     let tiles = w.n.div_ceil(TILE);
-    let bound_of = |t: usize| meta.tile_norm[t] * x_norm + eps_c * meta.tile_act[t];
+    let bound_of = |t: usize| {
+        // Two roundings on purpose: the bound decides pruning and must be
+        // the same number the tests reason about.
+        let norm_term = meta.tile_norm[t] * x_norm;
+        let eps_term = eps_c * meta.tile_act[t];
+        norm_term + eps_term
+    };
 
-    let mut top = TopK::new(k.min(w.n));
-    let mut evaluated = vec![false; tiles];
-    let mut evaluated_tiles = 0usize;
-    let mut evaluated_rows = 0usize;
-
-    // Tiles evaluate in PARALLEL batches: the first live run measured the
-    // serial walk at 469 ms against the dense head's rayon-wide 68 — a
-    // bound that isn't pruning must never cost more than the evaluation it
-    // failed to skip. A batch runs across the pool, its results merge into
-    // the heap serially, and the threshold advances between batches. The
-    // stop rule is unchanged (a tile is skipped only when its bound is
-    // below the threshold AT CHECK TIME, and the threshold only rises), so
-    // exactness is preserved; a batch may evaluate up to its own size past
-    // the serial stopping point — bounded extra work, never a wrong
-    // answer. Batch size RAMPS: the first batch is exactly big enough to
-    // fill the heap (so a real threshold exists before anything wider
-    // launches — a flat 64-tile first batch was measured evaluating an
-    // entire small vocab before pruning could begin), then doubles to the
-    // cap for parallel width.
-    const BATCH: usize = 64;
-    use rayon::prelude::*;
-    let eval_batch = |batch: &[u32],
-                      top: &mut TopK,
-                      evaluated: &mut [bool],
-                      evaluated_tiles: &mut usize,
-                      evaluated_rows: &mut usize| {
-        let results: Vec<(usize, usize, Vec<f32>)> = batch
-            .par_iter()
-            .map(|&t| {
-                let t = t as usize;
-                let n0 = t * TILE;
-                let n1 = ((t + 1) * TILE).min(w.n);
-                let mut vals = vec![0.0f32; n1 - n0];
-                w.dot_rows(n0, n1, &acts, x, integer_ok, &mut vals);
-                (t, n0, vals)
-            })
-            .collect();
-        for (t, n0, vals) in results {
-            evaluated[t] = true;
-            *evaluated_tiles += 1;
-            *evaluated_rows += vals.len();
-            for (i, &y) in vals.iter().enumerate() {
-                top.push(y, u32::try_from(n0 + i).expect("vocab fits u32"));
-            }
-        }
+    let eval = TileEval {
+        w,
+        acts: &acts,
+        x,
+        integer_ok,
+    };
+    let mut state = WalkState {
+        top: TopK::new(k.min(w.n)),
+        evaluated: vec![false; tiles],
+        evaluated_tiles: 0,
+        evaluated_rows: 0,
     };
 
     // Seeds first: the hot set's previous winners establish a high
@@ -381,18 +434,13 @@ pub fn head_topk(
         s
     };
     if !seed_batch.is_empty() {
-        eval_batch(
-            &seed_batch,
-            &mut top,
-            &mut evaluated,
-            &mut evaluated_tiles,
-            &mut evaluated_rows,
-        );
+        eval.eval_batch(&seed_batch, &mut state);
     }
 
     // Bound walk: tiles by bound descending, in batches; stop at the first
     // tile that cannot beat the current k-th value.
-    let mut order: Vec<u32> = (0..tiles as u32).collect();
+    let tile_count = u32::try_from(tiles).expect("tile count fits u32");
+    let mut order: Vec<u32> = (0..tile_count).collect();
     let bounds: Vec<f32> = (0..tiles).map(bound_of).collect();
     order.sort_unstable_by(|&a, &b| {
         bounds[b as usize]
@@ -405,25 +453,20 @@ pub fn head_topk(
         let mut batch: Vec<u32> = Vec::with_capacity(batch_target);
         let mut stop = false;
         while cursor < order.len() && batch.len() < batch_target {
-            let t = order[cursor] as usize;
+            let t = order[cursor];
+            let ti = t as usize;
             cursor += 1;
-            if evaluated[t] {
+            if state.evaluated[ti] {
                 continue;
             }
-            if bounds[t] < top.threshold() {
+            if bounds[ti] < state.top.threshold() {
                 stop = true; // every later tile's bound is smaller still
                 break;
             }
-            batch.push(t as u32);
+            batch.push(t);
         }
         if !batch.is_empty() {
-            eval_batch(
-                &batch,
-                &mut top,
-                &mut evaluated,
-                &mut evaluated_tiles,
-                &mut evaluated_rows,
-            );
+            eval.eval_batch(&batch, &mut state);
         }
         if stop {
             break;
@@ -431,12 +474,12 @@ pub fn head_topk(
         batch_target = (batch_target * 2).min(BATCH);
     }
 
-    let (ids, vals) = top.into_sorted();
+    let (ids, vals) = state.top.into_sorted();
     HeadTopK {
         ids,
         vals,
-        evaluated_rows,
-        evaluated_tiles,
+        evaluated_rows: state.evaluated_rows,
+        evaluated_tiles: state.evaluated_tiles,
     }
 }
 
@@ -471,8 +514,9 @@ impl HotSet {
     #[must_use]
     pub fn seeds(&mut self, total_tiles: usize, remainder: usize) -> Vec<u32> {
         let mut s = self.tiles.clone();
+        let modulus = u32::try_from(total_tiles.max(1)).unwrap_or(u32::MAX);
         for _ in 0..remainder {
-            self.cursor = (self.cursor + 1) % total_tiles.max(1) as u32;
+            self.cursor = (self.cursor + 1) % modulus;
             s.push(self.cursor);
         }
         s
@@ -491,7 +535,7 @@ impl HotSet {
             self.drift_max = self.drift_max.max(d);
         }
         self.prev_x = x.to_vec();
-        let mut tiles: Vec<u32> = result.ids.iter().map(|&id| id / TILE as u32).collect();
+        let mut tiles: Vec<u32> = result.ids.iter().map(|&id| id / TILE_U32).collect();
         tiles.sort_unstable();
         tiles.dedup();
         self.tiles = tiles;
@@ -532,9 +576,10 @@ pub fn meta_for(packed: &Arc<PackedQ4>) -> Arc<HeadMeta> {
 mod tests {
     use super::*;
     use crate::flex::kernels::{PackedQ4, gemv_q4n_auto};
+    use mummu_num::f32_from_usize;
 
     fn wave(len: usize, f: f32) -> Vec<f32> {
-        (0..len).map(|i| ((i as f32) * f).sin()).collect()
+        (0..len).map(|i| (f32_from_usize(i) * f).sin()).collect()
     }
 
     /// The head's guarantee, stated tie-honestly: the returned values are
@@ -594,9 +639,10 @@ mod tests {
         // ordering is strict, not a tie.
         let mut vals = vec![0.001f32; k_dim * vocab];
         for big in [17usize, 900, 1999] {
+            let big_shift = f32_from_usize(big) * 1e-4;
             for kk in 0..k_dim {
                 vals[kk * vocab + big] =
-                    (1.0 + (kk as f32 * 0.1).sin()) * (1.0 + big as f32 * 1e-4);
+                    (1.0 + (f32_from_usize(kk) * 0.1).sin()) * (1.0 + big_shift);
             }
         }
         let w = PackedQ4::from_f32(&vals, k_dim, vocab);
@@ -640,8 +686,9 @@ mod tests {
         let (k_dim, vocab) = (64, 2048);
         let mut vals = vec![0.001f32; k_dim * vocab];
         for big in [100usize, 101, 700] {
+            let big_shift = f32_from_usize(big) * 1e-4;
             for kk in 0..k_dim {
-                vals[kk * vocab + big] = 1.0 + big as f32 * 1e-4; // distinct
+                vals[kk * vocab + big] = 1.0 + big_shift; // distinct
             }
         }
         let w = PackedQ4::from_f32(&vals, k_dim, vocab);
@@ -653,7 +700,7 @@ mod tests {
         // A slightly-drifted next token: the same winner set.
         let x2: Vec<f32> = x1.iter().map(|v| v * 1.001).collect();
         let seeds = hot.seeds(vocab.div_ceil(TILE), 2);
-        assert!(!seeds.is_empty());
+        assert_ne!(seeds, [] as [u32; 0]);
         let r2 = head_topk(&w, &meta, &x2, 3, &seeds);
         let sorted = |v: &[u32]| {
             let mut s = v.to_vec();
@@ -673,7 +720,7 @@ mod tests {
         assert_ne!(s1.last(), s2.last());
     }
 
-    /// The per-request k override: fetch_max semantics while scopes
+    /// The per-request k override: `fetch_max` semantics while scopes
     /// overlap, safe-default fallback on drop. Large values on purpose —
     /// the override is process-global and a small k during a parallel
     /// head test's window would weaken ITS coverage, so this test proves
@@ -693,7 +740,7 @@ mod tests {
         assert_eq!(effective_k(), head_k(), "drop must restore the default");
     }
 
-    /// meta_for memoizes per twin allocation and rebuilds for a new one.
+    /// `meta_for` memoizes per twin allocation and rebuilds for a new one.
     #[test]
     fn meta_sidecar_memoizes() {
         let w = Arc::new(PackedQ4::from_f32(&wave(64 * 64, 0.3), 64, 64));

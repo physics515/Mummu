@@ -12,22 +12,27 @@
 //! The model is calibrated against measurements, not first principles.
 //! Qwen2.5-1.5B on the reference card measures ~8.0 GiB of runner VRAM in f32
 //! and ~3.6 GiB in f16 (`bench/BASELINE.md`) — roughly weights + KV cache plus
-//! a fixed overhead for activations, workspaces and CubeCL's memory pools.
+//! a fixed overhead for activations, workspaces and `CubeCL`'s memory pools.
 //! [`OVERHEAD_BYTES`] is that fixed term, and [`Fit::projected_bytes`] is the
 //! whole model; both are honest approximations whose job is to keep a plan on
 //! the right side of a cliff, not to predict allocator behaviour to the byte.
 
 use crate::backend::GpuAdapter;
+use mummu_num::{f64_from_u64, trunc_u64};
 
 /// Fixed VRAM a live runner needs beyond weights and KV cache: activations,
-/// matmul workspaces, and CubeCL's memory pools. Derived from the reference
+/// matmul workspaces, and `CubeCL`'s memory pools.
+///
+/// Derived from the reference
 /// measurements — Qwen2.5-1.5B (1.54 G params) reads ~8.0 GiB runner VRAM in
 /// f32 against 6.2 GiB of weights, and ~3.6 GiB in f16 against 3.1 GiB of
 /// weights, so the residual is ~0.5-1.8 GiB depending on dtype. 1 GiB is the
 /// middle of that band and errs toward *not* promising a fit.
 pub const OVERHEAD_BYTES: u64 = 1 << 30;
 
-/// Fraction of an adapter's VRAM a plan may claim. The rest is the display
+/// Fraction of an adapter's VRAM a plan may claim.
+///
+/// The rest is the display
 /// server's: the reference box runs 3.5-6.5 GiB of desktop ambient on the same
 /// card, and a plan that ignores it produces an allocation failure at load
 /// rather than a slow model.
@@ -47,7 +52,7 @@ pub enum Precision {
 impl Precision {
     /// Bytes per stored float.
     #[must_use]
-    pub fn bytes_per_float(self) -> u64 {
+    pub const fn bytes_per_float(self) -> u64 {
         match self {
             Self::F32 => 4,
             Self::F16 => 2,
@@ -56,7 +61,7 @@ impl Precision {
 
     /// Highest-first, the order the planner tries them in.
     #[must_use]
-    pub fn descending() -> [Self; 2] {
+    pub const fn descending() -> [Self; 2] {
         [Self::F32, Self::F16]
     }
 }
@@ -76,6 +81,12 @@ pub struct ModelShape {
 impl ModelShape {
     /// Sizing from a decoder's hyperparameters, so a caller passes the
     /// `config.json` numbers rather than pre-computing cache geometry.
+    ///
+    /// # Panics
+    ///
+    /// When `params` is zero, or when any of `layers`, `num_kv_heads` or
+    /// `head_dim` is zero — a decoder with no layers, heads or head width
+    /// is a caller bug, not a sizing question.
     #[must_use]
     pub fn from_decoder(
         params: u64,
@@ -101,7 +112,7 @@ impl ModelShape {
     /// Projected resident bytes at `precision`: weights + KV cache + the fixed
     /// runner overhead.
     #[must_use]
-    pub fn projected_bytes(&self, precision: Precision) -> u64 {
+    pub const fn projected_bytes(&self, precision: Precision) -> u64 {
         let per_float = precision.bytes_per_float();
         let weights = self.params.saturating_mul(per_float);
         let kv = self
@@ -139,7 +150,7 @@ impl DeviceBudget {
     /// Bytes a plan may claim, after leaving the display its share.
     #[must_use]
     pub fn usable_bytes(&self) -> u64 {
-        let usable = (self.vram_bytes as f64 * USABLE_VRAM_FRACTION) as u64;
+        let usable = trunc_u64(f64_from_u64(self.vram_bytes) * USABLE_VRAM_FRACTION);
         debug_assert!(usable <= self.vram_bytes, "usable VRAM cannot exceed total");
         usable
     }
@@ -161,7 +172,7 @@ impl Fit {
     /// Headroom left over — the slack a longer context or a second model
     /// would eat into.
     #[must_use]
-    pub fn headroom_bytes(&self) -> u64 {
+    pub const fn headroom_bytes(&self) -> u64 {
         self.usable_bytes.saturating_sub(self.projected_bytes)
     }
 }
@@ -172,6 +183,11 @@ impl Fit {
 ///
 /// Never silently ships a worse tier than the hardware can hold, and never
 /// picks f16 on an adapter that does not advertise `SHADER_F16`.
+///
+/// # Panics
+///
+/// When `shape.params` is zero — a model with no parameters cannot be sized
+/// ([`ModelShape::from_decoder`] already refuses one).
 #[must_use]
 pub fn pick_precision(shape: &ModelShape, budget: &DeviceBudget) -> Option<Fit> {
     assert!(shape.params > 0, "pick_precision: a model has parameters");
@@ -198,7 +214,7 @@ mod tests {
 
     const GIB: u64 = 1 << 30;
 
-    /// Qwen2.5-1.5B: 1.54 G params, 28 layers, 2 kv heads, head_dim 128.
+    /// Qwen2.5-1.5B: 1.54 G params, 28 layers, 2 kv heads, `head_dim` 128.
     fn qwen2_1_5b(context: usize) -> ModelShape {
         ModelShape::from_decoder(1_543_714_304, 28, 2, 128, context)
     }

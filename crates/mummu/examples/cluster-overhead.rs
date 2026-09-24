@@ -11,9 +11,18 @@
 //! If the split is nearly free, placement granularity is worth keeping as it
 //! is. If it is not, then no amount of scheduling reaches a fused runtime,
 //! and the partition width itself is the thing to change.
-use burn::tensor::{Device, DeviceKind, Tensor, TensorData};
+
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
+use burn::tensor::{DType, Device, DeviceKind, Tensor, TensorData};
 use mummu::backend;
+use mummu_num::f64_from_usize;
 use std::time::Instant;
+
+// This model's real geometry: hidden 5120, FFN 17408, clusters of 544.
+const HIDDEN: usize = 5120;
+const INTER: usize = 17408;
+const CLUSTER: usize = 544;
 
 /// Warm, then time `rounds` iterations; milliseconds per iteration.
 fn timed(rounds: usize, mut f: impl FnMut()) -> f64 {
@@ -22,17 +31,43 @@ fn timed(rounds: usize, mut f: impl FnMut()) -> f64 {
     for _ in 0..rounds {
         f();
     }
-    started.elapsed().as_secs_f64() * 1000.0 / rounds as f64
+    started.elapsed().as_secs_f64() * 1000.0 / f64_from_usize(rounds)
+}
+
+/// `count` cluster weights of `width` columns each, the same columns the
+/// full-width weight holds.
+fn cluster_weights(device: &Device, dtype: DType, width: usize, count: usize) -> Vec<Tensor<2>> {
+    (0..count)
+        .map(|_| {
+            Tensor::<2>::from_data(
+                TensorData::new(vec![0.01f32; HIDDEN * width], [HIDDEN, width]),
+                (device, dtype),
+            )
+        })
+        .collect()
+}
+
+/// The partitioned form: one matmul per cluster, results concatenated. This
+/// is what `ExpertPool::run_dense` does for one layer's remote clusters.
+fn timed_clustered(rounds: usize, x: &Tensor<2>, parts: &[Tensor<2>]) -> f64 {
+    timed(rounds, || {
+        let mut acc: Option<Tensor<2>> = None;
+        for w in parts {
+            let y = x.clone().matmul(w.clone());
+            acc = Some(match acc {
+                Some(a) => Tensor::cat(vec![a, y], 1),
+                None => y,
+            });
+        }
+        if let Some(a) = acc {
+            let _ = a.into_data().convert::<f32>().try_to_vec::<f32>().ok();
+        }
+    })
 }
 
 fn main() {
     let device = Device::wgpu(DeviceKind::DiscreteGpu(0));
     let dtype = backend::float_dtype(&device);
-
-    // This model's real geometry: hidden 5120, FFN 17408, clusters of 544.
-    const HIDDEN: usize = 5120;
-    const INTER: usize = 17408;
-    const CLUSTER: usize = 544;
     let clusters = INTER / CLUSTER;
 
     let x = Tensor::<2>::from_data(
@@ -45,14 +80,7 @@ fn main() {
         TensorData::new(vec![0.01f32; HIDDEN * INTER], [HIDDEN, INTER]),
         (&device, dtype),
     );
-    let parts: Vec<Tensor<2>> = (0..clusters)
-        .map(|_| {
-            Tensor::<2>::from_data(
-                TensorData::new(vec![0.01f32; HIDDEN * CLUSTER], [HIDDEN, CLUSTER]),
-                (&device, dtype),
-            )
-        })
-        .collect();
+    let parts = cluster_weights(&device, dtype, CLUSTER, clusters);
 
     println!("hidden {HIDDEN}, inter {INTER}, {clusters} clusters of {CLUSTER}\n");
 
@@ -63,21 +91,7 @@ fn main() {
     });
     println!("  one full-width matmul          {one:7.2} ms");
 
-    // The partitioned form:one matmul per cluster, results summed. This is
-    // what `ExpertPool::run_dense` does for one layer's remote clusters.
-    let split = timed(20, || {
-        let mut acc: Option<Tensor<2>> = None;
-        for w in &parts {
-            let y = x.clone().matmul(w.clone());
-            acc = Some(match acc {
-                Some(a) => Tensor::cat(vec![a, y], 1),
-                None => y,
-            });
-        }
-        if let Some(a) = acc {
-            let _ = a.into_data().convert::<f32>().try_to_vec::<f32>().ok();
-        }
-    });
+    let split = timed_clustered(20, &x, &parts);
     println!(
         "  {clusters} cluster matmuls           {split:7.2} ms   ({:.1}x)",
         split / one
@@ -96,27 +110,8 @@ fn main() {
             continue;
         }
         let n = INTER / width;
-        let ws: Vec<Tensor<2>> = (0..n)
-            .map(|_| {
-                Tensor::<2>::from_data(
-                    TensorData::new(vec![0.01f32; HIDDEN * width], [HIDDEN, width]),
-                    (&device, dtype),
-                )
-            })
-            .collect();
-        let ms = timed(10, || {
-            let mut acc: Option<Tensor<2>> = None;
-            for w in &ws {
-                let y = x.clone().matmul(w.clone());
-                acc = Some(match acc {
-                    Some(a) => Tensor::cat(vec![a, y], 1),
-                    None => y,
-                });
-            }
-            if let Some(a) = acc {
-                let _ = a.into_data().convert::<f32>().try_to_vec::<f32>().ok();
-            }
-        });
+        let ws = cluster_weights(&device, dtype, width, n);
+        let ms = timed_clustered(10, &x, &ws);
         println!(
             "    {n:2} x {width:5}   {ms:7.2} ms   ({:.2}x fused)",
             ms / one
@@ -145,8 +140,8 @@ fn main() {
     // materializes f32 regardless, f16 should beat BOTH, and it is reachable
     // by the existing ladder without any new kernel.
     {
-        let half = whole.clone().cast(burn::tensor::DType::F16);
-        let xh = x.clone().cast(burn::tensor::DType::F16);
+        let half = whole.cast(DType::F16);
+        let xh = x.cast(DType::F16);
         let ms = timed(20, || {
             let y = xh.clone().matmul(half.clone());
             let _ = y.into_data().convert::<f32>().try_to_vec::<f32>().ok();

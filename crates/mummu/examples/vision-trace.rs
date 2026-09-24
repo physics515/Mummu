@@ -16,6 +16,8 @@
 //! fingerprint. If they do not, the divergence is here, in preprocessing.
 //! If they do, it is downstream in the tower, which halves the search.
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use mummu::vision::VisionConfig;
 
 fn main() {

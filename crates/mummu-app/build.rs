@@ -1,3 +1,5 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 fn main() {
     // Reads `tauri.conf.json`, embeds `ui/` as the fallback frontend, and
     // attaches the Windows resources (icon, manifest). The manifest asks for

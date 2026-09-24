@@ -11,9 +11,9 @@
 //! CPU (`-ngl 0`): a *different* compute stack from the wgpu path under test,
 //! which is exactly what a parity reference should be.
 //!
-//! Every parity binary includes this module but uses a different slice of it
-//! (spawn vs attach, parsed vs raw responses), hence the per-item
-//! `allow(dead_code)`s.
+//! Every parity binary uses a different slice of it (spawn vs attach, parsed
+//! vs raw responses), which is why it lives in a library crate rather than a
+//! `#[path]`-shared file.
 
 use std::io::Read;
 use std::path::PathBuf;
@@ -29,16 +29,17 @@ const HEALTH_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_RESPONSE_BYTES: u64 = 16 << 20;
 
 /// Path to the llama.cpp server binary, from `MUMMU_LLAMA_SERVER`.
-#[allow(dead_code)] // the attach-only recorder never spawns
+#[must_use]
 pub fn server_exe() -> Option<PathBuf> {
     let exe = PathBuf::from(std::env::var_os("MUMMU_LLAMA_SERVER")?);
     exe.is_file().then_some(exe)
 }
 
-/// A llama-server to query. When we spawned it, it is killed on drop so a
-/// failing test never leaks a 2 GB process; when we merely attached, it
-/// belongs to someone else (a container too big to start per test) and is
-/// left running.
+/// A llama-server to query.
+///
+/// When we spawned it, it is killed on drop so a failing test never leaks a
+/// 2 GB process; when we merely attached, it belongs to someone else (a
+/// container too big to start per test) and is left running.
 pub struct LlamaServer {
     child: Option<Child>,
     /// `http://host:port`, no trailing slash.
@@ -58,10 +59,24 @@ impl LlamaServer {
     /// Spawn on `port` serving `gguf`, CPU-only, and wait until `/health`
     /// answers ok. Errors are strings: these run inside `#[ignore]`d tests
     /// where the caller panics with context.
-    #[allow(dead_code)] // the attach-only recorder never spawns
+    ///
+    /// # Errors
+    ///
+    /// When `exe` cannot be spawned, when the server exits (or its status
+    /// cannot be polled) before it reports healthy, or when `/health` has
+    /// not answered 200 after `HEALTH_TRIES` polls at `HEALTH_INTERVAL`
+    /// (two minutes) — the child is killed before that error is returned.
+    ///
+    /// # Panics
+    ///
+    /// When `port` is below 1024 (privileged) or `gguf` is not a file.
     pub fn start(exe: &std::path::Path, gguf: &std::path::Path, port: u16) -> Result<Self, String> {
         assert!(port >= 1024, "pick an unprivileged port");
-        assert!(gguf.is_file(), "reference gguf must exist: {gguf:?}");
+        assert!(
+            gguf.is_file(),
+            "reference gguf must exist: {}",
+            gguf.display()
+        );
         let child = Command::new(exe)
             .args(["-m"])
             .arg(gguf)
@@ -69,7 +84,7 @@ impl LlamaServer {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| format!("spawn {exe:?}: {e}"))?;
+            .map_err(|e| format!("spawn {}: {e}", exe.display()))?;
         let mut child = child;
         let server_url = format!("http://127.0.0.1:{port}");
         for _ in 0..HEALTH_TRIES {
@@ -96,7 +111,11 @@ impl LlamaServer {
     /// ok. The Flash-Next reference is a 111 GB mmap in its own
     /// memory-capped container that takes minutes to load, so spawning it
     /// per test is not an option — and nothing is killed on drop.
-    #[allow(dead_code)] // only the recorder attaches
+    ///
+    /// # Errors
+    ///
+    /// When `/health` at `base_url` has not answered 200 after
+    /// `HEALTH_TRIES` polls at `HEALTH_INTERVAL` (two minutes).
     pub fn attach(base_url: &str) -> Result<Self, String> {
         let base_url = base_url.trim_end_matches('/').to_string();
         for _ in 0..HEALTH_TRIES {
@@ -115,7 +134,12 @@ impl LlamaServer {
 
     /// GET a JSON endpoint — e.g. `/props`, whose `build_info` names the
     /// build a fixture was recorded against.
-    #[allow(dead_code)] // only the recorder reads server metadata
+    ///
+    /// # Errors
+    ///
+    /// When the request fails or the server answers a non-success status,
+    /// when the body cannot be read (it is capped at 16 MiB, so a runaway
+    /// response fails the parse), or when the body is not JSON.
     pub fn get_json(&self, path: &str) -> Result<serde_json::Value, String> {
         let url = format!("{}{path}", self.base_url);
         let mut resp = ureq::get(&url)
@@ -128,6 +152,12 @@ impl LlamaServer {
     /// recorder keeps fields the live legs never read (`timings`, `tokens`,
     /// `stop_type`); [`Self::greedy_completion`] is this transport with the
     /// gates' fixed body.
+    ///
+    /// # Errors
+    ///
+    /// When the POST fails or the server answers a non-success status (a
+    /// malformed body is a 400), when the response cannot be read (16 MiB
+    /// cap), or when it is not JSON.
     pub fn raw_completion(&self, body: &serde_json::Value) -> Result<serde_json::Value, String> {
         let url = format!("{}/completion", self.base_url);
         let payload = body.to_string();
@@ -141,7 +171,17 @@ impl LlamaServer {
     /// Raw greedy completion from exact `prompt_ids`: temperature 0,
     /// `n_predict` tokens, top-`n_probs` pre-sampling logprobs per position.
     /// Asserts the server evaluated exactly the ids we sent (no BOS injection).
-    #[allow(dead_code)] // the recorder sends its own body through raw_completion
+    ///
+    /// # Errors
+    ///
+    /// The transport errors of [`Self::raw_completion`], plus those of
+    /// [`parse_completion`]: the server reports a `tokens_evaluated` other
+    /// than `prompt_ids.len()` (BOS injection), or the response lacks the
+    /// `content` / `top_logprobs` / sampled-`id` fields the gates read.
+    ///
+    /// # Panics
+    ///
+    /// When `prompt_ids` is empty or `n_predict` is outside `1..=256`.
     pub fn greedy_completion(
         &self,
         prompt_ids: &[u32],
@@ -190,9 +230,17 @@ fn read_json(
 /// `{id, token, bytes, logprob}`. The logprobs are natural-log PRE-sampling
 /// values (`post_sampling_probs` defaults off), so a `top_k: 1` sampler does
 /// not truncate the list.
+///
+/// # Errors
+///
+/// When `tokens_evaluated` (0 if absent) is not `prompt_len`, when `content`
+/// is missing or not a string, when a `completion_probabilities` position
+/// lacks a `top_logprobs` array or a sampled `id`, when a `top_logprobs`
+/// entry lacks an integer `id` or a numeric `logprob`, or when an id does
+/// not fit a `u32` token id.
 pub fn parse_completion(v: &serde_json::Value, prompt_len: usize) -> Result<Completion, String> {
-    let evaluated = v["tokens_evaluated"].as_u64().unwrap_or(0) as usize;
-    if evaluated != prompt_len {
+    let evaluated = v["tokens_evaluated"].as_u64().unwrap_or(0);
+    if evaluated != prompt_len as u64 {
         return Err(format!(
             "server evaluated {evaluated} tokens for a {prompt_len}-id prompt — \
              token-id passthrough is broken (BOS injection?)"
@@ -211,7 +259,8 @@ pub fn parse_completion(v: &serde_json::Value, prompt_len: usize) -> Result<Comp
                 .ok_or_else(|| "completion_probabilities without top_logprobs".to_string())?
                 .iter()
                 .map(|e| {
-                    let id = e["id"].as_u64().ok_or("top_logprobs entry without id")? as u32;
+                    let raw_id = e["id"].as_u64().ok_or("top_logprobs entry without id")?;
+                    let id = u32::try_from(raw_id).map_err(|_| "top_logprobs id exceeds u32")?;
                     let logprob = e["logprob"].as_f64().ok_or("entry without logprob")?;
                     Ok((id, logprob))
                 })
@@ -221,7 +270,7 @@ pub fn parse_completion(v: &serde_json::Value, prompt_len: usize) -> Result<Comp
             let id = pos["id"]
                 .as_u64()
                 .ok_or("completion_probabilities position without a sampled id")?;
-            chosen.push(id as u32);
+            chosen.push(u32::try_from(id).map_err(|_| format!("sampled id {id} exceeds u32"))?);
         }
     }
     Ok(Completion {
@@ -238,19 +287,22 @@ pub struct Completion {
     // Only `parity_lfm2` and the recorder read the greedy text, so the other
     // parity binaries see this field as dead. It is real reference data, not
     // cruft.
-    #[allow(dead_code)]
     pub content: String,
     pub steps: Vec<Vec<(u32, f64)>>,
     /// The id the server actually sampled at each position. Under greedy
     /// sampling this is `steps[i][0].0` unless the top two tie exactly; it is
     /// kept separately so a fixture never has to assume that.
-    #[allow(dead_code)]
     pub chosen: Vec<u32>,
 }
 
 /// Natural-log softmax probabilities of `logits` at `ids`, computed in f64
 /// (the reference reports logprobs, not raw logits — same transform here).
-#[allow(dead_code)] // the recorder has no logits of its own
+///
+/// # Panics
+///
+/// When `logits` is empty, when its maximum is not finite (a `+inf` logit,
+/// or no finite logit at all), or when an `id` indexes past the end of
+/// `logits`.
 pub fn logprobs_at(logits: &[f32], ids: &[u32]) -> Vec<f64> {
     assert!(!logits.is_empty(), "empty logits");
     let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);

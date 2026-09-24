@@ -21,14 +21,21 @@
 //! buffer, the bus-level effect wgpu staging has); replace it with a real
 //! GPU loop when hunting a wgpu-specific interaction.
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use mummu::flex::insitu::{CellStats, cell_stats, kernel_innocent, main_effect};
+use mummu::flex::kernels::{self, PackedQ4};
+use mummu_num::{f32_from_usize, f64_from_usize};
+use rayon::prelude::*;
 
 /// One ANOVA cell: `(shape, batch, fusion, autotune, stats)`.
 type Cell = (String, usize, bool, bool, CellStats);
-use mummu::flex::kernels::{self, PackedQ4};
+
+/// Timed reps per cell.
+const REPS: usize = 30;
 
 fn wave(len: usize, f: f32) -> Vec<f32> {
-    (0..len).map(|i| ((i as f32) * f).sin()).collect()
+    (0..len).map(|i| (f32_from_usize(i) * f).sin()).collect()
 }
 
 #[cfg(windows)]
@@ -46,38 +53,90 @@ fn set_current_thread_priority(below_normal: bool) {
 }
 
 #[cfg(not(windows))]
-fn set_current_thread_priority(_below_normal: bool) {}
+const fn set_current_thread_priority(_below_normal: bool) {}
+
+/// The DRAM read roofline for this box (the innocence denominator): a
+/// threaded sum over 1 GiB, best of 3, in GB/s.
+fn dram_roofline_gbps() -> f64 {
+    let words = (1usize << 30) / 8;
+    let buf: Vec<u64> = (0..words as u64).collect();
+    let mut best = f64::INFINITY;
+    for _ in 0..3 {
+        let t0 = std::time::Instant::now();
+        let s: u64 = buf
+            .par_chunks(1 << 16)
+            .map(|c| c.iter().fold(0u64, |a, &b| a.wrapping_add(b)))
+            .reduce(|| 0, u64::wrapping_add);
+        std::hint::black_box(s);
+        best = best.min(t0.elapsed().as_secs_f64() * 1e3);
+    }
+    let gbps = f64_from_usize(words * 8) / (best * 1e6);
+    println!("dram read roofline: {gbps:.1} GB/s\n");
+    gbps
+}
+
+/// `REPS` timed GEMVs on `pool`, round-robin over `tensors` so the stream
+/// defeats the L3, after one warm call outside the clock.
+fn time_cell(pool: &rayon::ThreadPool, tensors: &[PackedQ4], x: &[f32], n: usize) -> CellStats {
+    let mut out = vec![0.0f32; n];
+    // Warm the pool + pages outside the clock.
+    pool.install(|| kernels::gemv_q4n_auto(&tensors[0], x, &mut out));
+    let mut samples = Vec::with_capacity(REPS);
+    for r in 0..REPS {
+        let w = &tensors[r % tensors.len()];
+        let t0 = std::time::Instant::now();
+        pool.install(|| kernels::gemv_q4n_auto(w, x, &mut out));
+        samples.push(t0.elapsed().as_secs_f64() * 1e3);
+    }
+    cell_stats(&samples)
+}
+
+/// One main-effect contrast line.
+fn print_contrast(label: &str, delta_ms: f64, clear: bool) {
+    println!(
+        "{label} {delta_ms:+.2} ms {}",
+        if clear { "(clear)" } else { "(within noise)" }
+    );
+}
+
+/// SPEC P1.1's decision rule. Quiet = widest pool, normal priority, no
+/// contender; live proxy = same pool with the contender on.
+fn print_verdict(cells: &[Cell], bytes_per_call: usize, roofline_gbps: f64) {
+    let quiet = cells
+        .iter()
+        .find(|c| c.1 == 16 && !c.2 && !c.3)
+        .expect("quiet cell");
+    let live = cells
+        .iter()
+        .find(|c| c.1 == 16 && !c.2 && c.3)
+        .expect("live cell");
+    let quiet_gbps = f64_from_usize(bytes_per_call) / (quiet.4.median_ms * 1e6);
+    let live_gbps = f64_from_usize(bytes_per_call) / (live.4.median_ms * 1e6);
+    println!(
+        "\nquiet {quiet_gbps:.1} GB/s vs roofline {roofline_gbps:.1}: kernel {} \
+         (live-proxy {live_gbps:.1} GB/s, ratio {:.2})",
+        if quiet_gbps >= 0.85 * roofline_gbps {
+            "INNOCENT — chase the environment"
+        } else {
+            "NOT at the roofline — look at the kernel first"
+        },
+        live_gbps / quiet_gbps,
+    );
+    let _ = kernel_innocent(quiet_gbps, roofline_gbps, live_gbps);
+    println!("largest |contrast| is the first code change (SPEC P1.1's decision rule).");
+}
 
 fn main() {
     println!("vnni available: {}", kernels::vnni_available());
-
-    // The DRAM read roofline for this box (the innocence denominator).
-    let roofline_gbps = {
-        let words = (1usize << 30) / 8;
-        let buf: Vec<u64> = (0..words as u64).collect();
-        let mut best = f64::INFINITY;
-        for _ in 0..3 {
-            let t0 = std::time::Instant::now();
-            use rayon::prelude::*;
-            let s: u64 = buf
-                .par_chunks(1 << 16)
-                .map(|c| c.iter().fold(0u64, |a, &b| a.wrapping_add(b)))
-                .reduce(|| 0, u64::wrapping_add);
-            std::hint::black_box(s);
-            best = best.min(t0.elapsed().as_secs_f64() * 1e3);
-        }
-        let gbps = (words * 8) as f64 / (best * 1e6);
-        println!("dram read roofline: {gbps:.1} GB/s\n");
-        gbps
-    };
+    let roofline_gbps = dram_roofline_gbps();
 
     // Enough production-shaped tensors that round-robin defeats the 128 MB
     // L3: 6 x [5120, 17408] packed ~= 300 MB of stream.
     let (k, n) = (5120usize, 17408usize);
     println!("packing 6 x [{k}, {n}] twins (~300 MB stream)…");
-    let tensors: Vec<PackedQ4> = (0..6)
+    let tensors: Vec<PackedQ4> = (0..6usize)
         .map(|i| {
-            let vals = wave(k * n, 0.11 + i as f32 * 0.013);
+            let vals = wave(k * n, f32_from_usize(i).mul_add(0.013, 0.11));
             PackedQ4::from_f32(&vals, k, n)
         })
         .collect();
@@ -101,7 +160,6 @@ fn main() {
         }))
     };
 
-    const REPS: usize = 30;
     let mut cells: Vec<Cell> = Vec::new();
     for &threads in &[4usize, 8, 16] {
         for &below in &[true, false] {
@@ -113,27 +171,17 @@ fn main() {
                     .expect("cell pool");
                 stop.store(false, std::sync::atomic::Ordering::Relaxed);
                 let contender = spawn_contender(contend);
-                let mut out = vec![0.0f32; n];
-                // Warm the pool + pages outside the clock.
-                pool.install(|| kernels::gemv_q4n_auto(&tensors[0], &x, &mut out));
-                let mut samples = Vec::with_capacity(REPS);
-                for r in 0..REPS {
-                    let w = &tensors[r % tensors.len()];
-                    let t0 = std::time::Instant::now();
-                    pool.install(|| kernels::gemv_q4n_auto(w, &x, &mut out));
-                    samples.push(t0.elapsed().as_secs_f64() * 1e3);
-                }
+                let stats = time_cell(&pool, &tensors, &x, n);
                 stop.store(true, std::sync::atomic::Ordering::Relaxed);
                 if let Some(h) = contender {
                     let _ = h.join();
                 }
-                let stats = cell_stats(&samples);
                 let label = format!(
                     "threads {threads:>2} | {} | contender {}",
                     if below { "below " } else { "normal" },
                     if contend { "on " } else { "off" },
                 );
-                let gbps = bytes_per_call as f64 / (stats.median_ms * 1e6);
+                let gbps = f64_from_usize(bytes_per_call) / (stats.median_ms * 1e6);
                 println!(
                     "{label}: median {:>6.2} ms [{:>6.2}, {:>6.2}] = {gbps:.1} GB/s",
                     stats.median_ms, stats.q05_ms, stats.q95_ms
@@ -155,58 +203,23 @@ fn main() {
     };
     println!();
     let c_threads = main_effect(&pooled(&|c| c.1 == 4), &pooled(&|c| c.1 == 16));
-    println!(
-        "contrast threads (4 vs 16):        {:+.2} ms {}",
+    print_contrast(
+        "contrast threads (4 vs 16):       ",
         c_threads.delta_ms,
-        if c_threads.clear {
-            "(clear)"
-        } else {
-            "(within noise)"
-        }
+        c_threads.clear,
     );
     let c_prio = main_effect(&pooled(&|c| c.2), &pooled(&|c| !c.2));
-    println!(
-        "contrast priority (below vs norm): {:+.2} ms {}",
+    print_contrast(
+        "contrast priority (below vs norm):",
         c_prio.delta_ms,
-        if c_prio.clear {
-            "(clear)"
-        } else {
-            "(within noise)"
-        }
+        c_prio.clear,
     );
     let c_cont = main_effect(&pooled(&|c| c.3), &pooled(&|c| !c.3));
-    println!(
-        "contrast contender (on vs off):    {:+.2} ms {}",
+    print_contrast(
+        "contrast contender (on vs off):   ",
         c_cont.delta_ms,
-        if c_cont.clear {
-            "(clear)"
-        } else {
-            "(within noise)"
-        }
+        c_cont.clear,
     );
 
-    // The decision rule. Quiet = widest pool, normal priority, no
-    // contender; live proxy = same pool with the contender on.
-    let quiet = cells
-        .iter()
-        .find(|c| c.1 == 16 && !c.2 && !c.3)
-        .expect("quiet cell");
-    let live = cells
-        .iter()
-        .find(|c| c.1 == 16 && !c.2 && c.3)
-        .expect("live cell");
-    let quiet_gbps = bytes_per_call as f64 / (quiet.4.median_ms * 1e6);
-    let live_gbps = bytes_per_call as f64 / (live.4.median_ms * 1e6);
-    println!(
-        "\nquiet {quiet_gbps:.1} GB/s vs roofline {roofline_gbps:.1}: kernel {} \
-         (live-proxy {live_gbps:.1} GB/s, ratio {:.2})",
-        if quiet_gbps >= 0.85 * roofline_gbps {
-            "INNOCENT — chase the environment"
-        } else {
-            "NOT at the roofline — look at the kernel first"
-        },
-        live_gbps / quiet_gbps,
-    );
-    let _ = kernel_innocent(quiet_gbps, roofline_gbps, live_gbps);
-    println!("largest |contrast| is the first code change (SPEC P1.1's decision rule).");
+    print_verdict(&cells, bytes_per_call, roofline_gbps);
 }

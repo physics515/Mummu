@@ -12,10 +12,14 @@
 //! about without a GPU. The one thing that genuinely needs burn — turning a
 //! rung into a `QuantScheme` — stays in `mummu::quant`.
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 pub mod bits;
 pub mod hadamard;
 pub mod joint;
 pub mod scales;
+
+use mummu_num::f64_from_u64;
 
 /// Which quantization the keep-quantized path applies on import.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,10 +27,12 @@ pub enum QuantPolicy {
     /// No quantization — the classic f32 path.
     Off,
     /// Half precision. Not a quantization at all: no codes, no block scales,
-    /// just a narrower float — so it has no [`Self::scheme`].
+    /// just a narrower float — so `mummu::quant::SchemeExt::scheme` is
+    /// `None` for it. (Not an intra-doc link: the trait lives in `mummu`,
+    /// which this crate deliberately does not depend on.)
     ///
     /// It earns a rung because a **quantized source makes f32 redundant**.
-    /// This 27B ships as Q4_K_S: 15.36 GB for ~27 G parameters is 4.55
+    /// This 27B ships as `Q4_K_S`: 15.36 GB for ~27 G parameters is 4.55
     /// bits/param, so the f32 in a pack is an upcast copy of 4-bit data and
     /// carries no more information than f16 does. Storing it at 4 B/param
     /// buys nothing over 2 B/param — and f16 measured the same speed on the
@@ -61,6 +67,11 @@ pub enum QuantPolicy {
 impl QuantPolicy {
     /// Parse the `MUMMU_QUANT` convention: `q8` / `int8` → [`Self::Q8`],
     /// `off`/empty/unset → [`Self::Off`]. Unknown values are a loud error.
+    ///
+    /// # Errors
+    /// If `MUMMU_QUANT` is set to anything other than `f16`/`fp16`,
+    /// `q8`/`int8`, `q4`/`int4`, `q2`/`int2`, `off` or the empty string
+    /// (case-insensitive); the message names the offending value.
     pub fn from_env() -> Result<Self, String> {
         match std::env::var("MUMMU_QUANT") {
             Err(_) => Ok(Self::Off),
@@ -80,7 +91,7 @@ impl QuantPolicy {
     /// Bits per stored weight — what the placement planner budgets with.
     /// `Off` is f32.
     #[must_use]
-    pub fn bits(self) -> usize {
+    pub const fn bits(self) -> usize {
         match self {
             Self::Off => 32,
             Self::F16 => 16,
@@ -96,7 +107,7 @@ impl QuantPolicy {
 
     /// The next rung down, or `None` at the bottom.
     #[must_use]
-    pub fn demote(self) -> Option<Self> {
+    pub const fn demote(self) -> Option<Self> {
         match self {
             Self::Off => Some(Self::F16),
             Self::F16 => Some(Self::Q8),
@@ -108,7 +119,7 @@ impl QuantPolicy {
 
     /// The next rung up, or `None` at the top.
     #[must_use]
-    pub fn promote(self) -> Option<Self> {
+    pub const fn promote(self) -> Option<Self> {
         match self {
             Self::Off => None,
             Self::F16 => Some(Self::Off),
@@ -122,7 +133,7 @@ impl QuantPolicy {
     /// `source_bits_per_param`.
     ///
     /// Precision above the source is bytes without information. A checkpoint
-    /// that ships at 4.55 bits/param (this 27B's Q4_K_S) gains nothing from
+    /// that ships at 4.55 bits/param (this 27B's `Q4_K_S`) gains nothing from
     /// f32 over f16 — measured 0.0000 relative error for f16 against the
     /// pack's own f32 bytes, because those bytes are themselves an upcast of
     /// 4-bit data. This is also the answer to "why not f64": the ceiling is
@@ -150,7 +161,7 @@ impl QuantPolicy {
     /// projections) crashes the block-range reshape.
     #[must_use]
     pub fn eligible(self, dims: &[usize]) -> bool {
-        const BLOCK: usize = 32; // keep in sync with `scheme()`
+        const BLOCK: usize = 32; // keep in sync with `SchemeExt::scheme`
         self != Self::Off
             && dims.len() == 2
             && dims.iter().product::<usize>() >= (1 << 16)
@@ -159,9 +170,11 @@ impl QuantPolicy {
 }
 
 /// What a tensor is, for the purpose of deciding how much precision it
-/// deserves. Coarse on purpose — a finer split would need per-tensor
-/// calibration data we do not have, and would imply a confidence this
-/// heuristic has not earned.
+/// deserves.
+///
+/// Coarse on purpose — a finer split would need per-tensor calibration
+/// data we do not have, and would imply a confidence this heuristic has
+/// not earned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     /// Q/K/V/O projections. More sensitive than FFN at equal size: they
@@ -197,16 +210,15 @@ pub struct TensorFacts {
 /// and Q2 ~6x Q4 again. That steepness is why the planner spends its budget
 /// keeping tensors off Q2 rather than spreading the pain evenly.
 #[must_use]
-pub fn rel_error(p: QuantPolicy) -> f64 {
+pub const fn rel_error(p: QuantPolicy) -> f64 {
     match p {
-        QuantPolicy::Off => 0.0,
-        // Measured at 0.0000 — below the probe's resolution against the
+        // F16 measured at 0.0000 — below the probe's resolution against the
         // pack's own f32 bytes, because those bytes are themselves an upcast
         // of a 4.55 bits/param source. Zero here is deliberate and load
         // bearing: it makes f32 -> f16 the first demotion the planner
         // reaches for, which is correct, since for such a checkpoint it
         // halves the bytes for no accuracy at all.
-        QuantPolicy::F16 => 0.0,
+        QuantPolicy::Off | QuantPolicy::F16 => 0.0,
         QuantPolicy::Q8 => 0.0058,
         QuantPolicy::Q4 => 0.0997,
         QuantPolicy::Q2 => 0.6226,
@@ -252,18 +264,15 @@ impl TensorFacts {
             Kind::Attention => 2.0,
             Kind::Ffn => 1.0,
         };
-        let edge = match self.layer {
-            // A trunk tensor sits outside the stack entirely; treat it as an
-            // edge rather than silently giving it the mildest weighting.
-            None => true,
-            Some(l) => l == 0 || l + 1 >= layers.max(1),
-        };
+        // A trunk tensor (`None`) sits outside the stack entirely; treat it
+        // as an edge rather than silently giving it the mildest weighting.
+        let edge = self.layer.is_none_or(|l| l == 0 || l + 1 >= layers.max(1));
         if edge { base * 2.0 } else { base }
     }
 }
 
 /// A precision assignment for every tensor, and what it costs.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
     /// Parallel to the `tensors` slice handed to [`plan`].
     pub precision: Vec<QuantPolicy>,
@@ -346,7 +355,7 @@ pub fn plan(
         }
         let freed = before - after;
         let cost = sensitivity * (rel_error(to) - rel_error(from));
-        Some((cost / freed as f64, freed, to))
+        Some((cost / f64_from_u64(freed), freed, to))
     };
 
     while bytes > budget {

@@ -20,6 +20,7 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
+use mummu_num::{f64_from_u64, f64_from_usize, trunc_usize};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -58,17 +59,29 @@ impl Timings {
     #[must_use]
     pub fn tokens_per_second(&self) -> Option<f64> {
         (self.completion_tokens > 1 && self.decode_ms > 0).then(|| {
-            #[allow(clippy::cast_precision_loss)]
-            let n = (self.completion_tokens - 1) as f64;
-            n / (self.decode_ms as f64 / 1000.0)
+            let n = f64_from_usize(self.completion_tokens - 1);
+            n / (f64_from_u64(self.decode_ms) / 1000.0)
         })
     }
 
     /// Time from the engine seeing the request to the client seeing a token.
     #[must_use]
-    pub fn ttft_ms(&self) -> u64 {
+    pub const fn ttft_ms(&self) -> u64 {
         self.plan_ms + self.queue_ms + self.load_ms + self.vision_ms + self.prefill_ms
     }
+}
+
+/// What a request asked for, as its surface read it. Flattened into the
+/// trace's JSON, so the wire shape is the three top-level fields it always
+/// was.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct Asked {
+    /// The answer goes out as it is generated.
+    pub stream: bool,
+    /// The model's `<think>` block is shown rather than withheld.
+    pub think: bool,
+    /// The output is constrained to a JSON value.
+    pub json_mode: bool,
 }
 
 /// Everything recorded about one request.
@@ -81,9 +94,8 @@ pub struct RequestTrace {
     /// `openai`, `ollama` or `native`.
     pub surface: &'static str,
     pub model: String,
-    pub stream: bool,
-    pub think: bool,
-    pub json_mode: bool,
+    #[serde(flatten)]
+    pub asked: Asked,
     pub tools: usize,
     pub images: usize,
     pub device: String,
@@ -109,9 +121,7 @@ static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub struct Begin {
     pub surface: &'static str,
     pub model: String,
-    pub stream: bool,
-    pub think: bool,
-    pub json_mode: bool,
+    pub asked: Asked,
     pub tools: usize,
     pub images: usize,
     pub started: std::time::Instant,
@@ -120,16 +130,13 @@ pub struct Begin {
 impl Begin {
     /// Record the finished request: log one line and keep it in the ring.
     pub fn finish(self, device: &str, timings: Timings, padded: bool, outcome: Result<(), &str>) {
-        #[allow(clippy::cast_possible_truncation)]
-        let total_ms = self.started.elapsed().as_millis() as u64;
+        let total_ms = crate::millis(self.started.elapsed());
         let trace = RequestTrace {
             seq: SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             at: now_rfc3339(),
             surface: self.surface,
             model: self.model,
-            stream: self.stream,
-            think: self.think,
-            json_mode: self.json_mode,
+            asked: self.asked,
             tools: self.tools,
             images: self.images,
             device: device.to_string(),
@@ -148,7 +155,9 @@ impl Begin {
         if let Ok(line) = serde_json::to_string(&trace) {
             eprintln!("[mummu-serve] trace {line}");
         }
-        let mut ring = TRACES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ring = TRACES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if ring.len() == RING {
             ring.pop_front();
         }
@@ -162,8 +171,7 @@ fn now_rfc3339() -> String {
         .map_or(0, |d| d.as_secs());
     // Civil-from-days (Howard Hinnant), to avoid a date dependency for one
     // timestamp.
-    #[allow(clippy::cast_possible_wrap)]
-    let days = (secs / 86_400) as i64;
+    let days = (secs / 86_400).cast_signed();
     let rem = secs % 86_400;
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
@@ -184,9 +192,10 @@ fn now_rfc3339() -> String {
 
 /// `GET /api/requests` — the recent traces, newest first.
 pub fn recent_json(limit: usize) -> Value {
-    let ring = TRACES.lock().unwrap_or_else(|e| e.into_inner());
-    let items: Vec<&RequestTrace> = ring.iter().rev().take(limit).collect();
-    json!({"requests": items})
+    let ring = TRACES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    json!({"requests": ring.iter().rev().take(limit).collect::<Vec<&RequestTrace>>()})
 }
 
 /// The `p`-th percentile of `v` (nearest rank), or `None` when empty.
@@ -195,13 +204,24 @@ fn percentile(v: &mut [f64], p: f64) -> Option<f64> {
         return None;
     }
     v.sort_by(f64::total_cmp);
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        clippy::cast_precision_loss
-    )]
-    let i = ((p / 100.0) * (v.len() - 1) as f64).round() as usize;
+    let i = trunc_usize(((p / 100.0) * f64_from_usize(v.len() - 1)).round());
     v.get(i).copied()
+}
+
+/// The aggregates over the traces in `ring` that `pred` picks.
+fn summarize(ring: &VecDeque<RequestTrace>, pred: &dyn Fn(&RequestTrace) -> bool) -> Value {
+    let picked: Vec<&RequestTrace> = ring.iter().filter(|t| pred(t)).collect();
+    let mut ttft: Vec<f64> = picked.iter().map(|t| f64_from_u64(t.ttft_ms)).collect();
+    let mut total: Vec<f64> = picked.iter().map(|t| f64_from_u64(t.total_ms)).collect();
+    let mut tps: Vec<f64> = picked.iter().filter_map(|t| t.tokens_per_second).collect();
+    json!({
+        "count": picked.len(),
+        "errors": picked.iter().filter(|t| t.outcome != "ok").count(),
+        "padded": picked.iter().filter(|t| t.padded).count(),
+        "ttft_ms": {"p50": percentile(&mut ttft.clone(), 50.0), "p95": percentile(&mut ttft, 95.0)},
+        "total_ms": {"p50": percentile(&mut total.clone(), 50.0), "p95": percentile(&mut total, 95.0)},
+        "tokens_per_second": {"p50": percentile(&mut tps.clone(), 50.0), "p95": percentile(&mut tps, 95.0)},
+    })
 }
 
 /// `GET /api/stats` — aggregates over the ring, split warm/cold.
@@ -211,33 +231,34 @@ fn percentile(v: &mut [f64], p: f64) -> Option<f64> {
 /// it turns a healthy p50 into a scary one and a real regression into
 /// noise.
 pub fn stats_json() -> Value {
-    let ring = TRACES.lock().unwrap_or_else(|e| e.into_inner());
-    let summarize = |pred: &dyn Fn(&RequestTrace) -> bool| -> Value {
-        let picked: Vec<&RequestTrace> = ring.iter().filter(|t| pred(t)).collect();
-        #[allow(clippy::cast_precision_loss)]
-        let mut ttft: Vec<f64> = picked.iter().map(|t| t.ttft_ms as f64).collect();
-        #[allow(clippy::cast_precision_loss)]
-        let mut total: Vec<f64> = picked.iter().map(|t| t.total_ms as f64).collect();
-        let mut tps: Vec<f64> = picked.iter().filter_map(|t| t.tokens_per_second).collect();
-        json!({
-            "count": picked.len(),
-            "errors": picked.iter().filter(|t| t.outcome != "ok").count(),
-            "padded": picked.iter().filter(|t| t.padded).count(),
-            "ttft_ms": {"p50": percentile(&mut ttft.clone(), 50.0), "p95": percentile(&mut ttft, 95.0)},
-            "total_ms": {"p50": percentile(&mut total.clone(), 50.0), "p95": percentile(&mut total, 95.0)},
-            "tokens_per_second": {"p50": percentile(&mut tps.clone(), 50.0), "p95": percentile(&mut tps, 95.0)},
-        })
+    // Every aggregate is computed under the lock and the guard dropped at
+    // the end of this block, before the response is assembled: serializing
+    // JSON is not worth holding every tracer's writes behind.
+    let (window, all, warm, cold, with_images, openai, ollama, native) = {
+        let ring = TRACES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            ring.len(),
+            summarize(&ring, &|_| true),
+            summarize(&ring, &|t| t.timings.load_ms == 0),
+            summarize(&ring, &|t| t.timings.load_ms > 0),
+            summarize(&ring, &|t| t.images > 0),
+            summarize(&ring, &|t| t.surface == "openai"),
+            summarize(&ring, &|t| t.surface == "ollama"),
+            summarize(&ring, &|t| t.surface == "native"),
+        )
     };
     json!({
-        "window": ring.len(),
-        "all": summarize(&|_| true),
-        "warm": summarize(&|t| t.timings.load_ms == 0),
-        "cold": summarize(&|t| t.timings.load_ms > 0),
-        "with_images": summarize(&|t| t.images > 0),
+        "window": window,
+        "all": all,
+        "warm": warm,
+        "cold": cold,
+        "with_images": with_images,
         "by_surface": {
-            "openai": summarize(&|t| t.surface == "openai"),
-            "ollama": summarize(&|t| t.surface == "ollama"),
-            "native": summarize(&|t| t.surface == "native"),
+            "openai": openai,
+            "ollama": ollama,
+            "native": native,
         },
     })
 }

@@ -19,9 +19,11 @@
 //! the calibration sweep watches. Folding into neighbors is per-model
 //! wiring: for a `y = x W` pair the input rotation folds into the previous
 //! layer's output projection (or the embedding), the output rotation into
-//! the next consumer; RMSNorm commutes with rotations only through its
+//! the next consumer; `RMSNorm` commutes with rotations only through its
 //! scalar (the norm), so the fold crosses `diag(gamma)` by absorbing gamma
 //! into W first — the same absorption SPEC P3.3 names.
+
+use mummu_num::{f64_from_usize, narrow};
 
 /// In-place Walsh–Hadamard transform (unnormalized butterflies). Length
 /// must be a power of two. Applying it twice multiplies by `len`, so the
@@ -30,22 +32,22 @@
 /// # Panics
 /// If `x.len()` is not a positive power of two.
 pub fn fwht(x: &mut [f32]) {
-    let n = x.len();
+    let len = x.len();
     assert!(
-        n.is_power_of_two(),
-        "fwht: length {n} is not a power of two"
+        len.is_power_of_two(),
+        "fwht: length {len} is not a power of two"
     );
-    let mut h = 1;
-    while h < n {
-        for block in x.chunks_mut(2 * h) {
-            let (a, b) = block.split_at_mut(h);
-            for i in 0..h {
-                let (u, v) = (a[i], b[i]);
-                a[i] = u + v;
-                b[i] = u - v;
+    let mut half = 1;
+    while half < len {
+        for block in x.chunks_mut(2 * half) {
+            let (lo, hi) = block.split_at_mut(half);
+            for i in 0..half {
+                let (left, right) = (lo[i], hi[i]);
+                lo[i] = left + right;
+                hi[i] = left - right;
             }
         }
-        h *= 2;
+        half *= 2;
     }
 }
 
@@ -66,11 +68,14 @@ pub fn sign_diagonal(seed: u64, n: usize) -> Vec<f32> {
 /// Rotate every length-`cols` row of `w` (row-major `rows x cols`) by the
 /// orthonormal `H = (1/sqrt(cols)) F D`: signs first, then the transform.
 /// `cols` must be a power of two.
+///
+/// # Panics
+/// If `w.len() != rows * cols`, or `cols` is not a positive power of two
+/// (the [`fwht`] length check).
 pub fn rotate_rows(w: &mut [f32], rows: usize, cols: usize, seed: u64) {
     assert_eq!(w.len(), rows * cols, "rotate_rows: shape");
     let d = sign_diagonal(seed, cols);
-    #[allow(clippy::cast_possible_truncation)]
-    let inv_sqrt = (1.0 / (cols as f64).sqrt()) as f32;
+    let inv_sqrt = narrow(1.0 / f64_from_usize(cols).sqrt());
     for row in w.chunks_mut(cols) {
         for (v, s) in row.iter_mut().zip(&d) {
             *v *= s;
@@ -83,11 +88,14 @@ pub fn rotate_rows(w: &mut [f32], rows: usize, cols: usize, seed: u64) {
 }
 
 /// Inverse of [`rotate_rows`] (`H^{-1} = D F / sqrt(cols)` — signs last).
+///
+/// # Panics
+/// If `w.len() != rows * cols`, or `cols` is not a positive power of two
+/// (the [`fwht`] length check).
 pub fn rotate_rows_inverse(w: &mut [f32], rows: usize, cols: usize, seed: u64) {
     assert_eq!(w.len(), rows * cols, "rotate_rows_inverse: shape");
     let d = sign_diagonal(seed, cols);
-    #[allow(clippy::cast_possible_truncation)]
-    let inv_sqrt = (1.0 / (cols as f64).sqrt()) as f32;
+    let inv_sqrt = narrow(1.0 / f64_from_usize(cols).sqrt());
     for row in w.chunks_mut(cols) {
         fwht(row);
         for (v, s) in row.iter_mut().zip(&d) {
@@ -97,11 +105,14 @@ pub fn rotate_rows_inverse(w: &mut [f32], rows: usize, cols: usize, seed: u64) {
 }
 
 /// Rotate every column of `w` by the same construction (the `H_out` side).
+///
+/// # Panics
+/// If `w.len() != rows * cols`, or `rows` is not a positive power of two
+/// (the [`fwht`] length check).
 pub fn rotate_cols(w: &mut [f32], rows: usize, cols: usize, seed: u64) {
     assert_eq!(w.len(), rows * cols, "rotate_cols: shape");
     let d = sign_diagonal(seed, rows);
-    #[allow(clippy::cast_possible_truncation)]
-    let inv_sqrt = (1.0 / (rows as f64).sqrt()) as f32;
+    let inv_sqrt = narrow(1.0 / f64_from_usize(rows).sqrt());
     let mut col = vec![0.0f32; rows];
     for j in 0..cols {
         for i in 0..rows {
@@ -115,10 +126,14 @@ pub fn rotate_cols(w: &mut [f32], rows: usize, cols: usize, seed: u64) {
 }
 
 /// The incoherence statistic the sweep watches: `max |w| * sqrt(n) / ||w||_2`
-/// — how far the worst coefficient sits above the RMS. 1.0 is perfectly
-/// flat; a lone spike in an otherwise-zero tensor scores `sqrt(n)`. The
-/// rotation drives this toward `O(sqrt(log n))`, which is what makes wide
-/// quantization groups near-lossless.
+/// — how far the worst coefficient sits above the RMS.
+///
+/// 1.0 is perfectly flat; a lone spike in an otherwise-zero tensor scores
+/// `sqrt(n)`. The rotation drives this toward `O(sqrt(log n))`, which is
+/// what makes wide quantization groups near-lossless.
+///
+/// # Panics
+/// If `w` is empty.
 #[must_use]
 pub fn incoherence(w: &[f32]) -> f32 {
     let n = w.len();
@@ -132,21 +147,21 @@ pub fn incoherence(w: &[f32]) -> f32 {
     if norm == 0.0 {
         return 0.0;
     }
-    #[allow(clippy::cast_possible_truncation)]
-    let r = (f64::from(max) * (n as f64).sqrt() / norm) as f32;
-    r
+
+    narrow(f64::from(max) * f64_from_usize(n).sqrt() / norm)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mummu_num::f32_from_usize;
 
     /// H is orthogonal: rotate + inverse is the identity to f32 precision.
     #[test]
     fn rotation_round_trips() {
         let (rows, cols) = (8, 64);
         let w: Vec<f32> = (0..rows * cols)
-            .map(|i| ((i as f32) * 0.37).sin())
+            .map(|i| (f32_from_usize(i) * 0.37).sin())
             .collect();
         let mut r = w.clone();
         rotate_rows(&mut r, rows, cols, 42);
@@ -161,7 +176,7 @@ mod tests {
     fn rotation_preserves_norms() {
         let (rows, cols) = (4, 128);
         let w: Vec<f32> = (0..rows * cols)
-            .map(|i| ((i as f32) * 0.11).cos())
+            .map(|i| (f32_from_usize(i) * 0.11).cos())
             .collect();
         let before: f64 = w.iter().map(|&v| f64::from(v) * f64::from(v)).sum();
         let mut r = w;
@@ -187,7 +202,7 @@ mod tests {
         assert!(before > 10.0, "a spike must score high, got {before}");
         rotate_rows(&mut w, 1, cols, 1234);
         let after = incoherence(&w);
-        let bound = 4.0 * (cols as f32).ln().sqrt(); // generous O(sqrt(log n))
+        let bound = 4.0 * f32_from_usize(cols).ln().sqrt(); // generous O(sqrt(log n))
         assert!(
             after < bound && after < before / 3.0,
             "rotation must spread the spike: {before} -> {after} (bound {bound})"
@@ -200,7 +215,7 @@ mod tests {
     fn group_range_improves() {
         let cols = 512usize;
         let mut w: Vec<f32> = (0..cols)
-            .map(|i| ((i as f32) * 0.05).sin() * 0.02)
+            .map(|i| (f32_from_usize(i) * 0.05).sin() * 0.02)
             .collect();
         for spike in [3usize, 100, 301] {
             w[spike] = 5.0;

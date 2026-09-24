@@ -40,9 +40,13 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering::Relaxed};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// What the runner is doing. A phase that carries counts renders as a
-/// determinate bar; one that cannot know its own size renders indeterminate,
-/// which is honest rather than a fake percentage that stalls at 90%.
+use mummu_num::f64_from_u64;
+
+/// What the runner is doing.
+///
+/// A phase that carries counts renders as a determinate bar; one that cannot
+/// know its own size renders indeterminate, which is honest rather than a
+/// fake percentage that stalls at 90%.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Phase {
@@ -149,7 +153,7 @@ pub enum Unit {
     Tensors = 0,
     /// Whole transformer layers, for a loop whose body is one layer.
     Layers = 1,
-    /// MoE experts, for the tiered loader's `layers * experts_per_layer`.
+    /// `MoE` experts, for the tiered loader's `layers * experts_per_layer`.
     Experts = 2,
 }
 
@@ -197,13 +201,15 @@ static MODEL: Mutex<String> = Mutex::new(String::new());
 fn model() -> MutexGuard<'static, String> {
     // A poisoned name is still a perfectly readable name, and refusing to show
     // a progress bar because a *label* lock was poisoned would be absurd.
-    MODEL.lock().unwrap_or_else(|e| e.into_inner())
+    MODEL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 // ---------------------------------------------------------------------------
@@ -552,7 +558,7 @@ impl Snapshot {
             return None;
         }
         let end = self.updated_ms.max(now_ms());
-        Some(end.saturating_sub(self.started_ms) as f64 / 1000.0)
+        Some(f64_from_u64(end.saturating_sub(self.started_ms)) / 1000.0)
     }
 
     /// Bytes per second over the current phase, or `None` when nothing has
@@ -567,7 +573,7 @@ impl Snapshot {
         if self.bytes == 0 || elapsed <= 0.0 {
             return None;
         }
-        Some(self.bytes as f64 / elapsed)
+        Some(f64_from_u64(self.bytes) / elapsed)
     }
 
     /// Seconds left, extrapolated from the share of items already done.
@@ -586,8 +592,8 @@ impl Snapshot {
         if self.expected == 0 || self.done == 0 || elapsed <= 0.0 {
             return None;
         }
-        let remaining = self.expected.saturating_sub(self.done) as f64;
-        Some(elapsed * remaining / self.done as f64)
+        let remaining = f64_from_u64(self.expected.saturating_sub(self.done));
+        Some(elapsed * remaining / f64_from_u64(self.done))
     }
 
     /// The fraction complete in `0.0..=1.0`, or `None` when this phase has no
@@ -597,7 +603,7 @@ impl Snapshot {
         if self.expected == 0 {
             return None;
         }
-        Some((self.done as f64 / self.expected as f64).clamp(0.0, 1.0))
+        Some((f64_from_u64(self.done) / f64_from_u64(self.expected)).clamp(0.0, 1.0))
     }
 }
 
@@ -613,7 +619,9 @@ impl Snapshot {
 #[cfg(test)]
 pub(crate) fn test_serial() -> MutexGuard<'static, ()> {
     static SERIAL: Mutex<()> = Mutex::new(());
-    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Read the current state. Cheap: nine relaxed loads and one short `String`
@@ -637,6 +645,7 @@ pub fn snapshot() -> Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mummu_num::trunc_u32;
 
     /// The state is process-wide and `cargo test` runs in parallel threads, so
     /// every test that writes to it takes this first — including the ones in
@@ -738,7 +747,7 @@ mod tests {
         advance(673, 14 << 30);
         let s = snapshot();
         assert_eq!((s.done, s.expected), (673, 851));
-        assert_eq!(s.fraction().map(|f| (f * 100.0) as u32), Some(79));
+        assert_eq!(s.fraction().map(|f| trunc_u32(f * 100.0)), Some(79));
 
         load.phase(Phase::Warming);
         let warming = snapshot();

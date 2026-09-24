@@ -29,8 +29,11 @@
 //! With no file, a built-in table of the 27B's recorded session numbers is
 //! used (see [`builtin_27b`]).
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use mummu::attrib;
 use mummu::sdf::{self, LayerCosts, Machine};
+use mummu_num::{f64_from_u64, f64_from_usize};
 
 /// The 27B's recorded session numbers (quiet + warm + same-session; this box
 /// drifts ~10% across sessions, so treat these as a coherent snapshot, not
@@ -124,23 +127,25 @@ impl Lcg {
     fn centered(&mut self) -> f64 {
         self.0 = self
             .0
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        ((self.0 >> 11) as f64) / ((1u64 << 53) as f64) - 0.5
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        f64_from_u64(self.0 >> 11) / f64_from_u64(1u64 << 53) - 0.5
     }
 }
 
+/// Toggle bits of the synthetic decomposition's `fences` and `launches`
+/// components (component order: dispatch, fences, crossings, launches).
+const FENCES: u32 = 1 << 1;
+const LAUNCHES: u32 = 1 << 3;
+
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
-    let (costs, placement, source) = match args.get(1) {
-        Some(path) => {
-            let (c, p) = load_costs(path)?;
-            (c, p, path.clone())
-        }
-        None => {
-            let (c, p) = builtin_27b();
-            (c, p, "built-in 27B recorded session numbers".to_string())
-        }
+    let (costs, placement, source) = if let Some(path) = args.get(1) {
+        let (c, p) = load_costs(path)?;
+        (c, p, path.clone())
+    } else {
+        let (c, p) = builtin_27b();
+        (c, p, "built-in 27B recorded session numbers".to_string())
     };
     let measured_ms: Option<f64> = match args.get(2) {
         Some(s) => Some(
@@ -196,13 +201,11 @@ fn run() -> Result<(), String> {
         attrib::Component::new("launches"),
     ];
     let cost_of = [
-        0.02 * placement.len() as f64,         // dispatch: nominal encode/layer
-        costs.readback_ms,                     // fences: the end-of-token sync
-        boundaries as f64 * costs.crossing_ms, // crossings: paid per boundary
-        gpu_layers as f64 * costs.launch_ms,   // launches: paid per GPU dispatch
+        0.02 * f64_from_usize(placement.len()), // dispatch: nominal encode/layer
+        costs.readback_ms,                      // fences: the end-of-token sync
+        f64_from_usize(boundaries) * costs.crossing_ms, // crossings: paid per boundary
+        f64_from_usize(gpu_layers) * costs.launch_ms, // launches: paid per GPU dispatch
     ];
-    const FENCES: u32 = 1 << 1;
-    const LAUNCHES: u32 = 1 << 3;
     let mut rng = Lcg(0x6d75_6d6d_7532_3742); // fixed seed: reproducible table
     let mut measure = |mask: u32| -> f64 {
         let mut ms: f64 = cost_of
@@ -212,9 +215,9 @@ fn run() -> Result<(), String> {
             .map(|(_, c)| c)
             .sum();
         if mask & FENCES != 0 && mask & LAUNCHES != 0 {
-            ms += 0.15 * cost_of[3]; // the interaction term
+            ms = 0.15f64.mul_add(cost_of[3], ms); // the interaction term
         }
-        ms * (1.0 + 0.04 * rng.centered()) // ±2% measurement noise
+        ms * 0.04f64.mul_add(rng.centered(), 1.0) // ±2% measurement noise
     };
     let replicates = 32;
     let a = attrib::attribute(components.len(), replicates, &mut measure);

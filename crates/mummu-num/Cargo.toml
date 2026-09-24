@@ -1,0 +1,14 @@
+[package]
+name = "mummu-num"
+description = "Exact, `as`-free integer/float conversions shared by every mummu crate."
+keywords = ["conversion", "float", "cast", "numeric"]
+categories = ["algorithms", "no-std"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Dependency-free, and the bottom of the workspace's own dependency order:
+# `mummu-mix` and `mummu-schedule` take nothing but this, so it publishes to
+# crates.io first of all.
+[dependencies]

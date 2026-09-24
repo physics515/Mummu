@@ -12,6 +12,8 @@
 //! `MUMMU_MODELS_DIR` (default `./models`), `MUMMU_BACKEND`,
 //! `MUMMU_FORCE_CPU`.
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use std::process::ExitCode;
 
 #[tokio::main(flavor = "multi_thread")]
@@ -69,7 +71,7 @@ async fn main() -> ExitCode {
             }
         }
         #[cfg(not(windows))]
-        fn demote_current_thread() {}
+        const fn demote_current_thread() {}
         // BELOW_NORMAL is the measured default (fence 26.5 -> 8.7 ms), but
         // it is also one axis of the in-situ ANOVA (SPEC P1.1): the live
         // host GEMV runs 2-3x slower than quiet, and thread priority under

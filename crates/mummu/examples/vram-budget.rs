@@ -4,6 +4,9 @@
 //! slot count would call a different function and return plausible-looking
 //! nonsense. Printing it next to the adapter's total, and next to whatever
 //! nvidia-smi says, is how that gets caught.
+
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 fn main() {
     let inv = mummu::backend::inventory();
     for g in &inv.gpus {

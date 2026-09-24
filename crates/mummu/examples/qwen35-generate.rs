@@ -10,12 +10,15 @@
 //! `MUMMU_FORCE_CPU=1` forces flex). Prints load time, resident policy, the
 //! streamed text, and tokens/s.
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use std::io::Write as _;
 use std::time::Instant;
 
 use mummu::models::CausalLm;
 use mummu::models::qwen35;
 use mummu::quant::QuantPolicy;
+use mummu_num::f32_from_usize;
 
 /// The default GPU policy, overridable by `MUMMU_FORCE_CPU=1` — a 27B's
 /// float side alone (5 GB embedding) plus quantized linears outgrows a
@@ -120,6 +123,6 @@ async fn run(
     let secs = t1.elapsed().as_secs_f32();
     eprintln!(
         "[qwen35-generate] {n} tokens in {secs:.1}s ({:.2} tok/s)",
-        n as f32 / secs.max(1e-3)
+        f32_from_usize(n) / secs.max(1e-3)
     );
 }

@@ -34,7 +34,7 @@
 //! ```
 //!
 //! `act` is the widest live prefill buffer (three `[chunk, intermediate]`
-//! f32 tensors through SwiGLU); `ε̂` is the allocator residual the analytic
+//! f32 tensors through `SwiGLU`); `ε̂` is the allocator residual the analytic
 //! terms do not explain — measured after every generation as
 //! `reserved − in_use_before − Σ s_l − act` and tracked as an envelope over
 //! the last requests (vLLM's profiling pass does the same for its KV budget:
@@ -86,8 +86,9 @@ use mummu::mix::joint;
 use mummu::mix::{Kind, QuantPolicy};
 use mummu::models::qwen35;
 use mummu::pack::{Pack, Precision, Role, TensorEntry};
+use mummu_num::{f64_from_u64, f64_from_usize, trunc_u64};
 
-use super::{AnyLm, BackendChoice, Loaded, SLOT, device_of, label_of, layer_index};
+use super::{AnyLm, BackendChoice, Loaded, SLOT, device_of, gib, label_of, layer_index};
 
 /// How often the idle rebalancer looks.
 const TICK: Duration = Duration::from_secs(5);
@@ -142,26 +143,25 @@ pub(super) fn card(backend: BackendChoice) -> Option<Card> {
         return None;
     }
     let (reserved, in_use) = pool(backend);
-    match crate::status::vram_reading(READ_BUDGET) {
-        Some(m) => Some(Card {
+    if let Some(m) = crate::status::vram_reading(READ_BUDGET) {
+        Some(Card {
             total: m.total,
             used: m.used.max(reserved),
             reserved,
             in_use,
-        }),
-        None => {
-            let total = mummu::backend::inventory()
-                .gpus
-                .iter()
-                .filter_map(|g| g.vram_bytes)
-                .max()?;
-            Some(Card {
-                total,
-                used: reserved,
-                reserved,
-                in_use,
-            })
-        }
+        })
+    } else {
+        let total = mummu::backend::inventory()
+            .gpus
+            .iter()
+            .filter_map(|g| g.vram_bytes)
+            .max()?;
+        Some(Card {
+            total,
+            used: reserved,
+            reserved,
+            in_use,
+        })
     }
 }
 
@@ -169,17 +169,26 @@ pub(super) fn card(backend: BackendChoice) -> Option<Card> {
 fn guard(ambient: u64) -> u64 {
     use mummu::schedule::watermark::{Watermark, WatermarkConfig};
     static WM: Mutex<Option<Watermark>> = Mutex::new(None);
-    let mut g = WM.lock().unwrap_or_else(|e| e.into_inner());
-    let wm = g.get_or_insert_with(|| {
-        Watermark::new(WatermarkConfig {
-            floor_bytes: 1 << 30,
-            frag_slack_bytes: 512 << 20,
-            // Ten minutes of 5 s polls: long enough to cover a co-tenant's
-            // bursts, short enough that one that left gives the card back.
-            window: 120,
-            ..WatermarkConfig::default()
-        })
-    });
+    feed_guard(
+        WM.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(|| {
+                Watermark::new(WatermarkConfig {
+                    floor_bytes: 1 << 30,
+                    frag_slack_bytes: 512 << 20,
+                    // Ten minutes of 5 s polls: long enough to cover a
+                    // co-tenant's bursts, short enough that one that left
+                    // gives the card back.
+                    window: 120,
+                    ..WatermarkConfig::default()
+                })
+            }),
+        ambient,
+    )
+}
+
+/// One observation into the watermark, and the guard it now asks for.
+fn feed_guard(wm: &mut mummu::schedule::watermark::Watermark, ambient: u64) -> u64 {
     wm.observe_ambient(ambient);
     // Taken, not read: a breach is one piece of evidence, and reading the
     // flag on every poll would boost the guard 1.5x per poll until the next
@@ -235,8 +244,12 @@ const RELEASE_FLOOR: u64 = 256 << 20;
 /// believed immediately — the guard's "up at once" property survives, it is
 /// only the bytes we can account for as our own that stop counting twice.
 fn ambient(c: &Card) -> u64 {
-    let mut last = LAST_READING.lock().unwrap_or_else(|e| e.into_inner());
-    let mut flight = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+    let mut last = LAST_READING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut flight = IN_FLIGHT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     correct_ambient(c, &mut last, &mut flight, Instant::now())
 }
 
@@ -309,7 +322,7 @@ pub(super) fn capacity(c: &Card) -> u64 {
 }
 
 /// Free for a NEW placement on `backend` — what every planner that has no
-/// resident layers to count (the fit planner, the precision mix, the MoE
+/// resident layers to count (the fit planner, the precision mix, the `MoE`
 /// tiers) spends: `K − in_use − V_pending`.
 pub(super) fn free_for_new(backend: BackendChoice) -> u64 {
     let Some(c) = card(backend) else {
@@ -379,7 +392,7 @@ fn residual_ceiling(card_total: Option<u64>) -> u64 {
 fn residual_for(card_total: Option<u64>) -> u64 {
     RESIDUAL
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .max()
         .map_or_else(
             || residual_prior(card_total),
@@ -422,8 +435,12 @@ fn recall_residual(pack_dir: &Path) {
     let Some(path) = residual_file_for(pack_dir) else {
         return;
     };
-    *RESIDUAL_FILE.lock().unwrap_or_else(|e| e.into_inner()) = Some(path.clone());
-    let mut env = RESIDUAL.lock().unwrap_or_else(|e| e.into_inner());
+    *RESIDUAL_FILE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(path.clone());
+    let mut env = RESIDUAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if env.max().is_some() {
         return;
     }
@@ -440,19 +457,19 @@ fn recall_residual(pack_dir: &Path) {
     // seeded by hand during an incident — must not start this process with a
     // working set the card cannot hold.
     let ceiling = residual_ceiling(inventory_vram());
-    env.push(v.min(ceiling));
+    let kept = v.min(ceiling);
+    env.push(kept);
+    drop(env);
+    let clamped = if v > ceiling {
+        format!(" (clamped from {:.2} GiB)", gib(v))
+    } else {
+        String::new()
+    };
     eprintln!(
         "[mummu-serve] placement: working-set residual {:.2} GiB, remembered from {}{}",
-        v.min(ceiling) as f64 / f64::from(1u32 << 30),
+        gib(kept),
         path.display(),
-        if v > ceiling {
-            format!(
-                " (clamped from {:.2} GiB)",
-                v as f64 / f64::from(1u32 << 30)
-            )
-        } else {
-            String::new()
-        },
+        clamped,
     );
 }
 
@@ -460,12 +477,16 @@ fn recall_residual(pack_dir: &Path) {
 fn remember_residual() {
     let Some(path) = RESIDUAL_FILE
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone()
     else {
         return;
     };
-    let Some(v) = RESIDUAL.lock().unwrap_or_else(|e| e.into_inner()).max() else {
+    let Some(v) = RESIDUAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .max()
+    else {
         return;
     };
     if let Some(dir) = path.parent() {
@@ -495,20 +516,20 @@ pub(super) fn note_device_failure(cause: &str) {
     if after == before {
         eprintln!(
             "[mummu-serve] placement: out of device memory with the working-set estimate already at its ceiling ({:.2} GiB of a {:.2} GiB card) — holding it there; this model's working set does not fit beside its own weights on this device",
-            before as f64 / f64::from(1u32 << 30),
-            card.unwrap_or(0) as f64 / f64::from(1u32 << 30),
+            gib(before),
+            gib(card.unwrap_or(0)),
         );
         return;
     }
     RESIDUAL
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .push(after);
     remember_residual();
     eprintln!(
         "[mummu-serve] placement: out of device memory — working-set estimate {:.2} -> {:.2} GiB; the next load places fewer layers",
-        before as f64 / f64::from(1u32 << 30),
-        after as f64 / f64::from(1u32 << 30),
+        gib(before),
+        gib(after),
     );
 }
 
@@ -529,16 +550,18 @@ static CONTEXTS: Mutex<Envelope> = Mutex::new(Envelope(VecDeque::new()));
 fn idle_context() -> usize {
     CONTEXTS
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .max()
-        .map_or(4096, |c| c as usize)
+        .map_or(4096, |c| usize::try_from(c).unwrap_or(usize::MAX))
 }
 
 /// Tokens served, for the horizon `H`.
 static SERVED: Mutex<VecDeque<(Instant, usize)>> = Mutex::new(VecDeque::new());
 
 fn horizon_tokens() -> f64 {
-    let mut s = SERVED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut s = SERVED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let now = Instant::now();
     while s
         .front()
@@ -548,7 +571,7 @@ fn horizon_tokens() -> f64 {
     }
     // At least one reply's worth: a server that just started serving should
     // be able to take back a card that freed up.
-    (s.iter().map(|(_, n)| *n).sum::<usize>()).max(256) as f64
+    f64_from_usize((s.iter().map(|(_, n)| *n).sum::<usize>()).max(256))
 }
 
 /// Measured pack read rate, seconds per byte (prior: this array's quiet
@@ -560,17 +583,19 @@ pub(super) fn note_disk(bytes: u64, secs: f64) {
     if bytes < (64 << 20) || secs <= 0.0 {
         return;
     }
-    let seen = secs / bytes as f64;
-    let mut d = DISK_S_PER_BYTE.lock().unwrap_or_else(|e| e.into_inner());
+    let seen = secs / f64_from_u64(bytes);
+    let mut d = DISK_S_PER_BYTE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // The first measurement replaces the prior outright; after that an
     // EWMA, so one slow read under a co-tenant does not define the disk.
-    *d = Some(d.map_or(seen, |prev| 0.7 * prev + 0.3 * seen));
+    *d = Some(d.map_or(seen, |prev| 0.3f64.mul_add(seen, 0.7 * prev)));
 }
 
 fn disk_s_per_byte() -> f64 {
     DISK_S_PER_BYTE
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .unwrap_or(DISK_PRIOR_S_PER_BYTE)
 }
 
@@ -581,25 +606,31 @@ static REQUEST: Mutex<Option<(usize, bool)>> = Mutex::new(None);
 /// Publish the request about to be planned for. `ctx` may be an estimate
 /// here; [`before_request`] replaces it with the exact token count.
 pub(super) fn set_request(ctx: usize, needs_tower: bool) {
-    *REQUEST.lock().unwrap_or_else(|e| e.into_inner()) = Some((ctx, needs_tower));
+    *REQUEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((ctx, needs_tower));
 }
 
 fn request() -> Option<(usize, bool)> {
-    *REQUEST.lock().unwrap_or_else(|e| e.into_inner())
+    *REQUEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// When the vision tower was last used, for [`TOWER_IDLE`].
 static TOWER_USED: Mutex<Option<Instant>> = Mutex::new(None);
 
 pub(super) fn note_tower_use() {
-    *TOWER_USED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+    *TOWER_USED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now());
 }
 
 // ---------------------------------------------------------------------------
 // The model as the solver sees it
 // ---------------------------------------------------------------------------
 
-fn policy_of(p: Precision) -> QuantPolicy {
+const fn policy_of(p: Precision) -> QuantPolicy {
     match p {
         Precision::Q4 => QuantPolicy::Q4,
         Precision::Q8 => QuantPolicy::Q8,
@@ -608,7 +639,7 @@ fn policy_of(p: Precision) -> QuantPolicy {
     }
 }
 
-fn precision_of(q: QuantPolicy) -> Precision {
+const fn precision_of(q: QuantPolicy) -> Precision {
     match q {
         QuantPolicy::Q4 | QuantPolicy::Q2 => Precision::Q4,
         QuantPolicy::Q8 => Precision::Q8,
@@ -768,7 +799,7 @@ pub(super) fn state_bytes(cfg: &qwen35::Qwen35Config, layer: usize, ctx: usize) 
 }
 
 /// The widest live activation: three `[chunk, intermediate]` f32 buffers
-/// through SwiGLU. Prefill is chunked, so this is bounded by the chunk, not
+/// through `SwiGLU`. Prefill is chunked, so this is bounded by the chunk, not
 /// the context.
 pub(super) fn act_bytes(cfg: &qwen35::Qwen35Config, ctx: usize) -> u64 {
     3 * ctx.min(mummu::decode::prefill_chunk_len()).max(1) as u64 * cfg.intermediate_size as u64 * 4
@@ -792,7 +823,7 @@ fn measure_device(
     let Some(entry) = pack.entry("blk.0.ffn_gate.weight") else {
         return DeviceModel::default();
     };
-    let numel = entry.shape.iter().product::<usize>() as f64;
+    let numel = f64_from_usize(entry.shape.iter().product::<usize>());
     let mut m = DeviceModel::default();
     for &p in levels {
         let Some(bytes) = blob_bytes(entry, p) else {
@@ -807,7 +838,8 @@ fn measure_device(
             ms
         };
         let q = policy_of(p);
-        m.rate.push((q, ms / 1e3 / bytes as f64));
+        let bytes = f64_from_u64(bytes);
+        m.rate.push((q, ms / 1e3 / bytes));
         // Resident bytes per pack byte on this device at this level.
         let resident = match (host, p) {
             // i8 slab + f32 block scales, plus the packed VNNI twin beside it.
@@ -821,13 +853,12 @@ fn measure_device(
             }
             (true, Precision::Q8) => numel * 1.125,
             // Floats are widened to f32 on load (host, wgpu; assumed on CUDA).
-            (_, Precision::F16) => numel * 4.0,
-            (_, Precision::F32) => numel * 4.0,
+            (_, Precision::F16 | Precision::F32) => numel * 4.0,
             // The card's pool pads what it holds: 11.28 GiB resident for a
             // 10.82 GiB plan on the 27B (v0.4.0's first production load).
-            (false, _) => bytes as f64 * 1.05,
+            (false, _) => bytes * 1.05,
         };
-        m.resident.push((q, resident / bytes as f64));
+        m.resident.push((q, resident / bytes));
     }
     m
 }
@@ -883,7 +914,7 @@ impl Live {
         let head_card_bytes = pack.entry("output.weight").map_or(0, |e| {
             let bytes = blob_bytes(e, trunk_precision(e, source_bits)).unwrap_or(0);
             // The card's pool padding, as for the layers.
-            (bytes as f64 * 1.05) as u64
+            trunc_u64(f64_from_u64(bytes) * 1.05)
         });
         let maps = layer_maps(&pack, cfg.num_layers, ceiling);
         let host_dev = mummu::backend::cpu_device();
@@ -994,7 +1025,7 @@ impl Live {
                             .iter()
                             .find(|(x, _)| *x == q)
                             .map_or(1.0, |x| x.1);
-                        (b as f64 * m) as u64
+                        trunc_u64(f64_from_u64(b) * m)
                     })
                     .sum::<u64>()
                     + l.fixed_bytes
@@ -1100,7 +1131,7 @@ impl Live {
                             .iter()
                             .find(|(x, _)| *x == q)
                             .map_or(1.0, |x| x.1);
-                        (b as f64 * r) as u64
+                        trunc_u64(f64_from_u64(b) * r)
                     })
                     .sum::<u64>()
                     + m.fixed_bytes
@@ -1137,7 +1168,8 @@ impl Live {
     }
 
     fn summary(&self, pb: &joint::Problem) -> String {
-        let mut hist: std::collections::BTreeMap<(usize, String), usize> = Default::default();
+        let mut hist: std::collections::BTreeMap<(usize, String), usize> =
+            std::collections::BTreeMap::new();
         for c in &self.assignment.layers {
             for q in &c.levels {
                 *hist.entry((c.device, format!("{q:?}"))).or_default() += 1;
@@ -1181,7 +1213,7 @@ pub(super) fn plan_load(pack_dir: &Path, backend: BackendChoice) -> Result<Live,
     }
     recall_residual(pack_dir);
     let mut live = Live::measure(pack_dir, backend)?;
-    let (ctx, tower) = request().unwrap_or((idle_context(), false));
+    let (ctx, tower) = request().unwrap_or_else(|| (idle_context(), false));
     let reading = card(backend);
     // The head follows the last layer. Solve with its bytes reserved on the
     // card first; if the last layer does not land there after all, the head
@@ -1203,8 +1235,8 @@ pub(super) fn plan_load(pack_dir: &Path, backend: BackendChoice) -> Result<Live,
     if !out.feasible {
         eprintln!(
             "[mummu-serve] placement: nothing fits everywhere (host {:.1} GiB needed of {:.1}) — loading anyway at the fastest host levels",
-            out.used[0] as f64 / f64::from(1u32 << 30),
-            pb.devices[0].capacity as f64 / f64::from(1u32 << 30),
+            gib(out.used[0]),
+            gib(pb.devices[0].capacity),
         );
     }
     live.assignment = out.assignment;
@@ -1221,17 +1253,17 @@ pub(super) fn plan_load(pack_dir: &Path, backend: BackendChoice) -> Result<Live,
         } else {
             format!(
                 " ({:.1} raw, {:.1} of it ours in flight)",
-                raw as f64 / f64::from(1u32 << 30),
-                (raw - a) as f64 / f64::from(1u32 << 30),
+                gib(raw),
+                gib(raw - a),
             )
         };
         eprintln!(
             "[mummu-serve] placement: card {:.1} GiB, ambient {:.1}{}, guard {:.1}, capacity {:.1} GiB for a {ctx}-token context{}",
-            c.total as f64 / f64::from(1u32 << 30),
-            a as f64 / f64::from(1u32 << 30),
+            gib(c.total),
+            gib(a),
             credited,
-            guard(a) as f64 / f64::from(1u32 << 30),
-            pb.devices.get(1).map_or(0, |d| d.capacity) as f64 / f64::from(1u32 << 30),
+            gib(guard(a)),
+            gib(pb.devices.get(1).map_or(0, |d| d.capacity)),
             if tower { " + vision tower" } else { "" },
         );
     }
@@ -1354,11 +1386,14 @@ fn explain_hold(live: &Live, pb: &joint::Problem) {
     if !target.feasible || target.time_s >= now_t * 0.99 {
         return;
     }
-    let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+    let mut said = SAID
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if *said == Some(key) {
         return;
     }
     *said = Some(key);
+    drop(said);
     let reread = joint::changed_bytes(pb, &live.assignment, &target.assignment);
     eprintln!(
         "[mummu-serve] placement hold: {} -> {} layers on {} would save {:.1} ms/token, {:.1}s over the {:.0}-token horizon — less than re-reading {:.2} GiB ({:.1}s at {:.0} MB/s)",
@@ -1368,14 +1403,14 @@ fn explain_hold(live: &Live, pb: &joint::Problem) {
         (now_t - target.time_s) * 1e3,
         (now_t - target.time_s) * pb.horizon_tokens,
         pb.horizon_tokens,
-        reread as f64 / f64::from(1u32 << 30),
-        reread as f64 * pb.disk_s_per_byte,
+        gib(reread),
+        f64_from_u64(reread) * pb.disk_s_per_byte,
         1.0 / pb.disk_s_per_byte / 1e6,
     );
 }
 
 /// What a re-plan decided, for the log.
-fn verdict_word(v: joint::Verdict) -> &'static str {
+const fn verdict_word(v: joint::Verdict) -> &'static str {
     match v {
         joint::Verdict::Hold => "hold",
         joint::Verdict::Repair => "repair",
@@ -1454,18 +1489,22 @@ pub(super) fn before_request(
 ) -> Option<u64> {
     CONTEXTS
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .push(ctx as u64);
     set_request(ctx, needs_tower);
     let AnyLm::Qwen35(lm) = &mut m.lm else {
         return None;
     };
-    let mut guard = LIVE.lock().unwrap_or_else(|e| e.into_inner());
-    let live = guard.as_mut().filter(|l| l.pack_dir.starts_with(key))?;
-    if let Err(e) = replan_and_apply(live, lm, ctx, needs_tower, false) {
-        eprintln!("[mummu-serve] placement: could not re-place before the request: {e}");
-    }
-    (live.backend != BackendChoice::Cpu).then(|| pool(live.backend).1)
+    LIVE.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_mut()
+        .filter(|l| l.pack_dir.starts_with(key))
+        .and_then(|live| {
+            if let Err(e) = replan_and_apply(live, lm, ctx, needs_tower, false) {
+                eprintln!("[mummu-serve] placement: could not re-place before the request: {e}");
+            }
+            (live.backend != BackendChoice::Cpu).then(|| pool(live.backend).1)
+        })
 }
 
 /// After a generation, holding the model: measure the working set it
@@ -1473,39 +1512,55 @@ pub(super) fn before_request(
 pub(super) fn after_request(ctx: usize, tokens: usize, in_use_before: Option<u64>) {
     SERVED
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .push_back((Instant::now(), tokens));
     let Some(before) = in_use_before else { return };
-    let guard = LIVE.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(live) = guard.as_ref() else { return };
-    let (reserved, _) = pool(live.backend);
-    let state: u64 = live
-        .assignment
-        .layers
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| c.device == 1)
-        .map(|(l, _)| state_bytes(&live.cfg, l, ctx))
-        .sum();
-    let residual = reserved
-        .saturating_sub(before)
-        .saturating_sub(state)
-        .saturating_sub(act_bytes(&live.cfg, ctx));
+    let residual = LIVE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .map(|live| live.residual_after(ctx, before));
+    let Some(residual) = residual else { return };
     RESIDUAL
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .push(residual);
     remember_residual();
 }
 
+impl Live {
+    /// ε̂ for a generation that just ran at `ctx` tokens, from the pool's
+    /// in-use bytes `before` it: what the card holds beyond the layers'
+    /// state and the activations.
+    fn residual_after(&self, ctx: usize, before: u64) -> u64 {
+        let (reserved, _) = pool(self.backend);
+        let state: u64 = self
+            .assignment
+            .layers
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.device == 1)
+            .map(|(l, _)| state_bytes(&self.cfg, l, ctx))
+            .sum();
+        reserved
+            .saturating_sub(before)
+            .saturating_sub(state)
+            .saturating_sub(act_bytes(&self.cfg, ctx))
+    }
+}
+
 /// Make `live` the placement of the model now resident.
 pub(super) fn adopt(live: Live) {
-    *LIVE.lock().unwrap_or_else(|e| e.into_inner()) = Some(live);
+    *LIVE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(live);
 }
 
 /// Forget the placement (the model it described left the slot).
 pub(super) fn forget(pack_dir: Option<&Path>) {
-    let mut g = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = LIVE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if pack_dir.is_none_or(|p| g.as_ref().is_some_and(|l| l.pack_dir == p)) {
         *g = None;
     }
@@ -1517,12 +1572,14 @@ fn tick() {
     // Idle tower: its VRAM goes back to layers.
     let idle_tower = TOWER_USED
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .is_some_and(|t| t.elapsed() > TOWER_IDLE);
     let mut failure: Option<(String, BackendChoice, String)> = None;
     let _ = SLOT.try_with_mut(|key, m: &mut Loaded| {
         if idle_tower && super::drop_tower() {
-            *TOWER_USED.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *TOWER_USED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
             device_of(m.backend).memory_cleanup();
             eprintln!(
                 "[mummu-serve] placement: vision tower idle for {}s — its VRAM goes back to layers",
@@ -1530,25 +1587,28 @@ fn tick() {
             );
         }
         let AnyLm::Qwen35(lm) = &mut m.lm else { return };
-        let mut guard = LIVE.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(live) = guard.as_mut().filter(|l| l.pack_dir.starts_with(key)) else {
+        let ctx = idle_context();
+        let replanned = LIVE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            .filter(|l| l.pack_dir.starts_with(key))
+            .map(|live| {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    replan_and_apply(live, lm, ctx, false, true)
+                }));
+                (live.model.clone(), live.backend, outcome)
+            });
+        let Some((model, backend, outcome)) = replanned else {
             return;
         };
-        let ctx = idle_context();
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            replan_and_apply(live, lm, ctx, false, true)
-        }));
         match outcome {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 eprintln!("[mummu-serve] placement: idle re-plan failed: {e}");
             }
             Err(p) => {
-                failure = Some((
-                    live.model.clone(),
-                    live.backend,
-                    crate::recovery::payload_text(&*p),
-                ));
+                failure = Some((model, backend, crate::recovery::payload_text(&*p)));
             }
         }
     });

@@ -64,7 +64,7 @@ pub enum TemplateError {
 
 impl From<hf_chat_template::Error> for TemplateError {
     fn from(e: hf_chat_template::Error) -> Self {
-        TemplateError::Jinja(e.to_string())
+        Self::Jinja(e.to_string())
     }
 }
 
@@ -82,9 +82,12 @@ impl std::fmt::Debug for ImportedTemplate {
     }
 }
 
-/// Our resolved special-token slot in the shape the Jinja context wants.
-fn token_field(slot: &Option<SpecialToken>) -> Option<TokenField> {
-    slot.as_ref().map(|t| TokenField::Str(t.content.clone()))
+/// One resolved special-token slot in the shape the Jinja context wants.
+///
+/// Callers hold `Option<SpecialToken>` slots, so they map this over
+/// `.as_ref()` themselves.
+fn token_field(slot: &SpecialToken) -> TokenField {
+    TokenField::Str(slot.content.clone())
 }
 
 impl ImportedTemplate {
@@ -95,6 +98,16 @@ impl ImportedTemplate {
     /// end a turn with `{{ eos_token }}` rather than a literal, so a template
     /// compiled without them renders a prompt the model never saw in
     /// training.
+    ///
+    /// # Errors
+    ///
+    /// [`TemplateError::Absent`] when `config` carries no `chat_template`;
+    /// [`TemplateError::Jinja`] when the template source does not compile.
+    ///
+    /// # Panics
+    ///
+    /// Only on an internal invariant that cannot fail: [`TokenizerConfig`]
+    /// never stores a blank `chat_template`, and this asserts it.
     pub fn from_config(config: &TokenizerConfig) -> Result<Self, TemplateError> {
         let source = config
             .chat_template
@@ -106,11 +119,11 @@ impl ImportedTemplate {
         );
         let hf = HfTokenizerConfig {
             chat_template: Some(ChatTemplateField::Single(source.to_string())),
-            bos_token: token_field(&config.bos_token),
-            eos_token: token_field(&config.eos_token),
-            pad_token: token_field(&config.pad_token),
-            unk_token: token_field(&config.unk_token),
-            extra: Default::default(),
+            bos_token: config.bos_token.as_ref().map(token_field),
+            eos_token: config.eos_token.as_ref().map(token_field),
+            pad_token: config.pad_token.as_ref().map(token_field),
+            unk_token: config.unk_token.as_ref().map(token_field),
+            extra: serde_json::Map::default(),
         };
         let inner = ChatTemplate::from_tokenizer_config(&hf)?;
         Ok(Self { inner })
@@ -119,6 +132,17 @@ impl ImportedTemplate {
     /// Read a checkpoint directory's `tokenizer_config.json` (falling back to
     /// a standalone `chat_template.jinja`, per [`TokenizerConfig::from_dir`])
     /// and compile what it declares.
+    ///
+    /// # Errors
+    ///
+    /// [`TemplateError::Jinja`] carrying the [`TokenizerConfig::from_dir`]
+    /// failure when `tokenizer_config.json` is missing, oversized, unreadable
+    /// or malformed (or the standalone template file is), and then
+    /// everything [`Self::from_config`] returns.
+    ///
+    /// # Panics
+    ///
+    /// When `dir` is the empty path.
     pub fn from_dir(dir: &Path) -> Result<Self, TemplateError> {
         assert!(!dir.as_os_str().is_empty(), "from_dir: empty dir");
         let config =
@@ -128,6 +152,11 @@ impl ImportedTemplate {
 
     /// Render a conversation, with the assistant generation prefix appended —
     /// the same contract as [`ChatMl::render`].
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::render_with_tools_json`]: a Jinja failure while
+    /// rendering, or a result over the byte bound.
     pub fn render(&self, turns: &[Turn]) -> Result<String, TemplateError> {
         self.render_with_tools(&[], turns)
     }
@@ -145,6 +174,12 @@ impl ImportedTemplate {
     /// some families want the signature bare (LFM2.5 does; its own renderer
     /// covers it). Use [`Self::render_with_tools_json`] when a checkpoint's
     /// template wants a different shape.
+    ///
+    /// # Errors
+    ///
+    /// [`TemplateError::BadTool`] when a tool's `parameters` cannot be
+    /// serialized to JSON, and then everything
+    /// [`Self::render_with_tools_json`] returns.
     pub fn render_with_tools(
         &self,
         tools: &[ToolSpec],
@@ -157,6 +192,18 @@ impl ImportedTemplate {
     /// Render with tool signatures given as raw JSON, for a template whose
     /// `tools` shape is not the `transformers` default (see
     /// [`Self::render_with_tools`]).
+    ///
+    /// # Errors
+    ///
+    /// [`TemplateError::Jinja`] when the template fails while rendering —
+    /// including a `raise_exception` it triggers itself — and
+    /// [`TemplateError::TooLarge`] when the result exceeds
+    /// [`MAX_RENDERED_BYTES`].
+    ///
+    /// # Panics
+    ///
+    /// When `turns` holds more than [`MAX_TURNS`] entries or `tools` more
+    /// than [`MAX_TOOLS`].
     pub fn render_with_tools_json(
         &self,
         tools: &[serde_json::Value],
@@ -251,14 +298,26 @@ impl Renderer {
     /// renderers match, and a checkpoint repackaged with a foreign template
     /// is caught at load by the consistency gate in `tokenizer.rs`, not
     /// silently obeyed here.
+    ///
+    /// # Errors
+    ///
+    /// Never with a family renderer. Without one, everything
+    /// [`ImportedTemplate::from_dir`] returns: an unreadable or malformed
+    /// `tokenizer_config.json`, a checkpoint with no template, or a template
+    /// that does not compile.
     pub fn for_checkpoint(family: Option<ChatMl>, dir: &Path) -> Result<Self, TemplateError> {
-        match family {
-            Some(chat_ml) => Ok(Self::Family(chat_ml)),
-            None => ImportedTemplate::from_dir(dir).map(Self::Imported),
-        }
+        family.map_or_else(
+            || ImportedTemplate::from_dir(dir).map(Self::Imported),
+            |chat_ml| Ok(Self::Family(chat_ml)),
+        )
     }
 
     /// Render a conversation with the generation prefix appended.
+    ///
+    /// # Errors
+    ///
+    /// Never for [`Renderer::Family`]; for [`Renderer::Imported`], what
+    /// [`ImportedTemplate::render`] returns.
     pub fn render(&self, turns: &[Turn]) -> Result<String, TemplateError> {
         match self {
             Self::Family(c) => Ok(c.render(turns)),
@@ -267,6 +326,11 @@ impl Renderer {
     }
 
     /// Render a tool-advertising conversation with the generation prefix.
+    ///
+    /// # Errors
+    ///
+    /// Never for [`Renderer::Family`]; for [`Renderer::Imported`], what
+    /// [`ImportedTemplate::render_with_tools`] returns.
     pub fn render_with_tools(
         &self,
         tools: &[ToolSpec],

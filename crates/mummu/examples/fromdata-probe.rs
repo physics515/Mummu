@@ -3,6 +3,9 @@
 //! per layer, per token, 1.4 s/token — while the GPU readback feeding it
 //! measured 4.9 µs. This reproduces (or fails to) outside the server, with
 //! and without a wgpu device alive, splitting creation vs first-op vs read.
+
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use burn::tensor::{Tensor, TensorData};
 use mummu::backend;
 use std::time::Instant;

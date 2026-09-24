@@ -63,6 +63,7 @@ pub fn packed_gemv_enabled() -> bool {
 /// Route one decode-shape matmul through the packed GEMV when everything
 /// lines up (m=1, Q4S block-32, path enabled); `None` means the caller
 /// should use its existing matmul.
+#[must_use]
 pub fn try_q4s_gemv(x: &Tensor<2>, w: &Tensor<2>) -> Option<Tensor<2>> {
     if !packed_gemv_enabled() {
         return None;
@@ -126,17 +127,18 @@ pub const FLEX_GEMM_MAX: usize = 1024;
     Cuda: cfg(feature = "cuda"),
 )]
 /// The packed-GEMV extension op. `x` is `[1, K]` f32, `w` is `[K, N]`
-/// QFloat (Q4S, block-32, f32 scales, PackedU32(0)); returns `[1, N]` f32.
+/// `QFloat` (Q4S, block-32, f32 scales, PackedU32(0)); returns `[1, N]` f32.
 pub trait Q4GemvOps: Backend {
     /// y = x · w, reading w's packed values and scales directly.
     fn q4s_gemv(x: FloatTensor<Self>, w: QuantizedTensor<Self>) -> FloatTensor<Self>;
 }
 
 #[backend_extension(Flex)]
-/// The packed-GEMM extension op (SPEC P5.1), host only: `x` is `[m, K]`
-/// f32, `w` as in [`Q4GemvOps`]; returns `[m, N]` f32 with the weight
-/// bytes streamed once for the whole batch. Only the Flex impl exists —
-/// callers gate on `backend::is_flex` (accelerators keep their own
+/// The packed-GEMM extension op (SPEC P5.1), host only.
+///
+/// `x` is `[m, K]` f32, `w` as in [`Q4GemvOps`]; returns `[m, N]` f32 with
+/// the weight bytes streamed once for the whole batch. Only the Flex impl
+/// exists — callers gate on `backend::is_flex` (accelerators keep their own
 /// dispatch economics and the split-K GEMV).
 pub trait Q4GemmOps: Backend {
     /// Y = X · w over the packed representation.
@@ -144,22 +146,26 @@ pub trait Q4GemmOps: Backend {
 }
 
 #[backend_extension(Flex)]
-/// The bounded-exact host lm_head (SPEC P4.3/P4.4): `[1, vocab]` logits
-/// whose top-`flex::head::head_k()` coordinates are the exact dense values
-/// and every other coordinate is `flex::head::SENTINEL`. Tile bounds
-/// (Cauchy–Schwarz + the activation-error aggregate) prove the skipped
-/// rows out of the top-k, so argmax and top-k sampling see exactly what
-/// the dense head would give them, at a fraction of the streamed bytes.
+/// The bounded-exact host `lm_head` (SPEC P4.3/P4.4).
+///
+/// `[1, vocab]` logits whose top-`flex::head::head_k()` coordinates are the
+/// exact dense values and every other coordinate is `flex::head::SENTINEL`.
+/// Tile bounds (Cauchy–Schwarz + the activation-error aggregate) prove the
+/// skipped rows out of the top-k, so argmax and top-k sampling see exactly
+/// what the dense head would give them, at a fraction of the streamed bytes.
 pub trait Q4HeadOps: Backend {
     /// Sentinel-dense bounded head evaluation.
     fn q4s_head_topk(x: FloatTensor<Self>, w: QuantizedTensor<Self>) -> FloatTensor<Self>;
 }
 
-/// Route the lm_head through the bounded-exact top-k path when everything
-/// lines up: the path is enabled (serve opts in; the parity harness's
+/// Route the `lm_head` through the bounded-exact top-k path when everything
+/// lines up.
+///
+/// That is: the path is enabled (serve opts in; the parity harness's
 /// full-softmax logprob legs must keep the dense head), the tensor lives
 /// on flex, it is a decode-shape call, and the weight is packed Q4.
 /// `None` means: use the dense head.
+#[must_use]
 pub fn try_q4s_head(x: &Tensor<2>, w: &Tensor<2>) -> Option<Tensor<2>> {
     if !crate::flex::head::enabled() || !packed_gemv_enabled() {
         return None;
@@ -196,13 +202,19 @@ mod cube_impl {
     };
     use cubecl::prelude::*;
 
+    /// Bits per packed value: `per_word` is 8 (Q4S) or 4 (Q8S), so this is
+    /// 4 or 8 — the shift/mask width the kernel decodes with.
+    fn value_bits(per_word: usize) -> u32 {
+        u32::try_from(32 / per_word).expect("per_word divides 32")
+    }
+
     /// Split-K packed GEMV.
     ///
-    /// A workgroup is 32 word-columns wide (UNIT_POS_X; coalesced — at any
+    /// A workgroup is 32 word-columns wide (`UNIT_POS_X`; coalesced — at any
     /// k the 32 lanes read 32 consecutive u32 words) by `split` k-slices
-    /// deep (UNIT_POS_Y). Each thread accumulates its word's `per_word`
-    /// outputs over k_len/split steps in registers; partials meet in shared
-    /// memory (32 * split * per_word f32 — 16 KiB at split 16, Q4) and the
+    /// deep (`UNIT_POS_Y`). Each thread accumulates its word's `per_word`
+    /// outputs over `k_len/split` steps in registers; partials meet in shared
+    /// memory (32 * split * `per_word` f32 — 16 KiB at split 16, Q4) and the
     /// slice-0 threads reduce and store.
     ///
     /// Why: the split-1 shape gave gate/up 2176 threads on a card with 8448
@@ -213,8 +225,8 @@ mod cube_impl {
     /// it removes.
     ///
     /// The barrier sits OUTSIDE the validity guard: in a partial workgroup
-    /// (n_words not a multiple of 32 — test shapes, never the 27B's) every
-    /// thread must still reach sync_cube, so invalid lanes contribute zero
+    /// (`n_words` not a multiple of 32 — test shapes, never the 27B's) every
+    /// thread must still reach `sync_cube`, so invalid lanes contribute zero
     /// partials and skip only the final store.
     #[cube(launch)]
     fn packed_gemv_kernel(
@@ -232,10 +244,10 @@ mod cube_impl {
         let valid = wc < n_words;
 
         let k_len = x.shape(1);
-        let bits = comptime!(32u32 / per_word as u32);
-        let mask = comptime!((1u32 << (32u32 / per_word as u32)) - 1);
-        let sign = comptime!(1u32 << (32u32 / per_word as u32 - 1));
-        let span = comptime!(1i32 << (32u32 / per_word as u32));
+        let bits = comptime!(value_bits(per_word));
+        let mask = comptime!((1u32 << value_bits(per_word)) - 1);
+        let sign = comptime!(1u32 << (value_bits(per_word) - 1));
+        let span = comptime!(1i32 << value_bits(per_word));
 
         let mut acc = Array::<f32>::new(per_word);
         #[unroll]
@@ -262,7 +274,10 @@ mod cube_impl {
                     if raw >= sign {
                         q -= span;
                     }
-                    acc[j] += f32::cast_from(q) * xs;
+                    // Two roundings on purpose: the same multiply-then-add
+                    // the dequantize-then-matmul reference performs.
+                    let prod = f32::cast_from(q) * xs;
+                    acc[j] += prod;
                 }
             }
         }
@@ -297,7 +312,7 @@ mod cube_impl {
     }
 
     /// Split-K factor (`MUMMU_GEMV_SPLIT`, default 16, max 32: the shared
-    /// partial buffer is 32 * split * per_word f32 — 16 KiB at (16, Q4)).
+    /// partial buffer is 32 * split * `per_word` f32 — 16 KiB at (16, Q4)).
     fn gemv_split_override() -> Option<usize> {
         static S: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
         *S.get_or_init(|| {
@@ -364,6 +379,8 @@ mod cube_impl {
         x: &CubeTensor<R>,
         shape: GemvShape,
     ) -> usize {
+        static CACHE: std::sync::OnceLock<std::sync::Mutex<SplitCache>> =
+            std::sync::OnceLock::new();
         let GemvShape {
             n,
             n_words,
@@ -373,18 +390,20 @@ mod cube_impl {
         if let Some(forced) = gemv_split_override() {
             return forced;
         }
-        static CACHE: std::sync::OnceLock<std::sync::Mutex<SplitCache>> =
-            std::sync::OnceLock::new();
         let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
         let key = (format!("{device:?}"), n, k_len, per_word);
-        if let Some(&hit) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        if let Some(&hit) = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+        {
             return hit;
         }
 
         let props = client.properties();
         // Usable L2 for a streaming weight; 3/4 is the common working
         // fraction once the activation and output tiles are accounted for.
-        let l2 = u64::from(props.hardware.max_shared_memory_size as u32)
+        let l2 = (props.hardware.max_shared_memory_size as u64)
             .checked_mul(0)
             .and(None::<u64>)
             .or_else(|| {
@@ -396,6 +415,9 @@ mod cube_impl {
             .map(|b| b / 4 * 3);
         let weight_bytes =
             (n_words as u64 * k_len as u64 * 4) + (w_scales.meta.num_elements() as u64 * 4);
+        let word_cubes = u32::try_from(n_words)
+            .expect("packed width fits u32")
+            .div_ceil(32);
 
         let mut best = (1usize, f64::INFINITY);
         for cand in split_candidates(weight_bytes, l2) {
@@ -407,8 +429,8 @@ mod cube_impl {
                     empty_device::<R, f32>(client.clone(), x.device.clone(), Shape::new([1, n]));
                 packed_gemv_kernel::launch::<R>(
                     client,
-                    CubeCount::Static((n_words as u32).div_ceil(32), 1, 1),
-                    CubeDim::new_2d(32, cand as u32),
+                    CubeCount::Static(word_cubes, 1, 1),
+                    CubeDim::new_2d(32, u32::try_from(cand).expect("split is at most 32")),
                     w_vals.clone().into_tensor_arg(),
                     w_scales.clone().into_tensor_arg(),
                     x.clone().into_tensor_arg(),
@@ -439,14 +461,14 @@ mod cube_impl {
         );
         cache
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(key, best.0);
         best.0
     }
 
     pub(super) fn q4s_gemv_cube<R: CubeRuntime>(
         x: CubeTensor<R>,
-        w: CubeTensor<R>,
+        w: &CubeTensor<R>,
     ) -> CubeTensor<R> {
         // Values per u32 word, straight off the scheme: 8 nibbles for Q4S,
         // 4 bytes for Q8S. Derived, not assumed — the values view's own
@@ -484,8 +506,10 @@ mod cube_impl {
         if split == 0 || !k_len.is_multiple_of(split) {
             split = 1;
         }
-        let cube_dim = CubeDim::new_2d(32, split as u32);
-        let cubes = (n_words as u32).div_ceil(32);
+        let cube_dim = CubeDim::new_2d(32, u32::try_from(split).expect("split is at most 32"));
+        let cubes = u32::try_from(n_words)
+            .expect("packed width fits u32")
+            .div_ceil(32);
         debug_assert_eq!(
             n_words * per_word,
             n,
@@ -507,7 +531,7 @@ mod cube_impl {
 
     impl<R: CubeRuntime> Q4GemvOps for CubeBackend<R> {
         fn q4s_gemv(x: FloatTensor<Self>, w: QuantizedTensor<Self>) -> FloatTensor<Self> {
-            q4s_gemv_cube::<R>(x, w)
+            q4s_gemv_cube::<R>(x, &w)
         }
     }
 }
@@ -548,7 +572,10 @@ mod flex_impl {
                         let src = &row[b * 32..b * 32 + 32];
                         let dst = &mut chunk[b * 32..b * 32 + 32];
                         for j in 0..32 {
-                            dst[j] += xs_s * f32::from(src[j]);
+                            // Two roundings on purpose: matches the
+                            // dequantize-then-matmul reference bit for bit.
+                            let prod = xs_s * f32::from(src[j]);
+                            dst[j] += prod;
                         }
                     }
                 }
@@ -557,14 +584,31 @@ mod flex_impl {
 
     /// The activation row(s) as a host slice, borrowing when contiguous.
     fn host_rows(x: &FloatTensor<Flex>) -> Vec<f32> {
-        match x.as_slice::<f32>() {
-            Some(s) => s.to_vec(),
-            None => x
-                .clone()
-                .into_data()
-                .try_to_vec::<f32>()
-                .expect("f32 activations"),
-        }
+        x.as_slice::<f32>().map_or_else(
+            || {
+                x.clone()
+                    .into_data()
+                    .try_to_vec::<f32>()
+                    .expect("f32 activations")
+            },
+            <[f32]>::to_vec,
+        )
+    }
+
+    /// The activation row as a host slice: borrowed when contiguous, else
+    /// read back once (the rare non-contiguous case).
+    fn host_row(x: &FloatTensor<Flex>) -> std::borrow::Cow<'_, [f32]> {
+        x.as_slice::<f32>().map_or_else(
+            || {
+                std::borrow::Cow::Owned(
+                    x.clone()
+                        .into_data()
+                        .try_to_vec::<f32>()
+                        .expect("f32 activations"),
+                )
+            },
+            std::borrow::Cow::Borrowed,
+        )
     }
 
     /// Does this weight qualify for the packed twin (SPEC 1's grid)?
@@ -581,14 +625,8 @@ mod flex_impl {
             let shape = w.shape();
             let [k_len, n] = shape.dims::<2>();
             let started = std::time::Instant::now();
-            let xs_owned;
-            let xs: &[f32] = match x.as_slice::<f32>() {
-                Some(s) => s,
-                None => {
-                    xs_owned = x.into_data().try_to_vec::<f32>().expect("f32 activations");
-                    &xs_owned
-                }
-            };
+            let xs = host_row(&x);
+            let xs: &[f32] = &xs;
             let wq: &[i8] = w
                 .tensor()
                 .as_slice::<i8>()
@@ -629,17 +667,14 @@ mod flex_impl {
     impl super::Q4HeadOps for Flex {
         fn q4s_head_topk(x: FloatTensor<Self>, w: QuantizedTensor<Self>) -> FloatTensor<Self> {
             use std::sync::Mutex;
+            // A process-global hot set purely improves the visiting order;
+            // interleaved requests only degrade the seeds, never the answer.
+            static HOT: Mutex<Option<crate::flex::head::HotSet>> = Mutex::new(None);
             let shape = w.shape();
             let [k_len, n] = shape.dims::<2>();
             let started = std::time::Instant::now();
-            let xs_owned;
-            let xs: &[f32] = match x.as_slice::<f32>() {
-                Some(s) => s,
-                None => {
-                    xs_owned = x.into_data().try_to_vec::<f32>().expect("f32 activations");
-                    &xs_owned
-                }
-            };
+            let xs = host_row(&x);
+            let xs: &[f32] = &xs;
             let wq: &[i8] = w
                 .tensor()
                 .as_slice::<i8>()
@@ -655,9 +690,6 @@ mod flex_impl {
                 return FlexTensor::from_data(TensorData::new(out, [1, n]));
             };
             let meta = crate::flex::head::meta_for(&packed);
-            // A process-global hot set purely improves the visiting order;
-            // interleaved requests only degrade the seeds, never the answer.
-            static HOT: Mutex<Option<crate::flex::head::HotSet>> = Mutex::new(None);
             let k = crate::flex::head::effective_k();
             let seeds = {
                 let mut hot = HOT
@@ -755,38 +787,37 @@ mod fusion_impl {
     };
     use burn_ir::{CustomOpIr, HandleContainer, OperationIr, OperationOutput, TensorIr};
 
+    /// The custom stream op that re-enters the inner backend's packed GEMV.
+    #[derive(Clone, Debug)]
+    struct Gemv<B> {
+        desc: CustomOpIr,
+        _b: core::marker::PhantomData<B>,
+    }
+    impl<B> Gemv<B> {
+        const fn new(desc: CustomOpIr) -> Self {
+            Self {
+                desc,
+                _b: core::marker::PhantomData,
+            }
+        }
+    }
+    impl<B1: FusionBackend + Q4GemvOps> Operation<B1::FusionRuntime> for Gemv<B1> {
+        fn execute(
+            &self,
+            handles: &mut HandleContainer<<B1::FusionRuntime as FusionRuntime>::FusionHandle>,
+        ) {
+            let ([x_ir, w_ir], [out_ir]) = self.desc.as_fixed();
+            let xt = handles.get_float_tensor::<B1>(x_ir);
+            let wt = handles.get_quantized_tensor::<B1>(w_ir);
+            let y = B1::q4s_gemv(xt, wt);
+            handles.register_float_tensor::<B1>(&out_ir.id, y);
+        }
+    }
+
     impl<B: FusionBackend + Q4GemvOps> Q4GemvOps for Fusion<B> {
         fn q4s_gemv(x: FloatTensor<Self>, w: QuantizedTensor<Self>) -> FloatTensor<Self> {
             let client = x.client.clone();
             let shape_out = Shape::new([x.shape[0], w.shape[1]]);
-
-            #[derive(Clone, Debug)]
-            struct Gemv<B> {
-                desc: CustomOpIr,
-                _b: core::marker::PhantomData<B>,
-            }
-            impl<B> Gemv<B> {
-                fn new(desc: CustomOpIr) -> Self {
-                    Self {
-                        desc,
-                        _b: core::marker::PhantomData,
-                    }
-                }
-            }
-            impl<B1: FusionBackend + Q4GemvOps> Operation<B1::FusionRuntime> for Gemv<B1> {
-                fn execute(
-                    &self,
-                    handles: &mut HandleContainer<
-                        <B1::FusionRuntime as FusionRuntime>::FusionHandle,
-                    >,
-                ) {
-                    let ([x_ir, w_ir], [out_ir]) = self.desc.as_fixed();
-                    let xt = handles.get_float_tensor::<B1>(x_ir);
-                    let wt = handles.get_quantized_tensor::<B1>(w_ir);
-                    let y = B1::q4s_gemv(xt, wt);
-                    handles.register_float_tensor::<B1>(&out_ir.id, y);
-                }
-            }
 
             let stream = StreamId::current();
             let out = TensorIr::uninit(client.create_empty_handle(), shape_out, DType::F32);
@@ -806,8 +837,9 @@ mod fusion_impl {
 mod tests {
     use super::*;
     use burn::tensor::{Distribution, Tensor, TensorData};
+    use mummu_num::f32_from_u64;
 
-    /// SplitMix64: a tiny deterministic generator for test inputs whose
+    /// `SplitMix64`: a tiny deterministic generator for test inputs whose
     /// assertion depends on the draw.
     struct Rng(u64);
 
@@ -822,7 +854,7 @@ mod tests {
         /// Uniform in `[-1, 1)`.
         fn uniform_vec(&mut self, len: usize) -> Vec<f32> {
             (0..len)
-                .map(|_| (self.next_u64() >> 40) as f32 / (1u64 << 23) as f32 - 1.0)
+                .map(|_| f32_from_u64(self.next_u64() >> 40) / f32_from_u64(1u64 << 23) - 1.0)
                 .collect()
         }
     }
@@ -847,7 +879,9 @@ mod tests {
     /// own error-bound tests in `flex::kernels`, not by this one.
     #[test]
     fn q4s_gemv_matches_dequant_matmul_on_flex() {
-        let _serial = FLEX_PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = FLEX_PATH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::flex::registry::force_disable(true);
         let _restore = RestoreFastPath;
         let device = crate::backend::cpu_device();
@@ -890,20 +924,22 @@ mod tests {
     /// (wrong scales, a ghost weight, a dropped offset) lands at O(1).
     #[test]
     fn q4s_gemv_vnni_twin_is_deterministic_and_faithful() {
-        let _serial = FLEX_PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = FLEX_PATH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::flex::registry::force_disable(false);
         let device = crate::backend::cpu_device();
         let (k, n) = (256, 96);
         let mut rng = Rng(0);
         let x = Tensor::<2>::from_data(TensorData::new(rng.uniform_vec(k), [1, k]), &device);
-        let w = Tensor::<2>::from_data(TensorData::new(rng.uniform_vec(k * n), [k, n]), &device);
-        let wq = crate::quant::quantize_weight(crate::quant::QuantPolicy::Q4, w);
+        let wf = Tensor::<2>::from_data(TensorData::new(rng.uniform_vec(k * n), [k, n]), &device);
+        let wq = crate::quant::quantize_weight(crate::quant::QuantPolicy::Q4, wf);
 
-        let a = try_q4s_gemv(&x, &wq).expect("packed path must engage");
-        let b = try_q4s_gemv(&x, &wq).expect("second call");
-        let rep = a
+        let first = try_q4s_gemv(&x, &wq).expect("packed path must engage");
+        let second = try_q4s_gemv(&x, &wq).expect("second call");
+        let rep = first
             .clone()
-            .sub(b)
+            .sub(second)
             .abs()
             .max()
             .into_data()
@@ -912,7 +948,7 @@ mod tests {
         assert_eq!(rep, 0.0, "twin path must be deterministic call to call");
 
         let want = x.matmul(wq.dequantize());
-        let diff = a
+        let diff = first
             .sub(want.clone())
             .abs()
             .max()
@@ -947,13 +983,15 @@ mod tests {
     /// an execution change, not a numerics change.
     #[test]
     fn q4s_gemm_matches_stacked_gemvs_on_flex() {
-        let _serial = FLEX_PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = FLEX_PATH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::flex::registry::force_disable(false);
         let device = crate::backend::cpu_device();
         let (k, n, m) = (192, 96, 5);
         let x = Tensor::<2>::random([m, k], Distribution::Uniform(-1.0, 1.0), &device);
-        let w = Tensor::<2>::random([k, n], Distribution::Uniform(-1.0, 1.0), &device);
-        let wq = crate::quant::quantize_weight(crate::quant::QuantPolicy::Q4, w);
+        let wf = Tensor::<2>::random([k, n], Distribution::Uniform(-1.0, 1.0), &device);
+        let wq = crate::quant::quantize_weight(crate::quant::QuantPolicy::Q4, wf);
 
         let gemm = try_q4s_gemv(&x, &wq).expect("gemm path must engage");
         assert_eq!(gemm.dims(), [m, n]);
@@ -986,7 +1024,9 @@ mod tests {
     /// by default: the gate must decline until serve opts in.
     #[test]
     fn bounded_head_scatter_matches_dense() {
-        let _serial = FLEX_PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = FLEX_PATH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::flex::registry::force_disable(false);
         let device = crate::backend::cpu_device();
         let (k, vocab) = (128, 512);
@@ -1019,14 +1059,16 @@ mod tests {
     /// disabling the VNNI path never disables prefill batching.
     #[test]
     fn q4s_gemm_i8_fallback_matches_stacked_gemvs() {
-        let _serial = FLEX_PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = FLEX_PATH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::flex::registry::force_disable(true);
         let _restore = RestoreFastPath;
         let device = crate::backend::cpu_device();
         let (k, n, m) = (128, 64, 3);
         let x = Tensor::<2>::random([m, k], Distribution::Uniform(-1.0, 1.0), &device);
-        let w = Tensor::<2>::random([k, n], Distribution::Uniform(-1.0, 1.0), &device);
-        let wq = crate::quant::quantize_weight(crate::quant::QuantPolicy::Q4, w);
+        let wf = Tensor::<2>::random([k, n], Distribution::Uniform(-1.0, 1.0), &device);
+        let wq = crate::quant::quantize_weight(crate::quant::QuantPolicy::Q4, wf);
 
         let gemm = try_q4s_gemv(&x, &wq).expect("gemm path must engage");
         let rows: Vec<Tensor<2>> = (0..m)

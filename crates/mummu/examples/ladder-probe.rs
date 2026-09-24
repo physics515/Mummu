@@ -10,11 +10,47 @@
 //!
 //! Reports relative error against the pack's own f32 bytes and the resident
 //! byte count, which together are what a placement decision trades off.
-use burn::tensor::{Tensor, TensorData};
+
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
+use burn::tensor::{Device, Tensor, TensorData};
 use mummu::backend;
 use mummu::pack::{Pack, Precision, Role};
 use mummu::quant::{QuantPolicy, quantize_weight};
+use mummu_num::{f32_from_usize, f64_from_usize};
 use std::path::PathBuf;
+
+/// Largest 2-D weight considered, in parameters: the f32 reference lives on
+/// the host and a multi-GB one turns this probe into a memory test.
+const MAX_PARAMS: usize = 128 << 20;
+
+/// Multiply `xs` by `w` on the GPU and return the worst relative error
+/// against the f32 reference `want` (scaled by its largest magnitude), or
+/// `None` when the matmul panicked or could not be read back.
+fn gpu_rel_error(gpu: &Device, xs: &[f32], w: Tensor<2>, want: &[f32], scale: f32) -> Option<f32> {
+    let xs = xs.to_vec();
+    let gpu = gpu.clone();
+    let k = xs.len();
+    let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let x = Tensor::<2>::from_data(
+            TensorData::new(xs, [1, k]),
+            (&gpu, backend::float_dtype(&gpu)),
+        );
+        x.matmul(w)
+            .into_data()
+            .convert::<f32>()
+            .try_to_vec::<f32>()
+            .ok()
+    }))
+    .ok()
+    .flatten()?;
+    Some(
+        got.iter()
+            .zip(want)
+            .map(|(a, b)| (a - b).abs() / scale)
+            .fold(0.0f32, f32::max),
+    )
+}
 
 fn main() {
     let dir = std::env::var("PACK_DIR").unwrap_or_else(|_| {
@@ -24,7 +60,6 @@ fn main() {
     let gpu = backend::gpu_device();
     let cpu = backend::cpu_device();
 
-    const MAX_PARAMS: usize = 128 << 20;
     let entry = pack
         .manifest
         .tensors
@@ -38,10 +73,12 @@ fn main() {
     println!(
         "{} [{k}, {n}] = {:.1} M params\n",
         entry.name,
-        params as f64 / 1e6
+        f64_from_usize(params) / 1e6
     );
 
-    let xs: Vec<f32> = (0..k).map(|i| ((i % 13) as f32 - 6.0) / 6.0).collect();
+    let xs: Vec<f32> = (0..k)
+        .map(|i| (f32_from_usize(i % 13) - 6.0) / 6.0)
+        .collect();
     let want = {
         let f32s = pack.read_f32(entry).expect("read f32");
         let x = Tensor::<2>::from_data(TensorData::new(xs.clone(), [1, k]), &cpu);
@@ -58,44 +95,16 @@ fn main() {
     std::panic::set_hook(Box::new(|_| {}));
 
     let report = |how: &str, w: Option<Tensor<2>>, bits: usize| {
-        let verdict = match w {
-            None => "PANIC".to_string(),
-            Some(w) => {
-                let xs = xs.clone();
-                let gpu = gpu.clone();
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                    let x = Tensor::<2>::from_data(
-                        TensorData::new(xs, [1, k]),
-                        (&gpu, backend::float_dtype(&gpu)),
-                    );
-                    x.matmul(w)
-                        .into_data()
-                        .convert::<f32>()
-                        .try_to_vec::<f32>()
-                        .ok()
-                }))
-                .ok()
-                .flatten()
-                {
-                    None => "PANIC".to_string(),
-                    Some(g) => {
-                        let worst = g
-                            .iter()
-                            .zip(&want)
-                            .map(|(a, b)| (a - b).abs() / scale)
-                            .fold(0.0f32, f32::max);
-                        format!("rel {worst:.4}")
-                    }
-                }
-            }
-        };
+        let verdict = w
+            .and_then(|w| gpu_rel_error(&gpu, &xs, w, &want, scale))
+            .map_or_else(|| "PANIC".to_string(), |worst| format!("rel {worst:.4}"));
         // Scales ride along at f32 per 32-value block; count them, or the
         // "16x smaller" claim for Q2 is a third off.
         // f16 carries no block scales; the quantized rungs do.
         let bytes = params * bits / 8 + if bits >= 16 { 0 } else { (params / 32) * 4 };
         println!(
             "  {how:<28} {verdict:<14} resident {:>6.1} MiB",
-            bytes as f64 / (1 << 20) as f64
+            f64_from_usize(bytes) / f64::from(1 << 20)
         );
     };
 

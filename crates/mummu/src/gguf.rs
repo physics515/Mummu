@@ -1,5 +1,7 @@
 //! GGUF container reader — the first slice of P3's "run what the ecosystem
-//! ships" import path. GGUF (llama.cpp's format) is one file: a small header
+//! ships" import path.
+//!
+//! GGUF (llama.cpp's format) is one file: a small header
 //! of typed metadata key-values, a tensor table (name, shape, quantized
 //! dtype, offset), then an aligned blob of tensor payloads.
 //!
@@ -8,6 +10,7 @@
 //! malformed, oversized, or unknown. Tensor payloads are *located*, never
 //! loaded here; dequantizing them into Burn tensors is the next slice.
 
+use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, Write};
 use std::path::Path;
@@ -100,7 +103,7 @@ pub enum GgufError {
 /// as `safetensors::to_usize`.)
 fn to_usize(value: u64, path: &str, what: &'static str) -> Result<usize, GgufError> {
     debug_assert!(
-        value <= usize::MAX as u64,
+        usize::try_from(value).is_ok(),
         "{what} fits usize on this target"
     );
     debug_assert!(!path.is_empty(), "an error needs a file to name");
@@ -125,7 +128,7 @@ pub enum GgufValue {
     F32(f32),
     Bool(bool),
     Str(String),
-    Array(Vec<GgufValue>),
+    Array(Vec<Self>),
     U64(u64),
     I64(i64),
     F64(f64),
@@ -168,7 +171,7 @@ impl GgufValue {
 
     /// The value as f32, if it is one.
     #[must_use]
-    pub fn as_f32(&self) -> Option<f32> {
+    pub const fn as_f32(&self) -> Option<f32> {
         match *self {
             Self::F32(v) => Some(v),
             _ => None,
@@ -177,7 +180,7 @@ impl GgufValue {
 
     /// The value as a bool, if it is one.
     #[must_use]
-    pub fn as_bool(&self) -> Option<bool> {
+    pub const fn as_bool(&self) -> Option<bool> {
         match *self {
             Self::Bool(v) => Some(v),
             _ => None,
@@ -186,7 +189,7 @@ impl GgufValue {
 
     /// The value as an array slice, if it is one.
     #[must_use]
-    pub fn as_array(&self) -> Option<&[GgufValue]> {
+    pub fn as_array(&self) -> Option<&[Self]> {
         match self {
             Self::Array(items) => Some(items),
             _ => None,
@@ -197,81 +200,128 @@ impl GgufValue {
 /// A GGML tensor dtype, as stored on disk. Quantized types pack fixed-size
 /// blocks; `block_size`/`bytes_per_block` give the layout the dequant slice
 /// (and size validation here) needs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(non_camel_case_types)] // the ecosystem's canonical spellings
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum GgmlType {
     F32,
     F16,
-    Q4_0,
-    Q4_1,
-    Q5_0,
-    Q5_1,
-    Q8_0,
-    Q8_1,
-    Q2_K,
-    Q3_K,
-    Q4_K,
-    Q5_K,
-    Q6_K,
-    Q8_K,
-    /// IQ4_XS: 4-bit non-linear (a 16-entry value table) with 6-bit
+    Q40,
+    Q41,
+    Q50,
+    Q51,
+    Q80,
+    Q81,
+    Q2K,
+    Q3K,
+    Q4K,
+    Q5K,
+    Q6K,
+    Q8K,
+    /// `IQ4_XS`: 4-bit non-linear (a 16-entry value table) with 6-bit
     /// sub-scales — the workhorse of unsloth's UD dynamic quants.
-    IQ4_XS,
-    /// IQ4_NL: IQ4_XS's 16-entry table in a simple 32-element block.
-    IQ4_NL,
-    /// IQ2_XS: 2.3125 bpw — 8-value rows from a 512-entry codebook grid.
-    IQ2_XS,
-    /// IQ2_S: 2.5625 bpw — the 1024-entry grid with separate sign bytes.
-    IQ2_S,
-    /// IQ3_XXS: 3.0625 bpw — 4-value rows from a 256-entry grid.
-    IQ3_XXS,
-    /// IQ3_S: 3.4375 bpw — the 512-entry grid, high index bits in `qh`.
-    IQ3_S,
+    Iq4Xs,
+    /// `IQ4_NL`: `IQ4_XS`'s 16-entry table in a simple 32-element block.
+    Iq4Nl,
+    /// `IQ2_XS`: 2.3125 bpw — 8-value rows from a 512-entry codebook grid.
+    Iq2Xs,
+    /// `IQ2_S`: 2.5625 bpw — the 1024-entry grid with separate sign bytes.
+    Iq2S,
+    /// `IQ3_XXS`: 3.0625 bpw — 4-value rows from a 256-entry grid.
+    Iq3Xxs,
+    /// `IQ3_S`: 3.4375 bpw — the 512-entry grid, high index bits in `qh`.
+    Iq3S,
     BF16,
-    /// Q1_0: binary `{−d, +d}`, one bit per weight (LSB first) with an f16
+    /// `Q1_0`: binary `{−d, +d}`, one bit per weight (LSB first) with an f16
     /// scale per 128 (upstream ggml id 41 — Prism's Bonsai 1-bit line).
-    Q1_0,
-    /// Q2_0: 2-bit code slots, four per byte low bits first, decoding as
+    Q10,
+    /// `Q2_0`: 2-bit code slots, four per byte low bits first, decoding as
     /// `(code − 1)·d` — `{−d, 0, +d, +2d}`, the last reserved — with an f16
     /// scale per 64 (upstream ggml id 42, the group-64 ternary format).
-    Q2_0,
-    /// PQ2_0: Q2_0's codec with the scale per 128 (Prism-private id 142 —
+    Q20,
+    /// `PQ2_0`: `Q2_0`'s codec with the scale per 128 (Prism-private id 142 —
     /// what Ternary-Bonsai ships as `*-PQ2_0.gguf`).
-    PQ2_0,
-    /// PTQ1_0: five base-3 trits per byte, scale per 128 (Prism-private id
-    /// 143, 1.75 bits/weight — TQ1_0's packing at group 128, not 256).
-    PTQ1_0,
+    Pq20,
+    /// `PTQ1_0`: five base-3 trits per byte, scale per 128 (Prism-private id
+    /// 143, 1.75 bits/weight — `TQ1_0`'s packing at group 128, not 256).
+    Ptq10,
+}
+
+/// Prints [`GgmlType::canonical_name`], so every `{dtype:?}` diagnostic names
+/// the dtype the way llama.cpp and the checkpoint filename do.
+impl std::fmt::Debug for GgmlType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.canonical_name())
+    }
 }
 
 impl GgmlType {
+    /// The ecosystem's spelling of this dtype — `Q4_0`, `IQ4_XS`, `PQ2_0` —
+    /// which is what llama.cpp prints, what the GGUF spec calls it, and what
+    /// the checkpoint filenames carry.
+    ///
+    /// The variants are camel case because the workspace admits no
+    /// `non_camel_case_types` allow, but every message a human matches
+    /// against llama.cpp's output has to say `Q4_0`, not `Q40` — so this is
+    /// also what [`Debug`] prints (see the impl below), and no `{dtype:?}`
+    /// site had to change when the variants were renamed.
+    #[must_use]
+    pub const fn canonical_name(self) -> &'static str {
+        match self {
+            Self::F32 => "F32",
+            Self::F16 => "F16",
+            Self::BF16 => "BF16",
+            Self::Q40 => "Q4_0",
+            Self::Q41 => "Q4_1",
+            Self::Q50 => "Q5_0",
+            Self::Q51 => "Q5_1",
+            Self::Q80 => "Q8_0",
+            Self::Q81 => "Q8_1",
+            Self::Q2K => "Q2_K",
+            Self::Q3K => "Q3_K",
+            Self::Q4K => "Q4_K",
+            Self::Q5K => "Q5_K",
+            Self::Q6K => "Q6_K",
+            Self::Q8K => "Q8_K",
+            Self::Iq4Xs => "IQ4_XS",
+            Self::Iq4Nl => "IQ4_NL",
+            Self::Iq2Xs => "IQ2_XS",
+            Self::Iq2S => "IQ2_S",
+            Self::Iq3Xxs => "IQ3_XXS",
+            Self::Iq3S => "IQ3_S",
+            Self::Q10 => "Q1_0",
+            Self::Q20 => "Q2_0",
+            Self::Pq20 => "PQ2_0",
+            Self::Ptq10 => "PTQ1_0",
+        }
+    }
+
     /// Decode the on-disk type id; unknown ids are a loud error, never a guess.
-    fn from_id(id: u32) -> Option<Self> {
+    const fn from_id(id: u32) -> Option<Self> {
         let ty = match id {
             0 => Self::F32,
             1 => Self::F16,
-            2 => Self::Q4_0,
-            3 => Self::Q4_1,
-            6 => Self::Q5_0,
-            7 => Self::Q5_1,
-            8 => Self::Q8_0,
-            9 => Self::Q8_1,
-            10 => Self::Q2_K,
-            11 => Self::Q3_K,
-            12 => Self::Q4_K,
-            13 => Self::Q5_K,
-            14 => Self::Q6_K,
-            15 => Self::Q8_K,
-            17 => Self::IQ2_XS,
-            18 => Self::IQ3_XXS,
-            20 => Self::IQ4_NL,
-            21 => Self::IQ3_S,
-            22 => Self::IQ2_S,
-            23 => Self::IQ4_XS,
+            2 => Self::Q40,
+            3 => Self::Q41,
+            6 => Self::Q50,
+            7 => Self::Q51,
+            8 => Self::Q80,
+            9 => Self::Q81,
+            10 => Self::Q2K,
+            11 => Self::Q3K,
+            12 => Self::Q4K,
+            13 => Self::Q5K,
+            14 => Self::Q6K,
+            15 => Self::Q8K,
+            17 => Self::Iq2Xs,
+            18 => Self::Iq3Xxs,
+            20 => Self::Iq4Nl,
+            21 => Self::Iq3S,
+            22 => Self::Iq2S,
+            23 => Self::Iq4Xs,
             30 => Self::BF16,
-            41 => Self::Q1_0,
-            42 => Self::Q2_0,
-            142 => Self::PQ2_0,
-            143 => Self::PTQ1_0,
+            41 => Self::Q10,
+            42 => Self::Q20,
+            142 => Self::Pq20,
+            143 => Self::Ptq10,
             _ => return None,
         };
         Some(ty)
@@ -279,60 +329,55 @@ impl GgmlType {
 
     /// Elements per quantization block (1 for plain float types).
     #[must_use]
-    pub fn block_size(self) -> u64 {
+    pub const fn block_size(self) -> u64 {
         match self {
             Self::F32 | Self::F16 | Self::BF16 => 1,
-            Self::Q4_0
-            | Self::Q4_1
-            | Self::Q5_0
-            | Self::Q5_1
-            | Self::Q8_0
-            | Self::Q8_1
-            | Self::IQ4_NL => 32,
-            Self::Q2_0 => 64,
-            Self::Q1_0 | Self::PQ2_0 | Self::PTQ1_0 => 128,
-            Self::Q2_K
-            | Self::Q3_K
-            | Self::Q4_K
-            | Self::Q5_K
-            | Self::Q6_K
-            | Self::Q8_K
-            | Self::IQ4_XS
-            | Self::IQ2_XS
-            | Self::IQ2_S
-            | Self::IQ3_XXS
-            | Self::IQ3_S => 256,
+            Self::Q40 | Self::Q41 | Self::Q50 | Self::Q51 | Self::Q80 | Self::Q81 | Self::Iq4Nl => {
+                32
+            }
+            Self::Q20 => 64,
+            Self::Q10 | Self::Pq20 | Self::Ptq10 => 128,
+            Self::Q2K
+            | Self::Q3K
+            | Self::Q4K
+            | Self::Q5K
+            | Self::Q6K
+            | Self::Q8K
+            | Self::Iq4Xs
+            | Self::Iq2Xs
+            | Self::Iq2S
+            | Self::Iq3Xxs
+            | Self::Iq3S => 256,
         }
     }
 
     /// Bytes one block occupies on disk (ggml's type sizes).
     #[must_use]
-    pub fn bytes_per_block(self) -> u64 {
+    pub const fn bytes_per_block(self) -> u64 {
         match self {
             Self::F32 => 4,
             Self::F16 | Self::BF16 => 2,
-            Self::Q4_0 => 18,    // f16 d + 16 B qs
-            Self::Q4_1 => 20,    // f16 d + f16 m + 16 B qs
-            Self::Q5_0 => 22,    // f16 d + 4 B qh + 16 B qs
-            Self::Q5_1 => 24,    // f16 d + f16 m + 4 B qh + 16 B qs
-            Self::Q8_0 => 34,    // f16 d + 32 i8
-            Self::Q8_1 => 36,    // f16 d + f16 s + 32 i8
-            Self::Q2_K => 84,    // 16 B scales + 64 B qs + f16 d + f16 dmin
-            Self::Q3_K => 110,   // 32 B hmask + 64 B qs + 12 B scales + f16 d
-            Self::Q4_K => 144,   // f16 d + f16 dmin + 12 B scales + 128 B qs
-            Self::Q5_K => 176,   // Q4_K + 32 B qh
-            Self::Q6_K => 210,   // 128 B ql + 64 B qh + 16 i8 scales + f16 d
-            Self::Q8_K => 292,   // f32 d + 256 i8 + 16 i16 bsums
-            Self::IQ4_XS => 136, // f16 d + u16 scales_h + 4 B scales_l + 128 B qs
-            Self::IQ4_NL => 18,  // f16 d + 16 B qs
-            Self::IQ2_XS => 74,  // f16 d + 32 u16 (grid|signs) + 8 B scales
-            Self::IQ2_S => 82,   // f16 d + 64 B qs(idx lo + signs) + 8 B qh + 8 B scales
-            Self::IQ3_XXS => 98, // f16 d + 64 B idx + 32 B (scale|signs) words
-            Self::IQ3_S => 110,  // f16 d + 64 B qs + 8 B qh + 32 B signs + 4 B scales
-            Self::Q1_0 => 18,    // f16 d + 16 B of bits
-            Self::Q2_0 => 18,    // f16 d + 16 B of 2-bit slots
-            Self::PQ2_0 => 34,   // f16 d + 32 B of 2-bit slots
-            Self::PTQ1_0 => 28,  // 24 B qs (5 trits/byte) + 2 B qh (4 trits/byte) + f16 d
+            // f16 d + 16 B: Q4_0 qs / IQ4_NL indices / Q1_0 bits / Q2_0 2-bit slots
+            Self::Q40 | Self::Iq4Nl | Self::Q10 | Self::Q20 => 18,
+            Self::Q41 => 20, // f16 d + f16 m + 16 B qs
+            Self::Q50 => 22, // f16 d + 4 B qh + 16 B qs
+            Self::Q51 => 24, // f16 d + f16 m + 4 B qh + 16 B qs
+            // f16 d + 32 B: Q8_0 i8 quants / PQ2_0 2-bit slots
+            Self::Q80 | Self::Pq20 => 34,
+            Self::Q81 => 36, // f16 d + f16 s + 32 i8
+            Self::Q2K => 84, // 16 B scales + 64 B qs + f16 d + f16 dmin
+            // Q3_K: 32 B hmask + 64 B qs + 12 B scales + f16 d;
+            // IQ3_S: f16 d + 64 B qs + 8 B qh + 32 B signs + 4 B scales
+            Self::Q3K | Self::Iq3S => 110,
+            Self::Q4K => 144,   // f16 d + f16 dmin + 12 B scales + 128 B qs
+            Self::Q5K => 176,   // Q4_K + 32 B qh
+            Self::Q6K => 210,   // 128 B ql + 64 B qh + 16 i8 scales + f16 d
+            Self::Q8K => 292,   // f32 d + 256 i8 + 16 i16 bsums
+            Self::Iq4Xs => 136, // f16 d + u16 scales_h + 4 B scales_l + 128 B qs
+            Self::Iq2Xs => 74,  // f16 d + 32 u16 (grid|signs) + 8 B scales
+            Self::Iq2S => 82,   // f16 d + 64 B qs(idx lo + signs) + 8 B qh + 8 B scales
+            Self::Iq3Xxs => 98, // f16 d + 64 B idx + 32 B (scale|signs) words
+            Self::Ptq10 => 28,  // 24 B qs (5 trits/byte) + 2 B qh (4 trits/byte) + f16 d
         }
     }
 
@@ -343,11 +388,11 @@ impl GgmlType {
     /// integer levels are as good as their block layout allows (exact with
     /// scale blocks along the source's own axis, 5% mean at Q4 / 0.3% at Q8
     /// with the pack's blocks along the output axis — measured on the real
-    /// 27B). Q2_0's reserved `+2` code is never emitted by a shipped
+    /// 27B). `Q2_0`'s reserved `+2` code is never emitted by a shipped
     /// checkpoint (histogrammed: zero occurrences).
     #[must_use]
-    pub fn is_ternary_family(self) -> bool {
-        matches!(self, Self::Q1_0 | Self::Q2_0 | Self::PQ2_0 | Self::PTQ1_0)
+    pub const fn is_ternary_family(self) -> bool {
+        matches!(self, Self::Q10 | Self::Q20 | Self::Pq20 | Self::Ptq10)
     }
 }
 
@@ -509,6 +554,26 @@ pub struct GgufFile {
 impl GgufFile {
     /// Read and validate a GGUF header (metadata + tensor table only — no
     /// tensor payloads are loaded).
+    ///
+    /// # Errors
+    ///
+    /// [`GgufError::Io`] when the file cannot be opened or ends inside the
+    /// header; [`GgufError::BadMagic`] / [`GgufError::UnsupportedVersion`]
+    /// for a non-GGUF or big-endian file, or a version other than 2 or 3;
+    /// [`GgufError::OverBound`] when a count (tensors, key-values), a string
+    /// or an array exceeds its `MAX_*` ceiling; [`GgufError::BadValue`] for
+    /// a malformed metadata value (unknown type id, a bool byte other than
+    /// 0/1, invalid UTF-8, arrays nested past two levels, a
+    /// `general.alignment` that is not a power of two);
+    /// [`GgufError::BadTensor`] for a table entry with 0 or more than 4
+    /// dims, an unknown ggml type id, an unaligned offset, an element count
+    /// that is not whole blocks, a duplicate name, or a payload that
+    /// overlaps its neighbour's.
+    ///
+    /// # Panics
+    ///
+    /// Only on an internal invariant: the payload offset is rounded up to
+    /// the alignment by construction, which the assertion restates.
     pub fn open(path: &Path) -> Result<Self, GgufError> {
         let file = File::open(path).map_err(|source| GgufError::Io {
             path: path.display().to_string(),
@@ -544,6 +609,22 @@ impl GgufFile {
     /// a real 4-shard model was observed with **0 tensors in shard 1**, so
     /// neither "metadata lives with tensors" nor "every shard has tensors"
     /// can be assumed.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`Self::open`] reports, for any shard;
+    /// [`GgufError::BadValue`] when `split.count` exceeds the 64-shard
+    /// bound, when the member's filename is not UTF-8 or does not carry the
+    /// `-NNNNN-of-NNNNN.gguf` index, when a shard the set claims is missing
+    /// on disk, when a tensor name appears in more than one shard, or when
+    /// `split.tensors.count` disagrees with what the shards carry;
+    /// [`GgufError::OverBound`] when `split.count` does not fit a `usize`.
+    ///
+    /// # Panics
+    ///
+    /// Only on internal invariants: the shard path list has one entry per
+    /// declared shard, and a count of at least 2 (checked first) means at
+    /// least one shard was opened.
     pub fn open_sharded(path: &Path) -> Result<Self, GgufError> {
         let first = Self::open(path)?;
         let Some(count) = first.get("split.count").and_then(GgufValue::as_u64) else {
@@ -634,6 +715,21 @@ impl GgufFile {
 
     /// Read one tensor's payload and dequantize it to f32, in the on-disk
     /// (ggml fastest-varying-first) element order.
+    ///
+    /// # Errors
+    ///
+    /// [`GgufError::BadValue`] when no tensor is called `name`;
+    /// [`GgufError::Io`] when the payload file cannot be opened, seeked, or
+    /// read to the tensor's full length; [`GgufError::OverBound`] when the
+    /// payload byte count does not fit a `usize`; [`GgufError::BadTensor`]
+    /// when the payload is not whole blocks or the dtype has no dequantizer
+    /// (`Q8_1`/`Q8_K` are activation formats, never weights).
+    ///
+    /// # Panics
+    ///
+    /// Only on internal invariants: a table entry validated at parse time
+    /// dequantizes to exactly its element count, and on a split header every
+    /// tensor index belongs to a shard (see [`Self::payload_location`]).
     pub fn read_tensor_f32(&self, name: &str) -> Result<Vec<f32>, GgufError> {
         use std::io::SeekFrom;
         let index = self.tensor_index(name).ok_or_else(|| GgufError::BadValue {
@@ -700,6 +796,22 @@ impl GgufFile {
     /// dequantized size is a meaningful fraction of RAM, use
     /// [`Self::dequant_to_safetensors_file`] — the two produce byte-identical
     /// output.
+    ///
+    /// # Errors
+    ///
+    /// [`GgufError::BadTensor`] when `map` leaves a tensor unmapped, a
+    /// [`GgufMap::Reshape`] changes the element count, two tensors map to
+    /// the same name, or a name is not encodable as JSON;
+    /// [`GgufError::OverBound`] when one dequantized tensor exceeds 8 GiB or
+    /// the planned payload exceeds 48 GiB; and whatever
+    /// [`Self::read_tensor_f32`] reports for a payload that cannot be read
+    /// or dequantized.
+    ///
+    /// # Panics
+    ///
+    /// Only on internal invariants: every planned byte is written exactly
+    /// once, the staging buffer stays within its bound, and the blob always
+    /// starts with the 8-byte header length.
     pub fn dequant_to_safetensors(
         &self,
         map: &dyn Fn(&GgufTensorInfo) -> Option<GgufMap>,
@@ -721,6 +833,17 @@ impl GgufFile {
     /// `SafetensorsStore::from_file` page the weights in as it needs them.
     /// (`safetensors::fuse_checkpoint_to_file` is the same trade on the
     /// unquantized path.)
+    ///
+    /// # Errors
+    ///
+    /// Everything [`Self::dequant_to_safetensors`] reports, plus
+    /// [`GgufError::Io`] when `out` cannot be created, written, flushed, or
+    /// synced.
+    ///
+    /// # Panics
+    ///
+    /// If `out` is the empty path. Otherwise only on the internal invariants
+    /// of [`Self::dequant_to_safetensors`].
     pub fn dequant_to_safetensors_file(
         &self,
         map: &dyn Fn(&GgufTensorInfo) -> Option<GgufMap>,
@@ -790,12 +913,14 @@ impl GgufFile {
                 index: p.source,
                 reason: format!("name is not encodable as JSON: {e}"),
             })?;
-            header.push_str(&format!(
+            write!(
+                header,
                 "{json_name}:{{\"dtype\":\"F32\",\"shape\":{:?},\"data_offsets\":[{},{}]}}",
                 p.shape,
                 p.start,
                 p.start + p.len,
-            ));
+            )
+            .expect("formatting into a String cannot fail");
         }
         header.push('}');
 
@@ -859,7 +984,7 @@ impl GgufFile {
     ///
     /// Offsets are contiguous and ascending in tensor-table order, which is
     /// what lets the copy pass be a single forward stream. A
-    /// [`GgufMap::Skip`] tensor (e.g. qwen35's unused NextN block) is dropped
+    /// [`GgufMap::Skip`] tensor (e.g. qwen35's unused `NextN` block) is dropped
     /// here: it earns no plan entry and counts toward neither the size bound
     /// nor the blob.
     fn plan_dequant(
@@ -1057,8 +1182,7 @@ impl Reader {
         };
         let v = match type_id {
             0 => GgufValue::U8(self.bytes::<1>()?[0]),
-            #[allow(clippy::cast_possible_wrap)] // bit-exact reinterpret is the format
-            1 => GgufValue::I8(self.bytes::<1>()?[0] as i8),
+            1 => GgufValue::I8(i8::from_le_bytes(self.bytes()?)),
             2 => GgufValue::U16(u16::from_le_bytes(self.bytes()?)),
             3 => GgufValue::I16(i16::from_le_bytes(self.bytes()?)),
             4 => GgufValue::U32(self.u32()?),
@@ -1263,6 +1387,19 @@ impl Reader {
 
 /// Dequantize a whole tensor payload to f32. `bytes` must be whole blocks of
 /// `dtype` (guaranteed for payload slices sized by [`GgufTensorInfo::byte_len`]).
+///
+/// # Errors
+///
+/// When `bytes` is empty or not a whole number of `dtype` blocks, or when
+/// `dtype` has no dequantizer (`Q8_1` and `Q8_K` are activation formats,
+/// never tensor storage). A block or element count wider than `usize` is
+/// reported the same way rather than assumed impossible.
+///
+/// # Panics
+///
+/// Only on internal invariants: each block handed to a dequantizer is
+/// exactly one block wide (`chunks_exact` guarantees it) and the output
+/// holds exactly `blocks × block_size` values.
 pub fn dequantize(dtype: GgmlType, bytes: &[u8]) -> Result<Vec<f32>, String> {
     let bpb = usize::try_from(dtype.bytes_per_block()).map_err(|_| {
         format!(
@@ -1289,7 +1426,7 @@ pub fn dequantize(dtype: GgmlType, bytes: &[u8]) -> Result<Vec<f32>, String> {
             GgmlType::F32 => {
                 out.push(f32::from_le_bytes(block.try_into().map_err(|_| {
                     format!("F32 block is {} bytes, not 4", block.len())
-                })?))
+                })?));
             }
             GgmlType::F16 => out.push(f16_to_f32(u16::from_le_bytes([block[0], block[1]]))),
             GgmlType::BF16 => {
@@ -1297,26 +1434,26 @@ pub fn dequantize(dtype: GgmlType, bytes: &[u8]) -> Result<Vec<f32>, String> {
                     u32::from(u16::from_le_bytes([block[0], block[1]])) << 16,
                 ));
             }
-            GgmlType::Q4_0 => dequant_q4_0(block, &mut out),
-            GgmlType::Q4_1 => dequant_q4_1(block, &mut out),
-            GgmlType::Q5_0 => dequant_q5_0(block, &mut out),
-            GgmlType::Q5_1 => dequant_q5_1(block, &mut out),
-            GgmlType::Q8_0 => dequant_q8_0(block, &mut out),
-            GgmlType::Q2_K => dequant_q2_k(block, &mut out),
-            GgmlType::Q3_K => dequant_q3_k(block, &mut out),
-            GgmlType::Q4_K => dequant_q4_k(block, &mut out),
-            GgmlType::Q5_K => dequant_q5_k(block, &mut out),
-            GgmlType::Q6_K => dequant_q6_k(block, &mut out),
-            GgmlType::IQ4_XS => dequant_iq4_xs(block, &mut out),
-            GgmlType::IQ4_NL => dequant_iq4_nl(block, &mut out),
-            GgmlType::IQ2_XS => dequant_iq2_xs(block, &mut out),
-            GgmlType::IQ2_S => dequant_iq2_s(block, &mut out),
-            GgmlType::IQ3_XXS => dequant_iq3_xxs(block, &mut out),
-            GgmlType::IQ3_S => dequant_iq3_s(block, &mut out),
-            GgmlType::Q1_0 => dequant_q1_0(block, &mut out),
-            GgmlType::Q2_0 => dequant_q2_slots(block, 64, &mut out),
-            GgmlType::PQ2_0 => dequant_q2_slots(block, 128, &mut out),
-            GgmlType::PTQ1_0 => dequant_ptq1_0(block, &mut out),
+            GgmlType::Q40 => dequant_q4_0(block, &mut out),
+            GgmlType::Q41 => dequant_q4_1(block, &mut out),
+            GgmlType::Q50 => dequant_q5_0(block, &mut out),
+            GgmlType::Q51 => dequant_q5_1(block, &mut out),
+            GgmlType::Q80 => dequant_q8_0(block, &mut out),
+            GgmlType::Q2K => dequant_q2_k(block, &mut out),
+            GgmlType::Q3K => dequant_q3_k(block, &mut out),
+            GgmlType::Q4K => dequant_q4_k(block, &mut out),
+            GgmlType::Q5K => dequant_q5_k(block, &mut out),
+            GgmlType::Q6K => dequant_q6_k(block, &mut out),
+            GgmlType::Iq4Xs => dequant_iq4_xs(block, &mut out),
+            GgmlType::Iq4Nl => dequant_iq4_nl(block, &mut out),
+            GgmlType::Iq2Xs => dequant_iq2_xs(block, &mut out),
+            GgmlType::Iq2S => dequant_iq2_s(block, &mut out),
+            GgmlType::Iq3Xxs => dequant_iq3_xxs(block, &mut out),
+            GgmlType::Iq3S => dequant_iq3_s(block, &mut out),
+            GgmlType::Q10 => dequant_q1_0(block, &mut out),
+            GgmlType::Q20 => dequant_q2_slots(block, 64, &mut out),
+            GgmlType::Pq20 => dequant_q2_slots(block, 128, &mut out),
+            GgmlType::Ptq10 => dequant_ptq1_0(block, &mut out),
             other => return Err(format!("dequant for {other:?} is not implemented yet")),
         }
     }
@@ -1330,7 +1467,7 @@ fn f16_to_f32(bits: u16) -> f32 {
     f32::from(half::f16::from_bits(bits))
 }
 
-/// Q1_0: f16 scale + 128 bits, LSB first; `x = bit ? d : −d`.
+/// `Q1_0`: f16 scale + 128 bits, LSB first; `x = bit ? d : −d`.
 fn dequant_q1_0(block: &[u8], out: &mut Vec<f32>) {
     assert_eq!(block.len(), 18, "Q1_0 block is 18 bytes");
     let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
@@ -1341,7 +1478,7 @@ fn dequant_q1_0(block: &[u8], out: &mut Vec<f32>) {
     }
 }
 
-/// Q2_0 (64 elements) and PQ2_0 (128): f16 scale + 2-bit code slots, four
+/// `Q2_0` (64 elements) and `PQ2_0` (128): f16 scale + 2-bit code slots, four
 /// per byte with element `j` at bits `2·(j % 4)`; `x = (code − 1)·d`, so
 /// `00 → −d`, `01 → 0`, `10 → +d`, `11 → +2d` (reserved — the Prism fork's
 /// `dequantize_row_q2_0`/`_pq2_0`).
@@ -1350,33 +1487,31 @@ fn dequant_q2_slots(block: &[u8], elems: usize, out: &mut Vec<f32>) {
     let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
     for &byte in &block[2..] {
         for shift in [0u8, 2, 4, 6] {
-            let code = i32::from((byte >> shift) & 0x3);
-            #[allow(clippy::cast_precision_loss)] // −1..=2
-            out.push((code - 1) as f32 * d);
+            let code = i16::from((byte >> shift) & 0x3);
+            out.push(f32::from(code - 1) * d);
         }
     }
 }
 
-/// PTQ1_0: 128 ternary values as base-3 trits — 24 bytes holding five
+/// `PTQ1_0`: 128 ternary values as base-3 trits — 24 bytes holding five
 /// trits each (120 values) in two stages of 16 then 8 bytes, 2 bytes holding
 /// four each (8 values), then the f16 scale. A trit is read by multiplying
 /// the byte by `3^n` (mod 256) and taking `(q·3) >> 8`, the encoder having
 /// stored `ceil(q_base3 · 256 / 243)` — the Prism fork's
-/// `dequantize_row_ptq1_0` (TQ1_0's scheme at group 128).
+/// `dequantize_row_ptq1_0` (`TQ1_0`'s scheme at group 128).
 fn dequant_ptq1_0(block: &[u8], out: &mut Vec<f32>) {
-    assert_eq!(block.len(), 28, "PTQ1_0 block is 28 bytes");
     const POW3: [u8; 6] = [1, 3, 9, 27, 81, 243];
     const STAGES: [usize; 3] = [32, 16, 8];
+    assert_eq!(block.len(), 28, "PTQ1_0 block is 28 bytes");
     let qs = &block[0..24];
     let qh = &block[24..26];
     let d = f16_to_f32(u16::from_le_bytes([block[26], block[27]]));
     let trit = |byte: u8, n: usize| -> f32 {
         let q = byte.wrapping_mul(POW3[n]);
-        let xi = i32::from((u16::from(q) * 3) >> 8);
-        #[allow(clippy::cast_precision_loss)] // −1..=1
-        {
-            (xi - 1) as f32 * d
-        }
+        // `(q·3) >> 8` is 0, 1 or 2 — two bits survive the shift, so the
+        // byte cast is exact.
+        let xi = i16::from(((u16::from(q) * 3) >> 8) as u8);
+        f32::from(xi - 1) * d
     };
     let mut j = 0usize;
     for &c in &STAGES {
@@ -1396,15 +1531,18 @@ fn dequant_ptq1_0(block: &[u8], out: &mut Vec<f32>) {
     }
 }
 
-/// Q8_0: f16 scale + 32 signed bytes; `x = d * q`.
+/// `Q8_0`: f16 scale + 32 signed bytes; `x = d * q`.
 fn dequant_q8_0(block: &[u8], out: &mut Vec<f32>) {
     assert_eq!(block.len(), 34, "Q8_0 block is 34 bytes");
     let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
-    #[allow(clippy::cast_possible_wrap)] // bit-exact reinterpret is the format
-    out.extend(block[2..34].iter().map(|&q| d * f32::from(q as i8)));
+    out.extend(
+        block[2..34]
+            .iter()
+            .map(|&q| d * f32::from(i8::from_ne_bytes([q]))),
+    );
 }
 
-/// Q4_0: f16 scale + 16 bytes of 4-bit quants; `x = d·(q − 8)` — all 16 low
+/// `Q4_0`: f16 scale + 16 bytes of 4-bit quants; `x = d·(q − 8)` — all 16 low
 /// nibbles are elements 0..16, the high nibbles elements 16..32.
 fn dequant_q4_0(block: &[u8], out: &mut Vec<f32>) {
     assert_eq!(block.len(), 18, "Q4_0 block is 18 bytes");
@@ -1414,55 +1552,63 @@ fn dequant_q4_0(block: &[u8], out: &mut Vec<f32>) {
     out.extend(qs.iter().map(|&b| d * (f32::from(b >> 4) - 8.0)));
 }
 
-/// Q4_1: f16 scale + f16 min + 16 bytes of 4-bit quants; `x = d·q + m`.
+/// `Q4_1`: f16 scale + f16 min + 16 bytes of 4-bit quants; `x = d·q + m`.
 fn dequant_q4_1(block: &[u8], out: &mut Vec<f32>) {
     assert_eq!(block.len(), 20, "Q4_1 block is 20 bytes");
     let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
     let m = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
     let qs = &block[4..20];
-    out.extend(qs.iter().map(|&b| d * f32::from(b & 0x0F) + m));
-    out.extend(qs.iter().map(|&b| d * f32::from(b >> 4) + m));
+    // Two roundings on purpose (scale, then add the min): matches ggml bit
+    // for bit.
+    out.extend(qs.iter().map(|&b| {
+        let scaled = d * f32::from(b & 0x0F);
+        scaled + m
+    }));
+    out.extend(qs.iter().map(|&b| {
+        let scaled = d * f32::from(b >> 4);
+        scaled + m
+    }));
 }
 
-/// Q5_0: f16 scale + 4 B of packed 5th bits + 16 B of 4-bit quants;
+/// `Q5_0`: f16 scale + 4 B of packed 5th bits + 16 B of 4-bit quants;
 /// `x = d·(q − 16)` with bit `j` of `qh` topping up element `j`.
 fn dequant_q5_0(block: &[u8], out: &mut Vec<f32>) {
     assert_eq!(block.len(), 22, "Q5_0 block is 22 bytes");
     let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
     let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
     let qs = &block[6..22];
-    #[allow(clippy::cast_possible_truncation)] // masked to one nibble bit
     out.extend(qs.iter().enumerate().map(|(j, &b)| {
-        let hi = ((qh >> j) << 4) as u8 & 0x10;
+        let hi = (((qh >> j) << 4) & 0x10) as u8;
         d * (f32::from((b & 0x0F) | hi) - 16.0)
     }));
-    #[allow(clippy::cast_possible_truncation)] // masked to one nibble bit
     out.extend(qs.iter().enumerate().map(|(j, &b)| {
-        let hi = (qh >> (j + 12)) as u8 & 0x10;
+        let hi = ((qh >> (j + 12)) & 0x10) as u8;
         d * (f32::from((b >> 4) | hi) - 16.0)
     }));
 }
 
-/// Q5_1: f16 scale + f16 min + 4 B packed 5th bits + 16 B quants; `x = d·q + m`.
+/// `Q5_1`: f16 scale + f16 min + 4 B packed 5th bits + 16 B quants; `x = d·q + m`.
 fn dequant_q5_1(block: &[u8], out: &mut Vec<f32>) {
     assert_eq!(block.len(), 24, "Q5_1 block is 24 bytes");
     let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
     let m = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
     let qh = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
     let qs = &block[8..24];
-    #[allow(clippy::cast_possible_truncation)] // masked to one nibble bit
+    // Two roundings on purpose (scale, then add the min): matches ggml bit
+    // for bit.
     out.extend(qs.iter().enumerate().map(|(j, &b)| {
-        let hi = ((qh >> j) << 4) as u8 & 0x10;
-        d * f32::from((b & 0x0F) | hi) + m
+        let hi = (((qh >> j) << 4) & 0x10) as u8;
+        let scaled = d * f32::from((b & 0x0F) | hi);
+        scaled + m
     }));
-    #[allow(clippy::cast_possible_truncation)] // masked to one nibble bit
     out.extend(qs.iter().enumerate().map(|(j, &b)| {
-        let hi = (qh >> (j + 12)) as u8 & 0x10;
-        d * f32::from((b >> 4) | hi) + m
+        let hi = ((qh >> (j + 12)) & 0x10) as u8;
+        let scaled = d * f32::from((b >> 4) | hi);
+        scaled + m
     }));
 }
 
-/// Q2_K: 256-element superblock — 16 packed (scale, min) nibbles + 64 B of
+/// `Q2_K`: 256-element superblock — 16 packed (scale, min) nibbles + 64 B of
 /// 2-bit quants + f16 d + f16 dmin; `x = d·sc·q − dmin·m` over 16 sub-blocks
 /// of 16.
 fn dequant_q2_k(block: &[u8], out: &mut Vec<f32>) {
@@ -1480,30 +1626,34 @@ fn dequant_q2_k(block: &[u8], out: &mut Vec<f32>) {
                 is += 1;
                 let dl = d * f32::from(sc & 0x0F);
                 let ml = dmin * f32::from(sc >> 4);
-                out.extend(part.iter().map(|&b| dl * f32::from((b >> shift) & 3) - ml));
+                // Two roundings on purpose (scale, then subtract the min):
+                // matches ggml bit for bit.
+                out.extend(part.iter().map(|&b| {
+                    let product = dl * f32::from((b >> shift) & 3);
+                    product - ml
+                }));
             }
         }
     }
     assert_eq!(is, 16, "16 sub-block scales consumed");
 }
 
-/// Unpack Q3_K's 12 packed scale bytes into 16 signed 6-bit sub-scales
+/// Unpack `Q3_K`'s 12 packed scale bytes into 16 signed 6-bit sub-scales
 /// (ggml's kmask bit dance, done bytewise).
 fn q3_k_scales(packed: &[u8]) -> [i8; 16] {
     assert_eq!(packed.len(), 12, "Q3_K scale block is 12 bytes");
     let mut sc = [0i8; 16];
-    #[allow(clippy::cast_possible_wrap)] // 6-bit values reinterpret exactly
     for j in 0..4 {
         let hi = packed[8 + j]; // 2-bit tops for slots j, j+4, j+8, j+12
-        sc[j] = ((packed[j] & 0x0F) | ((hi & 3) << 4)) as i8;
-        sc[j + 4] = ((packed[j + 4] & 0x0F) | (((hi >> 2) & 3) << 4)) as i8;
-        sc[j + 8] = ((packed[j] >> 4) | (((hi >> 4) & 3) << 4)) as i8;
-        sc[j + 12] = ((packed[j + 4] >> 4) | ((hi >> 6) << 4)) as i8;
+        sc[j] = i8::from_ne_bytes([(packed[j] & 0x0F) | ((hi & 3) << 4)]);
+        sc[j + 4] = i8::from_ne_bytes([(packed[j + 4] & 0x0F) | (((hi >> 2) & 3) << 4)]);
+        sc[j + 8] = i8::from_ne_bytes([(packed[j] >> 4) | (((hi >> 4) & 3) << 4)]);
+        sc[j + 12] = i8::from_ne_bytes([(packed[j + 4] >> 4) | ((hi >> 6) << 4)]);
     }
     sc
 }
 
-/// Q3_K: 256-element superblock — 32 B high-bit mask + 64 B of 2-bit quants
+/// `Q3_K`: 256-element superblock — 32 B high-bit mask + 64 B of 2-bit quants
 /// + 12 B packed 6-bit sub-scales + f16 d; `x = d·(sc − 32)·(q − hm·4)`.
 fn dequant_q3_k(block: &[u8], out: &mut Vec<f32>) {
     assert_eq!(block.len(), 110, "Q3_K superblock is 110 bytes");
@@ -1530,7 +1680,7 @@ fn dequant_q3_k(block: &[u8], out: &mut Vec<f32>) {
     assert_eq!(is, 16, "16 sub-block scales consumed");
 }
 
-/// The Q4_K/Q5_K 6-bit (scale, min) pair for sub-block `j` — ggml's
+/// The `Q4_K/Q5_K` 6-bit (scale, min) pair for sub-block `j` — ggml's
 /// `get_scale_min_k4`.
 fn scale_min_k4(scales: &[u8], j: usize) -> (f32, f32) {
     assert_eq!(scales.len(), 12, "K-quant scale block is 12 bytes");
@@ -1546,7 +1696,7 @@ fn scale_min_k4(scales: &[u8], j: usize) -> (f32, f32) {
     (f32::from(sc), f32::from(m))
 }
 
-/// Q4_K: 256-element superblock — f16 d + f16 dmin + 12 B packed 6-bit
+/// `Q4_K`: 256-element superblock — f16 d + f16 dmin + 12 B packed 6-bit
 /// (scale, min) pairs + 128 B of 4-bit quants; `x = d·sc·q − dmin·m`.
 fn dequant_q4_k(block: &[u8], out: &mut Vec<f32>) {
     assert_eq!(block.len(), 144, "Q4_K superblock is 144 bytes");
@@ -1559,12 +1709,23 @@ fn dequant_q4_k(block: &[u8], out: &mut Vec<f32>) {
         let (sc1, m1) = scale_min_k4(scales, chunk * 2);
         let (sc2, m2) = scale_min_k4(scales, chunk * 2 + 1);
         let q = &qs[chunk * 32..chunk * 32 + 32];
-        out.extend(q.iter().map(|&b| d * sc1 * f32::from(b & 0x0F) - dmin * m1));
-        out.extend(q.iter().map(|&b| d * sc2 * f32::from(b >> 4) - dmin * m2));
+        // Two roundings on purpose (scale, then subtract the min): matches
+        // ggml bit for bit. `dmin·m` is the same product hoisted out of the
+        // element loop.
+        let min1 = dmin * m1;
+        let min2 = dmin * m2;
+        out.extend(q.iter().map(|&b| {
+            let product = d * sc1 * f32::from(b & 0x0F);
+            product - min1
+        }));
+        out.extend(q.iter().map(|&b| {
+            let product = d * sc2 * f32::from(b >> 4);
+            product - min2
+        }));
     }
 }
 
-/// Q5_K: 256-element superblock — f16 d + f16 dmin + 12 B packed 6-bit
+/// `Q5_K`: 256-element superblock — f16 d + f16 dmin + 12 B packed 6-bit
 /// (scale, min) pairs + 32 B of 5th bits + 128 B of 4-bit quants;
 /// `x = d·sc·q − dmin·m` with two `qh` bits per byte per chunk.
 fn dequant_q5_k(block: &[u8], out: &mut Vec<f32>) {
@@ -1582,13 +1743,20 @@ fn dequant_q5_k(block: &[u8], out: &mut Vec<f32>) {
         let (sc1, m1) = scale_min_k4(scales, chunk * 2);
         let (sc2, m2) = scale_min_k4(scales, chunk * 2 + 1);
         let q = &qs[chunk * 32..chunk * 32 + 32];
+        // Two roundings on purpose (scale, then subtract the min): matches
+        // ggml bit for bit. `dmin·m` is the same product hoisted out of the
+        // element loop.
+        let min1 = dmin * m1;
+        let min2 = dmin * m2;
         out.extend(q.iter().zip(qh).map(|(&b, &h)| {
             let top = if h & u1 == 0 { 0 } else { 16 };
-            d * sc1 * f32::from((b & 0x0F) + top) - dmin * m1
+            let product = d * sc1 * f32::from((b & 0x0F) + top);
+            product - min1
         }));
         out.extend(q.iter().zip(qh).map(|(&b, &h)| {
             let top = if h & u2 == 0 { 0 } else { 16 };
-            d * sc2 * f32::from((b >> 4) + top) - dmin * m2
+            let product = d * sc2 * f32::from((b >> 4) + top);
+            product - min2
         }));
         u1 <<= 2;
         u2 <<= 2;
@@ -1596,12 +1764,12 @@ fn dequant_q5_k(block: &[u8], out: &mut Vec<f32>) {
     assert_eq!(u1, 0, "four bit-plane pairs consumed"); // 1<<8 wraps to 0
 }
 
-/// Q6_K: 256-element superblock — 128 B low-4 + 64 B high-2 + 16 i8
+/// `Q6_K`: 256-element superblock — 128 B low-4 + 64 B high-2 + 16 i8
 /// sub-scales + f16 d; `x = d·sc·(q − 32)`.
 fn dequant_q6_k(block: &[u8], out: &mut Vec<f32>) {
     assert_eq!(block.len(), 210, "Q6_K superblock is 210 bytes");
-    let (ql_all, rest) = block.split_at(128);
-    let (qh_all, rest) = rest.split_at(64);
+    let (lows, rest) = block.split_at(128);
+    let (highs, rest) = rest.split_at(64);
     let (scales, d_bytes) = rest.split_at(16);
     let d = f16_to_f32(u16::from_le_bytes([d_bytes[0], d_bytes[1]]));
     let start = out.len();
@@ -1609,8 +1777,8 @@ fn dequant_q6_k(block: &[u8], out: &mut Vec<f32>) {
     let y = &mut out[start..];
     // Two halves of 128 values, each consuming 64 ql / 32 qh / 8 scales.
     for half_idx in 0..2 {
-        let ql = &ql_all[half_idx * 64..half_idx * 64 + 64];
-        let qh = &qh_all[half_idx * 32..half_idx * 32 + 32];
+        let ql = &lows[half_idx * 64..half_idx * 64 + 64];
+        let qh = &highs[half_idx * 32..half_idx * 32 + 32];
         let sc = &scales[half_idx * 8..half_idx * 8 + 8];
         let base = half_idx * 128;
         for l in 0..32 {
@@ -1619,8 +1787,7 @@ fn dequant_q6_k(block: &[u8], out: &mut Vec<f32>) {
             let q2 = i16::from((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) - 32;
             let q3 = i16::from((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
             let q4 = i16::from((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
-            #[allow(clippy::cast_possible_wrap)] // i8 sub-scales are the format
-            let s = |i: usize| f32::from(sc[i] as i8);
+            let s = |i: usize| f32::from(i8::from_ne_bytes([sc[i]]));
             y[base + l] = d * s(is) * f32::from(q1);
             y[base + l + 32] = d * s(is + 2) * f32::from(q2);
             y[base + l + 64] = d * s(is + 4) * f32::from(q3);
@@ -1629,14 +1796,14 @@ fn dequant_q6_k(block: &[u8], out: &mut Vec<f32>) {
     }
 }
 
-/// IQ4_NL/IQ4_XS's 16-entry non-linear value table (llama.cpp
+/// `IQ4_NL/IQ4_XS`'s 16-entry non-linear value table (llama.cpp
 /// `kvalues_iq4nl`, frozen with the format).
 const KVALUES_IQ4NL: [f32; 16] = [
     -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0, 1.0, 13.0, 25.0, 38.0, 53.0, 69.0,
     89.0, 113.0,
 ];
 
-/// IQ4_XS: 256-element superblock — f16 d + 8 six-bit sub-scales (low 4 bits
+/// `IQ4_XS`: 256-element superblock — f16 d + 8 six-bit sub-scales (low 4 bits
 /// packed two-per-byte in `scales_l`, high 2 bits packed in `scales_h`) +
 /// 128 B of 4-bit indices into [`KVALUES_IQ4NL`]; per 32-group,
 /// `x = d·(sc − 32)·kvalues[q]` with the 16 low nibbles first
@@ -1658,7 +1825,7 @@ fn dequant_iq4_xs(block: &[u8], out: &mut Vec<f32>) {
     }
 }
 
-/// IQ4_NL: 32-element block — f16 d + 16 B of 4-bit indices into
+/// `IQ4_NL`: 32-element block — f16 d + 16 B of 4-bit indices into
 /// [`KVALUES_IQ4NL`]; low nibbles are elements 0..16, high 16..32
 /// (llama.cpp `dequantize_row_iq4_nl`).
 fn dequant_iq4_nl(block: &[u8], out: &mut Vec<f32>) {
@@ -1675,13 +1842,13 @@ use crate::gguf_iq_grids::{IQ2S_GRID, IQ2XS_GRID, IQ3S_GRID, IQ3XXS_GRID, KSIGNS
 /// (ggml's `kmask_iq2xs` is just bit `j`), scaled by `dl`.
 fn push_signed_row8(out: &mut Vec<f32>, dl: f32, grid: u64, signs: u8) {
     for j in 0..8 {
-        let mag = f32::from((grid >> (8 * j)) as u8);
+        let mag = f32::from(((grid >> (8 * j)) & 0xFF) as u8);
         let sign = if signs & (1 << j) != 0 { -1.0 } else { 1.0 };
         out.push(dl * mag * sign);
     }
 }
 
-/// IQ2_XS: 256-element superblock — f16 d + 32 u16 words (9-bit grid index +
+/// `IQ2_XS`: 256-element superblock — f16 d + 32 u16 words (9-bit grid index +
 /// 7-bit sign index) + 8 packed 4-bit sub-scales;
 /// `x = d·(0.5 + sc)·0.25·grid·±1` (llama.cpp `dequantize_row_iq2_xs`).
 fn dequant_iq2_xs(block: &[u8], out: &mut Vec<f32>) {
@@ -1708,7 +1875,7 @@ fn dequant_iq2_xs(block: &[u8], out: &mut Vec<f32>) {
     }
 }
 
-/// IQ2_S: 256-element superblock — f16 d + 64 B `qs` (32 low index bytes,
+/// `IQ2_S`: 256-element superblock — f16 d + 64 B `qs` (32 low index bytes,
 /// then 32 sign bytes) + 8 B `qh` (index bits 8..10) + 8 packed sub-scales
 /// (llama.cpp `dequantize_row_iq2_s`).
 fn dequant_iq2_s(block: &[u8], out: &mut Vec<f32>) {
@@ -1735,7 +1902,7 @@ fn dequant_iq2_s(block: &[u8], out: &mut Vec<f32>) {
 /// `bit0` into ggml's 8-bit sign mask), scaled by `dl`.
 fn push_signed_row4(out: &mut Vec<f32>, dl: f32, grid: u32, signs: u8, bit0: u8) {
     for j in 0..4u8 {
-        let mag = f32::from((grid >> (8 * j)) as u8);
+        let mag = f32::from(((grid >> (8 * j)) & 0xFF) as u8);
         let sign = if signs & (1 << (bit0 + j)) != 0 {
             -1.0
         } else {
@@ -1745,7 +1912,7 @@ fn push_signed_row4(out: &mut Vec<f32>, dl: f32, grid: u32, signs: u8, bit0: u8)
     }
 }
 
-/// IQ3_XXS: 256-element superblock — f16 d + 64 index bytes (into the
+/// `IQ3_XXS`: 256-element superblock — f16 d + 64 index bytes (into the
 /// 256-entry grid, 4 values each) + 8 u32 words carrying a 4-bit scale and
 /// four 7-bit sign indices (llama.cpp `dequantize_row_iq3_xxs`).
 fn dequant_iq3_xxs(block: &[u8], out: &mut Vec<f32>) {
@@ -1755,7 +1922,8 @@ fn dequant_iq3_xxs(block: &[u8], out: &mut Vec<f32>) {
     let sas = &block[66..98]; // scales-and-signs, one u32 per 32-group
     for ib32 in 0..8usize {
         let aux32 = u32::from_le_bytes(sas[4 * ib32..4 * ib32 + 4].try_into().expect("4"));
-        let db = d * (0.5 + (aux32 >> 28) as f32) * 0.5;
+        // The top nibble of the word is the 4-bit scale (exact in a byte).
+        let db = d * (0.5 + f32::from((aux32 >> 28) as u8)) * 0.5;
         for l in 0..4usize {
             let signs = KSIGNS_IQ2XS[usize::try_from((aux32 >> (7 * l)) & 127).expect("7 bits")];
             let g1 = IQ3XXS_GRID[usize::from(qs[8 * ib32 + 2 * l])];
@@ -1766,7 +1934,7 @@ fn dequant_iq3_xxs(block: &[u8], out: &mut Vec<f32>) {
     }
 }
 
-/// IQ3_S: 256-element superblock — f16 d + 64 index bytes + 8 B `qh` (index
+/// `IQ3_S`: 256-element superblock — f16 d + 64 index bytes + 8 B `qh` (index
 /// bit 8) + 32 sign bytes + 4 packed 4-bit sub-scales;
 /// `x = d·(1 + 2·sc)·grid·±1` (llama.cpp `dequantize_row_iq3_s`).
 fn dequant_iq3_s(block: &[u8], out: &mut Vec<f32>) {
@@ -1777,7 +1945,10 @@ fn dequant_iq3_s(block: &[u8], out: &mut Vec<f32>) {
     let signs = &block[74..106];
     let scales = &block[106..110];
     for ib32 in 0..8usize {
-        let db = d * (1.0 + 2.0 * f32::from((scales[ib32 / 2] >> (4 * (ib32 % 2))) & 0x0F));
+        // Two roundings on purpose (double, then add one): matches ggml bit
+        // for bit.
+        let twice = 2.0 * f32::from((scales[ib32 / 2] >> (4 * (ib32 % 2))) & 0x0F);
+        let db = d * (1.0 + twice);
         for l in 0..4usize {
             let h = u16::from(qh[ib32]);
             let i1 = usize::from(u16::from(qs[8 * ib32 + 2 * l]) | ((h << (8 - 2 * l)) & 256));
@@ -1792,10 +1963,11 @@ fn dequant_iq3_s(block: &[u8], out: &mut Vec<f32>) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use mummu_num::{f32_from_i32, trunc_i32};
     use std::io::Write;
 
     /// Minimal in-memory GGUF builder for tests.
-    pub(crate) struct TestGguf {
+    pub struct TestGguf {
         buf: Vec<u8>,
         tensor_count: u64,
         kv_count: u64,
@@ -1869,8 +2041,8 @@ pub(crate) mod tests {
             offset: u64,
         ) -> Self {
             Self::push_str(&mut self.tensors, name);
-            self.tensors
-                .extend_from_slice(&(dims.len() as u32).to_le_bytes());
+            let n_dims = u32::try_from(dims.len()).expect("test dims fit u32");
+            self.tensors.extend_from_slice(&n_dims.to_le_bytes());
             for d in dims {
                 self.tensors.extend_from_slice(&d.to_le_bytes());
             }
@@ -1933,9 +2105,9 @@ pub(crate) mod tests {
     fn two_shard_set() -> Vec<Vec<u8>> {
         // 8 f32 = 32 bytes, one per shard, each at its OWN shard's offset 0 —
         // which is the property that makes a per-shard payload base necessary.
-        let a: Vec<u8> = (0..8u32).flat_map(|i| (i as f32).to_le_bytes()).collect();
-        let b: Vec<u8> = (0..8u32)
-            .flat_map(|i| (100.0 + i as f32).to_le_bytes())
+        let a: Vec<u8> = (0..8u16).flat_map(|i| f32::from(i).to_le_bytes()).collect();
+        let b: Vec<u8> = (0..8u16)
+            .flat_map(|i| (100.0 + f32::from(i)).to_le_bytes())
             .collect();
         let s0 = TestGguf::new()
             .kv_str("general.architecture", "qwen4exp")
@@ -1988,8 +2160,8 @@ pub(crate) mod tests {
             .kv_str("general.architecture", "qwen2")
             .tensor("only.weight", &[8], 0, 0)
             .build_with_payload(
-                &(0..8u32)
-                    .flat_map(|i| (i as f32).to_le_bytes())
+                &(0..8u16)
+                    .flat_map(|i| f32::from(i).to_le_bytes())
                     .collect::<Vec<u8>>(),
             );
         with_split_set(&[bytes], |first| {
@@ -2025,7 +2197,7 @@ pub(crate) mod tests {
     fn a_duplicate_tensor_name_across_shards_is_refused() {
         // Two shards both claiming "a.weight": lookup order would silently
         // decide which payload wins, i.e. wrong weights with no error.
-        let payload: Vec<u8> = (0..8u32).flat_map(|i| (i as f32).to_le_bytes()).collect();
+        let payload: Vec<u8> = (0..8u16).flat_map(|i| f32::from(i).to_le_bytes()).collect();
         let dup = TestGguf::new()
             .kv_u32("split.count", 2)
             .kv_u32("split.no", 1)
@@ -2053,8 +2225,8 @@ pub(crate) mod tests {
             .kv_u32("split.tensors.count", 3)
             .tensor("a.weight", &[8], 0, 0)
             .build_with_payload(
-                &(0..8u32)
-                    .flat_map(|i| (i as f32).to_le_bytes())
+                &(0..8u16)
+                    .flat_map(|i| f32::from(i).to_le_bytes())
                     .collect::<Vec<u8>>(),
             );
         with_split_set(&set, |first| {
@@ -2068,10 +2240,7 @@ pub(crate) mod tests {
 
     /// Write `bytes` to a fresh temp file and run `f` on the parse result
     /// while the file still exists (payload reads re-open the path).
-    pub(crate) fn with_gguf_bytes<R>(
-        bytes: &[u8],
-        f: impl FnOnce(Result<GgufFile, GgufError>) -> R,
-    ) -> R {
+    pub fn with_gguf_bytes<R>(bytes: &[u8], f: impl FnOnce(Result<GgufFile, GgufError>) -> R) -> R {
         use std::sync::atomic::{AtomicU64, Ordering};
         // Parallel tests in one process must never share a temp file.
         static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -2134,7 +2303,7 @@ pub(crate) mod tests {
         assert_eq!(embd.dtype, GgmlType::F32);
         assert_eq!(embd.byte_len(), 64 * 2 * 4);
         let q = f.tensor("blk.0.attn_q.weight").expect("present");
-        assert_eq!(q.dtype, GgmlType::Q4_K);
+        assert_eq!(q.dtype, GgmlType::Q4K);
         assert_eq!(q.byte_len(), 144); // one 256-element Q4_K superblock
         assert_eq!(f.alignment, DEFAULT_ALIGNMENT);
         assert!(f.data_offset.is_multiple_of(f.alignment));
@@ -2227,9 +2396,8 @@ pub(crate) mod tests {
     fn q8_0_block_matches_hand_computation() {
         let mut block = Vec::new();
         block.extend_from_slice(&f16_bytes(0.5));
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        block.extend((0..32).map(|i| (i - 16) as i8 as u8));
-        let out = dequantize(GgmlType::Q8_0, &block).unwrap();
+        block.extend((0..32i8).map(|i| (i - 16).to_ne_bytes()[0]));
+        let out = dequantize(GgmlType::Q80, &block).unwrap();
         assert_eq!(out.len(), 32);
         assert_eq!(out[0], 0.5 * -16.0);
         assert_eq!(out[16], 0.0);
@@ -2251,11 +2419,11 @@ pub(crate) mod tests {
         block[16] = 0x51;
         // First quant byte of chunk 2 (sub-blocks 4/5): low nibble 4.
         block[16 + 64] = 0x04;
-        let out = dequantize(GgmlType::Q4_K, &block).unwrap();
+        let out = dequantize(GgmlType::Q4K, &block).unwrap();
         assert_eq!(out.len(), 256);
-        assert_eq!(out[0], 2.0 * 1.0 - 0.5 * 1.0); // d·sc0·q − dmin·m0 = 1.5
+        assert_eq!(out[0], 1.5); // d·sc0·q − dmin·m0 = 2·1 − 0.5·1
         assert_eq!(out[32], 3.0 * 5.0); // sub 1: m=0
-        assert_eq!(out[128], 1.0 * 4.0 - 0.5 * 2.0); // sub 4 via packed scales
+        assert_eq!(out[128], 3.0); // sub 4 via packed scales: 1·4 − 0.5·2
         // A zero quant in sub-block 0 still subtracts the min.
         assert_eq!(out[1], -0.5);
     }
@@ -2268,7 +2436,7 @@ pub(crate) mod tests {
         block[192] = 2; // scales[0] = 2
         block[194] = 1; // scales[2] = 1
         block[208..210].copy_from_slice(&f16_bytes(1.0)); // d
-        let out = dequantize(GgmlType::Q6_K, &block).unwrap();
+        let out = dequantize(GgmlType::Q6K, &block).unwrap();
         assert_eq!(out.len(), 256);
         // q1 = (15 | 3<<4) − 32 = 31, scale 2 → 62.
         assert_eq!(out[0], 62.0);
@@ -2289,7 +2457,7 @@ pub(crate) mod tests {
         // Sub-scale 1 = 0 → dl = 2·(0−32) = −64 for group 1.
         // qs[0]: low nibble index 8 (→ +1), high nibble index 15 (→ +113).
         block[8] = 0xF8; // low nibble = 8, high nibble = 15
-        let out = dequantize(GgmlType::IQ4_XS, &block).unwrap();
+        let out = dequantize(GgmlType::Iq4Xs, &block).unwrap();
         assert_eq!(out.len(), 256);
         // Group 0: dl = 2·(33−32) = 2. Element 0 = 2·kvalues[8] = 2·1.
         assert_eq!(out[0], 2.0);
@@ -2306,7 +2474,7 @@ pub(crate) mod tests {
         let mut b = vec![0u8; 18];
         b[0..2].copy_from_slice(&f16_bytes(2.0));
         b[2] = 0xF8; // low nibble 8 → kvalues[8] = 1; high 15 → kvalues[15] = 113
-        let out = dequantize(GgmlType::IQ4_NL, &b).unwrap();
+        let out = dequantize(GgmlType::Iq4Nl, &b).unwrap();
         assert_eq!(out.len(), 32);
         assert_eq!(out[0], 2.0);
         assert_eq!(out[16], 2.0 * 113.0);
@@ -2321,7 +2489,7 @@ pub(crate) mod tests {
         // = 129: bits 0 and 7 negative).
         b[2..4].copy_from_slice(&0x0201u16.to_le_bytes());
         b[66] = 0x21; // scales[0]: low nibble 1 → db0 = 0.375, high 2 → db1 = 0.625
-        let out = dequantize(GgmlType::IQ2_XS, &b).unwrap();
+        let out = dequantize(GgmlType::Iq2Xs, &b).unwrap();
         assert_eq!(out.len(), 256);
         assert_eq!(out[0], -0.375 * 43.0); // grid byte 0 = 0x2b, sign bit 0
         assert_eq!(out[1], 0.375 * 8.0);
@@ -2337,7 +2505,7 @@ pub(crate) mod tests {
         b[0..2].copy_from_slice(&f16_bytes(2.0));
         b[34] = 129; // signs byte for row 0: bits 0 and 7
         b[74] = 0x01; // scales[0] low nibble 1 → db0 = 2·1.5·0.25 = 0.75
-        let out = dequantize(GgmlType::IQ2_S, &b).unwrap();
+        let out = dequantize(GgmlType::Iq2S, &b).unwrap();
         assert_eq!(out.len(), 256);
         assert_eq!(out[0], -0.75 * 8.0); // grid 0 is all 8s
         assert_eq!(out[1], 0.75 * 8.0);
@@ -2353,7 +2521,7 @@ pub(crate) mod tests {
         b[2] = 1; // grid1 index 1 = 0x04040414: byte 0 = 20, rest 4
         // aux32 for group 0: scale bits 1 (db = 2·1.5·0.5 = 1.5), sign index 1.
         b[66..70].copy_from_slice(&((1u32 << 28) | 1).to_le_bytes());
-        let out = dequantize(GgmlType::IQ3_XXS, &b).unwrap();
+        let out = dequantize(GgmlType::Iq3Xxs, &b).unwrap();
         assert_eq!(out.len(), 256);
         assert_eq!(out[0], -1.5 * 20.0); // KSIGNS[1] bit 0
         assert_eq!(out[1], 1.5 * 4.0);
@@ -2368,7 +2536,7 @@ pub(crate) mod tests {
         b[2] = 1; // grid1 index 1 = 0x01010103: byte 0 = 3, rest 1
         b[74] = 1; // signs byte row 0: bit 0
         b[106] = 0x01; // scales[0] low nibble 1 → db = 1 + 2·1 = 3
-        let out = dequantize(GgmlType::IQ3_S, &b).unwrap();
+        let out = dequantize(GgmlType::Iq3S, &b).unwrap();
         assert_eq!(out.len(), 256);
         assert_eq!(out[0], -3.0 * 3.0);
         assert_eq!(out[1], 3.0);
@@ -2383,7 +2551,7 @@ pub(crate) mod tests {
         let mut b = vec![0u8; 18];
         b[0..2].copy_from_slice(&f16_bytes(2.0));
         b[2] = 0x31; // low nibble 1 → elem 0, high nibble 3 → elem 16
-        let out = dequantize(GgmlType::Q4_0, &b).unwrap();
+        let out = dequantize(GgmlType::Q40, &b).unwrap();
         assert_eq!(out.len(), 32);
         assert_eq!(out[0], (1.0 - 8.0) * 2.0);
         assert_eq!(out[16], (3.0 - 8.0) * 2.0);
@@ -2394,9 +2562,9 @@ pub(crate) mod tests {
         b[0..2].copy_from_slice(&f16_bytes(2.0));
         b[2..4].copy_from_slice(&f16_bytes(1.0));
         b[4] = 0x31;
-        let out = dequantize(GgmlType::Q4_1, &b).unwrap();
-        assert_eq!(out[0], 1.0 * 2.0 + 1.0);
-        assert_eq!(out[16], 3.0 * 2.0 + 1.0);
+        let out = dequantize(GgmlType::Q41, &b).unwrap();
+        assert_eq!(out[0], 3.0); // q·d + m = 1·2 + 1
+        assert_eq!(out[16], 7.0); // 3·2 + 1
         assert_eq!(out[1], 1.0);
     }
 
@@ -2407,7 +2575,7 @@ pub(crate) mod tests {
         b[0..2].copy_from_slice(&f16_bytes(1.0));
         b[2..6].copy_from_slice(&(1u32 | (1 << 16)).to_le_bytes());
         b[6] = 0x21; // low nibble 1 → elem 0, high nibble 2 → elem 16
-        let out = dequantize(GgmlType::Q5_0, &b).unwrap();
+        let out = dequantize(GgmlType::Q50, &b).unwrap();
         assert_eq!(out.len(), 32);
         assert_eq!(out[0], (1.0 + 16.0) - 16.0);
         assert_eq!(out[16], (2.0 + 16.0) - 16.0);
@@ -2419,8 +2587,8 @@ pub(crate) mod tests {
         b[2..4].copy_from_slice(&f16_bytes(1.0));
         b[4..8].copy_from_slice(&1u32.to_le_bytes());
         b[8] = 0x01;
-        let out = dequantize(GgmlType::Q5_1, &b).unwrap();
-        assert_eq!(out[0], (1.0 + 16.0) * 1.0 + 1.0);
+        let out = dequantize(GgmlType::Q51, &b).unwrap();
+        assert_eq!(out[0], 18.0); // (1 + 16)·d + m = 17·1 + 1
         assert_eq!(out[16], 1.0); // high nibble 0, qh bit 16 unset → just m
     }
 
@@ -2435,9 +2603,9 @@ pub(crate) mod tests {
         b[16] = 3; // qs[0] bits 0–1 → elem 0
         b[32] = 1; // qs[16] → elem 16 (sub 1)
         b[48] = 2; // qs[32] → elem 128 (second half)
-        let out = dequantize(GgmlType::Q2_K, &b).unwrap();
+        let out = dequantize(GgmlType::Q2K, &b).unwrap();
         assert_eq!(out.len(), 256);
-        assert_eq!(out[0], 2.0 * 3.0 - 0.5); // d·sc·q − dmin·m
+        assert_eq!(out[0], 5.5); // d·sc·q − dmin·m = 2·3 − 0.5·1
         assert_eq!(out[1], -0.5); // zero quant still subtracts the min
         assert_eq!(out[16], 1.0);
         assert_eq!(out[128], 15.0 * 2.0); // second half reads qs[32..]
@@ -2457,7 +2625,7 @@ pub(crate) mod tests {
         b[16] = 1; // hmask[16] bit 0 → element 16 too
         b[32] = 3; // qs[0] → elem 0
         b[48] = 2; // qs[16] → elem 16
-        let out = dequantize(GgmlType::Q3_K, &b).unwrap();
+        let out = dequantize(GgmlType::Q3K, &b).unwrap();
         assert_eq!(out.len(), 256);
         assert_eq!(out[0], 2.0 * 3.0); // high bit set → q unshifted
         assert_eq!(out[1], 2.0 * -4.0); // high bit clear → q − 4
@@ -2476,19 +2644,19 @@ pub(crate) mod tests {
         b[8] = 1; // sub 0 min
         b[16] = 1; // qh[0] bit 0 → elem 0 gets +16 (u1 = 1)
         b[48] = 0x21; // ql[0]: low 1 → elem 0, high 2 → elem 32
-        let out = dequantize(GgmlType::Q5_K, &b).unwrap();
+        let out = dequantize(GgmlType::Q5K, &b).unwrap();
         assert_eq!(out.len(), 256);
-        assert_eq!(out[0], 2.0 * (1.0 + 16.0) - 1.0);
+        assert_eq!(out[0], 33.0); // sc·(q + 16) − dmin·m = 2·17 − 1
         assert_eq!(out[1], -1.0); // zero quant still subtracts the min
         assert_eq!(out[32], 3.0 * 2.0); // qh bit 1 unset → no +16; m1 = 0
     }
 
     #[test]
     fn dequant_rejects_partial_blocks_and_unimplemented_types() {
-        assert!(dequantize(GgmlType::Q8_0, &[0u8; 33]).is_err());
-        assert!(dequantize(GgmlType::Q8_0, &[]).is_err());
+        assert!(dequantize(GgmlType::Q80, &[0u8; 33]).is_err());
+        assert!(dequantize(GgmlType::Q80, &[]).is_err());
         // Q8_K is an activation format, never tensor storage.
-        assert!(dequantize(GgmlType::Q8_K, &[0u8; 292]).is_err());
+        assert!(dequantize(GgmlType::Q8K, &[0u8; 292]).is_err());
     }
 
     /// The ternary family's ids, block widths and byte sizes, straight from
@@ -2496,21 +2664,21 @@ pub(crate) mod tests {
     #[test]
     fn ternary_family_ids_and_layouts_match_the_fork() {
         for (id, ty, block, bytes) in [
-            (41, GgmlType::Q1_0, 128, 18),
-            (42, GgmlType::Q2_0, 64, 18),
-            (142, GgmlType::PQ2_0, 128, 34),
-            (143, GgmlType::PTQ1_0, 128, 28),
+            (41, GgmlType::Q10, 128, 18),
+            (42, GgmlType::Q20, 64, 18),
+            (142, GgmlType::Pq20, 128, 34),
+            (143, GgmlType::Ptq10, 128, 28),
         ] {
             assert_eq!(GgmlType::from_id(id), Some(ty));
             assert_eq!(ty.block_size(), block, "{ty:?}");
             assert_eq!(ty.bytes_per_block(), bytes, "{ty:?}");
             assert!(ty.is_ternary_family());
         }
-        assert!(!GgmlType::Q4_0.is_ternary_family());
-        assert!(!GgmlType::IQ2_XS.is_ternary_family());
+        assert!(!GgmlType::Q40.is_ternary_family());
+        assert!(!GgmlType::Iq2Xs.is_ternary_family());
     }
 
-    /// Q2_0/PQ2_0: element `j` is the 2-bit slot at bits `2·(j % 4)` of byte
+    /// `Q2_0/PQ2_0`: element `j` is the 2-bit slot at bits `2·(j % 4)` of byte
     /// `j / 4`, decoding `(code − 1)·d` — the fork's `dequantize_row_q2_0`.
     #[test]
     fn q2_slots_decode_low_bits_first_as_code_minus_one() {
@@ -2518,39 +2686,44 @@ pub(crate) mod tests {
         // Byte 0b11_10_01_00 holds codes 0,1,2,3 in element order.
         let mut pq = vec![d[0], d[1]];
         pq.extend(std::iter::repeat_n(0b1110_0100u8, 32));
-        let out = dequantize(GgmlType::PQ2_0, &pq).unwrap();
+        let out = dequantize(GgmlType::Pq20, &pq).unwrap();
         assert_eq!(out.len(), 128);
         assert_eq!(&out[..4], &[-1.5, 0.0, 1.5, 3.0]);
         assert_eq!(&out[124..], &[-1.5, 0.0, 1.5, 3.0]);
         // Q2_0 is the same codec at 64 elements / 16 bytes.
         let mut q = vec![d[0], d[1]];
         q.extend(std::iter::repeat_n(0b0110_1001u8, 16)); // codes 1,2,2,1
-        let out = dequantize(GgmlType::Q2_0, &q).unwrap();
+        let out = dequantize(GgmlType::Q20, &q).unwrap();
         assert_eq!(out.len(), 64);
         assert_eq!(&out[..4], &[0.0, 1.5, 1.5, 0.0]);
         // A block of code-1 slots is all zeros whatever the scale says.
         let mut z = vec![d[0], d[1]];
         z.extend(std::iter::repeat_n(0b0101_0101u8, 32));
         assert!(
-            dequantize(GgmlType::PQ2_0, &z)
+            dequantize(GgmlType::Pq20, &z)
                 .unwrap()
                 .iter()
                 .all(|&v| v == 0.0)
         );
     }
 
-    /// Q1_0: bit `j % 8` of byte `j / 8`, LSB first, `1 → +d`, `0 → −d`.
+    /// `Q1_0`: bit `j % 8` of byte `j / 8`, LSB first, `1 → +d`, `0 → −d`.
     #[test]
     fn q1_0_reads_bits_lsb_first() {
         let d = half::f16::from_f32(0.25).to_bits().to_le_bytes();
         let mut b = vec![d[0], d[1]];
         b.push(0b0000_0001); // element 0 set, 1..8 clear
         b.extend(std::iter::repeat_n(0xFFu8, 15));
-        let out = dequantize(GgmlType::Q1_0, &b).unwrap();
+        let out = dequantize(GgmlType::Q10, &b).unwrap();
         assert_eq!(out.len(), 128);
         assert_eq!(out[0], 0.25);
-        assert!(out[1..8].iter().all(|&v| v == -0.25));
-        assert!(out[8..].iter().all(|&v| v == 0.25));
+        // Exact bit comparison: ±d must come back untouched, not "close".
+        assert!(
+            out[1..8]
+                .iter()
+                .all(|&v| v.to_bits() == (-0.25f32).to_bits())
+        );
+        assert!(out[8..].iter().all(|&v| v.to_bits() == 0.25f32.to_bits()));
     }
 
     /// The fork's `quantize_row_ptq1_0_ref`, ported verbatim: the encoder
@@ -2569,7 +2742,7 @@ pub(crate) mod tests {
                 for m in 0..c {
                     let mut q: u8 = 0;
                     for n in 0..5 {
-                        let xi = (x[m + n * c] * id).round() as i32 + 1;
+                        let xi = trunc_i32((x[m + n * c] * id).round()) + 1;
                         q = q.wrapping_mul(3).wrapping_add(u8::try_from(xi).unwrap());
                     }
                     qs[j + m] = u8::try_from((u16::from(q) * 256).div_ceil(243)).unwrap();
@@ -2581,7 +2754,7 @@ pub(crate) mod tests {
         for h in 0..2usize {
             let mut q: u8 = 0;
             for m in 0..4 {
-                let xi = (x[h + m * 2] * id).round() as i32 + 1;
+                let xi = trunc_i32((x[h + m * 2] * id).round()) + 1;
                 q = q.wrapping_mul(3).wrapping_add(u8::try_from(xi).unwrap());
             }
             q = q.wrapping_mul(3);
@@ -2599,20 +2772,20 @@ pub(crate) mod tests {
         // every position of every stage (16-byte, 8-byte, and the qh tail).
         let d = 0.75f32;
         let vals: Vec<f32> = (0..128)
-            .map(|i: i32| d * ((i * 7 + i / 5) % 3 - 1) as f32)
+            .map(|i: i32| d * f32_from_i32((i * 7 + i / 5) % 3 - 1))
             .collect();
         let block = encode_ptq1_0(&vals);
         assert_eq!(block.len(), 28);
-        let out = dequantize(GgmlType::PTQ1_0, &block).unwrap();
+        let out = dequantize(GgmlType::Ptq10, &block).unwrap();
         assert_eq!(
             out, vals,
             "every trit position must decode to what was encoded"
         );
         // Whole-row: two blocks decode independently, in order.
-        let mut two = block.clone();
+        let mut two = block;
         let neg: Vec<f32> = vals.iter().map(|v| -v).collect();
         two.extend(encode_ptq1_0(&neg));
-        let out = dequantize(GgmlType::PTQ1_0, &two).unwrap();
+        let out = dequantize(GgmlType::Ptq10, &two).unwrap();
         assert_eq!(&out[..128], &vals[..]);
         assert_eq!(&out[128..], &neg[..]);
     }
@@ -2654,7 +2827,9 @@ pub(crate) mod tests {
         // every other test that touches that process-wide state.
         let _serial = crate::progress::test_serial();
         // One F32 tensor with ggml dims [2, 3] and payload 1..=6.
-        let payload: Vec<u8> = (1..=6).flat_map(|v| (v as f32).to_le_bytes()).collect();
+        let payload: Vec<u8> = (1..=6u16)
+            .flat_map(|v| f32::from(v).to_le_bytes())
+            .collect();
         let bytes = TestGguf::new()
             .kv_str("general.architecture", "qwen2")
             .tensor("token_embd.weight", &[2, 3], 0, 0)

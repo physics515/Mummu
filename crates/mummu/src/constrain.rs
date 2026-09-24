@@ -57,7 +57,7 @@ const LIT_TRUE: u8 = 0;
 const LIT_FALSE: u8 = 1;
 const LIT_NULL: u8 = 2;
 
-fn literal(kind: u8) -> &'static [u8] {
+const fn literal(kind: u8) -> &'static [u8] {
     match kind {
         LIT_TRUE => b"true",
         LIT_FALSE => b"false",
@@ -133,7 +133,7 @@ impl Default for Json {
 
 impl Json {
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             stack: 0,
             depth: 0,
@@ -147,7 +147,7 @@ impl Json {
         self.st == St::Done
     }
 
-    fn push(&mut self, is_array: bool) -> bool {
+    const fn push(&mut self, is_array: bool) -> bool {
         if self.depth >= MAX_DEPTH {
             return false;
         }
@@ -177,7 +177,7 @@ impl Json {
     }
 
     /// A value (scalar, string, or a container that just closed) ended.
-    fn value_ended(&mut self) {
+    const fn value_ended(&mut self) {
         self.st = if self.depth == 0 {
             St::Done
         } else {
@@ -240,7 +240,7 @@ impl Json {
     }
 
     /// A byte that ends a number without being part of it.
-    fn num_terminator(b: u8) -> bool {
+    const fn num_terminator(b: u8) -> bool {
         is_ws(b) || b == b',' || b == b'}' || b == b']'
     }
 
@@ -249,40 +249,8 @@ impl Json {
     /// copy (see [`Self::accepts`]).
     pub fn step(&mut self, b: u8) -> bool {
         match self.st {
-            St::Start => match b {
-                _ if is_ws(b) => true,
-                b'{' => {
-                    self.push(false) && {
-                        self.st = St::NeedKeyOrEnd;
-                        true
-                    }
-                }
-                b'[' => {
-                    self.push(true) && {
-                        self.st = St::NeedValueOrEnd;
-                        true
-                    }
-                }
-                // A bare top-level scalar is legal JSON but has no decidable
-                // end; see the type comment.
-                _ => false,
-            },
-
-            St::NeedKeyOrEnd => match b {
-                _ if is_ws(b) => true,
-                b'"' => {
-                    self.st = St::KeyStr;
-                    true
-                }
-                b'}' => {
-                    self.pop(false) && {
-                        self.value_ended();
-                        true
-                    }
-                }
-                _ => false,
-            },
-
+            St::Start => self.step_start(b),
+            St::NeedKeyOrEnd => self.step_key_or_end(b),
             St::NeedKey => match b {
                 _ if is_ws(b) => true,
                 b'"' => {
@@ -292,38 +260,9 @@ impl Json {
                 _ => false,
             },
 
-            St::KeyStr => match b {
-                b'"' => {
-                    self.st = St::NeedColon;
-                    true
-                }
-                b'\\' => {
-                    self.st = St::KeyEsc;
-                    true
-                }
-                // Unescaped controls are the only forbidden string content;
-                // everything from 0x20 up (including UTF-8 continuation
-                // bytes, which is why this works a byte at a time) is fine.
-                0x20.. => true,
-                _ => false,
-            },
-            St::KeyEsc => escape(b).is_some_and(|next| {
-                self.st = match next {
-                    Esc::Simple => St::KeyStr,
-                    Esc::Unicode => St::KeyUni(4),
-                };
-                true
-            }),
-            St::KeyUni(n) => {
-                b.is_ascii_hexdigit() && {
-                    self.st = if n == 1 {
-                        St::KeyStr
-                    } else {
-                        St::KeyUni(n - 1)
-                    };
-                    true
-                }
-            }
+            St::KeyStr => self.step_string(b, true),
+            St::KeyEsc => self.step_escape(b, true),
+            St::KeyUni(n) => self.step_hex(b, n, true),
 
             St::NeedColon => match b {
                 _ if is_ws(b) => true,
@@ -337,125 +276,213 @@ impl Json {
             St::NeedValue => is_ws(b) || self.begin_value(b, None),
             St::NeedValueOrEnd => is_ws(b) || self.begin_value(b, Some(b']')),
 
-            St::Str => match b {
-                b'"' => {
-                    self.value_ended();
-                    true
-                }
-                b'\\' => {
-                    self.st = St::StrEsc;
-                    true
-                }
-                0x20.. => true,
-                _ => false,
-            },
-            St::StrEsc => escape(b).is_some_and(|next| {
-                self.st = match next {
-                    Esc::Simple => St::Str,
-                    Esc::Unicode => St::StrUni(4),
-                };
-                true
-            }),
-            St::StrUni(n) => {
-                b.is_ascii_hexdigit() && {
-                    self.st = if n == 1 { St::Str } else { St::StrUni(n - 1) };
-                    true
-                }
-            }
+            St::Str => self.step_string(b, false),
+            St::StrEsc => self.step_escape(b, false),
+            St::StrUni(n) => self.step_hex(b, n, false),
 
-            St::NumSign => match b {
-                b'0' => {
-                    self.st = St::NumZero;
-                    true
-                }
-                b'1'..=b'9' => {
-                    self.st = St::NumInt;
-                    true
-                }
-                _ => false,
-            },
+            St::NumSign => self.step_num_sign(b),
             // A leading zero admits no further integer digits ("01" is not
             // JSON), so only a fraction, an exponent, or the end.
             St::NumZero => self.number_tail(b, false),
-            St::NumInt => self.number_tail(b, true),
+            St::NumInt | St::NumFrac => self.number_tail(b, true),
             St::NumFracFirst => {
                 b.is_ascii_digit() && {
                     self.st = St::NumFrac;
                     true
                 }
             }
-            St::NumFrac => self.number_tail(b, true),
-            St::NumExpSign => match b {
-                b'+' | b'-' => {
-                    self.st = St::NumExpFirst;
-                    true
-                }
-                b'0'..=b'9' => {
-                    self.st = St::NumExp;
-                    true
-                }
-                _ => false,
-            },
+            St::NumExpSign => self.step_exp_sign(b),
             St::NumExpFirst => {
                 b.is_ascii_digit() && {
                     self.st = St::NumExp;
                     true
                 }
             }
-            St::NumExp => {
-                if b.is_ascii_digit() {
+            St::NumExp => self.step_exp_digits(b),
+
+            St::Lit(kind, at) => self.step_literal(b, kind, at),
+            St::AfterValue => self.step_after_value(b),
+            St::Done => is_ws(b),
+        }
+    }
+
+    /// [`St::Start`]: only a container may open the document.
+    const fn step_start(&mut self, b: u8) -> bool {
+        match b {
+            _ if is_ws(b) => true,
+            b'{' => {
+                self.push(false) && {
+                    self.st = St::NeedKeyOrEnd;
                     true
-                } else if Self::num_terminator(b) {
-                    self.value_ended();
-                    self.step(b)
-                } else {
-                    false
                 }
             }
-
-            St::Lit(kind, at) => {
-                let want = literal(kind);
-                if want.get(at as usize) != Some(&b) {
-                    return false;
+            b'[' => {
+                self.push(true) && {
+                    self.st = St::NeedValueOrEnd;
+                    true
                 }
-                let at = at + 1;
-                if at as usize == want.len() {
+            }
+            // A bare top-level scalar is legal JSON but has no decidable
+            // end; see the type comment.
+            _ => false,
+        }
+    }
+
+    /// [`St::NeedKeyOrEnd`]: a key, or the `}` of an empty object.
+    fn step_key_or_end(&mut self, b: u8) -> bool {
+        match b {
+            _ if is_ws(b) => true,
+            b'"' => {
+                self.st = St::KeyStr;
+                true
+            }
+            b'}' => {
+                self.pop(false) && {
                     self.value_ended();
+                    true
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Inside a key (`key`) or a value string: the closing quote, the start
+    /// of an escape, or any byte from 0x20 up.
+    ///
+    /// Unescaped controls are the only forbidden string content; everything
+    /// from 0x20 up (including UTF-8 continuation bytes, which is why this
+    /// works a byte at a time) is fine.
+    const fn step_string(&mut self, b: u8, key: bool) -> bool {
+        match b {
+            b'"' => {
+                if key {
+                    self.st = St::NeedColon;
                 } else {
-                    self.st = St::Lit(kind, at);
+                    self.value_ended();
                 }
                 true
             }
+            b'\\' => {
+                self.st = if key { St::KeyEsc } else { St::StrEsc };
+                true
+            }
+            0x20.. => true,
+            _ => false,
+        }
+    }
 
-            St::AfterValue => match b {
-                _ if is_ws(b) => true,
-                b',' => match self.top_is_array() {
-                    Some(true) => {
-                        self.st = St::NeedValue;
-                        true
-                    }
-                    Some(false) => {
-                        self.st = St::NeedKey;
-                        true
-                    }
-                    None => false,
-                },
-                b'}' => {
-                    self.pop(false) && {
-                        self.value_ended();
-                        true
-                    }
+    /// The byte after a backslash, in a key or a value string.
+    fn step_escape(&mut self, b: u8, key: bool) -> bool {
+        escape(b).is_some_and(|next| {
+            self.st = match (next, key) {
+                (Esc::Simple, true) => St::KeyStr,
+                (Esc::Simple, false) => St::Str,
+                (Esc::Unicode, true) => St::KeyUni(4),
+                (Esc::Unicode, false) => St::StrUni(4),
+            };
+            true
+        })
+    }
+
+    /// One of the `n` remaining hex digits of a `\uXXXX` escape.
+    const fn step_hex(&mut self, b: u8, n: u8, key: bool) -> bool {
+        b.is_ascii_hexdigit() && {
+            self.st = match (n == 1, key) {
+                (true, true) => St::KeyStr,
+                (true, false) => St::Str,
+                (false, true) => St::KeyUni(n - 1),
+                (false, false) => St::StrUni(n - 1),
+            };
+            true
+        }
+    }
+
+    /// [`St::NumSign`]: the digit that must follow `-`.
+    const fn step_num_sign(&mut self, b: u8) -> bool {
+        match b {
+            b'0' => {
+                self.st = St::NumZero;
+                true
+            }
+            b'1'..=b'9' => {
+                self.st = St::NumInt;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// [`St::NumExpSign`]: a sign or the first exponent digit.
+    const fn step_exp_sign(&mut self, b: u8) -> bool {
+        match b {
+            b'+' | b'-' => {
+                self.st = St::NumExpFirst;
+                true
+            }
+            b'0'..=b'9' => {
+                self.st = St::NumExp;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// [`St::NumExp`]: more exponent digits, or a terminator that closes the
+    /// number and is then re-dispatched.
+    fn step_exp_digits(&mut self, b: u8) -> bool {
+        if b.is_ascii_digit() {
+            true
+        } else if Self::num_terminator(b) {
+            self.value_ended();
+            self.step(b)
+        } else {
+            false
+        }
+    }
+
+    /// [`St::Lit`]: the next byte of `true` / `false` / `null`.
+    fn step_literal(&mut self, b: u8, kind: u8, at: u8) -> bool {
+        let want = literal(kind);
+        if want.get(at as usize) != Some(&b) {
+            return false;
+        }
+        let at = at + 1;
+        if at as usize == want.len() {
+            self.value_ended();
+        } else {
+            self.st = St::Lit(kind, at);
+        }
+        true
+    }
+
+    /// [`St::AfterValue`]: a separator or the container's closing bracket.
+    fn step_after_value(&mut self, b: u8) -> bool {
+        match b {
+            _ if is_ws(b) => true,
+            b',' => match self.top_is_array() {
+                Some(true) => {
+                    self.st = St::NeedValue;
+                    true
                 }
-                b']' => {
-                    self.pop(true) && {
-                        self.value_ended();
-                        true
-                    }
+                Some(false) => {
+                    self.st = St::NeedKey;
+                    true
                 }
-                _ => false,
+                None => false,
             },
-
-            St::Done => is_ws(b),
+            b'}' => {
+                self.pop(false) && {
+                    self.value_ended();
+                    true
+                }
+            }
+            b']' => {
+                self.pop(true) && {
+                    self.value_ended();
+                    true
+                }
+            }
+            _ => false,
         }
     }
 
@@ -495,7 +522,7 @@ impl Json {
     }
 }
 
-fn is_ws(b: u8) -> bool {
+const fn is_ws(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\n' | b'\r')
 }
 
@@ -504,7 +531,7 @@ enum Esc {
     Unicode,
 }
 
-fn escape(b: u8) -> Option<Esc> {
+const fn escape(b: u8) -> Option<Esc> {
     match b {
         b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => Some(Esc::Simple),
         b'u' => Some(Esc::Unicode),
@@ -535,10 +562,17 @@ impl TokenBytes {
     /// Specials are detected by decoding with `skip_special_tokens = true`
     /// and finding nothing left — an API-stable test that does not depend on
     /// how a given tokenizer.json happens to spell its added-token table.
+    ///
+    /// # Panics
+    ///
+    /// Only on an internal invariant that cannot fail: a vocabulary size is
+    /// converted to `u32` for the token ids, and real vocabularies are a few
+    /// hundred thousand entries.
     #[must_use]
     pub fn from_tokenizer(tok: &tokenizers::Tokenizer) -> Self {
         let n = tok.get_vocab_size(true);
-        let bytes = (0..n as u32)
+        let ids = 0..u32::try_from(n).expect("vocab size fits u32");
+        let bytes = ids
             .map(|id| {
                 let text = tok.decode(&[id], true).ok()?;
                 (!text.is_empty()).then(|| text.into_bytes().into_boxed_slice())
@@ -554,12 +588,12 @@ impl TokenBytes {
     }
 
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.bytes.len()
     }
 
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.bytes.is_empty()
     }
 }
@@ -576,7 +610,7 @@ pub struct JsonConstraint<T: std::ops::Deref<Target = TokenBytes> + Send + Sync>
 
 impl<T: std::ops::Deref<Target = TokenBytes> + Send + Sync> JsonConstraint<T> {
     #[must_use]
-    pub fn new(vocab: T) -> Self {
+    pub const fn new(vocab: T) -> Self {
         Self {
             vocab,
             state: Json::new(),
@@ -638,13 +672,7 @@ mod tests {
 
     #[test]
     fn incomplete_until_the_last_brace() {
-        for prefix in [
-            r#"{"#,
-            r#"{"a""#,
-            r#"{"a":"#,
-            r#"{"a":1"#,
-            r#"{"a":1,"b":2"#,
-        ] {
+        for prefix in [r"{", r#"{"a""#, r#"{"a":"#, r#"{"a":1"#, r#"{"a":1,"b":2"#] {
             assert!(
                 !feed(prefix).is_complete(),
                 "{prefix:?} must not be complete"
@@ -656,9 +684,11 @@ mod tests {
     #[test]
     fn rejects_the_classic_json_mistakes() {
         assert!(rejects(r#"{"a":1,}"#), "trailing comma in object");
-        assert!(rejects(r#"[1,2,]"#), "trailing comma in array");
-        assert!(rejects(r#"{a:1}"#), "unquoted key");
-        assert!(rejects(r#"{'a':1}"#), "single-quoted key");
+        assert!(rejects(r"[1,2,]"), "trailing comma in array");
+        // Spelled in two pieces so the literal does not read as a format
+        // argument (`{a:1}`) to the lint that looks for stray ones.
+        assert!(rejects(concat!("{a", ":1}")), "unquoted key");
+        assert!(rejects(r"{'a':1}"), "single-quoted key");
         assert!(rejects(r#"{"a":01}"#), "leading zero");
         assert!(rejects(r#"{"a":+1}"#), "leading plus");
         assert!(rejects(r#"{"a":.5}"#), "bare fraction");

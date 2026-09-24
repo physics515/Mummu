@@ -14,17 +14,20 @@ pub mod qwen3;
 pub mod qwen35;
 pub mod qwen4exp;
 
-/// Upper bound on one [`CausalLm::warm_up`] call. A warm-up is a fixed,
-/// bounded cost paid off the user's critical path — not a place to spend
-/// unbounded GPU time — and the measured curve flattens after ~32 steps
-/// (`mummu-bench/tests/warmup_f16.rs`), so this ceiling is 8x the useful
-/// depth, not a tuning knob.
+/// Upper bound on one [`CausalLm::warm_up`] call.
+///
+/// A warm-up is a fixed, bounded cost paid off the user's critical path —
+/// not a place to spend unbounded GPU time — and the measured curve flattens
+/// after ~32 steps (`mummu-bench/tests/warmup_f16.rs`), so this ceiling is
+/// 8x the useful depth, not a tuning knob.
 pub const MAX_WARM_UP_STEPS: usize = 256;
 
-/// The contract every causal LM in the zoo implements. A new architecture
-/// (Hermes-class function-caller, Gemma, Qwen3, …) provides its cache type,
-/// its forward pass, and its EOS check — decoding (greedy, sampled, streamed,
-/// cancellable) comes for free from the shared driver.
+/// The contract every causal LM in the zoo implements.
+///
+/// A new architecture (Hermes-class function-caller, Gemma, Qwen3, …)
+/// provides its cache type, its forward pass, and its EOS check — decoding
+/// (greedy, sampled, streamed, cancellable) comes for free from the shared
+/// driver.
 pub trait CausalLm {
     /// Per-generation decode state (KV cache, conv state, …).
     type Cache;
@@ -175,7 +178,7 @@ pub trait CausalLm {
     /// A freshly-started process decodes its first tokens far slower than its
     /// steady state — measured on Qwen2.5-1.5B at f16, the first 32 tokens run
     /// at 12.5 tok/s against a steady 37.6, and the curve is *flat* from token
-    /// 33 on (`mummu-bench/tests/warmup_f16.rs`). CubeCL already persists its
+    /// 33 on (`mummu-bench/tests/warmup_f16.rs`). `CubeCL` already persists its
     /// **autotune** choices to disk across processes, so what is left is
     /// per-process kernel compilation and pipeline creation, which the wgpu
     /// runtime does not cache anywhere (`CompilationCache` is wired for CUDA
@@ -235,7 +238,13 @@ pub trait CausalLm {
 /// returning `impl Future` does not reliably leak that. `constraint` vetoes
 /// any token that would break the grammar and decides when the value is
 /// complete (see [`crate::constrain`]).
-pub async fn generate_constrained<M: CausalLm>(
+///
+/// # Errors
+///
+/// A logits readback that fails (the device returned an error or a
+/// non-float buffer), or a constraint that vetoes every token so no
+/// candidate can be sampled — both from [`generate_loop`].
+pub async fn generate_constrained<M>(
     model: &M,
     prompt_ids: &[u32],
     max_tokens: usize,
@@ -243,7 +252,15 @@ pub async fn generate_constrained<M: CausalLm>(
     device: &Device,
     on_token: impl FnMut(u32) -> std::ops::ControlFlow<()>,
     constraint: Option<&mut dyn crate::constrain::Constraint>,
-) -> Result<Vec<u32>, String> {
+) -> Result<Vec<u32>, String>
+where
+    // `Sync`, not `Send`: the future holds `&M` across every await, and
+    // `&M: Send` is exactly `M: Sync`. Stating it here is what makes the
+    // `Send` guarantee above checkable instead of hoped for — every model in
+    // the zoo already satisfies it, so this closes a hole rather than
+    // narrowing what can be decoded.
+    M: CausalLm + Sync,
+{
     let mut cache = model.new_cache();
     generate_loop(
         |ids, past, need_logits| {
@@ -264,6 +281,27 @@ pub async fn generate_constrained<M: CausalLm>(
     .await
 }
 
+/// What [`generate_multimodal`] decodes over: the prompt, the image rows
+/// already placed in it, and how to sample.
+///
+/// Bundled rather than passed loose so the call stays readable; every field
+/// is exactly the argument it replaces, and the two that are borrowed for
+/// the whole decode (the token callback and the constraint) stay separate
+/// parameters.
+pub struct MultimodalPrompt<'a> {
+    /// The tokenized prompt, placeholder runs included.
+    pub ids: &'a [u32],
+    /// The tower's output and the prompt positions it belongs at; see
+    /// [`crate::vision::place`].
+    pub placed: &'a [crate::vision::Placed],
+    /// Decode ceiling, as in [`generate_constrained`].
+    pub max_tokens: usize,
+    /// Temperature, top-k and seed.
+    pub opts: &'a SamplerOptions,
+    /// The device the trunk runs on.
+    pub device: &'a Device,
+}
+
 /// [`generate_constrained`] for a prompt that carries images.
 ///
 /// Qwen3-VL specific by necessity: the embedding/trunk split it needs
@@ -272,29 +310,29 @@ pub async fn generate_constrained<M: CausalLm>(
 /// should use [`generate_constrained`], which is the same decode loop
 /// without the splice.
 ///
-/// `placed` carries the tower's output and the prompt positions it belongs
-/// at; see [`crate::vision::place`]. The splice happens per prefill chunk,
-/// so an image spanning a chunk boundary is handled in pieces.
-#[allow(clippy::too_many_arguments)] // `generate_constrained`'s arity plus the image rows
+/// `prompt.placed` carries the tower's output and the prompt positions it
+/// belongs at; see [`crate::vision::place`]. The splice happens per prefill
+/// chunk, so an image spanning a chunk boundary is handled in pieces.
+///
+/// # Errors
+///
+/// As [`generate_constrained`]: a failed logits readback, or a constraint
+/// that leaves no admissible token.
 pub async fn generate_multimodal(
     model: &qwen35::LoadedQwen35,
-    prompt_ids: &[u32],
-    placed: &[crate::vision::Placed],
-    max_tokens: usize,
-    opts: &SamplerOptions,
-    device: &Device,
+    prompt: &MultimodalPrompt<'_>,
     on_token: impl FnMut(u32) -> std::ops::ControlFlow<()>,
     constraint: Option<&mut dyn crate::constrain::Constraint>,
 ) -> Result<Vec<u32>, String> {
     let mut cache = model.new_cache();
     generate_loop(
         |ids, past, need_logits| {
-            let x = crate::vision::splice(model.embed(ids, device), past, placed);
-            model.forward_embeds(x, past, &mut cache, device, need_logits)
+            let x = crate::vision::splice(model.embed(ids, prompt.device), past, prompt.placed);
+            model.forward_embeds(x, past, &mut cache, prompt.device, need_logits)
         },
-        prompt_ids,
-        max_tokens,
-        opts,
+        prompt.ids,
+        prompt.max_tokens,
+        prompt.opts,
         |id| model.is_eos(id),
         on_token,
         constraint,

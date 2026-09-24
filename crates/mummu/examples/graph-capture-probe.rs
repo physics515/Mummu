@@ -21,11 +21,15 @@
 //! so the chain stays N dispatches even with the `fusion` feature on).
 //!
 //! Run: `cargo run --release -p mummu --example graph-capture-probe`
+
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use std::cell::Cell;
 use std::rc::Rc;
 use std::time::Instant;
 
 use burn::tensor::{Distribution, Tensor};
+use mummu_num::f64_from_usize;
 
 /// Square sizes swept, smallest first: small = launch-overhead dominated (the
 /// decode regime), large = GPU-bound (where any win must vanish, which is the
@@ -63,7 +67,7 @@ fn time_per_dispatch(device: &burn::tensor::Device, mut run: impl FnMut()) -> f6
     }
     let elapsed = started.elapsed().as_secs_f64();
     assert!(elapsed > 0.0, "timer returned a non-positive interval");
-    let dispatches = (ITERS * CHAIN) as f64;
+    let dispatches = f64_from_usize(ITERS * CHAIN);
     assert!(dispatches > 0.0, "dispatch count must be positive");
     elapsed * 1e6 / dispatches
 }
@@ -81,7 +85,7 @@ fn sweep_size(device: &burn::tensor::Device, side: usize) -> (f64, f64, bool) {
 
     // Scale the operand so a 32-long chain neither overflows nor denormalizes:
     // entries ~N(0, 1/side) keep each product's magnitude near the input's.
-    let scale = 1.0 / (side as f64).sqrt();
+    let scale = 1.0 / f64_from_usize(side).sqrt();
     let x = Tensor::<2>::random([side, side], Distribution::Normal(0.0, scale), device);
     let w = Tensor::<2>::random([side, side], Distribution::Normal(0.0, scale), device);
 
@@ -90,8 +94,8 @@ fn sweep_size(device: &burn::tensor::Device, side: usize) -> (f64, f64, bool) {
     // free test of which path burn took — no private field to inspect.
     let calls = Rc::new(Cell::new(0usize));
     let counter = Rc::clone(&calls);
-    let x_captured = x.clone();
-    let w_captured = w.clone();
+    let x_captured = x;
+    let w_captured = w;
     let chain = move || {
         counter.set(counter.get() + 1);
         let mut acc = x_captured.clone();

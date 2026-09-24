@@ -2,7 +2,7 @@
 //!
 //! The pieces every model load shares (P3): a dtype-cast adapter (HF ships
 //! bf16, which wgpu can't ingest directly), a weights-file picker
-//! (**safetensors** preferred, the PyTorch state dict `pytorch_model.bin` as
+//! (**safetensors** preferred, the `PyTorch` state dict `pytorch_model.bin` as
 //! the fallback for models never re-shipped as safetensors), and a
 //! checked-load wrapper that **fails on missing or errored params** instead
 //! of silently zero-initing — a partial load is a quietly broken model.
@@ -46,9 +46,10 @@ pub enum ImportError {
 }
 
 /// Why a freshly-imported model failed its post-load **sanity smoke** (one
-/// forward, checked for liveness). These are the silent-broken-import failure
-/// modes a checked *load* cannot see — the weights all applied, but the model
-/// does not actually compute.
+/// forward, checked for liveness).
+///
+/// These are the silent-broken-import failure modes a checked *load* cannot
+/// see — the weights all applied, but the model does not actually compute.
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum SanityError {
     /// Logits contain NaN or ±Inf — the classic signature of a wrong dtype
@@ -88,10 +89,24 @@ pub struct SanitySmoke {
 const DEGENERATE_SPREAD: f32 = 1e-4;
 
 /// Post-load **sanity smoke** over one forward's logits: finite, the expected
-/// width, and not degenerate. This is *liveness*, not parity — an arbitrary
-/// user import has no reference to compare against (catalog models get the P7
-/// parity gates); this only proves the model actually computes rather than
-/// silently returning garbage a checked load reported as fully applied.
+/// width, and not degenerate.
+///
+/// This is *liveness*, not parity — an arbitrary user import has no
+/// reference to compare against (catalog models get the P7 parity gates);
+/// this only proves the model actually computes rather than silently
+/// returning garbage a checked load reported as fully applied.
+///
+/// # Errors
+///
+/// [`SanityError::WrongVocab`] when `logits.len() != expected_vocab`;
+/// [`SanityError::NonFinite`] when any logit is NaN or infinite;
+/// [`SanityError::Degenerate`] when `max − min` is below `1e-4`.
+///
+/// # Panics
+///
+/// If `expected_vocab` is 0, or if the argmax index does not fit a `u32`
+/// (a vocabulary past four billion tokens). The emptiness check after the
+/// width test is an internal invariant.
 pub fn logit_sanity(logits: &[f32], expected_vocab: usize) -> Result<SanitySmoke, SanityError> {
     assert!(
         expected_vocab > 0,
@@ -135,7 +150,7 @@ pub fn logit_sanity(logits: &[f32], expected_vocab: usize) -> Result<SanitySmoke
         "healthy smoke has positive finite spread"
     );
     Ok(SanitySmoke {
-        top_id: top_id as u32,
+        top_id: u32::try_from(top_id).expect("a vocabulary index fits u32"),
         top_logit: max,
         spread,
     })
@@ -152,11 +167,13 @@ pub fn logit_sanity(logits: &[f32], expected_vocab: usize) -> Result<SanitySmoke
 /// keep importing their adapters from one place.
 pub use burn::store::FloatCastAdapter;
 
-/// Load `store` (any format: safetensors, PyTorch state dict, …) into
-/// `module`, refusing partial results: any missing param or per-tensor error
-/// is an [`ImportError::Incomplete`] carrying the store's own readable
-/// report. Unused checkpoint tensors are *allowed* (e.g. BERT's
-/// intentionally-skipped `pooler.*`) — callers that care inspect the report.
+/// Load `store` (any format: safetensors, `PyTorch` state dict, …) into
+/// `module`, refusing partial results.
+///
+/// Any missing param or per-tensor error is an [`ImportError::Incomplete`]
+/// carrying the store's own readable report. Unused checkpoint tensors are
+/// *allowed* (e.g. BERT's intentionally-skipped `pooler.*`) — callers that
+/// care inspect the report.
 ///
 /// # This call cannot feed the progress bar, and that is not an oversight
 ///
@@ -171,6 +188,12 @@ pub use burn::store::FloatCastAdapter;
 /// checkpoints this serves are also the small ones (a `model.safetensors`
 /// that fits one file), where the wait being explained is seconds rather
 /// than the minutes a packed 27B takes.
+///
+/// # Errors
+///
+/// [`ImportError::Load`] when the store itself fails (an unreadable or
+/// malformed checkpoint file); [`ImportError::Incomplete`] when any module
+/// param is missing from the checkpoint or errored while being applied.
 pub fn load_checked<M, S>(
     module: &mut M,
     store: &mut S,
@@ -256,7 +279,7 @@ impl DequantSink {
 /// Owns a scratch file for the life of one load.
 ///
 /// The file is as large as the weights it carries (~28 GB dequantizing
-/// OLMoE-1B-7B's Q4_K_M), so leaving one behind on a failed load would
+/// OLMoE-1B-7B's `Q4_K_M`), so leaving one behind on a failed load would
 /// quietly fill the disk over a few retries. `Drop` removes it on every exit
 /// path, success or `?` — and because the store reads it lazily, the guard
 /// must outlive `load_checked`, which holding it as a local does.
@@ -272,6 +295,15 @@ impl ScratchFile {
     /// The name carries a process-unique counter as well as the pid: two
     /// concurrent loads in one process must not choose the same file and
     /// interleave their writes into it.
+    ///
+    /// # Errors
+    ///
+    /// [`ImportError::Parse`] when a stale scratch file of the same name
+    /// exists and cannot be removed.
+    ///
+    /// # Panics
+    ///
+    /// If `dir` is the empty path.
     pub fn new(dir: &Path) -> Result<Self, ImportError> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -327,6 +359,21 @@ impl Drop for ScratchFile {
 /// **indeterminate** `loading` rather than leaving a finished 320/320 on
 /// screen for the seconds that install takes. An honest sweep beats a bar
 /// that says 100% and is not done.
+///
+/// # Errors
+///
+/// [`ImportError::Parse`] wrapping whatever the dequant reports — `map`
+/// leaving a tensor unmapped, a reshape that changes the element count, a
+/// rename collision, a tensor or payload over its size bound, a payload
+/// that cannot be read or dequantized, or (scratch sink) a scratch file
+/// that cannot be written — plus [`ScratchFile::new`]'s error when a stale
+/// scratch file cannot be cleared.
+///
+/// # Panics
+///
+/// Only on internal invariants: a parsed GGUF always dequantizes to a
+/// non-empty blob or payload, and [`DequantSink::resolve`] never returns
+/// `Auto`.
 pub fn gguf_store(
     f: &GgufFile,
     map: &dyn Fn(&GgufTensorInfo) -> Option<GgufMap>,
@@ -356,7 +403,7 @@ pub fn gguf_store(
         DequantSink::Scratch => {
             // Beside the gguf, so the scratch write lands on the volume the
             // weights already live on.
-            let scratch = ScratchFile::new(f.path.parent().unwrap_or(Path::new(".")))?;
+            let scratch = ScratchFile::new(f.path.parent().unwrap_or_else(|| Path::new(".")))?;
             let bytes = f
                 .dequant_to_safetensors_file(map, scratch.path())
                 .map_err(|e| parse(e.to_string()))?;
@@ -372,6 +419,14 @@ pub fn gguf_store(
 }
 
 /// `dir/file`, or [`ImportError::MissingFile`] if absent.
+///
+/// # Errors
+///
+/// [`ImportError::MissingFile`] when `dir/file` is not a regular file.
+///
+/// # Panics
+///
+/// If `file` is empty.
 pub fn required_file(dir: &Path, file: &str) -> Result<PathBuf, ImportError> {
     assert!(!file.is_empty(), "required_file: empty file name");
     let path = dir.join(file);
@@ -387,13 +442,18 @@ pub fn required_file(dir: &Path, file: &str) -> Result<PathBuf, ImportError> {
 pub enum WeightsFile {
     /// `model.safetensors` — the primary format.
     Safetensors(PathBuf),
-    /// `pytorch_model.bin` — the PyTorch state dict older checkpoints ship.
+    /// `pytorch_model.bin` — the `PyTorch` state dict older checkpoints ship.
     PytorchBin(PathBuf),
 }
 
 /// Pick the weights file in `dir`: `model.safetensors` when present, else
 /// `pytorch_model.bin`. Reports the *safetensors* name when neither exists
 /// (it's the file a fresh download would produce).
+///
+/// # Errors
+///
+/// [`ImportError::MissingFile`] (naming `model.safetensors`) when neither
+/// file exists in `dir`.
 pub fn weights_file(dir: &Path) -> Result<WeightsFile, ImportError> {
     let safetensors = dir.join("model.safetensors");
     if safetensors.is_file() {

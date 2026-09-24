@@ -15,6 +15,8 @@
 //! (T5's `<extra_id_*>`) live in sibling metadata — both are the caller's
 //! layer, not the proto import's.
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use std::path::PathBuf;
 
 use tokenizers::Tokenizer;

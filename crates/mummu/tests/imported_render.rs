@@ -15,6 +15,8 @@
 //! MUMMU_QWEN3_DIR=path/to/qwen3-0.6b \
 //!   cargo test -p mummu --features jinja-template --test imported_render -- --ignored --nocapture
 //! ```
+
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 #![cfg(feature = "jinja-template")]
 
 use std::path::PathBuf;
@@ -43,22 +45,21 @@ fn weather_spec() -> ToolSpec {
 
 /// Report where two renders diverge, for a readable failure.
 fn diff(label: &str, ours: &str, reference: &str) -> String {
-    match ours
-        .bytes()
+    ours.bytes()
         .zip(reference.bytes())
         .position(|(a, b)| a != b)
         .or_else(|| (ours.len() != reference.len()).then(|| ours.len().min(reference.len())))
-    {
-        None => format!("{label}: byte-identical ({} B)", ours.len()),
-        Some(at) => {
-            let lo = at.saturating_sub(60);
-            format!(
-                "{label}: DIVERGES at byte {at}\n  imported…{:?}\n  family  …{:?}",
-                &ours[lo..(at + 60).min(ours.len())],
-                &reference[lo..(at + 60).min(reference.len())],
-            )
-        }
-    }
+        .map_or_else(
+            || format!("{label}: byte-identical ({} B)", ours.len()),
+            |at| {
+                let lo = at.saturating_sub(60);
+                format!(
+                    "{label}: DIVERGES at byte {at}\n  imported…{:?}\n  family  …{:?}",
+                    &ours[lo..(at + 60).min(ours.len())],
+                    &reference[lo..(at + 60).min(reference.len())],
+                )
+            },
+        )
 }
 
 /// Plain conversation, tools, and a full function-calling history: the

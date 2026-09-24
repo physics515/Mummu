@@ -1,14 +1,23 @@
-//! Rotary position embeddings (RoPE), HF duplicated-half layout, computed
+//! Rotary position embeddings (`RoPE`), HF duplicated-half layout, computed
 //! manually so the same tables serve every architecture (Qwen theta 1e6 vs
 //! LFM2 theta 1e6 vs others) and every backend.
 
 use burn::tensor::{Device, Tensor, TensorData};
+use mummu_num::f32_from_usize;
 
 use super::MAX_CONTEXT_TOKENS;
 
-/// RoPE cos/sin tables `[1, 1, t, head_dim]` for absolute positions
-/// `past..past+t`, HF duplicated-half layout (each frequency written to both
-/// halves of the head dim, so [`apply_rope`]'s rotate-half math lines up).
+/// `RoPE` cos/sin tables `[1, 1, t, head_dim]` for absolute positions
+/// `past..past+t`.
+///
+/// HF duplicated-half layout (each frequency written to both halves of the
+/// head dim, so [`apply_rope`]'s rotate-half math lines up).
+///
+/// # Panics
+///
+/// Panics if `t == 0`, if `head_dim` is odd or below 2, or if `past + t`
+/// exceeds [`MAX_CONTEXT_TOKENS`].
+#[must_use]
 pub fn rope_tables(
     t: usize,
     past: usize,
@@ -31,9 +40,9 @@ pub fn rope_tables(
     let mut cos = vec![0f32; t * head_dim];
     let mut sin = vec![0f32; t * head_dim];
     for i in 0..t {
-        let pos = (past + i) as f32;
+        let pos = f32_from_usize(past + i);
         for k in 0..half {
-            let inv = 1.0f32 / theta.powf(2.0 * k as f32 / head_dim as f32);
+            let inv = 1.0f32 / theta.powf(2.0 * f32_from_usize(k) / f32_from_usize(head_dim));
             let (s, c) = (pos * inv).sin_cos();
             cos[i * head_dim + k] = c;
             cos[i * head_dim + k + half] = c;
@@ -53,6 +62,11 @@ pub fn rope_tables(
 }
 
 /// `rotate_half`: split the last dim in two, return `cat([-x2, x1])`.
+///
+/// # Panics
+///
+/// Panics if the last dim of `x` is odd or below 2.
+#[must_use]
 pub fn rotate_half(x: Tensor<4>) -> Tensor<4> {
     let dims = x.dims();
     let half = dims[3] / 2;
@@ -66,8 +80,14 @@ pub fn rotate_half(x: Tensor<4>) -> Tensor<4> {
     Tensor::cat(vec![x2.neg(), x1], 3)
 }
 
-/// Apply RoPE: `x*cos + rotate_half(x)*sin`. `cos`/`sin` come from
+/// Apply `RoPE`: `x*cos + rotate_half(x)*sin`. `cos`/`sin` come from
 /// [`rope_tables`] and must cover the same `t` and `head_dim` as `x`.
+///
+/// # Panics
+///
+/// Panics if `x` and `cos` disagree on `[t, head_dim]`, or (via
+/// [`rotate_half`]) if the head dim is odd or below 2.
+#[must_use]
 pub fn apply_rope(x: Tensor<4>, cos: &Tensor<4>, sin: &Tensor<4>) -> Tensor<4> {
     let (xd, cd) = (x.dims(), cos.dims());
     assert!(

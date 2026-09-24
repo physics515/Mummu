@@ -10,12 +10,12 @@
 //! What the architecture is, from `qwen4exp.*` metadata (48 blocks, hidden
 //! 2560, `general.size_label = "512x56B"`):
 //!
-//! * **Gated DeltaNet + full attention**, in qwen35's exact proportions —
+//! * **Gated `DeltaNet` + full attention**, in qwen35's exact proportions —
 //!   `full_attention_interval = 4`, so 12 of 48 layers are attention and the
 //!   other 36 are GDN at qwen35's shape (conv 4, state 128, 16 groups,
 //!   inner 6144). That is why this port reuses `qwen35` rather than starting
 //!   over.
-//! * **A 512-expert MoE in every layer**, top-10 routed (`expert_count` /
+//! * **A 512-expert `MoE` in every layer**, top-10 routed (`expert_count` /
 //!   `expert_used_count`), each expert 640 wide, plus a shared expert of the
 //!   same width.
 //! * **Hyper-connections**: 4 streams, low-rank 320.
@@ -63,6 +63,148 @@ fn non_negative(v: &GgufValue) -> Option<u64> {
         .or_else(|| v.as_i64().and_then(|x| u64::try_from(x).ok()))
 }
 
+/// A `u64` header value as `usize`, or which key is missing.
+fn meta_usize(f: &GgufFile, key: &str) -> Result<usize, String> {
+    f.get(key)
+        .and_then(GgufValue::as_u64)
+        .map(|v| usize::try_from(v).expect("metadata fits usize"))
+        .ok_or_else(|| format!("GGUF metadata missing {key}"))
+}
+
+/// An `f32` header value, or which key is missing.
+fn meta_f32(f: &GgufFile, key: &str) -> Result<f32, String> {
+    f.get(key)
+        .and_then(GgufValue::as_f32)
+        .ok_or_else(|| format!("GGUF metadata missing {key}"))
+}
+
+/// A header array of non-negative integers, bounded by [`MAX_PLE_TABLE`].
+///
+/// Header arrays are the PLE hash function's parameters. They are read,
+/// never assumed: a wrong multiplier silently selects wrong embedding
+/// rows, which reads as a quality regression rather than an error.
+fn meta_u64_array(f: &GgufFile, key: &str) -> Result<Vec<u64>, String> {
+    let vals = f
+        .get(key)
+        .and_then(GgufValue::as_array)
+        .ok_or_else(|| format!("GGUF metadata missing array {key}"))?;
+    if vals.len() > MAX_PLE_TABLE {
+        return Err(format!(
+            "{key} has {} entries, past the {MAX_PLE_TABLE} bound",
+            vals.len()
+        ));
+    }
+    vals.iter()
+        .map(|v| {
+            non_negative(v).ok_or_else(|| format!("{key} holds a non-integer or negative entry"))
+        })
+        .collect()
+}
+
+/// `qwen4exp.ple.layers` (absent → none), refusing more than one layer or
+/// one past the trunk.
+fn ple_layers(f: &GgufFile, num_layers: usize) -> Result<Vec<usize>, String> {
+    let ple_layers = f
+        .get("qwen4exp.ple.layers")
+        .and_then(GgufValue::as_array)
+        .map_or_else(Vec::new, |vals| {
+            vals.iter()
+                .filter_map(GgufValue::as_i64)
+                .filter_map(|v| usize::try_from(v).ok())
+                .collect::<Vec<_>>()
+        });
+    // One PLE module at most, as llama.cpp: hparams hold one set of hash
+    // constants and the cache one conv history.
+    if ple_layers.len() > 1 {
+        return Err(format!(
+            "qwen4exp.ple.layers lists {} layers; only one PLE layer is supported",
+            ple_layers.len()
+        ));
+    }
+    if let Some(&l) = ple_layers.iter().find(|&&l| l >= num_layers) {
+        return Err(format!(
+            "PLE layer {l} is out of range ({num_layers} layers)"
+        ));
+    }
+    Ok(ple_layers)
+}
+
+/// `qwen4exp.attention.compress_ratios`, exactly one entry per layer.
+fn compress_ratios(f: &GgufFile, num_layers: usize) -> Result<Vec<usize>, String> {
+    let ratios = meta_u64_array(f, "qwen4exp.attention.compress_ratios")?
+        .into_iter()
+        .map(|v| usize::try_from(v).map_err(|_| "compress ratio does not fit usize".to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    if ratios.len() != num_layers {
+        return Err(format!(
+            "qwen4exp.attention.compress_ratios has {} entries for {num_layers} layers",
+            ratios.len()
+        ));
+    }
+    Ok(ratios)
+}
+
+/// The PLE hash arrays as the header carries them.
+struct PleHashArrays {
+    multipliers: Vec<u64>,
+    head_offsets: Vec<u64>,
+    head_vocab_sizes: Vec<u64>,
+}
+
+/// `qwen4exp.ple.{layer_multipliers, head_offsets, head_vocab_sizes}`.
+fn ple_hash_arrays(f: &GgufFile) -> Result<PleHashArrays, String> {
+    let multipliers = meta_u64_array(f, "qwen4exp.ple.layer_multipliers")?;
+    let head_offsets = meta_u64_array(f, "qwen4exp.ple.head_offsets")?;
+    let head_vocab_sizes = meta_u64_array(f, "qwen4exp.ple.head_vocab_sizes")?;
+    // Negative space: one offset per head vocabulary, or the table cannot
+    // be indexed at all.
+    if head_offsets.len() != head_vocab_sizes.len() {
+        return Err(format!(
+            "PLE has {} head offsets but {} head vocab sizes",
+            head_offsets.len(),
+            head_vocab_sizes.len()
+        ));
+    }
+    Ok(PleHashArrays {
+        multipliers,
+        head_offsets,
+        head_vocab_sizes,
+    })
+}
+
+/// `qwen4exp.rope.dimension_count`, accepted only when the header's
+/// `rope.dimension_sections` are text-degenerate.
+///
+/// The attention layers run plain partial `RoPE` over `rope_dim` dims.
+/// That is exact for llama.cpp's IMROPE only while every rotated
+/// frequency is assigned to the t/h/w sections, which all equal the
+/// token position for text; a non-zero 4th (e) section would give
+/// those dims angle 0 in llama.cpp and a real rotation here. The
+/// shipped header is `[11, 11, 10, 0]`, so refuse anything else loudly
+/// rather than rotate the wrong dims silently.
+fn text_rope_dim(f: &GgufFile) -> Result<usize, String> {
+    let rope_dim = meta_usize(f, "qwen4exp.rope.dimension_count")?;
+    let sections = f
+        .get("qwen4exp.rope.dimension_sections")
+        .and_then(GgufValue::as_array)
+        .ok_or("GGUF metadata missing array qwen4exp.rope.dimension_sections")?
+        .iter()
+        .map(|v| {
+            v.as_i64()
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or_else(|| "rope.dimension_sections holds a non-integer entry".to_string())
+        })
+        .collect::<Result<Vec<usize>, String>>()?;
+    let rotated: usize = sections.iter().take(3).sum();
+    if sections.len() != 4 || sections[3] != 0 || 2 * rotated != rope_dim {
+        return Err(format!(
+            "rope.dimension_sections {sections:?} is not text-degenerate for rope.dimension_count \
+             {rope_dim}: only [t, h, w, 0] with 2*(t+h+w) == rope_dim is implemented"
+        ));
+    }
+    Ok(rope_dim)
+}
+
 /// Hyperparameters of the `qwen4exp` architecture.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Qwen4expConfig {
@@ -75,7 +217,7 @@ pub struct Qwen4expConfig {
     pub head_dim: usize,
     pub rms_norm_eps: f64,
     pub rope_theta: f32,
-    /// Leading dims of each head that RoPE rotates.
+    /// Leading dims of each head that `RoPE` rotates.
     pub rope_dim: usize,
     /// Layer `i` is full attention iff `(i+1) % interval == 0`.
     pub full_attention_interval: usize,
@@ -129,21 +271,21 @@ pub struct Qwen4expConfig {
 }
 
 impl Qwen4expConfig {
-    /// Is `layer` a full-attention layer (as opposed to Gated DeltaNet)?
+    /// Is `layer` a full-attention layer (as opposed to Gated `DeltaNet`)?
     #[must_use]
-    pub fn is_attention(&self, layer: usize) -> bool {
+    pub const fn is_attention(&self, layer: usize) -> bool {
         (layer + 1).is_multiple_of(self.full_attention_interval)
     }
 
-    /// q/k projection width in the DeltaNet mix.
+    /// q/k projection width in the `DeltaNet` mix.
     #[must_use]
-    pub fn key_dim(&self) -> usize {
+    pub const fn key_dim(&self) -> usize {
         self.n_k_heads * self.d_state
     }
 
-    /// Channels through the DeltaNet conv: q + k + v concatenated.
+    /// Channels through the `DeltaNet` conv: q + k + v concatenated.
     #[must_use]
-    pub fn conv_dim(&self) -> usize {
+    pub const fn conv_dim(&self) -> usize {
         2 * self.key_dim() + self.d_inner
     }
 
@@ -179,13 +321,13 @@ impl Qwen4expConfig {
 
     /// The config the reused qwen35 blocks read ([`crate::models::qwen35::GatedAttention`],
     /// [`crate::models::qwen35::GatedDeltaNet`]): the same shapes, and the
-    /// DeltaNet output gate set to **sigmoid** — qwen4exp's one numerical
+    /// `DeltaNet` output gate set to **sigmoid** — qwen4exp's one numerical
     /// difference from qwen35 in those blocks (llama.cpp
     /// `llama-qwen4exp.cpp` `build_norm_gated`). `intermediate_size` has no
-    /// qwen4exp meaning (the FFN is the MoE) and neither block reads it; it
+    /// qwen4exp meaning (the FFN is the `MoE`) and neither block reads it; it
     /// carries the shared-expert width only so the field is not a zero.
     #[must_use]
-    pub fn blocks_config(&self) -> Qwen35Config {
+    pub const fn blocks_config(&self) -> Qwen35Config {
         Qwen35Config {
             vocab_size: self.vocab_size,
             hidden_size: self.hidden_size,
@@ -216,12 +358,12 @@ impl Qwen4expConfig {
     /// Width of one token's PLE embedding: `(ngram-1)·heads_per_ngram` rows
     /// of `ple_row_width` (16 · 160 = 2560).
     #[must_use]
-    pub fn ple_embed_width(&self) -> usize {
+    pub const fn ple_embed_width(&self) -> usize {
         self.ple_ngram_size.saturating_sub(1) * self.ple_heads_per_ngram * self.ple_row_width
     }
 
     /// Total rows in the PLE table — the sum of every head's vocabulary.
-    /// The shipped table is 28.8 GB at IQ4_NL, so this is the number that
+    /// The shipped table is 28.8 GB at `IQ4_NL`, so this is the number that
     /// decides whether it can be resident or must stay on disk.
     #[must_use]
     pub fn ple_total_rows(&self) -> u64 {
@@ -235,43 +377,29 @@ impl Qwen4expConfig {
     /// the full KV but **zero tensors**, so `token_embd.weight` — which is
     /// where the vocabulary size comes from — only exists once the shards
     /// are joined.
+    ///
+    /// # Errors
+    ///
+    /// The architecture is not `qwen4exp`; a required `qwen4exp.*` key or
+    /// array is missing, negative, or over the [`MAX_PLE_TABLE`] bound;
+    /// `token_embd.weight` is absent or not 2-D; `full_attention_interval`
+    /// is zero; `expert_used_count` exceeds `expert_count`; more than one
+    /// PLE layer, or one past the trunk; a compress-ratio array that is not
+    /// one entry per layer; PLE head offsets and vocab sizes of different
+    /// lengths; `rope.dimension_sections` that are not text-degenerate; or
+    /// any invariant [`Self::validate`] refuses.
+    ///
+    /// # Panics
+    ///
+    /// Only on a 32-bit target, when a header dimension or count does not
+    /// fit `usize`.
     pub fn from_gguf(f: &GgufFile) -> Result<Self, String> {
         let arch = f.architecture().unwrap_or("<missing>");
         if arch != "qwen4exp" {
             return Err(format!("GGUF architecture '{arch}' is not qwen4exp"));
         }
-        let usize_at = |key: &str| -> Result<usize, String> {
-            f.get(key)
-                .and_then(GgufValue::as_u64)
-                .map(|v| usize::try_from(v).expect("metadata fits usize"))
-                .ok_or_else(|| format!("GGUF metadata missing {key}"))
-        };
-        let f32_at = |key: &str| -> Result<f32, String> {
-            f.get(key)
-                .and_then(GgufValue::as_f32)
-                .ok_or_else(|| format!("GGUF metadata missing {key}"))
-        };
-        // Header arrays are the PLE hash function's parameters. They are read,
-        // never assumed: a wrong multiplier silently selects wrong embedding
-        // rows, which reads as a quality regression rather than an error.
-        let u64_array = |key: &str| -> Result<Vec<u64>, String> {
-            let vals = f
-                .get(key)
-                .and_then(GgufValue::as_array)
-                .ok_or_else(|| format!("GGUF metadata missing array {key}"))?;
-            if vals.len() > MAX_PLE_TABLE {
-                return Err(format!(
-                    "{key} has {} entries, past the {MAX_PLE_TABLE} bound",
-                    vals.len()
-                ));
-            }
-            vals.iter()
-                .map(|v| {
-                    non_negative(v)
-                        .ok_or_else(|| format!("{key} holds a non-integer or negative entry"))
-                })
-                .collect()
-        };
+        let usize_at = |key: &str| meta_usize(f, key);
+        let f32_at = |key: &str| meta_f32(f, key);
 
         let embd = f
             .tensor("token_embd.weight")
@@ -293,80 +421,14 @@ impl Qwen4expConfig {
             ));
         }
 
-        let ple_layers = f
-            .get("qwen4exp.ple.layers")
-            .and_then(GgufValue::as_array)
-            .map(|vals| {
-                vals.iter()
-                    .filter_map(GgufValue::as_i64)
-                    .filter_map(|v| usize::try_from(v).ok())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        // One PLE module at most, as llama.cpp: hparams hold one set of hash
-        // constants and the cache one conv history.
-        if ple_layers.len() > 1 {
-            return Err(format!(
-                "qwen4exp.ple.layers lists {} layers; only one PLE layer is supported",
-                ple_layers.len()
-            ));
-        }
-        if let Some(&l) = ple_layers.iter().find(|&&l| l >= num_layers) {
-            return Err(format!(
-                "PLE layer {l} is out of range ({num_layers} layers)"
-            ));
-        }
-        let attention_compress_ratios = u64_array("qwen4exp.attention.compress_ratios")?
-            .into_iter()
-            .map(|v| {
-                usize::try_from(v).map_err(|_| "compress ratio does not fit usize".to_string())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if attention_compress_ratios.len() != num_layers {
-            return Err(format!(
-                "qwen4exp.attention.compress_ratios has {} entries for {num_layers} layers",
-                attention_compress_ratios.len()
-            ));
-        }
-        let ple_layer_multipliers = u64_array("qwen4exp.ple.layer_multipliers")?;
-        let ple_head_offsets = u64_array("qwen4exp.ple.head_offsets")?;
-        let ple_head_vocab_sizes = u64_array("qwen4exp.ple.head_vocab_sizes")?;
-        // Negative space: one offset per head vocabulary, or the table cannot
-        // be indexed at all.
-        if ple_head_offsets.len() != ple_head_vocab_sizes.len() {
-            return Err(format!(
-                "PLE has {} head offsets but {} head vocab sizes",
-                ple_head_offsets.len(),
-                ple_head_vocab_sizes.len()
-            ));
-        }
-
-        // The attention layers run plain partial RoPE over `rope_dim` dims.
-        // That is exact for llama.cpp's IMROPE only while every rotated
-        // frequency is assigned to the t/h/w sections, which all equal the
-        // token position for text; a non-zero 4th (e) section would give
-        // those dims angle 0 in llama.cpp and a real rotation here. The
-        // shipped header is [11, 11, 10, 0], so refuse anything else loudly
-        // rather than rotate the wrong dims silently.
-        let rope_dim = usize_at("qwen4exp.rope.dimension_count")?;
-        let sections = f
-            .get("qwen4exp.rope.dimension_sections")
-            .and_then(GgufValue::as_array)
-            .ok_or("GGUF metadata missing array qwen4exp.rope.dimension_sections")?
-            .iter()
-            .map(|v| {
-                v.as_i64()
-                    .and_then(|n| usize::try_from(n).ok())
-                    .ok_or_else(|| "rope.dimension_sections holds a non-integer entry".to_string())
-            })
-            .collect::<Result<Vec<usize>, String>>()?;
-        let rotated: usize = sections.iter().take(3).sum();
-        if sections.len() != 4 || sections[3] != 0 || 2 * rotated != rope_dim {
-            return Err(format!(
-                "rope.dimension_sections {sections:?} is not text-degenerate for rope.dimension_count \
-                 {rope_dim}: only [t, h, w, 0] with 2*(t+h+w) == rope_dim is implemented"
-            ));
-        }
+        let ple_layers = ple_layers(f, num_layers)?;
+        let attention_compress_ratios = compress_ratios(f, num_layers)?;
+        let PleHashArrays {
+            multipliers: ple_layer_multipliers,
+            head_offsets: ple_head_offsets,
+            head_vocab_sizes: ple_head_vocab_sizes,
+        } = ple_hash_arrays(f)?;
+        let rope_dim = text_rope_dim(f)?;
 
         let cfg = Self {
             vocab_size,
@@ -431,6 +493,15 @@ impl Qwen4expConfig {
     }
 
     /// Shape invariants the forward depends on, checked once at load.
+    ///
+    /// # Errors
+    ///
+    /// Fewer than two hyper-connection streams or a zero low rank; a top-k
+    /// that is zero or exceeds the expert count; a PLE layer that is an
+    /// attention layer; a PLE layer with an empty embedding; a non-zero
+    /// compress ratio on a `DeltaNet` layer; or a `DeltaNet`/attention
+    /// layout the reused qwen35 blocks refuse
+    /// ([`Qwen35Config::validate`]).
     pub fn validate(&self) -> Result<(), String> {
         if self.hyper_connection_count < 2 || self.hyper_connection_low_rank == 0 {
             // llama.cpp and transformers both refuse hc <= 1: nothing to mix.
@@ -472,7 +543,7 @@ mod tests {
     /// The real shipped header's values (unsloth UD-Q4_K_XL, all four
     /// shards), so a drift in parsing shows up as a failing test rather than
     /// a bad load. Shared with the model tests (tensor-map completeness).
-    pub(crate) fn shipped() -> Qwen4expConfig {
+    pub fn shipped() -> Qwen4expConfig {
         Qwen4expConfig {
             vocab_size: 248_320,
             hidden_size: 2560,
@@ -571,7 +642,7 @@ mod tests {
         c.validate().expect("shipped config validates");
         // top_k 2048 + ratio 4 - 1: past this, dense != QSA.
         assert_eq!(c.dense_attention_limit(), Some(2051));
-        let mut dense = c.clone();
+        let mut dense = c;
         dense.attention_compress_ratios.fill(0);
         assert_eq!(
             dense.dense_attention_limit(),

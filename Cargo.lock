@@ -5114,7 +5114,7 @@ dependencies = [
 
 [[package]]
 name = "mummu"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "burn",
  "burn-cubecl",
@@ -5130,7 +5130,9 @@ dependencies = [
  "image",
  "inferno",
  "mummu-mix",
+ "mummu-num",
  "mummu-schedule",
+ "mummu-testkit",
  "once_cell",
  "pollster",
  "rayon",
@@ -5147,7 +5149,7 @@ dependencies = [
 
 [[package]]
 name = "mummu-app"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "mummu-serve",
  "tauri",
@@ -5157,26 +5159,37 @@ dependencies = [
 
 [[package]]
 name = "mummu-bench"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "burn",
  "criterion",
  "mummu",
+ "mummu-num",
  "tokenizers",
  "tokio",
 ]
 
 [[package]]
 name = "mummu-mix"
-version = "0.4.1"
+version = "0.5.0"
+dependencies = [
+ "mummu-num",
+]
+
+[[package]]
+name = "mummu-num"
+version = "0.5.0"
 
 [[package]]
 name = "mummu-schedule"
-version = "0.4.1"
+version = "0.5.0"
+dependencies = [
+ "mummu-num",
+]
 
 [[package]]
 name = "mummu-serve"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -5186,6 +5199,7 @@ dependencies = [
  "http-body",
  "libc",
  "mummu",
+ "mummu-num",
  "rayon",
  "serde",
  "serde_json",
@@ -5193,6 +5207,19 @@ dependencies = [
  "tokenizers",
  "tokio",
  "tokio-tungstenite",
+]
+
+[[package]]
+name = "mummu-testkit"
+version = "0.5.0"
+dependencies = [
+ "burn",
+ "mummu",
+ "mummu-num",
+ "serde",
+ "serde_json",
+ "tokenizers",
+ "ureq 3.4.2",
 ]
 
 [[package]]

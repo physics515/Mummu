@@ -41,10 +41,14 @@
 //! is `n <= 16` (65 536 subsets), asserted, because past that the exact
 //! method is the wrong tool.
 
+use mummu_num::{f64_from_u64, f64_from_usize};
+
 /// A togglable component of the decode step — a lightweight name for one bit
-/// of the subset mask. Exists so attribution tables carry human-readable
-/// labels next to `phi` without this module dictating what a "component" is
-/// (a feature flag, an injected sleep, a skipped fence…).
+/// of the subset mask.
+///
+/// Exists so attribution tables carry human-readable labels next to `phi`
+/// without this module dictating what a "component" is (a feature flag, an
+/// injected sleep, a skipped fence…).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Component {
     pub name: String,
@@ -88,8 +92,8 @@ pub fn shapley(n: usize, v: &mut dyn FnMut(u32) -> f64) -> Vec<f64> {
     // Memoize v: each subset is measured exactly once, then reused by every
     // component's marginal sum.
     let mut table = vec![0.0f64; size];
-    for (mask, slot) in table.iter_mut().enumerate() {
-        *slot = v(mask as u32);
+    for (mask, slot) in (0u32..).zip(table.iter_mut()) {
+        *slot = v(mask);
     }
     shapley_from_table(n, &table)
 }
@@ -102,14 +106,15 @@ fn shapley_from_table(n: usize, table: &[f64]) -> Vec<f64> {
     // exactly-represented integers.
     let mut fact = [1.0f64; 17];
     for i in 1..=16 {
-        fact[i] = fact[i - 1] * i as f64;
+        fact[i] = fact[i - 1] * f64_from_usize(i);
     }
     let n_fact = fact[n];
+    let subsets = u32::try_from(table.len()).expect("n <= 16 keeps the subset table under 2^16");
     let mut phi = vec![0.0f64; n];
     for (j, phi_j) in phi.iter_mut().enumerate() {
         let bit = 1u32 << j;
         let mut acc = 0.0f64;
-        for mask in 0..table.len() as u32 {
+        for mask in 0..subsets {
             if mask & bit != 0 {
                 continue; // enumerate S ⊆ N \ {j}
             }
@@ -117,7 +122,10 @@ fn shapley_from_table(n: usize, table: &[f64]) -> Vec<f64> {
             // Probability that, in a uniformly random toggle order, exactly
             // the components of S precede j.
             let weight = fact[s] * fact[n - 1 - s] / n_fact;
-            acc += weight * (table[(mask | bit) as usize] - table[mask as usize]);
+            // Two roundings on purpose: the tests pin these values exactly.
+            let marginal = table[(mask | bit) as usize] - table[mask as usize];
+            let term = weight * marginal;
+            acc += term;
         }
         *phi_j = acc;
     }
@@ -178,13 +186,13 @@ pub fn attribute(n: usize, replicates: usize, measure: &mut dyn FnMut(u32) -> f6
     let mut per_replicate: Vec<Vec<f64>> = Vec::with_capacity(replicates);
     let mut table = vec![0.0f64; size];
     for _ in 0..replicates {
-        for (mask, slot) in table.iter_mut().enumerate() {
-            *slot = measure(mask as u32);
+        for (mask, slot) in (0u32..).zip(table.iter_mut()) {
+            *slot = measure(mask);
         }
         per_replicate.push(shapley_from_table(n, &table));
     }
 
-    let r = replicates as f64;
+    let r = f64_from_usize(replicates);
     let mut phi = vec![0.0f64; n];
     let mut ci95 = vec![0.0f64; n];
     for j in 0..n {
@@ -213,7 +221,7 @@ pub fn attribute(n: usize, replicates: usize, measure: &mut dyn FnMut(u32) -> f6
 /// Two-sided 95% Student-t critical value for `df` degrees of freedom.
 /// Table for small df where the normal 1.96 badly undercovers (df=1 needs
 /// 12.7, not 1.96); beyond 30 the normal approximation is within 2%.
-fn t_975(df: usize) -> f64 {
+const fn t_975(df: usize) -> f64 {
     const TABLE: [f64; 30] = [
         12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228, 2.201, 2.179, 2.160,
         2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086, 2.080, 2.074, 2.069, 2.064, 2.060, 2.056,
@@ -269,11 +277,11 @@ pub fn parse_folded(folded: &str) -> Result<Vec<(String, f64)>, String> {
         let (path, count_tok) = rest.rsplit_once(' ').ok_or_else(|| {
             format!("folded line {lineno}: missing `(Nx)` count before the self-time in {line:?}")
         })?;
-        let count_ok = count_tok
+        let count_well_formed = count_tok
             .strip_prefix('(')
             .and_then(|t| t.strip_suffix("x)"))
             .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()));
-        if !count_ok {
+        if !count_well_formed {
             return Err(format!(
                 "folded line {lineno}: count field {count_tok:?} is not of the form `(Nx)` \
                  in {line:?}"
@@ -282,7 +290,7 @@ pub fn parse_folded(folded: &str) -> Result<Vec<(String, f64)>, String> {
         if path.is_empty() {
             return Err(format!("folded line {lineno}: empty path in {line:?}"));
         }
-        out.push((path.to_string(), self_us as f64 / 1000.0));
+        out.push((path.to_string(), f64_from_u64(self_us) / 1000.0));
     }
     Ok(out)
 }
@@ -306,9 +314,9 @@ mod tests {
         fn centered(&mut self) -> f64 {
             self.0 = self
                 .0
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            ((self.0 >> 11) as f64) / ((1u64 << 53) as f64) - 0.5
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            f64_from_u64(self.0 >> 11) / f64_from_u64(1u64 << 53) - 0.5
         }
     }
 
@@ -356,8 +364,10 @@ mod tests {
         let mut v = |mask: u32| -> f64 {
             // Arbitrary but deterministic: nonlinear in the popcount and
             // mask-dependent, so components interact.
-            let s = mask.count_ones() as f64;
-            3.0 + 1.7 * s * s + 0.31 * f64::from(mask ^ (mask >> 1))
+            let s = f64::from(mask.count_ones());
+            let quadratic = 1.7 * s * s;
+            let gray = 0.31 * f64::from(mask ^ (mask >> 1));
+            3.0 + quadratic + gray
         };
         let full = (1u32 << n) - 1;
         let total = v(full) - v(0);
@@ -474,6 +484,6 @@ mod tests {
     /// n = 0 is a degenerate but legal game: no components, no shares.
     #[test]
     fn zero_components_is_empty() {
-        assert!(shapley(0, &mut |_| 7.0).is_empty());
+        assert_eq!(shapley(0, &mut |_| 7.0), [] as [f64; 0]);
     }
 }

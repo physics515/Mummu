@@ -69,9 +69,10 @@ pub fn waterfill(pending: &[f64], bandwidth: f64) -> Vec<f64> {
 
 /// The online dual variable of the waterfilling problem: a price on bus
 /// bytes that rises while measured demand exceeds the target and decays
-/// toward zero when the bus has slack. Consumers that solve
-/// `max_x U(x) - mu x` locally then converge to the fair split without a
-/// central allocator running per token.
+/// toward zero when the bus has slack.
+///
+/// Consumers that solve `max_x U(x) - mu x` locally then converge to the
+/// fair split without a central allocator running per token.
 #[derive(Debug, Clone)]
 pub struct ShadowPrice {
     mu: f64,
@@ -83,6 +84,10 @@ pub struct ShadowPrice {
 }
 
 impl ShadowPrice {
+    /// A price of zero with dual step `gamma`.
+    ///
+    /// # Panics
+    /// If `gamma` is not finite and positive.
     #[must_use]
     pub fn new(gamma: f64) -> Self {
         assert!(
@@ -94,24 +99,33 @@ impl ShadowPrice {
 
     /// Current price.
     #[must_use]
-    pub fn price(&self) -> f64 {
+    pub const fn price(&self) -> f64 {
         self.mu
     }
 
     /// One dual step: `mu <- [mu + gamma * (measured_total - target)]+`.
     /// Returns the updated price.
+    ///
+    /// # Panics
+    /// If `measured_total` or `target` is not finite.
     pub fn observe(&mut self, measured_total: f64, target: f64) -> f64 {
         assert!(
             measured_total.is_finite() && target.is_finite(),
             "ShadowPrice::observe: non-finite input"
         );
-        self.mu = (self.mu + self.gamma * (measured_total - target)).max(0.0);
+        self.mu = self
+            .gamma
+            .mul_add(measured_total - target, self.mu)
+            .max(0.0);
         self.mu
     }
 
     /// The utility-maximizing demand of a `-W/x` consumer at the current
     /// price: `x*(mu) = sqrt(W / mu)` (unbounded at price zero — the caller
     /// caps by its physical ceiling).
+    ///
+    /// # Panics
+    /// If `pending` or `ceiling` is negative.
     #[must_use]
     pub fn demand(&self, pending: f64, ceiling: f64) -> f64 {
         assert!(pending >= 0.0 && ceiling >= 0.0);
@@ -128,16 +142,16 @@ impl ShadowPrice {
 // ---------------------------------------------------------------------------
 
 /// Row-major matrix product.
-fn matmul(a: &[Vec<f64>], b: &[Vec<f64>]) -> Vec<Vec<f64>> {
-    let (n, k) = (a.len(), b.len());
-    let m = if k > 0 { b[0].len() } else { 0 };
-    let mut out = vec![vec![0.0; m]; n];
-    for i in 0..n {
-        assert_eq!(a[i].len(), k, "matmul: inner dims disagree");
-        for (p, brow) in b.iter().enumerate() {
-            let aip = a[i][p];
-            for j in 0..m {
-                out[i][j] += aip * brow[j];
+fn matmul(lhs: &[Vec<f64>], rhs: &[Vec<f64>]) -> Vec<Vec<f64>> {
+    let (rows, inner) = (lhs.len(), rhs.len());
+    let cols = if inner > 0 { rhs[0].len() } else { 0 };
+    let mut out = vec![vec![0.0; cols]; rows];
+    for i in 0..rows {
+        assert_eq!(lhs[i].len(), inner, "matmul: inner dims disagree");
+        for (p, brow) in rhs.iter().enumerate() {
+            let aip = lhs[i][p];
+            for j in 0..cols {
+                out[i][j] = aip.mul_add(brow[j], out[i][j]);
             }
         }
     }
@@ -197,7 +211,7 @@ fn solve(a: &[Vec<f64>], rhs: &[Vec<f64>]) -> Vec<Vec<f64>> {
             if row != col && aug[row][col] != 0.0 {
                 let f = aug[row][col];
                 for j in col..n + m {
-                    aug[row][j] -= f * aug[col][j];
+                    aug[row][j] = f.mul_add(-aug[col][j], aug[row][j]);
                 }
             }
         }
@@ -221,28 +235,28 @@ pub fn fit_dynamics(
     controls: &[Vec<f64>],
     next_states: &[Vec<f64>],
 ) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
-    let t = states.len();
-    assert!(t > 0, "fit_dynamics: no observations");
+    let observations = states.len();
+    assert!(observations > 0, "fit_dynamics: no observations");
     assert!(
-        controls.len() == t && next_states.len() == t,
+        controls.len() == observations && next_states.len() == observations,
         "fit_dynamics: observation counts disagree"
     );
     let ns = states[0].len();
     let nu = controls[0].len();
-    let d = ns + nu;
+    let dim = ns + nu;
     // Regressor rows z_t = [s_t; u_t]; solve (Z'Z + ridge I) Theta = Z' S'.
-    let z: Vec<Vec<f64>> = states
+    let regressors: Vec<Vec<f64>> = states
         .iter()
         .zip(controls)
-        .map(|(s, u)| {
-            assert_eq!(s.len(), ns, "fit_dynamics: ragged state");
-            assert_eq!(u.len(), nu, "fit_dynamics: ragged control");
-            s.iter().chain(u.iter()).copied().collect()
+        .map(|(state, control)| {
+            assert_eq!(state.len(), ns, "fit_dynamics: ragged state");
+            assert_eq!(control.len(), nu, "fit_dynamics: ragged control");
+            state.iter().chain(control.iter()).copied().collect()
         })
         .collect();
-    let zt = transpose(&z);
-    let mut ztz = matmul(&zt, &z);
-    let ridge = 1e-8 * (0..d).map(|i| ztz[i][i]).fold(1.0f64, f64::max);
+    let zt = transpose(&regressors);
+    let mut ztz = matmul(&zt, &regressors);
+    let ridge = 1e-8 * (0..dim).map(|i| ztz[i][i]).fold(1.0f64, f64::max);
     for (i, row) in ztz.iter_mut().enumerate() {
         row[i] += ridge;
     }
@@ -255,9 +269,10 @@ pub fn fit_dynamics(
 }
 
 /// Solve the discrete algebraic Riccati equation by fixed-point iteration
-/// (`P <- Q + A'PA - A'PB (R + B'PB)^-1 B'PA`), then return the
-/// infinite-horizon gain `K = (R + B'PB)^-1 B'PA`, so the control law is
-/// `u = -K s`.
+/// and return the infinite-horizon LQR gain.
+///
+/// The iteration is `P <- Q + A'PA - A'PB (R + B'PB)^-1 B'PA`; the gain
+/// returned is `K = (R + B'PB)^-1 B'PA`, so the control law is `u = -K s`.
 ///
 /// Converges for any stabilizable `(A, B)` with `Q >= 0`, `R > 0`; iteration
 /// stops when successive `P`s agree to 1e-10 relative or after `max_iter`.
@@ -278,29 +293,31 @@ pub fn lqr_gain(
     let nu = b[0].len();
     assert!(q.len() == ns && r.len() == nu, "lqr_gain: Q/R dims");
 
+    // Names follow the DARE: `riccati` is P, `control_term` is R + B'PB,
+    // `coupling` is B'PA, `state_term` is A'PA and `cross_term` is A'PB.
     let at = transpose(a);
     let bt = transpose(b);
-    let mut p = q.to_vec();
+    let mut riccati = q.to_vec();
     for _ in 0..max_iter {
-        let pa = matmul(&p, a); // P A
-        let pb = matmul(&p, b); // P B
-        let btpb = add(r, &matmul(&bt, &pb)); // R + B'PB
-        let btpa = matmul(&bt, &pa); // B'PA
-        let k = solve(&btpb, &btpa); // (R+B'PB)^-1 B'PA
-        let atpa = matmul(&at, &pa); // A'PA
-        let atpb = matmul(&at, &pb); // A'PB
-        let next = add(q, &sub(&atpa, &matmul(&atpb, &k)));
-        let delta = diff_norm(&p, &next);
+        let pa = matmul(&riccati, a); // P A
+        let pb = matmul(&riccati, b); // P B
+        let control_term = add(r, &matmul(&bt, &pb)); // R + B'PB
+        let coupling = matmul(&bt, &pa); // B'PA
+        let gain = solve(&control_term, &coupling); // (R+B'PB)^-1 B'PA
+        let state_term = matmul(&at, &pa); // A'PA
+        let cross_term = matmul(&at, &pb); // A'PB
+        let next = add(q, &sub(&state_term, &matmul(&cross_term, &gain)));
+        let delta = diff_norm(&riccati, &next);
         let scale = norm(&next).max(1.0);
-        p = next;
+        riccati = next;
         if delta / scale < 1e-10 {
             break;
         }
     }
-    let pb = matmul(&p, b);
-    let btpb = add(r, &matmul(&bt, &pb));
-    let btpa = matmul(&bt, &matmul(&p, a));
-    solve(&btpb, &btpa)
+    let pb = matmul(&riccati, b);
+    let control_term = add(r, &matmul(&bt, &pb));
+    let coupling = matmul(&bt, &matmul(&riccati, a));
+    solve(&control_term, &coupling)
 }
 
 fn sub(a: &[Vec<f64>], b: &[Vec<f64>]) -> Vec<Vec<f64>> {
@@ -339,11 +356,12 @@ pub fn lqr_control(k: &[Vec<f64>], s: &[f64]) -> Vec<f64> {
 // Byte-ledger admission (the TDMA-lite slice of SPEC P1.2)
 // ---------------------------------------------------------------------------
 
-/// A per-step DRAM byte budget for one consumer class. The point is
-/// *admission over priority*: instead of asking the OS scheduler to keep
-/// staging copies from stampeding the weight stream (it arbitrates at
-/// millisecond quanta and loses), the step hands each class a byte budget
-/// and the class defers work that does not fit to the next step.
+/// A per-step DRAM byte budget for one consumer class.
+///
+/// The point is *admission over priority*: instead of asking the OS
+/// scheduler to keep staging copies from stampeding the weight stream (it
+/// arbitrates at millisecond quanta and loses), the step hands each class a
+/// byte budget and the class defers work that does not fit to the next step.
 ///
 /// The ledger never blocks — `admit` answers, the caller chooses. Work that
 /// MUST happen this step (correctness) is charged with [`Ledger::charge`]
@@ -357,7 +375,7 @@ pub struct Ledger {
 
 impl Ledger {
     #[must_use]
-    pub fn new(budget_bytes: u64) -> Self {
+    pub const fn new(budget_bytes: u64) -> Self {
         Self {
             budget: budget_bytes,
             spent: 0,
@@ -366,13 +384,13 @@ impl Ledger {
 
     /// Would `bytes` more fit this step's budget?
     #[must_use]
-    pub fn admit(&self, bytes: u64) -> bool {
+    pub const fn admit(&self, bytes: u64) -> bool {
         self.spent.saturating_add(bytes) <= self.budget
     }
 
     /// Record `bytes` as moved (admitted or not — mandatory traffic charges
     /// unconditionally and overdraws).
-    pub fn charge(&mut self, bytes: u64) {
+    pub const fn charge(&mut self, bytes: u64) {
         self.spent = self.spent.saturating_add(bytes);
     }
 
@@ -386,7 +404,7 @@ impl Ledger {
 
     /// Start the next step: budget may carry a correction (e.g. last step's
     /// overdraft subtracted by the caller).
-    pub fn reset(&mut self, budget_bytes: u64) {
+    pub const fn reset(&mut self, budget_bytes: u64) {
         self.budget = budget_bytes;
         self.spent = 0;
     }
@@ -461,6 +479,9 @@ impl ThreadTuner {
     /// width (>2x its recorded best) clears the neighbors' records so the
     /// search re-opens — machine state changed, and the old picks are stale
     /// (the autotune-cache lesson).
+    ///
+    /// # Panics
+    /// If `median_ms` is not finite and positive.
     pub fn observe(&mut self, median_ms: f64) -> usize {
         assert!(
             median_ms.is_finite() && median_ms > 0.0,
@@ -483,12 +504,14 @@ impl ThreadTuner {
             self.observed[self.cur] = median_ms;
         }
 
-        // Probe an unmeasured neighbor before judging direction.
-        for delta in [1i64, -1] {
-            let n = self.cur as i64 + delta;
-            if n >= 0 && (n as usize) < self.candidates.len() && self.observed[n as usize].is_nan()
-            {
-                self.cur = n as usize;
+        // Probe an unmeasured neighbor before judging direction: the wider
+        // one first, then the narrower.
+        for neighbor in [Some(self.cur + 1), self.cur.checked_sub(1)]
+            .into_iter()
+            .flatten()
+        {
+            if neighbor < self.candidates.len() && self.observed[neighbor].is_nan() {
+                self.cur = neighbor;
                 self.streak = 0;
                 return self.width();
             }
@@ -523,6 +546,7 @@ impl ThreadTuner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mummu_num::{f64_from_u64, f64_from_usize};
 
     // -- waterfill ---------------------------------------------------------
 
@@ -599,21 +623,26 @@ mod tests {
         let b = vec![vec![1.0]];
         let q = vec![vec![1.0]];
         let r = vec![vec![1.0]];
-        let k = lqr_gain(&a, &b, &q, &r, 10_000)[0][0];
+        let gain = lqr_gain(&a, &b, &q, &r, 10_000)[0][0];
         // Solve the scalar DARE independently by bisection on P.
-        let f = |p: f64| 1.0 + 0.81 * p - 0.81 * p * p / (1.0 + p) - p;
+        let residual = |p_trial: f64| {
+            0.81f64.mul_add(p_trial, 1.0) - 0.81 * p_trial * p_trial / (1.0 + p_trial) - p_trial
+        };
         let (mut lo, mut hi) = (0.0, 100.0);
         for _ in 0..200 {
-            let mid = 0.5 * (lo + hi);
-            if f(mid) > 0.0 {
+            let mid = f64::midpoint(lo, hi);
+            if residual(mid) > 0.0 {
                 lo = mid;
             } else {
                 hi = mid;
             }
         }
-        let p = 0.5 * (lo + hi);
-        let k_ref = 0.9 * p / (1.0 + p);
-        assert!((k - k_ref).abs() < 1e-6, "K {k} vs closed form {k_ref}");
+        let riccati = f64::midpoint(lo, hi);
+        let k_ref = 0.9 * riccati / (1.0 + riccati);
+        assert!(
+            (gain - k_ref).abs() < 1e-6,
+            "K {gain} vs closed form {k_ref}"
+        );
     }
 
     #[test]
@@ -627,19 +656,27 @@ mod tests {
             seed ^= seed << 13;
             seed ^= seed >> 7;
             seed ^= seed << 17;
-            (seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+            f64_from_u64(seed >> 11) / f64_from_u64(1u64 << 53) - 0.5
         };
         let mut states = Vec::new();
         let mut controls = Vec::new();
         let mut nexts = Vec::new();
         for _ in 0..64 {
-            let s = [rand() * 4.0, rand() * 4.0];
-            let u = rand() * 2.0;
-            states.push(s.to_vec());
-            controls.push(vec![u]);
+            let state = [rand() * 4.0, rand() * 4.0];
+            let control = rand() * 2.0;
+            states.push(state.to_vec());
+            controls.push(vec![control]);
             nexts.push(vec![
-                a_true[0][0] * s[0] + a_true[0][1] * s[1] + b_true[0][0] * u,
-                a_true[1][0] * s[0] + a_true[1][1] * s[1] + b_true[1][0] * u,
+                f64::mul_add(
+                    b_true[0][0],
+                    control,
+                    f64::mul_add(a_true[0][1], state[1], a_true[0][0] * state[0]),
+                ),
+                f64::mul_add(
+                    b_true[1][0],
+                    control,
+                    f64::mul_add(a_true[1][1], state[1], a_true[1][0] * state[0]),
+                ),
             ]);
         }
         let (a, b) = fit_dynamics(&states, &controls, &nexts);
@@ -651,18 +688,26 @@ mod tests {
         }
         let q = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
         let r = vec![vec![0.1]];
-        let k = lqr_gain(&a, &b, &q, &r, 10_000);
+        let gain = lqr_gain(&a, &b, &q, &r, 10_000);
         // Closed loop from a large start must contract to ~zero.
-        let mut s = vec![10.0, -8.0];
+        let mut state = vec![10.0, -8.0];
         for _ in 0..200 {
-            let u = lqr_control(&k, &s);
-            let ns = vec![
-                a_true[0][0] * s[0] + a_true[0][1] * s[1] + b_true[0][0] * u[0],
-                a_true[1][0] * s[0] + a_true[1][1] * s[1] + b_true[1][0] * u[0],
+            let control = lqr_control(&gain, &state);
+            let next_state = vec![
+                f64::mul_add(
+                    b_true[0][0],
+                    control[0],
+                    f64::mul_add(a_true[0][1], state[1], a_true[0][0] * state[0]),
+                ),
+                f64::mul_add(
+                    b_true[1][0],
+                    control[0],
+                    f64::mul_add(a_true[1][1], state[1], a_true[1][0] * state[0]),
+                ),
             ];
-            s = ns;
+            state = next_state;
         }
-        let norm = (s[0] * s[0] + s[1] * s[1]).sqrt();
+        let norm = state[0].hypot(state[1]);
         assert!(norm < 1e-3, "closed loop did not contract: |s| = {norm}");
     }
 
@@ -686,8 +731,8 @@ mod tests {
 
     /// A synthetic unimodal cost curve with the minimum at 12 threads.
     fn cost(width: usize) -> f64 {
-        let w = width as f64;
-        1.0 + (w - 12.0) * (w - 12.0) * 0.02
+        let w = f64_from_usize(width);
+        ((w - 12.0) * (w - 12.0)).mul_add(0.02, 1.0)
     }
 
     #[test]
@@ -711,7 +756,10 @@ mod tests {
         // Regime change: minimum moves to 4 (heavy contention penalizes
         // width), and the settled width's cost triples — the tuner must
         // notice and re-search rather than trusting stale records.
-        let cost2 = |w: usize| 3.0 + (w as f64 - 4.0) * (w as f64 - 4.0) * 0.05;
+        let cost2 = |w: usize| {
+            let w = f64_from_usize(w);
+            ((w - 4.0) * (w - 4.0)).mul_add(0.05, 3.0)
+        };
         for _ in 0..64 {
             width = t.observe(cost2(width));
         }

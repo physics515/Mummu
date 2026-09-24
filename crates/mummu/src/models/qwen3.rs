@@ -1,7 +1,7 @@
 //! Qwen3 dense decoder, from scratch on the shared `nn` blocks. Structurally
 //! Qwen2 with three deltas the shared blocks already cover:
-//!   * **per-head q/k RMSNorm** over `head_dim`, applied post-projection before
-//!     RoPE — `GqaAttention`'s `qk_norm_eps` path (the same code the LFM2 port
+//!   * **per-head q/k `RMSNorm`** over `head_dim`, applied post-projection before
+//!     `RoPE` — `GqaAttention`'s `qk_norm_eps` path (the same code the LFM2 port
 //!     validated against Ollama; HF Qwen3 orders it identically:
 //!     `q_norm(q_proj(x).view(b,t,nh,hd)).transpose(1,2)`);
 //!   * **no q/k/v projection bias** (`attention_bias: false`);
@@ -9,7 +9,7 @@
 //!     `hidden_size` (Qwen3-4B: 32·128 = 4096 vs hidden 2560), which
 //!     `GqaAttentionConfig` already treats as independent.
 //!
-//! Everything else — RmsNorm, GQA + KV cache, SwiGLU, tied/untied lm-head — is
+//! Everything else — `RmsNorm`, GQA + KV cache, `SwiGLU`, tied/untied lm-head — is
 //! the shared stack, so this file is config + weight-key remaps only. The port
 //! stays `[ ]` in the roadmap until Mummu's parity gate (P7) re-verifies it
 //! against a same-weights reference; loading and decoding are proven here.
@@ -29,7 +29,8 @@ use crate::import::{
 use crate::models::CausalLm;
 use crate::models::qwen2::{EosIds, gguf_f32, gguf_usize};
 use crate::nn::{
-    GqaAttention, GqaAttentionConfig, LayerKv, SwiGluMlp, SwiGluMlpConfig, causal_mask, rope_tables,
+    GqaAttention, GqaAttentionConfig, HeadShape, LayerKv, SwiGluMlp, SwiGluMlpConfig, causal_mask,
+    rope_tables,
 };
 
 /// Qwen3 architecture hyperparameters, read from the checkpoint's `config.json`.
@@ -47,7 +48,7 @@ pub struct Qwen3Config {
     pub head_dim: usize,
     pub rms_norm_eps: f64,
     pub rope_theta: f32,
-    /// Frequency scaling (YaRN / linear / …). `null` on the Qwen3 checkpoints
+    /// Frequency scaling (`YaRN` / linear / …). `null` on the Qwen3 checkpoints
     /// in the zoo; a scaled one is refused at load rather than answered wrong
     /// ([`crate::attn_config`]).
     /// `rope_parameters` is the same object under the name newer transformers
@@ -74,6 +75,13 @@ pub struct Qwen3Config {
 
 impl Qwen3Config {
     /// Parse `config.json` bytes; derives `head_dim` when absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns the JSON error as a string, or an error when validation
+    /// refuses the config: a non-plain rope scaling, a live (clipping)
+    /// sliding window, a head count that is not a positive multiple of the
+    /// KV heads, zero layers or vocab, or an odd `head_dim` below 2.
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, String> {
         let mut cfg: Self = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
         if cfg.head_dim == 0 {
@@ -85,8 +93,16 @@ impl Qwen3Config {
 
     /// Hyperparameters from a GGUF header's `qwen3.*` metadata. Unlike Qwen2,
     /// `head_dim` is **required** metadata (`qwen3.attention.key_length`),
-    /// because Qwen3's head_dim is decoupled — deriving it from
+    /// because Qwen3's `head_dim` is decoupled — deriving it from
     /// `hidden / heads` is wrong for these checkpoints (4B: 80 ≠ 128).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the architecture is not `qwen3`, a required
+    /// `qwen3.*` key is missing or not an integer/float, `token_embd.weight`
+    /// is absent or does not match `embedding_length`, the tokenizer vocab
+    /// exceeds the embedding rows, or the resulting config fails the same
+    /// validation as [`Self::from_json_bytes`].
     pub fn from_gguf(f: &GgufFile) -> Result<Self, String> {
         let arch = f.architecture().unwrap_or("<missing>");
         if arch != "qwen3" {
@@ -120,7 +136,7 @@ impl Qwen3Config {
         // key_length is Qwen3's real head_dim; only fall back for a malformed
         // file, and let validate() catch an impossible result.
         let head_dim = gguf_usize(f, "qwen3.attention.key_length")
-            .unwrap_or(hidden_size / num_attention_heads.max(1));
+            .unwrap_or_else(|_| hidden_size / num_attention_heads.max(1));
         let cfg = Self {
             vocab_size,
             hidden_size,
@@ -253,7 +269,7 @@ fn build(cfg: &Qwen3Config, device: &Device) -> Qwen3 {
     }
 }
 
-/// The safetensors key remap: strip `model.`, rename every RmsNorm `weight` →
+/// The safetensors key remap: strip `model.`, rename every `RmsNorm` `weight` →
 /// Burn's `gamma`. Qwen3 adds the per-head `self_attn.q_norm` / `k_norm` to the
 /// set of norms the qwen2 chain already handled.
 fn install_remaps(store: SafetensorsStore) -> SafetensorsStore {
@@ -267,6 +283,13 @@ fn install_remaps(store: SafetensorsStore) -> SafetensorsStore {
 }
 
 /// Build from `dir/config.json` and load `dir/model.safetensors`, checked.
+///
+/// # Errors
+///
+/// Returns an [`ImportError`] when `config.json` or `model.safetensors` is
+/// missing, when the config is unreadable or invalid, when the sibling
+/// tokenizer metadata contradicts it, or when the checked load finds the
+/// checkpoint incomplete or mismatched.
 pub fn load_from_dir(dir: &Path, device: &Device) -> Result<LoadedQwen3, ImportError> {
     let cfg_path = required_file(dir, "config.json")?;
     let weights = required_file(dir, "model.safetensors")?;
@@ -349,9 +372,18 @@ fn qwen3_gguf_name(name: &str) -> Option<String> {
     Some(format!("model.layers.{layer}.{mapped}"))
 }
 
-/// Load a Qwen3 model straight from a **GGUF** file: hyperparameters from the
-/// `qwen3.*` metadata, weights dequantized to f32 and driven through the same
-/// checked-load pipeline (adapters + remaps) the safetensors path uses.
+/// Load a Qwen3 model straight from a **GGUF** file.
+///
+/// Hyperparameters come from the `qwen3.*` metadata, weights are dequantized
+/// to f32 and driven through the same checked-load pipeline (adapters +
+/// remaps) the safetensors path uses.
+///
+/// # Errors
+///
+/// Returns an [`ImportError`] when the file cannot be opened or parsed as
+/// a GGUF, when its metadata fails [`Qwen3Config::from_gguf`], when a
+/// tensor name is unmapped or the dequant fails, or when the checked load
+/// finds the checkpoint incomplete or mismatched.
 pub fn load_from_gguf(path: &Path, device: &Device) -> Result<LoadedQwen3, ImportError> {
     let parse = |reason: String| ImportError::Parse {
         file: path.to_path_buf(),
@@ -403,7 +435,10 @@ impl CausalLm for LoadedQwen3 {
         let cfg = &self.config;
 
         // Dtype pinned to the backend TYPE, never the per-device policy.
-        let ids32: Vec<i32> = new_ids.iter().map(|&i| i as i32).collect();
+        let ids32: Vec<i32> = new_ids
+            .iter()
+            .map(|&i| i32::try_from(i).expect("token id fits i32"))
+            .collect();
         let input = Tensor::<1, Int>::from_data(
             TensorData::new(ids32, [t]),
             (device, crate::backend::int_dtype(device)),
@@ -416,16 +451,14 @@ impl CausalLm for LoadedQwen3 {
 
         for (layer, kv) in self.model.layers.iter().zip(cache.iter_mut()) {
             let h = layer.input_layernorm.forward(x.clone());
-            let h = layer.self_attn.forward(
-                h,
-                cfg.num_attention_heads,
-                cfg.num_key_value_heads,
-                cfg.head_dim,
-                &cos,
-                &sin,
-                mask.as_ref(),
-                kv,
-            );
+            let shape = HeadShape {
+                num_heads: cfg.num_attention_heads,
+                num_kv_heads: cfg.num_key_value_heads,
+                head_dim: cfg.head_dim,
+            };
+            let h = layer
+                .self_attn
+                .forward(h, shape, &cos, &sin, mask.as_ref(), kv);
             x = x.add(h);
             let h2 = layer.post_attention_layernorm.forward(x.clone());
             x = x.add(layer.mlp.forward(h2));
@@ -437,12 +470,11 @@ impl CausalLm for LoadedQwen3 {
             self.model.lm_head.is_some() != cfg.tie_word_embeddings,
             "lm_head presence must match the config's tie flag"
         );
-        match &self.model.lm_head {
-            Some(head) => head.forward(last), // [1, vocab]
-            None => {
-                let w = self.model.embed_tokens.weight.val(); // [vocab, hidden]
-                last.matmul(w.swap_dims(0, 1)) // [1, vocab]
-            }
+        if let Some(head) = &self.model.lm_head {
+            head.forward(last) // [1, vocab]
+        } else {
+            let w = self.model.embed_tokens.weight.val(); // [vocab, hidden]
+            last.matmul(w.swap_dims(0, 1)) // [1, vocab]
         }
     }
 }
@@ -452,7 +484,7 @@ mod tests {
     use super::*;
     use crate::gguf::{GgmlType, GgufTensorInfo};
 
-    /// A synthetic toy config with a **decoupled** head_dim (num_heads·head_dim
+    /// A synthetic toy config with a **decoupled** `head_dim` (`num_heads·head_dim`
     /// = 4·6 = 24 ≠ hidden 16), exercising the Qwen3-specific shape path.
     fn toy_config() -> Qwen3Config {
         Qwen3Config {

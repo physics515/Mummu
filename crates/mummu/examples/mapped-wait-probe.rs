@@ -1,7 +1,10 @@
 //! Decisive split: does `into_data` on a wgpu tensor BLOCK on the GPU, or
 //! does it return deferred-mapped bytes whose first CPU touch pays the
-//! fence? Submit ~hundreds of ms of GPU work, then time into_data, the
-//! flex from_data, and the first byte-touch separately.
+//! fence? Submit ~hundreds of ms of GPU work, then time `into_data`, the
+//! flex `from_data`, and the first byte-touch separately.
+
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use burn::tensor::Tensor;
 use mummu::backend;
 use std::time::Instant;

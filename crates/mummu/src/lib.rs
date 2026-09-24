@@ -6,13 +6,21 @@
 //! `B: Backend`; consumers (laurelane, Nanna) pick a device at runtime and
 //! keep their domain glue out of this crate.
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 // Burn's `fusion` feature wraps backends in deeply nested generic types.
 #![recursion_limit = "512"]
+
+// The bare `///` line under some of the `pub mod` docs below is load-bearing:
+// rustdoc concatenates the outer `///` here with the module's own `//!` header,
+// and without the paragraph break the merged first paragraph trips
+// `clippy::too_long_first_doc_paragraph` (whose report carries no span, so it is
+// a long hunt from scratch).
 
 pub mod adapt;
 pub mod attn_config;
 /// Wall-clock attribution machinery: exact Shapley values over togglable
 /// components, with repeated-measure confidence intervals (SPEC 2).
+///
 pub mod attrib;
 pub mod backend;
 pub mod cache;
@@ -34,6 +42,7 @@ pub mod manage;
 pub mod overlay;
 /// Synchronous-dataflow model of the decode step: priced DAG, the maximum
 /// cycle ratio, and the T* period floor (SPEC 2).
+///
 pub mod sdf;
 /// Scheduler B — per-tensor precision placement (crate `mummu-mix`).
 pub use mummu_mix as mix;
@@ -45,6 +54,7 @@ pub mod plan;
 pub mod prof;
 /// Structured load progress — what a progress bar reads instead of scraping
 /// the loader's once-per-15-seconds log line (SPEC: see the module header).
+///
 pub mod progress;
 pub mod quant;
 pub mod registry;
@@ -52,6 +62,7 @@ pub mod safetensors;
 /// Scheduler A — dividing work across devices (crate `mummu-schedule`).
 pub use mummu_schedule as schedule;
 /// Render a checkpoint's own imported chat template (feature `jinja-template`).
+///
 #[cfg(feature = "jinja-template")]
 pub mod template;
 pub mod tier;

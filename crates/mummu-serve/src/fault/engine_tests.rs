@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use axum::body::Bytes;
 use axum::response::Response;
 use futures::StreamExt;
+use mummu_num::f32_from_usize;
 use serde_json::{Value, json};
 
 use super::{Arm, arm, last_load, loads};
@@ -57,7 +58,7 @@ fn safetensors(tensors: &[(String, Vec<usize>)]) -> Vec<u8> {
             let v = if is_norm {
                 1.0f32
             } else {
-                (((k * 7 + i * 13) % 11) as f32 - 5.0) * 0.02
+                (f32_from_usize((k * 7 + i * 13) % 11) - 5.0) * 0.02
             };
             data.extend_from_slice(&v.to_le_bytes());
         }
@@ -144,12 +145,12 @@ fn write_tiny_qwen2(dir: &Path) {
 struct Fixture {
     root: Scratch,
     local: Scratch,
-    _serial: std::sync::MutexGuard<'static, ()>,
+    _serial: tokio::sync::MutexGuard<'static, ()>,
 }
 
 impl Fixture {
-    fn new(name: &str) -> Self {
-        let serial = crate::progress_serial();
+    async fn new(name: &str) -> Self {
+        let serial = crate::progress_serial().await;
         recovery::reset_for_tests();
         recovery::install_panic_hook();
         engine::register_devices();
@@ -273,9 +274,8 @@ fn poisoned_on(key: DeviceKey) -> bool {
 /// The fixture is a real model on the real path: it loads once, answers, and
 /// a second chat is a hit on the slot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[allow(clippy::await_holding_lock)] // the fixture serializes tests; nothing else waits on it
 async fn the_fixture_loads_once_and_answers_through_the_real_engine() {
-    let fx = Fixture::new("happy");
+    let fx = Fixture::new("happy").await;
     let before = loads();
     assert_answered(&chat().await);
     assert_eq!(loads(), before + 1);
@@ -293,9 +293,8 @@ async fn the_fixture_loads_once_and_answers_through_the_real_engine() {
 /// loads fresh — and the CPU load that answers it does NOT clear the card's
 /// poison, because it proves nothing about the card.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[allow(clippy::await_holding_lock)] // the fixture serializes tests; nothing else waits on it
 async fn an_oom_during_the_load_fails_the_load_and_nothing_half_placed_is_kept() {
-    let fx = Fixture::new("load-oom");
+    let fx = Fixture::new("load-oom").await;
     // As plan_fit's GGUF ladder notes a model it plans, before the load.
     engine::test_support::note(BackendChoice::Cpu, &fx.dir());
     arm(Arm {
@@ -338,6 +337,9 @@ async fn an_oom_during_the_load_fails_the_load_and_nothing_half_placed_is_kept()
         engine::test_support::noted(&fx.dir()),
         "a model that landed lost its residency note"
     );
+    // The fixture holds `progress_serial` for the whole test: released
+    // here, at the end, and not at its last mention above.
+    drop(fx);
 }
 
 /// A device failure no request caught — the hook saw it on a device thread
@@ -345,9 +347,8 @@ async fn an_oom_during_the_load_fails_the_load_and_nothing_half_placed_is_kept()
 /// stamp, checked under the slot lock, stops it being served. The next chat
 /// must reload.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[allow(clippy::await_holding_lock)] // the fixture serializes tests; nothing else waits on it
 async fn a_device_failure_nobody_caught_makes_the_resident_model_stale() {
-    let fx = Fixture::new("stale");
+    let fx = Fixture::new("stale").await;
     assert_answered(&chat().await);
     let loaded = loads();
     arm(Arm {
@@ -380,9 +381,8 @@ async fn a_device_failure_nobody_caught_makes_the_resident_model_stale() {
 /// The next chat loads fresh, and that load (on the model's own device)
 /// clears the poison.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[allow(clippy::await_holding_lock)] // the fixture serializes tests; nothing else waits on it
 async fn an_error_path_device_failure_moves_the_epoch_and_the_model_is_never_served_again() {
-    let fx = Fixture::new("err-path");
+    let fx = Fixture::new("err-path").await;
     assert_answered(&chat().await);
     let (loaded, epoch) = (loads(), recovery::fault_epoch());
     arm(Arm {
@@ -417,9 +417,8 @@ async fn an_error_path_device_failure_moves_the_epoch_and_the_model_is_never_ser
 /// epoch — and each has its own test above; this one fails only if both
 /// go, and it is here because it is the scenario the review described.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[allow(clippy::await_holding_lock)] // the fixture serializes tests; nothing else waits on it
 async fn a_request_queued_behind_an_error_path_failure_gets_a_fresh_model() {
-    let _fx = Fixture::new("err-queued");
+    let _fx = Fixture::new("err-queued").await;
     assert_answered(&chat().await);
     let loaded = loads();
     arm(Arm {
@@ -451,9 +450,8 @@ fn count_exit(_: i32) {
 /// in a row for the card — the sticky fault a restart is for — and the
 /// second one restarts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[allow(clippy::await_holding_lock)] // the fixture serializes tests; nothing else waits on it
 async fn a_token_resets_the_failure_count_only_on_the_device_that_produced_it() {
-    let fx = Fixture::new("count");
+    let fx = Fixture::new("count").await;
     fx.supervise(count_exit);
     let exits = COUNT_EXITS.load(SeqCst);
 
@@ -492,6 +490,9 @@ async fn a_token_resets_the_failure_count_only_on_the_device_that_produced_it() 
         wait_for(&COUNT_EXITS, exits + 1, Duration::from_secs(5)),
         "the restart was decided and never taken"
     );
+    // The fixture holds `progress_serial` for the whole test: released
+    // here, at the end, and not at its last mention above.
+    drop(fx);
 }
 
 static LATCH_EXITS: AtomicU32 = AtomicU32::new(0);
@@ -504,9 +505,8 @@ fn latch_exit(_: i32) {
 /// every entry check before the decision existed — is refused at the load
 /// closure, the first point it would touch the device. It must not load.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[allow(clippy::await_holding_lock)] // the fixture serializes tests; nothing else waits on it
 async fn a_request_queued_behind_a_restart_decision_is_refused_not_loaded() {
-    let fx = Fixture::new("latch");
+    let fx = Fixture::new("latch").await;
     fx.supervise(latch_exit);
     let exits = LATCH_EXITS.load(SeqCst);
     arm(Arm {
@@ -535,6 +535,9 @@ async fn a_request_queued_behind_a_restart_decision_is_refused_not_loaded() {
         "the queued request started a load on a device the process had decided to leave"
     );
     assert!(wait_for(&LATCH_EXITS, exits + 1, Duration::from_secs(5)));
+    // The fixture holds `progress_serial` for the whole test: released
+    // here, at the end, and not at its last mention above.
+    drop(fx);
 }
 
 static REFUSE_EXITS: AtomicU32 = AtomicU32::new(0);
@@ -546,9 +549,8 @@ fn refuse_exit(_: i32) {
 /// real status on both surfaces — a 503, not a 200 whose stream then says
 /// so — and nothing is loaded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[allow(clippy::await_holding_lock)] // the fixture serializes tests; nothing else waits on it
 async fn every_entry_point_refuses_a_new_chat_while_restarting() {
-    let fx = Fixture::new("refuse");
+    let fx = Fixture::new("refuse").await;
     fx.supervise(refuse_exit);
     let exits = REFUSE_EXITS.load(SeqCst);
     let _ = recovery::record_failure(MODEL, &[CUDA0], "CUDA_ERROR_ILLEGAL_ADDRESS");
@@ -558,7 +560,7 @@ async fn every_entry_point_refuses_a_new_chat_while_restarting() {
 
     let native = crate::chat(request()).await;
     assert_eq!(native.status(), 503, "POST /api/chat during a restart");
-    let shim = crate::shim::chat(Bytes::from(
+    let shim = Box::pin(crate::shim::chat(Bytes::from(
         json!({
             "model": MODEL,
             "messages": [{"role": "user", "content": "hello there"}],
@@ -566,7 +568,7 @@ async fn every_entry_point_refuses_a_new_chat_while_restarting() {
             "options": {"temperature": 0, "num_predict": 3},
         })
         .to_string(),
-    ))
+    )))
     .await;
     assert_eq!(
         shim.status(),
@@ -575,15 +577,17 @@ async fn every_entry_point_refuses_a_new_chat_while_restarting() {
     );
     assert_eq!(loads(), before, "a refused chat loaded a model");
     assert!(wait_for(&REFUSE_EXITS, exits + 1, Duration::from_secs(5)));
+    // The fixture holds `progress_serial` for the whole test: released
+    // here, at the end, and not at its last mention above.
+    drop(fx);
 }
 
 /// A chat response still being written counts as in flight — from the moment
 /// it is handed out until its last frame — so an exiting process waits for
 /// the error frame it owes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[allow(clippy::await_holding_lock)] // the fixture serializes tests; nothing else waits on it
 async fn an_open_chat_response_counts_as_in_flight_until_its_last_frame() {
-    let _fx = Fixture::new("in-flight");
+    let _fx = Fixture::new("in-flight").await;
     assert_answered(&chat().await);
     assert_eq!(recovery::in_flight(), 0);
     arm(Arm {
@@ -613,9 +617,8 @@ fn drain_exit(_: i32) {
 /// client still reading its error frame holds the process up; when it is
 /// done, the exit is taken.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[allow(clippy::await_holding_lock)] // the fixture serializes tests; nothing else waits on it
 async fn the_exit_waits_for_open_responses_before_it_goes() {
-    let fx = Fixture::new("drain");
+    let fx = Fixture::new("drain").await;
     fx.supervise(drain_exit);
     let exits = DRAIN_EXITS.load(SeqCst);
     arm(Arm {
@@ -641,6 +644,9 @@ async fn the_exit_waits_for_open_responses_before_it_goes() {
         wait_for(&DRAIN_EXITS, exits + 1, Duration::from_secs(3)),
         "and it did not exit once the response closed"
     );
+    // The fixture holds `progress_serial` for the whole test: released
+    // here, at the end, and not at its last mention above.
+    drop(fx);
 }
 
 /// MINOR 6: mummu catches some device-thread panics on purpose — the kernel
@@ -649,9 +655,8 @@ async fn the_exit_waits_for_open_responses_before_it_goes() {
 /// health stays 200. An OOM in the very same window still poisons the
 /// device and makes the model stale.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[allow(clippy::await_holding_lock)] // the fixture serializes tests; nothing else waits on it
 async fn a_handled_kernel_gap_does_not_poison_but_an_oom_in_the_same_window_does() {
-    let _fx = Fixture::new("kernel-gap");
+    let _fx = Fixture::new("kernel-gap").await;
     assert_answered(&chat().await);
     let (loaded, epoch) = (loads(), recovery::fault_epoch());
     arm(Arm {
@@ -695,9 +700,8 @@ async fn a_handled_kernel_gap_does_not_poison_but_an_oom_in_the_same_window_does
 /// (no fit check, placeholder policy) that finds the resident copy stale
 /// must plan its load afresh — never load under the shortcut's plan.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[allow(clippy::await_holding_lock)] // the fixture serializes tests; nothing else waits on it
 async fn a_load_planned_against_a_resident_copy_that_went_stale_is_planned_afresh() {
-    let fx = Fixture::new("replan");
+    let fx = Fixture::new("replan").await;
     assert_answered(&chat().await);
     let loaded = loads();
     // As plan_fit's GGUF ladder notes a model it plans.
@@ -714,16 +718,18 @@ async fn a_load_planned_against_a_resident_copy_that_went_stale_is_planned_afres
         !info.from_resident,
         "the reload ran under the resident shortcut's plan — no fit check: {info:?}"
     );
+    // The fixture holds `progress_serial` for the whole test: released
+    // here, at the end, and not at its last mention above.
+    drop(fx);
 }
 
 /// MINOR 7: the eviction outside the engine says exactly what it found — an
 /// empty slot is not a dropped model, and a slot another request holds is
 /// neither dropped nor claimed to hold a model from before the failure.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[allow(clippy::await_holding_lock)] // the fixture serializes tests; nothing else waits on it
 async fn the_eviction_says_only_what_happened() {
     use mummu::cache::Cleared;
-    let fx = Fixture::new("evict-says");
+    let fx = Fixture::new("evict-says").await;
     let empty = engine::evict_after_device_failure();
     assert_eq!(empty, Cleared::Empty);
     let line = engine::eviction_line(&empty);
@@ -739,7 +745,7 @@ async fn the_eviction_says_only_what_happened() {
         engine::eviction_line(&dropped).contains("dropped the resident model"),
         "{dropped:?}"
     );
-    assert!(engine::resident_dirs().is_empty());
+    assert_eq!(engine::resident_dirs(), [] as [std::path::PathBuf; 0]);
 
     arm(Arm {
         stall_ms: 400,
@@ -761,9 +767,8 @@ async fn the_eviction_says_only_what_happened() {
 /// the engine's, reported through `recovery::contain` — still evicts the
 /// resident model rather than leaving it for the fault stamp alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[allow(clippy::await_holding_lock)] // the fixture serializes tests; nothing else waits on it
 async fn a_device_failure_decided_outside_the_engine_still_evicts_the_resident_model() {
-    let _fx = Fixture::new("fallback-evict");
+    let _fx = Fixture::new("fallback-evict").await;
     assert_answered(&chat().await);
     let stream = crate::spawn_chat(MODEL.into(), false, |_| async {
         Err::<engine::ChatResult, _>(ChatError::request(super::INVALID_READ_ERR))

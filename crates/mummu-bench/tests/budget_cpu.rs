@@ -6,12 +6,15 @@
 //! MUMMU_QWEN2_05B_DIR=path/to/qwen2.5-0.5b cargo test -p mummu-bench --release --test budget_cpu -- --ignored --nocapture
 //! ```
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use std::path::PathBuf;
 use std::time::Instant;
 
 use mummu::decode::argmax_id;
 use mummu::models::CausalLm;
 use mummu::models::qwen2;
+use mummu_num::f64_from_usize;
 use tokenizers::Tokenizer;
 
 /// From bench/BASELINE.md (recorded 11.7 tok/s on 2026-07-10; ~2x headroom).
@@ -57,7 +60,7 @@ async fn qwen2_05b_cpu_decode_stays_inside_its_budget() {
         next = argmax_id(logits).await.expect("argmax");
         out.push(next);
     }
-    let tok_per_s = DECODE_STEPS as f64 / start.elapsed().as_secs_f64();
+    let tok_per_s = f64_from_usize(DECODE_STEPS) / start.elapsed().as_secs_f64();
     let text = tok.decode(&out, true).expect("decode");
 
     eprintln!(

@@ -1,4 +1,4 @@
-//! How small do a qwen35 checkpoint's DeltaNet q/k head norms get, and how
+//! How small do a qwen35 checkpoint's `DeltaNet` q/k head norms get, and how
 //! far does the q/k L2 form ([`GdnL2`]) move its logits?
 //!
 //! ```text
@@ -16,12 +16,16 @@
 //! Runs on flex unless `PROBE_DEVICE=gpu`. Set `MUMMU_GDN_CHUNK=off` for
 //! prompts past ~256 tokens on a tree without the chunked-prefill NaN fix.
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use std::time::Instant;
 
+use burn::tensor::Device;
 use mummu::chat::Turn;
 use mummu::models::CausalLm;
-use mummu::models::qwen35::{self, GdnL2, gdn_l2_probe};
+use mummu::models::qwen35::{self, GdnL2, LoadedQwen35, gdn_l2_probe};
 use mummu::quant::QuantPolicy;
+use mummu_num::{f64_from_usize, trunc_usize};
 
 fn prompts() -> Vec<(&'static str, Vec<Turn>)> {
     vec![
@@ -88,7 +92,7 @@ fn prompts() -> Vec<(&'static str, Vec<Turn>)> {
 }
 
 fn log_softmax(x: &[f32]) -> Vec<f64> {
-    let m = x.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+    let m = f64::from(x.iter().copied().fold(f32::NEG_INFINITY, f32::max));
     let lse = m + x
         .iter()
         .map(|&v| (f64::from(v) - m).exp())
@@ -100,162 +104,133 @@ fn log_softmax(x: &[f32]) -> Vec<f64> {
 fn top(lp: &[f64], k: usize) -> Vec<u32> {
     let mut idx: Vec<usize> = (0..lp.len()).collect();
     idx.sort_by(|&a, &b| lp[b].total_cmp(&lp[a]));
-    idx[..k].iter().map(|&i| i as u32).collect()
+    idx[..k]
+        .iter()
+        .map(|&i| u32::try_from(i).expect("vocab index fits u32"))
+        .collect()
 }
 
 /// Relative difference between the two forms' normalized head at norm `n`.
 fn rel(n: f32, eps: f64) -> f64 {
     let n = f64::from(n);
-    1.0 - n.max(eps) / (n * n + eps).sqrt()
+    1.0 - n.max(eps) / f64::mul_add(n, n, eps).sqrt()
 }
 
 fn quantile(sorted: &[f32], q: f64) -> f32 {
-    sorted[((sorted.len() - 1) as f64 * q).round() as usize]
+    sorted[trunc_usize((f64_from_usize(sorted.len() - 1) * q).round())]
 }
 
-#[tokio::main]
-async fn main() {
-    let mut args = std::env::args().skip(1);
-    let path = std::path::PathBuf::from(
-        args.next()
-            .expect("usage: gdn-l2-probe <gguf> <off|q8|q4> [greedy_tokens]"),
-    );
-    let policy = match args.next().as_deref() {
-        Some("off") | None => QuantPolicy::Off,
-        Some("q8") => QuantPolicy::Q8,
-        Some("q4") => QuantPolicy::Q4,
-        Some(other) => panic!("unknown quant policy {other:?} (off|q8|q4)"),
-    };
-    let greedy: usize = args.next().map_or(0, |s| s.parse().expect("greedy_tokens"));
-    let device = match std::env::var("PROBE_DEVICE").as_deref() {
-        Ok("gpu") => mummu::backend::gpu_device(),
-        _ => mummu::backend::cpu_device(),
-    };
-
-    let f = mummu::gguf::GgufFile::open(&path).expect("gguf opens");
-    let tok = mummu::tokenizer::tokenizer_from_gguf(&f).expect("tokenizer from gguf");
-    drop(f);
-
-    let t0 = Instant::now();
-    let mut loaded = qwen35::load_from_gguf_quantized(&path, &device, policy).expect("model loads");
-    let cfg = loaded.config.clone();
-    let eps = cfg.rms_norm_eps;
-    let delta_layers: Vec<usize> = (0..cfg.num_layers)
-        .filter(|&i| !cfg.is_attention(i))
-        .collect();
-    eprintln!(
-        "[gdn-l2] {} | {policy:?} on {device:?} | loaded in {:.1}s | layers {} ({} DeltaNet) \
-         hk {} hv {} ds {} eps {eps:e} | default form {:?}",
-        path.display(),
-        t0.elapsed().as_secs_f32(),
-        cfg.num_layers,
-        delta_layers.len(),
-        cfg.n_k_heads,
-        cfg.n_v_heads,
-        cfg.d_state,
-        cfg.gdn_l2,
-    );
-
-    let mut pooled_q: Vec<Vec<f32>> = vec![Vec::new(); delta_layers.len()];
-    let mut pooled_k: Vec<Vec<f32>> = vec![Vec::new(); delta_layers.len()];
-
-    for (name, turns) in prompts() {
-        let rendered = mummu::chat::ChatMl::qwen3().render(&turns);
-        let ids = tok
-            .encode(rendered.as_str(), false)
-            .expect("prompt encodes")
-            .get_ids()
-            .to_vec();
-
-        let mut logits = Vec::new();
-        for form in [GdnL2::ClampNorm, GdnL2::AddEps] {
-            loaded.config.gdn_l2 = form;
-            gdn_l2_probe::set_enabled(form == GdnL2::ClampNorm);
-            let t = Instant::now();
-            let mut cache = loaded.new_cache();
-            let l = loaded
-                .forward(&ids, 0, &mut cache, &device)
-                .into_data()
-                .convert::<f32>()
-                .try_to_vec::<f32>()
-                .expect("logits read back");
-            gdn_l2_probe::set_enabled(false);
-            eprintln!(
-                "[gdn-l2] {name}: {} tokens, {form:?} prefill {:.1}s",
-                ids.len(),
-                t.elapsed().as_secs_f32()
-            );
-            assert!(
-                l.iter().all(|v| v.is_finite()),
-                "{name}/{form:?}: non-finite logits"
-            );
-            logits.push(l);
-        }
-        let records = gdn_l2_probe::take();
-        assert_eq!(
-            records.len(),
-            delta_layers.len(),
-            "one record per DeltaNet layer per prefill"
-        );
-        for (i, r) in records.into_iter().enumerate() {
-            pooled_q[i].extend(r.q);
-            pooled_k[i].extend(r.k);
-        }
-
-        let (lc, la) = (log_softmax(&logits[0]), log_softmax(&logits[1]));
-        let (tc, ta) = (top(&lc, 5), top(&la, 5));
-        let max_dlp = tc
-            .iter()
-            .chain(&ta)
-            .map(|&i| (lc[i as usize] - la[i as usize]).abs())
-            .fold(0.0f64, f64::max);
-        let kl: f64 = lc.iter().zip(&la).map(|(&c, &a)| c.exp() * (c - a)).sum();
-        let max_dlogit = logits[0]
-            .iter()
-            .zip(&logits[1])
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-        println!(
-            "prompt {name:<15} n={:<4} top5 clamp {tc:?} add {ta:?} same_order={} \
-             max|dlogprob|(top5 union)={max_dlp:.3e} KL(clamp||add)={kl:.3e} max|dlogit|={max_dlogit:.3e}",
+/// One prefill of `ids` under each L2 form — `ClampNorm` with the head-norm
+/// tap on, then `AddEps` — returning the two logit rows in that order.
+/// Panics on a non-finite logit.
+fn prefill_both_forms(
+    loaded: &mut LoadedQwen35,
+    ids: &[u32],
+    device: &Device,
+    name: &str,
+) -> Vec<Vec<f32>> {
+    let mut logits = Vec::new();
+    for form in [GdnL2::ClampNorm, GdnL2::AddEps] {
+        loaded.config.gdn_l2 = form;
+        gdn_l2_probe::set_enabled(form == GdnL2::ClampNorm);
+        let t = Instant::now();
+        let mut cache = loaded.new_cache();
+        let l = loaded
+            .forward(ids, 0, &mut cache, device)
+            .into_data()
+            .convert::<f32>()
+            .try_to_vec::<f32>()
+            .expect("logits read back");
+        gdn_l2_probe::set_enabled(false);
+        eprintln!(
+            "[gdn-l2] {name}: {} tokens, {form:?} prefill {:.1}s",
             ids.len(),
-            tc == ta,
+            t.elapsed().as_secs_f32()
         );
-        let top10 = |lp: &[f64]| -> String {
-            top(lp, 10)
-                .iter()
-                .map(|&i| format!("{i}:{:.6}", lp[i as usize]))
-                .collect::<Vec<_>>()
-                .join(" ")
-        };
-        println!("  ids   {ids:?}");
-        println!("  clamp {}", top10(&lc));
-        println!("  add   {}", top10(&la));
-
-        if greedy > 0 {
-            let mut outs = Vec::new();
-            for form in [GdnL2::ClampNorm, GdnL2::AddEps] {
-                loaded.config.gdn_l2 = form;
-                let out = loaded
-                    .greedy_generate(&ids, greedy, &device)
-                    .await
-                    .expect("greedy decode");
-                outs.push(out);
-            }
-            let agree = outs[0]
-                .iter()
-                .zip(&outs[1])
-                .take_while(|(a, b)| a == b)
-                .count();
-            println!(
-                "greedy {name:<15} agree {agree}/{} | clamp {:?} | add {:?}",
-                outs[0].len().min(outs[1].len()),
-                tok.decode(&outs[0], false).unwrap_or_default(),
-                tok.decode(&outs[1], false).unwrap_or_default(),
-            );
-        }
+        assert!(
+            l.iter().all(|v| v.is_finite()),
+            "{name}/{form:?}: non-finite logits"
+        );
+        logits.push(l);
     }
+    logits
+}
 
+/// How far the two forms' first-forward distributions sit apart: top-5 ids,
+/// max |Δlogprob| over the union of both top-5s, KL, max |Δlogit|, and the
+/// top-10 rows themselves.
+fn report_logits(name: &str, ids: &[u32], logits: &[Vec<f32>]) {
+    let (lc, la) = (log_softmax(&logits[0]), log_softmax(&logits[1]));
+    let (tc, ta) = (top(&lc, 5), top(&la, 5));
+    let max_dlp = tc
+        .iter()
+        .chain(&ta)
+        .map(|&i| (lc[i as usize] - la[i as usize]).abs())
+        .fold(0.0f64, f64::max);
+    let kl: f64 = lc.iter().zip(&la).map(|(&c, &a)| c.exp() * (c - a)).sum();
+    let max_dlogit = logits[0]
+        .iter()
+        .zip(&logits[1])
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    println!(
+        "prompt {name:<15} n={:<4} top5 clamp {tc:?} add {ta:?} same_order={} \
+         max|dlogprob|(top5 union)={max_dlp:.3e} KL(clamp||add)={kl:.3e} max|dlogit|={max_dlogit:.3e}",
+        ids.len(),
+        tc == ta,
+    );
+    let top10 = |lp: &[f64]| -> String {
+        top(lp, 10)
+            .iter()
+            .map(|&i| format!("{i}:{:.6}", lp[i as usize]))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    println!("  ids   {ids:?}");
+    println!("  clamp {}", top10(&lc));
+    println!("  add   {}", top10(&la));
+}
+
+/// Greedy-decode `ids` under both forms and report the agreeing prefix.
+async fn greedy_both_forms(
+    loaded: &mut LoadedQwen35,
+    tok: &tokenizers::Tokenizer,
+    ids: &[u32],
+    greedy: usize,
+    device: &Device,
+    name: &str,
+) {
+    let mut outs = Vec::new();
+    for form in [GdnL2::ClampNorm, GdnL2::AddEps] {
+        loaded.config.gdn_l2 = form;
+        let out = loaded
+            .greedy_generate(ids, greedy, device)
+            .await
+            .expect("greedy decode");
+        outs.push(out);
+    }
+    let agree = outs[0]
+        .iter()
+        .zip(&outs[1])
+        .take_while(|(a, b)| a == b)
+        .count();
+    println!(
+        "greedy {name:<15} agree {agree}/{} | clamp {:?} | add {:?}",
+        outs[0].len().min(outs[1].len()),
+        tok.decode(&outs[0], false).unwrap_or_default(),
+        tok.decode(&outs[1], false).unwrap_or_default(),
+    );
+}
+
+/// The per-DeltaNet-layer head-norm table, pooled over every prompt, and
+/// its summary line.
+fn print_norm_table(
+    delta_layers: &[usize],
+    pooled_k: &[Vec<f32>],
+    pooled_q: &[Vec<f32>],
+    eps: f64,
+    prompt_count: usize,
+) {
     println!(
         "\n{:>5} | {:>9} {:>9} {:>9} {:>9} {:>8} {:>8} {:>9} | {:>9} {:>9} {:>8} {:>8} {:>9}",
         "layer",
@@ -314,18 +289,93 @@ async fn main() {
         );
     }
     println!(
-        "\nsummary: {tot} (token, k-head) samples pooled over {} DeltaNet layers x {} prompts; \
+        "\nsummary: {tot} (token, k-head) samples pooled over {} DeltaNet layers x {prompt_count} prompts; \
          min |k| {:.3e} (layer {}, rel {:.2e}), min |q| {:.3e} (layer {}, rel {:.2e}); \
          k heads >=1e-3 rel: {k3} ({:.4}%), >=1e-2: {k2} ({:.4}%); q heads >=1e-3: {q3}, >=1e-2: {q2}",
         delta_layers.len(),
-        prompts().len(),
         worst_k.0,
         worst_k.1,
         rel(worst_k.0, eps),
         worst_q.0,
         worst_q.1,
         rel(worst_q.0, eps),
-        100.0 * k3 as f64 / tot as f64,
-        100.0 * k2 as f64 / tot as f64,
+        100.0 * f64_from_usize(k3) / f64_from_usize(tot),
+        100.0 * f64_from_usize(k2) / f64_from_usize(tot),
     );
+}
+
+#[tokio::main]
+async fn main() {
+    let mut args = std::env::args().skip(1);
+    let path = std::path::PathBuf::from(
+        args.next()
+            .expect("usage: gdn-l2-probe <gguf> <off|q8|q4> [greedy_tokens]"),
+    );
+    let policy = match args.next().as_deref() {
+        Some("off") | None => QuantPolicy::Off,
+        Some("q8") => QuantPolicy::Q8,
+        Some("q4") => QuantPolicy::Q4,
+        Some(other) => panic!("unknown quant policy {other:?} (off|q8|q4)"),
+    };
+    let greedy: usize = args.next().map_or(0, |s| s.parse().expect("greedy_tokens"));
+    let device = match std::env::var("PROBE_DEVICE").as_deref() {
+        Ok("gpu") => mummu::backend::gpu_device(),
+        _ => mummu::backend::cpu_device(),
+    };
+
+    let f = mummu::gguf::GgufFile::open(&path).expect("gguf opens");
+    let tok = mummu::tokenizer::tokenizer_from_gguf(&f).expect("tokenizer from gguf");
+    drop(f);
+
+    let t0 = Instant::now();
+    let mut loaded = qwen35::load_from_gguf_quantized(&path, &device, policy).expect("model loads");
+    let cfg = loaded.config.clone();
+    let eps = cfg.rms_norm_eps;
+    let delta_layers: Vec<usize> = (0..cfg.num_layers)
+        .filter(|&i| !cfg.is_attention(i))
+        .collect();
+    eprintln!(
+        "[gdn-l2] {} | {policy:?} on {device:?} | loaded in {:.1}s | layers {} ({} DeltaNet) \
+         hk {} hv {} ds {} eps {eps:e} | default form {:?}",
+        path.display(),
+        t0.elapsed().as_secs_f32(),
+        cfg.num_layers,
+        delta_layers.len(),
+        cfg.n_k_heads,
+        cfg.n_v_heads,
+        cfg.d_state,
+        cfg.gdn_l2,
+    );
+
+    let mut pooled_q: Vec<Vec<f32>> = vec![Vec::new(); delta_layers.len()];
+    let mut pooled_k: Vec<Vec<f32>> = vec![Vec::new(); delta_layers.len()];
+
+    for (name, turns) in prompts() {
+        let rendered = mummu::chat::ChatMl::qwen3().render(&turns);
+        let ids = tok
+            .encode(rendered.as_str(), false)
+            .expect("prompt encodes")
+            .get_ids()
+            .to_vec();
+
+        let logits = prefill_both_forms(&mut loaded, &ids, &device, name);
+        let records = gdn_l2_probe::take();
+        assert_eq!(
+            records.len(),
+            delta_layers.len(),
+            "one record per DeltaNet layer per prefill"
+        );
+        for (i, r) in records.into_iter().enumerate() {
+            pooled_q[i].extend(r.q);
+            pooled_k[i].extend(r.k);
+        }
+
+        report_logits(name, &ids, &logits);
+
+        if greedy > 0 {
+            greedy_both_forms(&mut loaded, &tok, &ids, greedy, &device, name).await;
+        }
+    }
+
+    print_norm_table(&delta_layers, &pooled_k, &pooled_q, eps, prompts().len());
 }

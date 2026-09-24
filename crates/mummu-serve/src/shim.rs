@@ -1,6 +1,6 @@
 //! Ollama-compatibility shim: a second listener that speaks the Ollama HTTP
 //! protocol (NDJSON streaming) and drives the same engine as the native API,
-//! so Ollama clients — open-webui, LangChain's Ollama integration, plain
+//! so Ollama clients — open-webui, `LangChain`'s Ollama integration, plain
 //! `curl` scripts — can use mummu without knowing it isn't ollama. The two
 //! surfaces share the backend slots, so a model loaded here is the same
 //! resident model the native UI talks to.
@@ -33,6 +33,7 @@ use axum::routing::{delete as delete_route, get, post};
 use mummu::chat::{ToolCall, ToolSpec};
 use mummu::manage::ModelManager;
 use mummu::registry::{Architecture, ModelSpec, WeightFormat};
+use mummu_num::{f64_from_u64, trunc_i64};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -47,7 +48,7 @@ use crate::{
 
 /// The shim's routes. Binding and serving them (and draining them on
 /// shutdown) belongs to `crate::serve_on`, which owns both listeners.
-pub(crate) fn router() -> Router {
+pub fn router() -> Router {
     Router::new()
         // `get` also answers HEAD (axum strips the body), which is what the
         // sync shim spelled out as a separate `HEAD /` arm.
@@ -80,25 +81,25 @@ async fn root() -> &'static str {
 }
 
 async fn version() -> Response {
-    json_response(200, json!({"version": "0.1.0"}))
+    json_response(200, &json!({"version": "0.1.0"}))
 }
 
 async fn no_embeddings() -> Response {
     json_response(
         501,
-        json!({"error": "embeddings are not supported by the mummu-serve shim"}),
+        &json!({"error": "embeddings are not supported by the mummu-serve shim"}),
     )
 }
 
 async fn unsupported() -> Response {
     json_response(
         501,
-        json!({"error": "not supported by the mummu-serve shim"}),
+        &json!({"error": "not supported by the mummu-serve shim"}),
     )
 }
 
 async fn not_found_path() -> Response {
-    json_response(404, json!({"error": "not found"}))
+    json_response(404, &json!({"error": "not found"}))
 }
 
 // ---------------------------------------------------------------------------
@@ -119,10 +120,11 @@ fn resolve(manager: &ModelManager, name: &str) -> Option<ModelSpec> {
 /// RFC 3339 UTC from a `SystemTime` (no chrono dependency — civil-from-days,
 /// Howard Hinnant's algorithm). Also how `recovery` stamps the times it
 /// reports, so the two surfaces spell a time the same way.
-pub(crate) fn rfc3339(t: std::time::SystemTime) -> String {
-    let secs = t
+pub fn rfc3339(time: std::time::SystemTime) -> String {
+    let secs = time
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs()) as i64;
+        .map_or(0, |d| d.as_secs())
+        .cast_signed();
     let days = secs.div_euclid(86_400);
     let sod = secs.rem_euclid(86_400);
     let z = days + 719_468;
@@ -150,8 +152,14 @@ fn now_rfc3339() -> String {
 /// Stable fake digest: ollama clients treat it as an opaque identity.
 fn digest(name: &str) -> String {
     use sha2::Digest;
+    use std::fmt::Write as _;
     let hash = sha2::Sha256::digest(name.as_bytes());
-    hash.iter().map(|b| format!("{b:02x}")).collect()
+    let mut out = String::with_capacity(hash.len() * 2);
+    for b in hash {
+        // Writing into a `String` cannot fail.
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 fn details(spec: &ModelSpec) -> serde_json::Value {
@@ -222,18 +230,23 @@ fn build_tags() -> serde_json::Value {
 }
 
 fn store_tags(body: serde_json::Value) {
-    *TAGS_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), body));
+    *TAGS_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((Instant::now(), body));
 }
 
 async fn tags() -> Response {
-    json_response(200, tags_body().await)
+    json_response(200, &tags_body().await)
 }
 
 /// The `/api/tags` body, cache and all — the catalog source `/v1/models`
-/// maps into OpenAI's shape, so the two surfaces never disagree about what
+/// maps into `OpenAI`'s shape, so the two surfaces never disagree about what
 /// is installed and neither one walks the disk twice.
-pub(crate) async fn tags_body() -> serde_json::Value {
-    let cached = TAGS_CACHE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+pub async fn tags_body() -> serde_json::Value {
+    let cached = TAGS_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
     match cached {
         Some((at, body)) if at.elapsed() < TAGS_TTL => body,
         Some((_, body)) => {
@@ -274,7 +287,7 @@ async fn ps() -> Response {
                 entry
             })
             .collect();
-        json_response(200, json!({"models": models}))
+        json_response(200, &json!({"models": models}))
     })
     .await
 }
@@ -334,7 +347,7 @@ async fn show(body: Bytes) -> Response {
     let family = format!("{:?}", spec.architecture).to_lowercase();
     json_response(
         200,
-        json!({
+        &json!({
             "modelfile": format!("# mummu catalog model {} ({})", spec.name, spec.repo),
             "parameters": "",
             "template": "{{ .Prompt }}",
@@ -360,12 +373,12 @@ async fn delete(body: Bytes) -> Response {
         if !engine::unload_all() {
             return json_response(
                 409,
-                json!({"error": "a generation is in flight — cannot delete a model that is loaded"}),
+                &json!({"error": "a generation is in flight — cannot delete a model that is loaded"}),
             );
         }
         match manager.remove(&spec.name) {
-            Ok(()) => json_response(200, json!({})),
-            Err(e) => json_response(500, json!({"error": e})),
+            Ok(()) => json_response(200, &json!({})),
+            Err(e) => json_response(500, &json!({"error": e})),
         }
     })
     .await
@@ -374,7 +387,7 @@ async fn delete(body: Bytes) -> Response {
 fn not_found(model: &str) -> Response {
     json_response(
         404,
-        json!({"error": format!("model {model:?} not found, try pulling it first")}),
+        &json!({"error": format!("model {model:?} not found, try pulling it first")}),
     )
 }
 
@@ -446,7 +459,7 @@ fn ended_without_result() -> serde_json::Value {
 
 /// The sampling knobs ollama clients put in `options` (names are ollama's).
 #[derive(Deserialize, Default)]
-pub(crate) struct OllamaOptions {
+pub struct OllamaOptions {
     pub(crate) temperature: Option<f32>,
     pub(crate) top_p: Option<f32>,
     pub(crate) top_k: Option<usize>,
@@ -474,7 +487,7 @@ impl OllamaOptions {
         let seed = self.seed.unwrap_or_else(|| {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos() as u64)
+                .map_or(0, crate::nanos)
         });
         Ok(mummu::decode::SamplerOptions {
             temperature,
@@ -487,7 +500,10 @@ impl OllamaOptions {
     /// Ollama's `num_predict`: -1 (and 0/absent) mean "model default".
     fn max_tokens(&self) -> usize {
         match self.num_predict {
-            Some(n) if n > 0 => (n as usize).min(MAX_MAX_TOKENS),
+            // A count too big for a `usize` is certainly past the cap.
+            Some(n) if n > 0 => {
+                usize::try_from(n).map_or(MAX_MAX_TOKENS, |n| n.min(MAX_MAX_TOKENS))
+            }
             _ => DEFAULT_MAX_TOKENS,
         }
     }
@@ -502,16 +518,9 @@ impl OllamaOptions {
 /// the harder bug to find.
 #[derive(Deserialize)]
 #[serde(untagged)]
-pub(crate) enum OllamaFormat {
+pub enum OllamaFormat {
     Named(String),
-    Schema(
-        #[expect(
-            dead_code,
-            reason = "refused today; the schema to constrain to once the ROADMAP's \
-                      grammar-constrained decoding (JSON Schema via llguidance) lands"
-        )]
-        serde_json::Value,
-    ),
+    Schema(serde_json::Value),
 }
 
 impl OllamaFormat {
@@ -523,12 +532,12 @@ impl OllamaFormat {
             Self::Named(s) => Err(format!(
                 "unsupported format {s:?} — this server understands \"json\""
             )),
-            Self::Schema(_) => Err(
-                "a JSON Schema in `format` is not supported — this server can constrain output \
-                 to JSON, but not to a given schema; use \"format\": \"json\" and validate the \
-                 shape client-side"
-                    .into(),
-            ),
+            Self::Schema(schema) => Err(format!(
+                "a JSON Schema in `format` ({} top-level keys) is not supported — this server \
+                 can constrain output to JSON, but not to a given schema; use \"format\": \
+                 \"json\" and validate the shape client-side",
+                schema.as_object().map_or(0, serde_json::Map::len)
+            )),
         }
     }
 }
@@ -581,11 +590,11 @@ struct OllamaGenerateRequest {
     think: Option<bool>,
 }
 
-/// One entry of a request's `tools` array. Ollama and OpenAI spell it the
+/// One entry of a request's `tools` array. Ollama and `OpenAI` spell it the
 /// same way: `{"type": "function", "function": {name, description,
 /// parameters}}`.
 #[derive(Deserialize)]
-pub(crate) struct ToolDef {
+pub struct ToolDef {
     #[serde(default)]
     function: Option<FunctionDef>,
 }
@@ -601,7 +610,7 @@ struct FunctionDef {
 
 /// A request's tool definitions as the renderer takes them. An entry that is
 /// not a function is skipped.
-pub(crate) fn tool_specs(defs: &[ToolDef]) -> Vec<ToolSpec> {
+pub fn tool_specs(defs: &[ToolDef]) -> Vec<ToolSpec> {
     defs.iter()
         .filter_map(|t| t.function.as_ref())
         .map(|f| ToolSpec {
@@ -619,11 +628,7 @@ pub(crate) fn tool_specs(defs: &[ToolDef]) -> Vec<ToolSpec> {
 /// Offer `tools` to the model a plan runs, or say why it cannot take them —
 /// in the words ollama's own server uses, so a client that recognises that
 /// refusal and retries without tools still can.
-pub(crate) fn offer_tools(
-    p: &mut RunPlan,
-    model: &str,
-    tools: Vec<ToolSpec>,
-) -> Result<(), String> {
+pub fn offer_tools(p: &mut RunPlan, model: &str, tools: Vec<ToolSpec>) -> Result<(), String> {
     if !tools.is_empty() && !engine::supports_tools(p.spec.architecture) {
         return Err(format!("{model:?} does not support tools"));
     }
@@ -643,7 +648,7 @@ fn allow_thinking(p: &RunPlan, model: &str) -> Result<(), String> {
 }
 
 /// Everything a chat/generate run needs after validation.
-pub(crate) struct RunPlan {
+pub struct RunPlan {
     pub(crate) spec: ModelSpec,
     pub(crate) root: std::path::PathBuf,
     pub(crate) turns: Vec<mummu::chat::Turn>,
@@ -653,14 +658,14 @@ pub(crate) struct RunPlan {
     pub(crate) images: Vec<mummu::vision::Patches>,
     /// Let the client see a reasoning model's thinking: the engine passes the
     /// `<think>` block through, and the surface decides where it goes —
-    /// inline on OpenAI's, ollama's `thinking` field on the shim's.
+    /// inline on `OpenAI`'s, ollama's `thinking` field on the shim's.
     pub(crate) think: bool,
     /// Tool definitions to advertise to the model (see [`offer_tools`]).
     pub(crate) tools: Vec<ToolSpec>,
 }
 
 /// Validate a request into a `RunPlan`, or hand back the error response.
-pub(crate) fn plan(
+pub fn plan(
     model: &str,
     messages: &[ChatMessage],
     options: &OllamaOptions,
@@ -681,26 +686,26 @@ pub(crate) fn plan(
     // out. `prepare_images` only reads the tower's header, not its weights.
     let raw = match decode_images(messages) {
         Ok(v) => v,
-        Err(e) => return Err(Box::new(json_response(400, json!({"error": e})))),
+        Err(e) => return Err(Box::new(json_response(400, &json!({"error": e})))),
     };
     let images = match engine::prepare_images(&spec, &root, &raw) {
         Ok(v) => v,
-        Err(e) => return Err(Box::new(json_response(400, json!({"error": e})))),
+        Err(e) => return Err(Box::new(json_response(400, &json!({"error": e})))),
     };
     let marks = match engine::placeholders(&spec, &root, &images) {
         Ok(v) => v,
-        Err(e) => return Err(Box::new(json_response(500, json!({"error": e})))),
+        Err(e) => return Err(Box::new(json_response(500, &json!({"error": e})))),
     };
     let messages = with_placeholders(messages, &marks);
     let turns = to_turns(&messages, spec.architecture)
-        .map_err(|e| json_response(400, json!({"error": e})))?;
+        .map_err(|e| json_response(400, &json!({"error": e})))?;
     let opts = options
         .sampler()
-        .map_err(|e| json_response(400, json!({"error": e})))?;
+        .map_err(|e| json_response(400, &json!({"error": e})))?;
     let max_tokens = options.max_tokens();
     let format = match format.map(OllamaFormat::resolve).transpose() {
         Ok(f) => f.flatten(),
-        Err(e) => return Err(Box::new(json_response(400, json!({"error": e})))),
+        Err(e) => return Err(Box::new(json_response(400, &json!({"error": e})))),
     };
     Ok(RunPlan {
         spec,
@@ -763,8 +768,8 @@ fn with_placeholders(messages: &[ChatMessage], marks: &[String]) -> Vec<ChatMess
 
 /// Ollama's final frame: timing in nanoseconds.
 fn done_value(model: &str, r: &engine::ChatResult, started: Instant) -> serde_json::Value {
-    let total_ns = started.elapsed().as_nanos() as u64;
-    let eval_ns = (r.elapsed_ms as u64).saturating_mul(1_000_000);
+    let total_ns = crate::nanos(started.elapsed());
+    let eval_ns = r.elapsed_ms.saturating_mul(1_000_000);
     json!({
         "model": model,
         "created_at": now_rfc3339(),
@@ -836,16 +841,18 @@ async fn run(p: RunPlan, stream: bool, wrap: Wrap, finish: Finish) -> Response {
     let begin = crate::trace::Begin {
         surface: "ollama",
         model: p.spec.name.clone(),
-        stream,
-        think: p.think,
-        json_mode: p.format.is_some(),
+        asked: crate::trace::Asked {
+            stream,
+            think: p.think,
+            json_mode: p.format.is_some(),
+        },
         tools: p.tools.len(),
         images: p.images.len(),
         started: Instant::now(),
     };
     // The process is exiting to restart the GPU backend (see `recovery`).
     if recovery::restarting() {
-        return json_response(503, json!({"error": recovery::restarting_message()}));
+        return json_response(503, &json!({"error": recovery::restarting_message()}));
     }
     if !stream && let Some(dir) = engine::load_in_flight() {
         // A non-stream response sends no bytes until the whole generation is
@@ -867,7 +874,7 @@ async fn run(p: RunPlan, stream: bool, wrap: Wrap, finish: Finish) -> Response {
         );
         return json_response(
             503,
-            json!({"error": format!(
+            &json!({"error": format!(
                 "a model is loading ({loading}); a non-streaming request would wait \
                  silently for the whole load — retry once it completes, or set \"stream\": true"
             )}),
@@ -881,7 +888,7 @@ async fn run(p: RunPlan, stream: bool, wrap: Wrap, finish: Finish) -> Response {
         engine::tool_calls(p.spec.architecture)
     };
     let think = p.think;
-    respond(
+    Box::pin(respond(
         model,
         stream,
         think,
@@ -889,19 +896,18 @@ async fn run(p: RunPlan, stream: bool, wrap: Wrap, finish: Finish) -> Response {
         wrap,
         finish,
         move |sink| async move {
-            let r = engine::run_chat(
-                &p.spec,
-                &p.root,
-                &p.turns,
-                &p.opts,
-                p.max_tokens,
-                p.format,
-                p.think,
-                p.images,
-                p.tools,
-                |delta| sink.delta(delta),
-            )
-            .await;
+            let req = engine::GenerationRequest {
+                spec: &p.spec,
+                models_root: &p.root,
+                turns: &p.turns,
+                opts: &p.opts,
+                max_tokens: p.max_tokens,
+                format: p.format,
+                think: p.think,
+                images: p.images,
+                tools: p.tools,
+            };
+            let r = engine::run_chat(&req, |delta| sink.delta(delta)).await;
             // Padded exactly when a buffered answer outlived the keep-alive
             // grace — the condition `keepalive_json` pads on.
             let padded = !stream && begin.started.elapsed() >= crate::KEEPALIVE_GRACE;
@@ -916,7 +922,7 @@ async fn run(p: RunPlan, stream: bool, wrap: Wrap, finish: Finish) -> Response {
             }
             r
         },
-    )
+    ))
     .await
 }
 
@@ -990,13 +996,13 @@ struct Held {
 impl Held {
     /// One delta, as the client may see it now.
     fn push(&mut self, delta: &str) -> Split {
-        let Split { visible, thought } = match &mut self.reasoning {
-            Some(r) => r.push(delta),
-            None => Split {
+        let Split { visible, thought } = self.reasoning.as_mut().map_or_else(
+            || Split {
                 visible: delta.to_owned(),
                 thought: String::new(),
             },
-        };
+            |r| r.push(delta),
+        );
         let visible = match &mut self.calls {
             Some(f) => f.push(&visible),
             None => visible,
@@ -1052,13 +1058,17 @@ impl ShimSink {
         let Some(tx) = &self.tx else {
             return ControlFlow::Continue(());
         };
-        let split = match &self.held {
-            Some(h) => h.lock().unwrap_or_else(|e| e.into_inner()).push(text),
-            None => Split {
+        let split = self.held.as_ref().map_or_else(
+            || Split {
                 visible: text.to_owned(),
                 thought: String::new(),
             },
-        };
+            |h| {
+                h.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(text)
+            },
+        );
         if split.visible.is_empty() && split.thought.is_empty() {
             return ControlFlow::Continue(());
         }
@@ -1156,7 +1166,9 @@ where
             let line = match recovery::contain(&model, run(sink)).await {
                 Ok(mut r) => {
                     if let Some(held) = held {
-                        let mut held = held.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut held = held
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                         for frame in held.tail(&model, wrap, &mut r) {
                             let _ = tx.send(frame);
                         }
@@ -1208,7 +1220,7 @@ where
     .await
 }
 
-pub(crate) async fn chat(body: Bytes) -> Response {
+pub async fn chat(body: Bytes) -> Response {
     let parsed: OllamaChatRequest = match parse_json(&body) {
         Ok(p) => p,
         Err(response) => return *response,
@@ -1224,13 +1236,13 @@ pub(crate) async fn chat(body: Bytes) -> Response {
         Err(response) => return *response,
     };
     if let Err(e) = allow_thinking(&p, &parsed.model) {
-        return json_response(400, json!({"error": e}));
+        return json_response(400, &json!({"error": e}));
     }
     let tools = tool_specs(parsed.tools.as_deref().unwrap_or_default());
     if let Err(e) = offer_tools(&mut p, &parsed.model, tools) {
-        return json_response(400, json!({"error": e}));
+        return json_response(400, &json!({"error": e}));
     }
-    run(p, parsed.stream.unwrap_or(true), chat_delta, chat_done).await
+    Box::pin(run(p, parsed.stream.unwrap_or(true), chat_delta, chat_done)).await
 }
 
 /// One streamed piece of an `/api/chat` answer.
@@ -1288,14 +1300,14 @@ async fn generate(body: Bytes) -> Response {
         Err(response) => return *response,
     };
     if let Err(e) = allow_thinking(&p, &parsed.model) {
-        return json_response(400, json!({"error": e}));
+        return json_response(400, &json!({"error": e}));
     }
-    run(
+    Box::pin(run(
         p,
         parsed.stream.unwrap_or(true),
         generate_delta,
         generate_done,
-    )
+    ))
     .await
 }
 
@@ -1345,7 +1357,7 @@ async fn pull(body: Bytes) -> Response {
     let Some(spec) = resolve(&manager, &parsed.model) else {
         return json_response(
             404,
-            json!({"error": format!(
+            &json!({"error": format!(
                 "model {:?} is not in the mummu catalog (the shim can only pull catalog models)",
                 parsed.model
             )}),
@@ -1357,8 +1369,8 @@ async fn pull(body: Bytes) -> Response {
         return blocking(move || {
             let manager = ModelManager::new(models_root());
             match manager.install(&name, |_| {}) {
-                Ok(_) => json_response(200, json!({"status": "success"})),
-                Err(e) => json_response(500, json!({"error": e})),
+                Ok(_) => json_response(200, &json!({"status": "success"})),
+                Err(e) => json_response(500, &json!({"error": e})),
             }
         })
         .await;
@@ -1375,9 +1387,9 @@ async fn pull(body: Bytes) -> Response {
             }
             let total = p.total_bytes.unwrap_or(0);
             let pct = if total > 0 {
-                ((p.received_bytes as f64 / total as f64) * 100.0) as i64
+                trunc_i64((f64_from_u64(p.received_bytes) / f64_from_u64(total)) * 100.0)
             } else {
-                (p.received_bytes >> 26) as i64
+                (p.received_bytes >> 26).cast_signed()
             };
             if pct == last_pct {
                 return;
@@ -1412,11 +1424,13 @@ mod tests {
                                 couldn't find resource for that handle: Memory location was \
                                 never initialized\")";
 
-    async fn fails_like_production() -> Result<engine::ChatResult, ChatError> {
+    /// Called from inside the generation's own future, so the panic lands
+    /// where production's did.
+    fn fails_like_production() -> Result<engine::ChatResult, ChatError> {
         panic!("{INVALID_READ}")
     }
 
-    async fn fails_with_an_ordinary_bug() -> Result<engine::ChatResult, ChatError> {
+    fn fails_with_an_ordinary_bug() -> Result<engine::ChatResult, ChatError> {
         panic!("called `Option::unwrap()` on a `None` value")
     }
 
@@ -1446,13 +1460,12 @@ mod tests {
     /// a last line `{"error": "…"}`. The incident's clients got a stream that
     /// ended on nothing.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // serializes tests; nothing else waits on it
     async fn a_streamed_shim_chat_that_hits_the_gpu_failure_ends_on_an_error_line() {
-        let _serial = crate::progress_serial();
+        let _serial = crate::progress_serial().await;
         recovery::reset_for_tests();
         recovery::install_panic_hook();
 
-        let response = respond("m".into(), true, false, None, wrap, finish, |_| {
+        let response = respond("m".into(), true, false, None, wrap, finish, |_| async {
             fails_like_production()
         })
         .await;
@@ -1475,13 +1488,12 @@ mod tests {
     /// Buffered: a non-2xx carrying `{"error": "…"}` — 503 for the GPU,
     /// because retrying is the right thing to do, and 500 for a plain bug.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // serializes tests; nothing else waits on it
     async fn a_buffered_shim_chat_answers_non_2xx_with_the_error() {
-        let _serial = crate::progress_serial();
+        let _serial = crate::progress_serial().await;
         recovery::reset_for_tests();
         recovery::install_panic_hook();
 
-        let response = respond("m".into(), false, false, None, wrap, finish, |_| {
+        let response = respond("m".into(), false, false, None, wrap, finish, |_| async {
             fails_like_production()
         })
         .await;
@@ -1496,7 +1508,7 @@ mod tests {
         );
 
         recovery::reset_for_tests();
-        let response = respond("m".into(), false, false, None, wrap, finish, |_| {
+        let response = respond("m".into(), false, false, None, wrap, finish, |_| async {
             fails_with_an_ordinary_bug()
         })
         .await;
@@ -1739,7 +1751,7 @@ mod tests {
     /// A replayed call is whatever the client sent, and the renderers assert
     /// their input — an LFM2 history with a string for arguments panicked
     /// mid-request. Each is refused as the client's mistake instead, for
-    /// every family, and a JSON-encoded object (OpenAI's spelling) is read.
+    /// every family, and a JSON-encoded object (`OpenAI`'s spelling) is read.
     #[test]
     fn a_replayed_call_the_renderers_cannot_take_is_refused_not_panicked_on() {
         let with_calls = |calls: serde_json::Value| -> Vec<ChatMessage> {
@@ -1755,7 +1767,7 @@ mod tests {
         for _ in 0..mummu::chat::MAX_VALUE_DEPTH {
             at_bound = json!([at_bound]);
         }
-        let deep = json!([at_bound.clone()]);
+        let deep = json!([at_bound]);
         let too_many: Vec<_> = (0..=mummu::chat::MAX_TOOL_CALLS)
             .map(|_| json!({"name": "get_weather", "arguments": {}}))
             .collect();
@@ -1806,9 +1818,8 @@ mod tests {
     /// structured in a frame of its own before the final line — which does
     /// not repeat it.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // serializes tests; nothing else waits on it
     async fn a_streamed_tool_call_arrives_structured_and_its_markup_never_does() {
-        let _serial = crate::progress_serial();
+        let _serial = crate::progress_serial().await;
         let hermes = engine::tool_calls(Architecture::Qwen3);
         let response = respond(
             "m".into(),
@@ -1850,9 +1861,8 @@ mod tests {
     /// Markup that did not parse is not swallowed: what was held back goes
     /// out as text, so the client sees everything the model wrote.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // serializes tests; nothing else waits on it
     async fn held_back_markup_that_was_not_a_call_is_released_as_text() {
-        let _serial = crate::progress_serial();
+        let _serial = crate::progress_serial().await;
         let hermes = engine::tool_calls(Architecture::Qwen3);
         let raw = "Hmm <tool_call>{not json</tool_call> then <tool_call>{\"name\": \"cut";
         let response = respond(
@@ -1887,9 +1897,8 @@ mod tests {
 
     /// Buffered, the one object carries the prose and the calls together.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // serializes tests; nothing else waits on it
     async fn a_buffered_tool_call_comes_back_in_the_message() {
-        let _serial = crate::progress_serial();
+        let _serial = crate::progress_serial().await;
         let hermes = engine::tool_calls(Architecture::Qwen3);
         let response = respond(
             "m".into(),
@@ -1943,9 +1952,8 @@ mod tests {
     /// the blank line Qwen writes after `</think>` — what ollama's own
     /// parser makes of the same tokens.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // serializes tests; nothing else waits on it
     async fn a_streamed_answer_that_thinks_splits_into_thinking_and_content() {
-        let _serial = crate::progress_serial();
+        let _serial = crate::progress_serial().await;
         let response = respond(
             "m".into(),
             true,
@@ -1996,9 +2004,8 @@ mod tests {
 
     /// Buffered, the one object carries both fields.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // serializes tests; nothing else waits on it
     async fn a_buffered_answer_that_thinks_carries_both_fields() {
-        let _serial = crate::progress_serial();
+        let _serial = crate::progress_serial().await;
         let response = respond(
             "m".into(),
             false,
@@ -2019,9 +2026,8 @@ mod tests {
     /// /api/generate is the same split in its own fields: `thinking` beside
     /// `response`, streamed and buffered.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // serializes tests; nothing else waits on it
     async fn generate_puts_the_thinking_beside_the_response() {
-        let _serial = crate::progress_serial();
+        let _serial = crate::progress_serial().await;
         let response = respond(
             "m".into(),
             true,
@@ -2067,9 +2073,8 @@ mod tests {
     /// A request that did not ask gets what the engine hands it, untouched —
     /// no `thinking` field, and none of the whitespace the split eats.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // serializes tests; nothing else waits on it
     async fn an_answer_that_did_not_ask_is_passed_through_as_it_was() {
-        let _serial = crate::progress_serial();
+        let _serial = crate::progress_serial().await;
         let response = respond(
             "m".into(),
             true,
@@ -2100,9 +2105,8 @@ mod tests {
     /// what ollama answers. (A request that did not ask gets the engine's
     /// error instead, which says to raise the cap; see `crate::think`.)
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // serializes tests; nothing else waits on it
     async fn thinking_cut_off_by_the_token_cap_is_still_thinking() {
-        let _serial = crate::progress_serial();
+        let _serial = crate::progress_serial().await;
         let cut = "<think>\nStep one, step two</thi";
         let response = respond(
             "m".into(),
@@ -2150,9 +2154,8 @@ mod tests {
     /// thinking stays in `thinking`, verbatim, and is not one it made — the
     /// engine reads calls from the same place (`engine::lift_tool_calls`).
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // serializes tests; nothing else waits on it
     async fn a_call_drafted_while_thinking_stays_in_the_thinking() {
-        let _serial = crate::progress_serial();
+        let _serial = crate::progress_serial().await;
         let hermes = engine::tool_calls(Architecture::Qwen3);
         let block = "<think>\nMaybe <tool_call>{\"name\": \"x\"}</tool_call>?\n</think>";
         let response = respond(
@@ -2276,10 +2279,9 @@ mod tests {
     /// A pull ends on its own `status` line: only a chat stream is held to
     /// ending on a final line.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // serializes tests; nothing else waits on it
     async fn only_a_chat_stream_is_given_a_final_line() {
         // Holds an `InFlight`, which an exit test elsewhere would wait on.
-        let _serial = crate::progress_serial();
+        let _serial = crate::progress_serial().await;
         let (tx, rx) = mpsc::unbounded_channel();
         tx.send(json!({"status": "success"})).expect("open");
         drop(tx);

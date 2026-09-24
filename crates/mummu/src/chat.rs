@@ -1,10 +1,12 @@
-//! Explicit chat templates. Prompt wrapping is part of a model's contract —
+//! Explicit chat templates.
+//!
+//! Prompt wrapping is part of a model's contract —
 //! an implicit or slightly-wrong template silently ruins output quality — so
 //! templates are code here, never guessed: each per-model constructor is
 //! byte-verified against the parity references (the Qwen2 template renders
 //! the exact prompt committed in the Candle logits fixture).
 //!
-//! Both zoo LLMs speak ChatML; LFM2.5 additionally prefixes `<|startoftext|>`.
+//! Both zoo LLMs speak `ChatML`; LFM2.5 additionally prefixes `<|startoftext|>`.
 //! Tool use comes in two conventions, selected by the per-model constructor:
 //!
 //! - **Hermes** (Qwen2.5/Qwen3): tool signatures in a `<tools>` block of the
@@ -21,6 +23,8 @@
 //!   `[get_weather(city="Paris")]` — results returned in a dedicated `tool`
 //!   role turn, and `</think>`-prefixed reasoning stripped from every
 //!   assistant history turn but the last.
+
+use std::fmt::Write as _;
 
 /// Who is speaking in a [`Turn`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,13 +62,12 @@ enum ThinkStrip {
 }
 
 impl Role {
-    fn tag(self, style: ToolCallStyle) -> &'static str {
+    const fn tag(self, style: ToolCallStyle) -> &'static str {
         match (self, style) {
             (Self::System, _) => "system",
-            (Self::User, _) => "user",
-            (Self::Assistant, _) => "assistant",
             // Hermes: tool results ride in a user turn; LFM: a real tool turn.
-            (Self::Tool, ToolCallStyle::Hermes) => "user",
+            (Self::User, _) | (Self::Tool, ToolCallStyle::Hermes) => "user",
+            (Self::Assistant, _) => "assistant",
             (Self::Tool, ToolCallStyle::Lfm) => "tool",
         }
     }
@@ -117,6 +120,10 @@ impl Turn {
     /// An assistant turn that invokes tools: each call becomes a Hermes
     /// `<tool_call>` block in the turn body (what the model itself would
     /// have emitted), so histories containing calls re-render faithfully.
+    ///
+    /// # Panics
+    ///
+    /// When `calls` is empty or holds more than [`MAX_TOOL_CALLS`] entries.
     #[must_use]
     pub fn assistant_tool_calls(calls: &[ToolCall]) -> Self {
         assert!(!calls.is_empty(), "assistant_tool_calls: no calls");
@@ -144,6 +151,13 @@ impl Turn {
     /// the calls render as one bracketed call list between the
     /// `<|tool_call_start|>`/`<|tool_call_end|>` special tokens — exactly
     /// what an LFM2.5 model emits — so histories re-render faithfully.
+    ///
+    /// # Panics
+    ///
+    /// When `calls` is empty or holds more than [`MAX_TOOL_CALLS`] entries;
+    /// when a call has an empty name or `arguments` that are neither a JSON
+    /// object nor `null`; or when an argument value nests deeper than
+    /// [`MAX_VALUE_DEPTH`].
     #[must_use]
     pub fn assistant_tool_calls_lfm(calls: &[ToolCall]) -> Self {
         assert!(!calls.is_empty(), "assistant_tool_calls_lfm: no calls");
@@ -176,9 +190,11 @@ impl Turn {
 }
 
 /// Deepest literal nesting the Pythonic renderer/parser will follow — far
-/// past any real argument payload, and the recursion bound for both. Public
-/// so a caller rendering calls it did not write (a client's replayed tool
-/// loop) can refuse deeper ones instead of tripping the renderer's assert.
+/// past any real argument payload, and the recursion bound for both.
+///
+/// Public so a caller rendering calls it did not write (a client's replayed
+/// tool loop) can refuse deeper ones instead of tripping the renderer's
+/// assert.
 pub const MAX_VALUE_DEPTH: usize = 8;
 
 /// Serialize a value the way Python's `json.dumps` does by default — `", "`
@@ -313,7 +329,7 @@ fn python_string_literal(s: &str, out: &mut String) {
             '\t' => out.push_str("\\t"),
             '\r' => out.push_str("\\r"),
             c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
+                write!(out, "\\u{:04x}", c as u32).expect("writing to a String cannot fail");
             }
             c => out.push(c),
         }
@@ -342,7 +358,7 @@ struct ToolWire<'a> {
 }
 
 /// One tool invocation, as emitted by the model inside `<tool_call>` tags.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ToolCall {
     pub name: String,
     #[serde(default)]
@@ -377,10 +393,20 @@ pub enum ToolCallError {
     TooMany,
 }
 
-/// Extract Hermes-style tool calls from a model response: every
-/// `<tool_call>…</tool_call>` block parses as a [`ToolCall`]; the text
+/// Extract Hermes-style tool calls from a model response.
+///
+/// Every `<tool_call>…</tool_call>` block parses as a [`ToolCall`]; the text
 /// outside the blocks (the model's prose, trimmed) comes back alongside.
 /// Text with no blocks is simply `(vec![], text)` — not an error.
+///
+/// # Errors
+///
+/// - [`ToolCallError::TooMany`] once more than [`MAX_TOOL_CALLS`] blocks
+///   have been seen.
+/// - [`ToolCallError::Unclosed`] when a `<tool_call>` has no matching
+///   `</tool_call>`.
+/// - [`ToolCallError::BadJson`] when a block's body is not the JSON of a
+///   [`ToolCall`].
 pub fn parse_tool_calls(text: &str) -> Result<(Vec<ToolCall>, String), ToolCallError> {
     const OPEN: &str = "<tool_call>";
     const CLOSE: &str = "</tool_call>";
@@ -409,11 +435,24 @@ pub fn parse_tool_calls(text: &str) -> Result<(Vec<ToolCall>, String), ToolCallE
     Ok((calls, prose.trim().to_string()))
 }
 
-/// Extract LFM-style tool calls from a model response: every
-/// `<|tool_call_start|>…<|tool_call_end|>` block parses as a *Pythonic call
-/// list* (`[name(k=v, …), …]`); the text outside the blocks (the model's
-/// prose, trimmed) comes back alongside. Text with no blocks is simply
-/// `(vec![], text)` — not an error.
+/// Extract LFM-style tool calls from a model response.
+///
+/// Every `<|tool_call_start|>…<|tool_call_end|>` block parses as a *Pythonic
+/// call list* (`[name(k=v, …), …]`); the text outside the blocks (the
+/// model's prose, trimmed) comes back alongside. Text with no blocks is
+/// simply `(vec![], text)` — not an error.
+///
+/// # Errors
+///
+/// - [`ToolCallError::Unclosed`] when a `<|tool_call_start|>` has no
+///   matching `<|tool_call_end|>`.
+/// - [`ToolCallError::Syntax`] when a block is not a well-formed call list
+///   (a missing bracket, an unterminated string, an unknown literal, an
+///   unsupported escape, trailing text, …).
+/// - [`ToolCallError::TooDeep`] when an argument value nests deeper than
+///   [`MAX_VALUE_DEPTH`].
+/// - [`ToolCallError::TooMany`] when the calls across all blocks exceed
+///   [`MAX_TOOL_CALLS`].
 pub fn parse_tool_calls_lfm(text: &str) -> Result<(Vec<ToolCall>, String), ToolCallError> {
     const OPEN: &str = "<|tool_call_start|>";
     const CLOSE: &str = "<|tool_call_end|>";
@@ -459,7 +498,7 @@ struct PythonicParser<'a> {
 }
 
 impl<'a> PythonicParser<'a> {
-    fn new(src: &'a str, block: usize) -> Self {
+    const fn new(src: &'a str, block: usize) -> Self {
         Self { src, pos: 0, block }
     }
 
@@ -579,7 +618,7 @@ impl<'a> PythonicParser<'a> {
         }
         self.skip_ws();
         match self.peek() {
-            Some('"') | Some('\'') => Ok(serde_json::Value::String(self.parse_string()?)),
+            Some('"' | '\'') => Ok(serde_json::Value::String(self.parse_string()?)),
             Some('[') => self.parse_list(depth),
             Some('{') => self.parse_dict(depth),
             Some(c) if c == '-' || c.is_ascii_digit() => self.parse_number(),
@@ -624,7 +663,7 @@ impl<'a> PythonicParser<'a> {
                 break;
             }
             self.skip_ws();
-            if !matches!(self.peek(), Some('"') | Some('\'')) {
+            if !matches!(self.peek(), Some('"' | '\'')) {
                 return Err(self.fail("dict keys must be strings"));
             }
             let key = self.parse_string()?;
@@ -723,7 +762,7 @@ fn last_user_query(turns: &[Turn]) -> usize {
                 && !(t.content.starts_with("<tool_response>")
                     && t.content.ends_with("</tool_response>"))
         })
-        .unwrap_or(turns.len().saturating_sub(1))
+        .unwrap_or_else(|| turns.len().saturating_sub(1))
 }
 
 /// Qwen3's assistant-history reasoning rule, byte-for-byte from its
@@ -751,18 +790,18 @@ fn qwen3_think_content(
     let first_close = content.find("</think>").unwrap_or(last_close);
     debug_assert!(first_close <= last_close, "find precedes rfind");
     let before = content[..first_close].trim_end_matches('\n');
-    let reasoning = match before.rfind("<think>") {
-        Some(open) => &before[open + "<think>".len()..],
-        None => before,
-    };
+    let reasoning = before
+        .rfind("<think>")
+        .map_or(before, |open| &before[open + "<think>".len()..]);
     let reasoning = reasoning.trim_matches('\n');
     std::borrow::Cow::Owned(format!("<think>\n{reasoning}\n</think>\n\n{body}"))
 }
 
-/// The ChatML template family: `<|im_start|>role\ncontent<|im_end|>\n` per
-/// turn, then an open assistant turn for the model to complete. `bos` is
-/// prepended once when a model requires a start-of-text token; `tool_style`
-/// picks the tool-use convention (see the module docs).
+/// The `ChatML` template family: `<|im_start|>role\ncontent<|im_end|>\n` per
+/// turn, then an open assistant turn for the model to complete.
+///
+/// `bos` is prepended once when a model requires a start-of-text token;
+/// `tool_style` picks the tool-use convention (see the module docs).
 #[derive(Debug, Clone)]
 pub struct ChatMl {
     bos: Option<&'static str>,
@@ -775,9 +814,9 @@ pub struct ChatMl {
 }
 
 impl ChatMl {
-    /// Qwen2 / Qwen2.5-Instruct: plain ChatML, no BOS, Hermes tool use.
+    /// Qwen2 / Qwen2.5-Instruct: plain `ChatML`, no BOS, Hermes tool use.
     #[must_use]
-    pub fn qwen2() -> Self {
+    pub const fn qwen2() -> Self {
         Self {
             bos: None,
             tool_style: ToolCallStyle::Hermes,
@@ -786,12 +825,12 @@ impl ChatMl {
         }
     }
 
-    /// Qwen3 / Qwen3.5: Qwen2's ChatML + Hermes wire format, plus the two
+    /// Qwen3 / Qwen3.5: Qwen2's `ChatML` + Hermes wire format, plus the two
     /// behavioral deltas its template adds — `<think>` reasoning stripped
     /// from assistant turns at/before the last user query, and NO default
     /// system preamble when tools are supplied without a system turn.
     #[must_use]
-    pub fn qwen3() -> Self {
+    pub const fn qwen3() -> Self {
         Self {
             bos: None,
             tool_style: ToolCallStyle::Hermes,
@@ -800,10 +839,10 @@ impl ChatMl {
         }
     }
 
-    /// LFM2 / LFM2.5-Instruct: ChatML behind `<|startoftext|>`, LFM
+    /// LFM2 / LFM2.5-Instruct: `ChatML` behind `<|startoftext|>`, LFM
     /// (Pythonic) tool use.
     #[must_use]
-    pub fn lfm2() -> Self {
+    pub const fn lfm2() -> Self {
         Self {
             bos: Some("<|startoftext|>"),
             tool_style: ToolCallStyle::Lfm,
@@ -815,6 +854,11 @@ impl ChatMl {
     /// Render a conversation into the raw prompt string, ending with the open
     /// assistant turn the model completes. The caller tokenizes the result
     /// with special tokens enabled by the tokenizer itself, not re-added.
+    ///
+    /// # Panics
+    ///
+    /// When `turns` is empty, holds more than [`MAX_TURNS`] entries, or ends
+    /// with an assistant turn (the template opens that turn itself).
     #[must_use]
     pub fn render(&self, turns: &[Turn]) -> String {
         assert!(!turns.is_empty(), "chat render: no turns");
@@ -905,6 +949,13 @@ impl ChatMl {
     ///   appended to the system turn — the exact shape of LFM2.5's
     ///   `chat_template.jinja` + model card, which injects *no* default
     ///   preamble: without a system turn the tools line stands alone.
+    ///
+    /// # Panics
+    ///
+    /// When `tools` is empty (use [`Self::render`]), holds more than
+    /// [`MAX_TOOLS`] entries, or contains a tool with an empty name; and for
+    /// everything [`Self::render`] panics on, since it renders the wrapped
+    /// conversation through it.
     #[must_use]
     pub fn render_with_tools(&self, tools: &[ToolSpec], turns: &[Turn]) -> String {
         assert!(
@@ -1060,7 +1111,7 @@ mod tests {
     /// The tools section must match the Qwen2.5/Qwen3 chat template's wording
     /// and tag structure byte-for-byte (the model was trained on this text).
     /// Inside a tool's `parameters` schema, keys serialize in INSERTION order
-    /// (serde_json `preserve_order`, a workspace feature) — matching how
+    /// (`serde_json` `preserve_order`, a workspace feature) — matching how
     /// Python/transformers renders the same schema from a dict.
     #[test]
     fn tools_render_matches_the_hermes_template_shape() {
@@ -1137,7 +1188,7 @@ mod tests {
     #[test]
     fn parse_of_plain_text_is_empty_not_an_error() {
         let (calls, prose) = parse_tool_calls("The answer is 4.").unwrap();
-        assert!(calls.is_empty());
+        assert_eq!(calls, [] as [crate::chat::ToolCall; 0]);
         assert_eq!(prose, "The answer is 4.");
     }
 
@@ -1163,7 +1214,7 @@ mod tests {
         let turn = Turn::assistant_tool_calls(&calls);
         let (parsed, prose) = parse_tool_calls(&turn.content).unwrap();
         assert_eq!(parsed, calls);
-        assert!(prose.is_empty());
+        assert_eq!(prose, "");
     }
 
     #[test]
@@ -1251,7 +1302,7 @@ mod tests {
     }
 
     /// The LFM2.5 template strips `</think>` reasoning from every assistant
-    /// history turn but the LAST (keep_past_thinking=false default).
+    /// history turn but the LAST (`keep_past_thinking=false` default).
     #[test]
     fn lfm_strips_past_thinking_but_keeps_the_last() {
         let raw = ChatMl::lfm2().render(&[
@@ -1308,7 +1359,7 @@ mod tests {
 
     /// A pre-wrapped `<tool_response>` user turn is NOT a user query: the
     /// last real query stays earlier, so a later assistant turn keeps its
-    /// reasoning (the template's multi_step_tool rule).
+    /// reasoning (the template's `multi_step_tool` rule).
     #[test]
     fn qwen3_ignores_tool_response_user_turns_when_finding_the_last_query() {
         let raw = ChatMl::qwen3().render(&[
@@ -1380,7 +1431,7 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "get_candidate_status");
         assert_eq!(calls[0].arguments["candidate_id"], "12345");
-        assert!(prose.is_empty());
+        assert_eq!(prose, "");
     }
 
     #[test]
@@ -1398,7 +1449,7 @@ mod tests {
     #[test]
     fn lfm_parse_of_plain_text_is_empty_not_an_error() {
         let (calls, prose) = parse_tool_calls_lfm("The answer is 4.").unwrap();
-        assert!(calls.is_empty());
+        assert_eq!(calls, [] as [crate::chat::ToolCall; 0]);
         assert_eq!(prose, "The answer is 4.");
     }
 
@@ -1485,6 +1536,6 @@ mod tests {
         let turn = Turn::assistant_tool_calls_lfm(&calls);
         let (parsed, prose) = parse_tool_calls_lfm(&turn.content).unwrap();
         assert_eq!(parsed, calls);
-        assert!(prose.is_empty());
+        assert_eq!(prose, "");
     }
 }

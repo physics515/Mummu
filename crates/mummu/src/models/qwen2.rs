@@ -1,6 +1,7 @@
-//! Qwen2 / Qwen2.5 decoder, from scratch on the shared `nn` blocks:
-//! Embedding → N×{RmsNorm, GQA attention (RoPE, KV cache), RmsNorm, SwiGLU}
-//! → RmsNorm → tied lm-head. Config-driven — the 0.5B and 1.5B tiers (and any
+//! Qwen2 / Qwen2.5 decoder, from scratch on the shared `nn` blocks.
+//!
+//! Embedding → N×{RmsNorm, GQA attention (`RoPE`, KV cache), `RmsNorm`, `SwiGLU`}
+//! → `RmsNorm` → tied lm-head. Config-driven — the 0.5B and 1.5B tiers (and any
 //! other single-file Qwen2 checkpoint) load through the same code.
 //!
 //! Ported from laurelane's parity-validated implementation (single-forward
@@ -22,7 +23,8 @@ use crate::import::{
 };
 use crate::models::CausalLm;
 use crate::nn::{
-    GqaAttention, GqaAttentionConfig, LayerKv, SwiGluMlp, SwiGluMlpConfig, causal_mask, rope_tables,
+    GqaAttention, GqaAttentionConfig, HeadShape, LayerKv, SwiGluMlp, SwiGluMlpConfig, causal_mask,
+    rope_tables,
 };
 
 /// Qwen2 architecture hyperparameters, read from the checkpoint's `config.json`.
@@ -38,7 +40,7 @@ pub struct Qwen2Config {
     pub head_dim: usize,
     pub rms_norm_eps: f64,
     pub rope_theta: f32,
-    /// Frequency scaling (YaRN / linear / …). `null` on every Qwen2.5
+    /// Frequency scaling (`YaRN` / linear / …). `null` on every Qwen2.5
     /// checkpoint at its native context; a scaled one is refused at load
     /// rather than answered wrong ([`crate::attn_config`]).
     /// `rope_parameters` is the same object under the name newer transformers
@@ -115,6 +117,13 @@ pub(crate) fn gguf_f32(f: &GgufFile, key: &str) -> Result<f32, String> {
 
 impl Qwen2Config {
     /// Parse `config.json` bytes; derives `head_dim` when absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns the JSON error as a string, or an error when validation
+    /// refuses the config: a non-plain rope scaling, a live (clipping)
+    /// sliding window, a head count that is not a positive multiple of the
+    /// KV heads, or zero layers or vocab.
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self, String> {
         let mut cfg: Self = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
         if cfg.head_dim == 0 {
@@ -127,6 +136,14 @@ impl Qwen2Config {
     /// Hyperparameters from a GGUF header's `qwen2.*` metadata — a GGUF file
     /// is self-contained, no `config.json` beside it. `vocab_size` comes from
     /// the embedding tensor (llama.cpp may pad it past the tokenizer vocab).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the architecture is not `qwen2`, a required
+    /// `qwen2.*` key is missing or not an integer/float, `token_embd.weight`
+    /// is absent or does not match `embedding_length`, the tokenizer vocab
+    /// exceeds the embedding rows, or the resulting config fails the same
+    /// validation as [`Self::from_json_bytes`].
     pub fn from_gguf(f: &GgufFile) -> Result<Self, String> {
         let arch = f.architecture().unwrap_or("<missing>");
         if arch != "qwen2" {
@@ -227,10 +244,12 @@ pub struct DecoderLayer {
     pub post_attention_layernorm: RmsNorm,
 }
 
-/// The Qwen2 decoder stack (HF's `model.*` subtree). The lm-head is tied on
-/// the small tiers (0.5B/1.5B safetensors); untied checkpoints — the 7B, and
-/// every llama.cpp GGUF (which materializes the head as `output.weight`, at
-/// higher precision than the embedding) — carry it explicitly.
+/// The Qwen2 decoder stack (HF's `model.*` subtree).
+///
+/// The lm-head is tied on the small tiers (0.5B/1.5B safetensors); untied
+/// checkpoints — the 7B, and every llama.cpp GGUF (which materializes the
+/// head as `output.weight`, at higher precision than the embedding) — carry
+/// it explicitly.
 #[derive(Module, Debug)]
 pub struct Qwen2 {
     pub embed_tokens: Embedding,
@@ -295,9 +314,16 @@ fn build(cfg: &Qwen2Config, device: &Device) -> Qwen2 {
 /// `dir/model.safetensors` into it, checked (no silent partial loads).
 ///
 /// The key remap maps HF names onto our HF-mirroring field paths: strip the
-/// `model.` prefix and rename RmsNorm `weight` → Burn's `gamma`
+/// `model.` prefix and rename `RmsNorm` `weight` → Burn's `gamma`
 /// (`PyTorchToBurnAdapter` renames Layer/Batch/Group norm params but NOT
-/// RmsNorm; it does transpose the Linear weights).
+/// `RmsNorm`; it does transpose the Linear weights).
+///
+/// # Errors
+///
+/// Returns an [`ImportError`] when `config.json` or `model.safetensors` is
+/// missing, when the config is unreadable or invalid, when the sibling
+/// tokenizer metadata contradicts it, or when the checked load finds the
+/// checkpoint incomplete or mismatched.
 pub fn load_from_dir(dir: &Path, device: &Device) -> Result<LoadedQwen2, ImportError> {
     let cfg_path = required_file(dir, "config.json")?;
     let weights = required_file(dir, "model.safetensors")?;
@@ -383,9 +409,18 @@ fn qwen2_gguf_name(name: &str) -> Option<String> {
 }
 
 /// Load a Qwen2 model straight from a **GGUF** file (any dtype the dequant
-/// suite covers — Q4_K_M, Q8_0, F16, …): hyperparameters from the GGUF
-/// metadata, weights dequantized to f32 and driven through the exact store
-/// pipeline (adapters + remaps + checked load) the safetensors path uses.
+/// suite covers — `Q4_K_M`, `Q8_0`, F16, …).
+///
+/// Hyperparameters come from the GGUF metadata, weights are dequantized to
+/// f32 and driven through the exact store pipeline (adapters + remaps +
+/// checked load) the safetensors path uses.
+///
+/// # Errors
+///
+/// Returns an [`ImportError`] when the file cannot be opened or parsed as
+/// a GGUF, when its metadata fails [`Qwen2Config::from_gguf`], when a
+/// tensor name is unmapped or the dequant fails, or when the checked load
+/// finds the checkpoint incomplete or mismatched.
 pub fn load_from_gguf(path: &Path, device: &Device) -> Result<LoadedQwen2, ImportError> {
     let parse = |reason: String| ImportError::Parse {
         file: path.to_path_buf(),
@@ -442,7 +477,10 @@ impl CausalLm for LoadedQwen2 {
 
         // i32 token ids: native for wgpu and the flex CPU backend alike.
         // Dtype pinned to the backend TYPE, never the per-device policy.
-        let ids32: Vec<i32> = new_ids.iter().map(|&i| i as i32).collect();
+        let ids32: Vec<i32> = new_ids
+            .iter()
+            .map(|&i| i32::try_from(i).expect("token id fits i32"))
+            .collect();
         let input = Tensor::<1, Int>::from_data(
             TensorData::new(ids32, [t]),
             (device, crate::backend::int_dtype(device)),
@@ -457,16 +495,14 @@ impl CausalLm for LoadedQwen2 {
 
         for (layer, kv) in self.model.layers.iter().zip(cache.iter_mut()) {
             let h = layer.input_layernorm.forward(x.clone());
-            let h = layer.self_attn.forward(
-                h,
-                cfg.num_attention_heads,
-                cfg.num_key_value_heads,
-                cfg.head_dim,
-                &cos,
-                &sin,
-                mask.as_ref(),
-                kv,
-            );
+            let shape = HeadShape {
+                num_heads: cfg.num_attention_heads,
+                num_kv_heads: cfg.num_key_value_heads,
+                head_dim: cfg.head_dim,
+            };
+            let h = layer
+                .self_attn
+                .forward(h, shape, &cos, &sin, mask.as_ref(), kv);
             x = x.add(h);
             let h2 = layer.post_attention_layernorm.forward(x.clone());
             x = x.add(layer.mlp.forward(h2));
@@ -478,14 +514,13 @@ impl CausalLm for LoadedQwen2 {
             self.model.lm_head.is_some() != cfg.tie_word_embeddings,
             "lm_head presence must match the config's tie flag"
         );
-        match &self.model.lm_head {
+        if let Some(head) = &self.model.lm_head {
             // Untied: the checkpoint's own head projection.
-            Some(head) => head.forward(last), // [1, vocab]
+            head.forward(last) // [1, vocab]
+        } else {
             // Tied lm-head: logits = last_hidden @ embed_weight^T.
-            None => {
-                let w = self.model.embed_tokens.weight.val(); // [vocab, hidden]
-                last.matmul(w.swap_dims(0, 1)) // [1, vocab]
-            }
+            let w = self.model.embed_tokens.weight.val(); // [vocab, hidden]
+            last.matmul(w.swap_dims(0, 1)) // [1, vocab]
         }
     }
 }

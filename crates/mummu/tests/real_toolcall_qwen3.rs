@@ -10,6 +10,8 @@
 //!   cargo test -p mummu --test real_toolcall_qwen3 -- --ignored --nocapture
 //! ```
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use std::path::PathBuf;
 
 use mummu::chat::{ChatMl, ToolSpec, Turn, parse_tool_calls};

@@ -34,6 +34,8 @@
 //! `MUMMU_BACKEND` / `MUMMU_FORCE_CPU` / fit-planner variables stay where
 //! they were, read at the point of use.
 
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 /// How a build names itself. Compiled here only for the tests: `build.rs`
 /// includes the same file with `#[path]` and is the thing that calls it, and
 /// a build script is not a test target — so without this the stamp rules
@@ -58,12 +60,23 @@ pub mod trace;
 /// tests in parallel threads of one process, so every test that WRITES it —
 /// in any module of this crate — takes this first. Reading it under the lock
 /// is what makes an assertion about the phase mean anything.
+///
+/// A tokio mutex rather than a std one: an async test holds the guard across
+/// its awaits, which is the whole point, and a std guard held across an
+/// `.await` is the deadlock shape `clippy::await_holding_lock` exists for.
 #[cfg(test)]
-pub(crate) static PROGRESS_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static PROGRESS_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Take [`PROGRESS_SERIAL`] from an async test.
 #[cfg(test)]
-pub(crate) fn progress_serial() -> std::sync::MutexGuard<'static, ()> {
-    PROGRESS_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+pub(crate) async fn progress_serial() -> tokio::sync::MutexGuard<'static, ()> {
+    PROGRESS_SERIAL.lock().await
+}
+
+/// Take [`PROGRESS_SERIAL`] from a synchronous test (no runtime on the thread).
+#[cfg(test)]
+pub(crate) fn progress_serial_blocking() -> tokio::sync::MutexGuard<'static, ()> {
+    PROGRESS_SERIAL.blocking_lock()
 }
 
 use std::convert::Infallible;
@@ -81,6 +94,7 @@ use axum::routing::{get, post};
 use mummu::chat::{Role, Turn};
 use mummu::decode::SamplerOptions;
 use mummu::manage::ModelManager;
+use mummu_num::{f64_from_u64, f64_from_usize, trunc_i64};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::net::TcpListener;
@@ -131,31 +145,37 @@ pub(crate) mod test_seams {
     static MODELS_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
     static BACKEND: Mutex<Option<crate::engine::BackendChoice>> = Mutex::new(None);
 
-    pub(crate) fn models_root() -> Option<PathBuf> {
+    pub fn models_root() -> Option<PathBuf> {
         MODELS_ROOT
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
 
     #[cfg(feature = "fault-injection")]
-    pub(crate) fn set_models_root(root: Option<PathBuf>) {
-        *MODELS_ROOT.lock().unwrap_or_else(|e| e.into_inner()) = root;
+    pub fn set_models_root(root: Option<PathBuf>) {
+        *MODELS_ROOT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = root;
     }
 
-    pub(crate) fn backend() -> Option<crate::engine::BackendChoice> {
-        *BACKEND.lock().unwrap_or_else(|e| e.into_inner())
+    pub fn backend() -> Option<crate::engine::BackendChoice> {
+        *BACKEND
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     #[cfg(feature = "fault-injection")]
-    pub(crate) fn set_backend(backend: Option<crate::engine::BackendChoice>) {
-        *BACKEND.lock().unwrap_or_else(|e| e.into_inner()) = backend;
+    pub fn set_backend(backend: Option<crate::engine::BackendChoice>) {
+        *BACKEND
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = backend;
     }
 
     /// A scratch directory that removes itself when dropped — on a failed
     /// assertion too, which unwinds through it. An earlier run of these tests
     /// cleaned up only on success and left seventeen directories in `/tmp`.
-    pub(crate) struct Scratch(PathBuf);
+    pub struct Scratch(PathBuf);
 
     impl Scratch {
         pub(crate) fn new(name: &str) -> Self {
@@ -206,9 +226,10 @@ pub fn prepare_models_root() -> std::io::Result<PathBuf> {
 }
 
 /// Report the device policy once at startup — the honest record of whether
-/// this environment actually has a usable GPU adapter. Probing adapters is
-/// blocking work; callers on an async thread should hand this to
-/// `spawn_blocking`.
+/// this environment actually has a usable GPU adapter.
+///
+/// Probing adapters is blocking work; callers on an async thread should hand
+/// this to `spawn_blocking`.
 pub fn log_device_policy(root: &std::path::Path) {
     let inv = mummu::backend::inventory();
     for gpu in &inv.gpus {
@@ -432,7 +453,7 @@ where
     }
 }
 
-pub(crate) fn json_response(status: u16, body: serde_json::Value) -> Response {
+pub(crate) fn json_response(status: u16, body: &serde_json::Value) -> Response {
     let status = axum::http::StatusCode::from_u16(status)
         .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
     (
@@ -441,6 +462,17 @@ pub(crate) fn json_response(status: u16, body: serde_json::Value) -> Response {
         body.to_string(),
     )
         .into_response()
+}
+
+/// Whole milliseconds of `d`, saturating at `u64::MAX`: `Duration::as_millis`
+/// is a `u128`, which nothing on the wire or in a trace wants.
+pub(crate) fn millis(d: std::time::Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Whole nanoseconds of `d`, saturating at `u64::MAX` (see [`millis`]).
+pub(crate) fn nanos(d: std::time::Duration) -> u64 {
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// How long a buffered answer may take before the connection needs
@@ -499,7 +531,7 @@ where
     tokio::select! {
         res = &mut rx => {
             let (status, body) = res.unwrap_or_else(|_| (500, crate::worker_vanished()));
-            json_response(status, body)
+            json_response(status, &body)
         }
         () = tokio::time::sleep(KEEPALIVE_GRACE) => {
             let stream = async_stream::stream! {
@@ -545,26 +577,26 @@ pub(crate) fn parse_json<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result
         Err(e) => {
             return Err(Box::new(json_response(
                 400,
-                json!({"error": format!("body read: {e}")}),
+                &json!({"error": format!("body read: {e}")}),
             )));
         }
     };
     if text.len() > MAX_BODY_BYTES {
         return Err(Box::new(json_response(
             400,
-            json!({"error": "body too large"}),
+            &json!({"error": "body too large"}),
         )));
     }
     serde_json::from_str::<T>(text).map_err(|e| {
         Box::new(json_response(
             400,
-            json!({"error": format!("bad json: {e}")}),
+            &json!({"error": format!("bad json: {e}")}),
         ))
     })
 }
 
 async fn not_found() -> Response {
-    json_response(404, json!({"error": "not found"}))
+    json_response(404, &json!({"error": "not found"}))
 }
 
 async fn ui() -> Response {
@@ -613,7 +645,7 @@ async fn health() -> Response {
     blocking(|| {
         let poisoned = recovery::poisoned();
         let body = health_json(recovery::current().as_ref(), poisoned);
-        json_response(if poisoned { 503 } else { 200 }, body)
+        json_response(if poisoned { 503 } else { 200 }, &body)
     })
     .await
 }
@@ -685,7 +717,7 @@ async fn models() -> Response {
             .collect();
         json_response(
             200,
-            json!({"models": list, "device": engine::device_label()}),
+            &json!({"models": list, "device": engine::device_label()}),
         )
     })
     .await
@@ -698,11 +730,11 @@ async fn unload() -> Response {
     // caller acts on (it frees nothing, and the next request still hits the
     // old model).
     if blocking(engine::unload_all).await {
-        json_response(200, json!({"status": "unloaded"}))
+        json_response(200, &json!({"status": "unloaded"}))
     } else {
         json_response(
             409,
-            json!({"error": "a generation is in flight — the model stays resident until it finishes"}),
+            &json!({"error": "a generation is in flight — the model stays resident until it finishes"}),
         )
     }
 }
@@ -772,7 +804,7 @@ pub(crate) struct FinalFrame {
 }
 
 impl FinalFrame {
-    pub(crate) fn new(
+    pub(crate) const fn new(
         tx: mpsc::UnboundedSender<serde_json::Value>,
         fallback: serde_json::Value,
     ) -> Self {
@@ -822,12 +854,12 @@ async fn pull(body: Bytes) -> Response {
             if cancelled {
                 return; // client gone; drain the remaining callbacks quietly
             }
-            let pct = p
-                .total_bytes
-                .map(|t| ((p.received_bytes as f64 / t.max(1) as f64) * 100.0) as i64);
+            let pct = p.total_bytes.map(|t| {
+                trunc_i64((f64_from_u64(p.received_bytes) / f64_from_u64(t.max(1))) * 100.0)
+            });
             // Throttle: one frame per whole percent (or per 64 MiB when the
             // server didn't announce a total).
-            let tick = pct.unwrap_or((p.received_bytes >> 26) as i64);
+            let tick = pct.unwrap_or_else(|| (p.received_bytes >> 26).cast_signed());
             if tick == last_pct {
                 return;
             }
@@ -865,7 +897,7 @@ async fn pull(body: Bytes) -> Response {
 /// with a 524 — and a cold `/api/chat` produces none for **seven minutes**
 /// while a 27B is read from disk and placed across devices. SSE does not help:
 /// the clock runs from the request, and there is nothing to stream yet.
-/// Cloudflare does not apply that timeout to WebSockets.
+/// Cloudflare does not apply that timeout to `WebSockets`.
 ///
 /// The upgrade alone is not the fix, though. An idle WebSocket is still
 /// reaped, so this **heartbeats while the model loads** — without the ping
@@ -883,7 +915,7 @@ async fn chat_ws(upgrade: axum::extract::ws::WebSocketUpgrade) -> Response {
 /// reads the frames off a real socket.
 async fn drive_chat_ws(
     mut socket: axum::extract::ws::WebSocket,
-    start: fn(ChatRequest) -> Result<ChatStream, Rejection>,
+    start: fn(&ChatRequest) -> Result<ChatStream, Rejection>,
 ) -> Result<(), String> {
     use axum::extract::ws::Message;
     // `close` is `SinkExt::close`, not an inherent method on WebSocket.
@@ -899,7 +931,7 @@ async fn drive_chat_ws(
         match socket.recv().await {
             Some(Ok(Message::Text(text))) => break text,
             // A client may ping before sending; keep waiting for the body.
-            Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+            Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
             Some(Ok(Message::Close(_))) | None => return Ok(()),
             Some(Ok(_)) => return Err("expected a text frame carrying the request".into()),
             Some(Err(e)) => return Err(e.to_string()),
@@ -910,7 +942,7 @@ async fn drive_chat_ws(
             status: 400,
             error: format!("bad json: {e}"),
         })
-        .and_then(start);
+        .and_then(|parsed| start(&parsed));
     let mut chat = match started {
         Ok(chat) => chat,
         Err(rejection) => {
@@ -932,25 +964,22 @@ async fn drive_chat_ws(
     beat.tick().await; // the first tick is immediate; skip it
     loop {
         tokio::select! {
-            event = rx.recv() => match event {
-                Some(frame) => {
-                    let done = is_final_frame(&frame);
-                    if socket.send(Message::Text(frame.to_string().into())).await.is_err() {
-                        return Ok(()); // client gone; the generation task sees the closed channel
-                    }
-                    if done {
-                        let _ = socket.close().await;
-                        return Ok(());
-                    }
+            event = rx.recv() => if let Some(frame) = event {
+                let done = is_final_frame(&frame);
+                if socket.send(Message::Text(frame.to_string().into())).await.is_err() {
+                    return Ok(()); // client gone; the generation task sees the closed channel
                 }
-                None => {
-                    // The worker is gone without a final frame (see
-                    // `ended_without_result`): never close on silence.
-                    let frame = ended_without_result();
-                    let _ = socket.send(Message::Text(frame.to_string().into())).await;
+                if done {
                     let _ = socket.close().await;
                     return Ok(());
                 }
+            } else {
+                // The worker is gone without a final frame (see
+                // `ended_without_result`): never close on silence.
+                let frame = ended_without_result();
+                let _ = socket.send(Message::Text(frame.to_string().into())).await;
+                let _ = socket.close().await;
+                return Ok(());
             },
             _ = beat.tick() => {
                 // Keeps the proxy from reaping a connection that is waiting on
@@ -976,7 +1005,7 @@ pub(crate) struct ChatMessage {
     /// how ollama's own clients replay one.
     #[serde(default, deserialize_with = "null_as_empty")]
     pub(crate) content: String,
-    /// Base64 image payloads, ollama's per-message spelling. OpenAI puts
+    /// Base64 image payloads, ollama's per-message spelling. `OpenAI` puts
     /// them in `content` parts instead; both land here before planning.
     #[serde(default)]
     pub(crate) images: Vec<String>,
@@ -1015,7 +1044,7 @@ fn replayed_calls<'de, D: serde::Deserializer<'de>>(
 /// An output grammar the decoder must obey, asked for by a request.
 ///
 /// Both compatibility surfaces spell the same thing differently — ollama's
-/// `"format": "json"` and OpenAI's `"response_format": {"type":
+/// `"format": "json"` and `OpenAI`'s `"response_format": {"type":
 /// "json_object"}` — so they translate into this one type and share the
 /// machinery in `mummu::constrain`.
 ///
@@ -1139,7 +1168,7 @@ fn sampler_options(o: &ChatOptions) -> Result<SamplerOptions, String> {
     let seed = o.seed.unwrap_or_else(|| {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos() as u64)
+            .map_or(0, nanos)
     });
     Ok(SamplerOptions {
         temperature,
@@ -1176,7 +1205,9 @@ fn publish_profile() {
                 "[mummu-serve] profile: {} stacks — GET /api/profile for the flame graph",
                 folded.lines().count()
             );
-            *LAST_PROFILE.lock().unwrap_or_else(|e| e.into_inner()) = Some((svg, folded));
+            *LAST_PROFILE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((svg, folded));
         }
         Err(e) => eprintln!("[mummu-serve] profile: flamegraph failed: {e}"),
     }
@@ -1187,7 +1218,7 @@ fn publish_profile() {
 async fn profile_svg() -> Response {
     let last = LAST_PROFILE
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     match last {
         Some((svg, _)) => Response::builder()
@@ -1196,7 +1227,7 @@ async fn profile_svg() -> Response {
             .expect("static response"),
         None => json_response(
             404,
-            json!({"error": "no profiled generation yet — POST /api/chat with \"profile\": true, then retry"}),
+            &json!({"error": "no profiled generation yet — POST /api/chat with \"profile\": true, then retry"}),
         ),
     }
 }
@@ -1206,7 +1237,7 @@ async fn profile_svg() -> Response {
 async fn profile_folded() -> Response {
     let last = LAST_PROFILE
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     match last {
         Some((_, folded)) => Response::builder()
@@ -1215,7 +1246,7 @@ async fn profile_folded() -> Response {
             .expect("static response"),
         None => json_response(
             404,
-            json!({"error": "no profiled generation yet — POST /api/chat with \"profile\": true, then retry"}),
+            &json!({"error": "no profiled generation yet — POST /api/chat with \"profile\": true, then retry"}),
         ),
     }
 }
@@ -1225,7 +1256,7 @@ async fn chat(body: Bytes) -> Response {
         Ok(p) => p,
         Err(response) => return *response,
     };
-    match start_chat(parsed) {
+    match start_chat(&parsed) {
         Ok(chat) => sse_response(chat.rx, Some(chat.inflight)),
         Err(rejection) => rejection.response(),
     }
@@ -1249,7 +1280,7 @@ struct Rejection {
 
 impl Rejection {
     fn response(&self) -> Response {
-        json_response(self.status, json!({"error": self.error}))
+        json_response(self.status, &json!({"error": self.error}))
     }
 
     fn frame(&self) -> serde_json::Value {
@@ -1261,7 +1292,7 @@ impl Rejection {
 /// they assert it, and a replayed call is whatever the client sent.
 ///
 /// Arguments must be an object, as ollama's own API types them; one that
-/// arrives JSON-encoded in a string, OpenAI's spelling, is decoded. `null`
+/// arrives JSON-encoded in a string, `OpenAI`'s spelling, is decoded. `null`
 /// is a call with no arguments.
 fn replayable(calls: &[mummu::chat::ToolCall]) -> Result<Vec<mummu::chat::ToolCall>, String> {
     use mummu::chat::{MAX_TOOL_CALLS, MAX_VALUE_DEPTH};
@@ -1323,7 +1354,7 @@ fn replayable(calls: &[mummu::chat::ToolCall]) -> Result<Vec<mummu::chat::ToolCa
 ///
 /// The generation outlives the caller: it runs as its own task and whoever
 /// holds the receiver drains it.
-fn start_chat(parsed: ChatRequest) -> Result<ChatStream, Rejection> {
+fn start_chat(parsed: &ChatRequest) -> Result<ChatStream, Rejection> {
     let reject = |status: u16, error: String| Rejection { status, error };
     // The process is exiting to restart the GPU backend (see `recovery`).
     if recovery::restarting() {
@@ -1352,19 +1383,18 @@ fn start_chat(parsed: ChatRequest) -> Result<ChatStream, Rejection> {
     let profile = parsed.profile || std::env::var("MUMMU_PROFILE").is_ok();
     let name = spec.name.clone();
     Ok(spawn_chat(name, profile, move |sink| async move {
-        engine::run_chat(
-            &spec,
-            &root,
-            &turns,
-            &opts,
+        let req = engine::GenerationRequest {
+            spec: &spec,
+            models_root: &root,
+            turns: &turns,
+            opts: &opts,
             max_tokens,
-            None,
-            false,
-            Vec::new(),
-            Vec::new(),
-            |delta| sink.delta(delta),
-        )
-        .await
+            format: None,
+            think: false,
+            images: Vec::new(),
+            tools: Vec::new(),
+        };
+        engine::run_chat(&req, |delta| sink.delta(delta)).await
     }))
 }
 
@@ -1431,14 +1461,14 @@ where
         }
         let frame = match result {
             Ok(r) => {
-                let secs = (r.elapsed_ms as f64 / 1000.0).max(1e-3);
+                let secs = (f64_from_u64(r.elapsed_ms) / 1000.0).max(1e-3);
                 json!({
                     "type": "done",
                     "text": r.text,
                     "tokens": r.tokens,
                     "device": r.device,
                     "elapsed_ms": r.elapsed_ms,
-                    "tokens_per_second": (r.tokens as f64 / secs * 10.0).round() / 10.0,
+                    "tokens_per_second": (f64_from_usize(r.tokens) / secs * 10.0).round() / 10.0,
                 })
             }
             Err(e) => {
@@ -1511,8 +1541,8 @@ mod tests {
         assert_eq!(h["version"], json!(status::VERSION));
         assert_eq!(
             h["version"],
-            json!("0.4.1"),
-            "this branch ships as v0.4.1; the workspace version is what says so"
+            json!("0.5.0"),
+            "this branch ships as v0.5.0; the workspace version is what says so"
         );
         let build = h["build"].as_str().expect("build is a string");
         assert!(
@@ -1544,13 +1574,14 @@ mod tests {
                             memory allocating 261319680 bytes";
 
     /// A generation that fails the way production's did: a panic on the
-    /// request's own worker, from the first read.
-    async fn fails_like_production() -> Result<engine::ChatResult, recovery::ChatError> {
+    /// request's own worker, from the first read. Called from inside the
+    /// generation's own future, so the panic lands where production's did.
+    fn fails_like_production() -> Result<engine::ChatResult, recovery::ChatError> {
         panic!("{INVALID_READ}")
     }
 
     /// A generation that panics for a reason that is NOT the GPU's.
-    async fn fails_with_an_ordinary_bug() -> Result<engine::ChatResult, recovery::ChatError> {
+    fn fails_with_an_ordinary_bug() -> Result<engine::ChatResult, recovery::ChatError> {
         panic!("index out of bounds: the len is 3 but the index is 7")
     }
 
@@ -1583,13 +1614,12 @@ mod tests {
     /// client got a 200 carrying NOTHING. It must get exactly one final
     /// frame, an error, saying what failed and what happens next.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // serializes tests; nothing else waits on it
     async fn an_sse_chat_that_hits_the_gpu_failure_ends_in_an_error_frame() {
-        let _serial = progress_serial();
+        let _serial = progress_serial().await;
         recovery::reset_for_tests();
         recovery::install_panic_hook();
 
-        let chat = spawn_chat("qwen3.8-27b-ud-q4ks".into(), false, |_| {
+        let chat = spawn_chat("qwen3.8-27b-ud-q4ks".into(), false, |_| async {
             fails_like_production()
         });
         let frames = sse_frames(sse_response(chat.rx, Some(chat.inflight))).await;
@@ -1613,13 +1643,14 @@ mod tests {
     /// A panic that is not the GPU's still reaches the client — as an error
     /// that promises no recovery, because none is happening.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // serializes tests; nothing else waits on it
     async fn an_ordinary_panic_is_an_error_frame_that_promises_no_recovery() {
-        let _serial = progress_serial();
+        let _serial = progress_serial().await;
         recovery::reset_for_tests();
         recovery::install_panic_hook();
 
-        let chat = spawn_chat("m".into(), false, |_| fails_with_an_ordinary_bug());
+        let chat = spawn_chat("m".into(), false, |_| async {
+            fails_with_an_ordinary_bug()
+        });
         let frames = sse_frames(sse_response(chat.rx, Some(chat.inflight))).await;
         let last = frames.last().expect("a frame");
         assert_eq!(last["type"], json!("error"), "{last}");
@@ -1656,13 +1687,7 @@ mod tests {
         assert!(rx.try_recv().is_err(), "exactly one final frame");
     }
 
-    fn failing_start(_: ChatRequest) -> Result<ChatStream, Rejection> {
-        Ok(spawn_chat("qwen3.8-27b-ud-q4ks".into(), false, |_| {
-            fails_like_production()
-        }))
-    }
-
-    fn restarting_start(_: ChatRequest) -> Result<ChatStream, Rejection> {
+    fn restarting_start(_: &ChatRequest) -> Result<ChatStream, Rejection> {
         Err(Rejection {
             status: 503,
             error: recovery::restarting_message().to_owned(),
@@ -1671,7 +1696,7 @@ mod tests {
 
     /// Every text frame a real WebSocket client receives for one chat.
     async fn ws_frames(
-        start: fn(ChatRequest) -> Result<ChatStream, Rejection>,
+        start: fn(&ChatRequest) -> Result<ChatStream, Rejection>,
     ) -> Vec<serde_json::Value> {
         use futures::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message;
@@ -1709,13 +1734,18 @@ mod tests {
     /// socket before it closes — never as a socket that simply closes, which
     /// is what the chat page drew as an empty bubble.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[allow(clippy::await_holding_lock)] // serializes tests; nothing else waits on it
     async fn a_websocket_chat_that_hits_the_gpu_failure_gets_an_error_frame() {
-        let _serial = progress_serial();
+        let _serial = progress_serial().await;
         recovery::reset_for_tests();
         recovery::install_panic_hook();
 
-        let frames = ws_frames(failing_start).await;
+        // A start whose generation fails the way production's did.
+        let frames = ws_frames(|_| {
+            Ok(spawn_chat("qwen3.8-27b-ud-q4ks".into(), false, |_| async {
+                fails_like_production()
+            }))
+        })
+        .await;
         let last = frames.last().expect("at least one frame before the close");
         assert_eq!(last["type"], json!("error"), "{frames:?}");
         assert_eq!(last["recovery"], json!("reload"), "{last}");
@@ -1738,9 +1768,8 @@ mod tests {
     /// is poisoned it must answer non-2xx — Docker's `curl -sf` fails on it —
     /// and say why; and a clean load must bring it back.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // serializes tests; nothing else waits on it
     async fn health_is_503_and_says_why_while_the_gpu_is_poisoned() {
-        let _serial = progress_serial();
+        let _serial = progress_serial().await;
         recovery::reset_for_tests();
         recovery::install_panic_hook();
         assert_eq!(health().await.status(), 200);
@@ -1837,9 +1866,8 @@ mod tests {
     /// With it, the route arms what it is told to and nothing more.
     #[cfg(feature = "fault-injection")]
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // serializes tests; nothing else waits on it
     async fn a_fault_injection_build_arms_faults_through_its_route() {
-        let _serial = progress_serial();
+        let _serial = progress_serial().await;
         assert_eq!(
             post_status(
                 router(),

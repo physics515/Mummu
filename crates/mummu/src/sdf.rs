@@ -78,9 +78,11 @@ pub struct Node {
 }
 
 /// A dependency: `to` cannot start (for a given token) until `from` finished
-/// it `delay` tokens earlier. `cost` is milliseconds paid on the edge itself
-/// — a crossing, a fence — and `delay` is tokens in flight on the
-/// dependency: 0 for same-token edges, 1 for the token-loop back edge.
+/// it `delay` tokens earlier.
+///
+/// `cost` is milliseconds paid on the edge itself — a crossing, a fence —
+/// and `delay` is tokens in flight on the dependency: 0 for same-token
+/// edges, 1 for the token-loop back edge.
 #[derive(Debug, Clone)]
 pub struct Edge {
     pub from: usize,
@@ -89,9 +91,10 @@ pub struct Edge {
     pub delay: u32,
 }
 
-/// A priced directed graph. Build with [`Graph::add_node`] /
-/// [`Graph::add_edge`], or via [`decode_graph`] for the standard per-token
-/// chain.
+/// A priced directed graph.
+///
+/// Build with [`Graph::add_node`] / [`Graph::add_edge`], or via
+/// [`decode_graph`] for the standard per-token chain.
 #[derive(Debug, Clone, Default)]
 pub struct Graph {
     pub nodes: Vec<Node>,
@@ -204,7 +207,12 @@ pub fn max_cycle_ratio(g: &Graph) -> Option<f64> {
     let probe = |lambda: f64| -> bool {
         let adjusted: Vec<(usize, usize, f64)> = arcs
             .iter()
-            .map(|a| (a.0, a.1, a.2 - lambda * f64::from(a.3)))
+            .map(|a| {
+                // Two roundings on purpose: the probe must price a cycle
+                // exactly as the bisection's comparisons expect.
+                let scaled_delay = lambda * f64::from(a.3);
+                (a.0, a.1, a.2 - scaled_delay)
+            })
             .collect();
         has_positive_cycle(n, &adjusted)
     };
@@ -220,7 +228,7 @@ pub fn max_cycle_ratio(g: &Graph) -> Option<f64> {
     let mut lo = 0.0f64;
     let mut hi = arcs.iter().map(|a| a.2.max(0.0)).sum::<f64>() + 1.0;
     for _ in 0..200 {
-        let mid = 0.5 * (lo + hi);
+        let mid = f64::midpoint(lo, hi);
         if probe(mid) {
             lo = mid;
         } else {
@@ -230,12 +238,13 @@ pub fn max_cycle_ratio(g: &Graph) -> Option<f64> {
             break;
         }
     }
-    Some(0.5 * (lo + hi))
+    Some(f64::midpoint(lo, hi))
 }
 
-/// The measured cost table a decode graph is priced from. All milliseconds,
-/// all measured (never assumed — see `examples/orchestration-attribution.rs`
-/// for the 27B's recorded numbers).
+/// The measured cost table a decode graph is priced from.
+///
+/// All milliseconds, all measured (never assumed — see
+/// `examples/orchestration-attribution.rs` for the 27B's recorded numbers).
 #[derive(Debug, Clone)]
 pub struct LayerCosts {
     /// Kernel time per layer, in execution order. Length defines the layer
@@ -255,9 +264,11 @@ pub struct LayerCosts {
 }
 
 /// Build the standard decode-step graph: the per-token layer chain with
-/// crossing costs at placement boundaries, a final readback edge into a
-/// zero-work `sample` node (the host-side argmax), and the token-loop back
-/// edge (`sample → layer 0`, delay 1) closing the cycle.
+/// crossing costs at placement boundaries.
+///
+/// A final readback edge runs into a zero-work `sample` node (the
+/// host-side argmax), and the token-loop back edge (`sample → layer 0`,
+/// delay 1) closes the cycle.
 ///
 /// The next token's input token id is a few bytes; its upload is treated as
 /// part of layer 0's work, so the back edge itself is free — the delay is
@@ -325,7 +336,9 @@ pub fn decode_graph(costs: &LayerCosts, placement: &[Machine]) -> Result<Graph, 
 }
 
 /// The floor as a regression gate: measured steady-state token time must be
-/// within 5% of T*. 5% is headroom for this box's session-to-session drift
+/// within 5% of T*.
+///
+/// 5% is headroom for this box's session-to-session drift
 /// (~10% cold, far less warm+quiet+same-session, which is the only regime
 /// decode numbers are quoted from) without letting a real scheduling
 /// regression — which shows up as tens of percent — hide inside it.
@@ -391,16 +404,18 @@ mod tests {
     /// A→B→A prices (1+2+1)/1 = 4, A→C→A prices (1+10)/2 = 5.5.
     #[test]
     fn two_cycles_take_the_maximum() {
-        let mut g = Graph::default();
-        let a = g.add_node("a", 1.0);
-        let b = g.add_node("b", 2.0);
-        let c = g.add_node("c", 10.0);
-        g.add_edge(a, b, 0.0, 0);
-        g.add_edge(b, a, 1.0, 1);
-        g.add_edge(a, c, 0.0, 0);
-        g.add_edge(c, a, 0.0, 2);
-        let t = max_cycle_ratio(&g).expect("well-formed");
-        assert_rel(t, 5.5, 1e-9, "binding cycle");
+        // Paper notation: `node_a`/`node_b`/`node_c` are the graph's A/B/C,
+        // and `period` is T*, the maximum cycle ratio.
+        let mut graph = Graph::default();
+        let node_a = graph.add_node("a", 1.0);
+        let node_b = graph.add_node("b", 2.0);
+        let node_c = graph.add_node("c", 10.0);
+        graph.add_edge(node_a, node_b, 0.0, 0);
+        graph.add_edge(node_b, node_a, 1.0, 1);
+        graph.add_edge(node_a, node_c, 0.0, 0);
+        graph.add_edge(node_c, node_a, 0.0, 2);
+        let period = max_cycle_ratio(&graph).expect("well-formed");
+        assert_rel(period, 5.5, 1e-9, "binding cycle");
     }
 
     /// The fission shape: fork → {A ∥ B} → join, token back edge. Each
@@ -408,17 +423,17 @@ mod tests {
     /// max, not sum. This is exactly why the SDF floor rewards overlap.
     #[test]
     fn parallel_branches_bind_at_the_longer_branch_not_the_sum() {
-        let mut g = Graph::default();
-        let fork = g.add_node("fork", 2.0);
-        let a = g.add_node("branch_a", 10.0);
-        let b = g.add_node("branch_b", 3.0);
-        let join = g.add_node("join", 1.0);
-        g.add_edge(fork, a, 0.0, 0);
-        g.add_edge(fork, b, 0.0, 0);
-        g.add_edge(a, join, 0.0, 0);
-        g.add_edge(b, join, 0.0, 0);
-        g.add_edge(join, fork, 0.5, 1);
-        let t = max_cycle_ratio(&g).expect("well-formed");
+        let mut graph = Graph::default();
+        let fork = graph.add_node("fork", 2.0);
+        let long_branch = graph.add_node("branch_a", 10.0);
+        let short_branch = graph.add_node("branch_b", 3.0);
+        let join = graph.add_node("join", 1.0);
+        graph.add_edge(fork, long_branch, 0.0, 0);
+        graph.add_edge(fork, short_branch, 0.0, 0);
+        graph.add_edge(long_branch, join, 0.0, 0);
+        graph.add_edge(short_branch, join, 0.0, 0);
+        graph.add_edge(join, fork, 0.5, 1);
+        let t = max_cycle_ratio(&graph).expect("well-formed");
         // 2 (fork) + 10 (longer branch) + 1 (join) + 0.5 (back edge).
         assert_rel(t, 13.5, 1e-9, "fork/join period");
         // Sanity: distinctly below the serial sum (which would add 3 more).
@@ -440,7 +455,11 @@ mod tests {
         let g = decode_graph(&costs, &placement).expect("valid table");
         let t = max_cycle_ratio(&g).expect("well-formed");
         // 3 GPU layers pay launch; one Gpu→Host boundary pays a crossing.
-        let analytic = (14.0 + 0.05) * 3.0 + 36.0 * 2.0 + 0.5 + 8.5;
+        // Summed term by term so the expected value is the plain arithmetic
+        // the comment states, not a fused product-sum.
+        let gpu_layers = (14.0 + 0.05) * 3.0;
+        let host_layers = 36.0 * 2.0;
+        let analytic = gpu_layers + host_layers + 0.5 + 8.5;
         assert_rel(t, analytic, 1e-9, "chain+backedge");
     }
 
@@ -510,7 +529,7 @@ mod tests {
 
         let neg = LayerCosts {
             per_layer_ms: vec![1.0, -2.0],
-            ..costs.clone()
+            ..costs
         };
         assert!(decode_graph(&neg, &[Machine::Host, Machine::Host]).is_err());
 

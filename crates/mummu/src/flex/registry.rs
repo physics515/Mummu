@@ -28,7 +28,9 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use super::kernels::PackedQ4;
 
-/// Is the packed host path enabled? `MUMMU_VNNI_GEMV`, default on;
+/// Is the packed host path enabled?
+///
+/// `MUMMU_VNNI_GEMV`, default on;
 /// `0`/`off`/`false` restores the i8 scalar path everywhere (the downgrade
 /// contract every fast path in this repo carries). [`force_disable`] wins
 /// over the env — tests of the baseline path use it.
@@ -104,7 +106,9 @@ pub fn insert(values_i8: &[i8], packed: Arc<PackedQ4>) {
 }
 
 /// The packed twin for this slab, building it lazily (and logging, once per
-/// shape) when the loader did not register one. `scales` is the device
+/// shape) when the loader did not register one.
+///
+/// `scales` is the device
 /// grid's `[K, N/32]` blocks-along-N layout. Callers gate on [`enabled`];
 /// this function always answers so direct users (tests, probes) are not
 /// coupled to the kill switch.
@@ -126,8 +130,7 @@ pub fn resolve(values_i8: &[i8], scales: &[f32], k: usize, n: usize) -> Option<A
     // duplicate build is wasted work, not wrongness.
     log_lazy(k, n);
     let packed = Arc::new(PackedQ4::from_q4s_slab(values_i8, scales, k, n));
-    let mut m = map().lock().unwrap_or_else(PoisonError::into_inner);
-    m.insert(
+    map().lock().unwrap_or_else(PoisonError::into_inner).insert(
         key,
         Entry {
             tag,
@@ -149,7 +152,7 @@ fn log_lazy(k: usize, n: usize) {
     }
 }
 
-fn bytes_of(values_i8: &[i8]) -> &[u8] {
+const fn bytes_of(values_i8: &[i8]) -> &[u8] {
     // SAFETY: i8 and u8 have identical layout; the slice is only read.
     unsafe { std::slice::from_raw_parts(values_i8.as_ptr().cast::<u8>(), values_i8.len()) }
 }
@@ -157,6 +160,7 @@ fn bytes_of(values_i8: &[i8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mummu_num::f32_from_usize;
 
     /// Serializes this module's tests: each one `clear()`s the process-global
     /// map, and a clear landing between another test's insert and its
@@ -168,24 +172,26 @@ mod tests {
         let _serial = REGISTRY_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         clear();
         let (k, n) = (64usize, 32usize);
-        let vals: Vec<f32> = (0..k * n).map(|i| ((i as f32) * 0.13).sin()).collect();
+        let vals: Vec<f32> = (0..k * n)
+            .map(|i| (f32_from_usize(i) * 0.13).sin())
+            .collect();
         let (qi8, scales) = crate::pack::quantize_blocks(&vals, n, crate::pack::Precision::Q4);
-        let a = resolve(&qi8, &scales, k, n).expect("enabled by default");
-        let b = resolve(&qi8, &scales, k, n).expect("hit");
+        let first = resolve(&qi8, &scales, k, n).expect("enabled by default");
+        let second = resolve(&qi8, &scales, k, n).expect("hit");
         assert!(
-            Arc::ptr_eq(&a, &b),
+            Arc::ptr_eq(&first, &second),
             "second resolve must be the memoized twin"
         );
 
         // Same address, different contents: the tag must force a re-pack.
-        let mut qi8b = qi8.clone();
+        let mut qi8b = qi8;
         // Ensure identical allocation size but different first byte...
         qi8b[0] = qi8b[0].wrapping_add(1);
-        let c = resolve(&qi8b, &scales, k, n).expect("rebuild");
+        let rebuilt = resolve(&qi8b, &scales, k, n).expect("rebuild");
         // (ptr differs here because it is a different Vec — the tag check is
         // exercised by the ptr-collision case below only probabilistically,
         // so at minimum the API must return a twin matching the new slab.)
-        let deq = c.dequantize();
+        let deq = rebuilt.dequantize();
         assert_eq!(deq.len(), k * n);
         clear();
     }
@@ -195,7 +201,9 @@ mod tests {
         let _serial = REGISTRY_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         clear();
         let (k, n) = (64usize, 32usize);
-        let vals: Vec<f32> = (0..k * n).map(|i| ((i as f32) * 0.07).cos()).collect();
+        let vals: Vec<f32> = (0..k * n)
+            .map(|i| (f32_from_usize(i) * 0.07).cos())
+            .collect();
         let (qi8, scales) = crate::pack::quantize_blocks(&vals, n, crate::pack::Precision::Q4);
         register_from_f32(&qi8, &vals, k, n);
         let got = resolve(&qi8, &scales, k, n).expect("registered");

@@ -3,6 +3,9 @@
 //! after a process has thousands of resident flex pool slabs. If first-op-
 //! on-a-fresh-thread scales with resident state, the 27 ms is per-thread
 //! flex init, and the fix is a long-lived worker per device.
+
+#![warn(clippy::pedantic, clippy::nursery, clippy::all)]
+
 use burn::tensor::{Tensor, TensorData};
 use mummu::backend;
 use std::time::Instant;
