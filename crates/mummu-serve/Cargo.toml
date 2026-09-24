@@ -1,6 +1,9 @@
 [package]
 name = "mummu-serve"
 description = "Minimal HTTP server + web chat UI over the mummu model runner (GPU via wgpu, CPU fallback)."
+# Not published: this is a deployable service, not a library anyone depends
+# on. It ships as a container and a GitHub release artifact instead.
+publish = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true

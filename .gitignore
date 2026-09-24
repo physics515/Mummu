@@ -14,3 +14,6 @@ target/
 # OS / editor
 .DS_Store
 Thumbs.db
+
+# Cygwin/MSYS crash dumps left by the Windows-era toolchain
+*.stackdump
