@@ -244,8 +244,12 @@ const RELEASE_FLOOR: u64 = 256 << 20;
 /// believed immediately — the guard's "up at once" property survives, it is
 /// only the bytes we can account for as our own that stop counting twice.
 fn ambient(c: &Card) -> u64 {
-    let mut last = LAST_READING.lock().unwrap_or_else(|e| e.into_inner());
-    let mut flight = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+    let mut last = LAST_READING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut flight = IN_FLIGHT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     correct_ambient(c, &mut last, &mut flight, Instant::now())
 }
 
