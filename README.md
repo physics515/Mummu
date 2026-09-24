@@ -16,13 +16,61 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
 - **Quantize to fit, fill the hardware** — a planner probes every GPU + the CPU (VRAM / RAM), then imports or **quantizes on the fly** (GGUF K-quants, GPTQ / AWQ, or Burn's own int8/int4) and chooses precision + **layer placement** so the *largest model that fits* runs and every device is used — sharded across GPUs, spilling cold layers to CPU when needed. Plus a model-management API (download progress, disk usage, remove) apps surface in their settings UI.
 - **Local embeddings** — a from-scratch MiniLM-class sentence embedder (CPU) for fully-offline semantic search.
 
+## Use it
+
+```toml
+[dependencies]
+mummu = "0.4"
+```
+
+Load a checkpoint and decode. The library is async end to end — a decode that waits on the device
+yields its worker instead of parking it:
+
+```rust
+use std::path::Path;
+
+use mummu::models::CausalLm;
+use mummu::models::qwen2;
+
+async fn answer(prompt: &[u32]) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+    // The runtime probe picks the GPU when there is one, the CPU otherwise.
+    let device = if mummu::backend::use_gpu() {
+        mummu::backend::gpu_device()
+    } else {
+        mummu::backend::cpu_device()
+    };
+
+    // A directory holding config.json / tokenizer.json / model.safetensors.
+    let dir = Path::new("path/to/qwen2.5-1.5b-instruct");
+    let model = qwen2::load_from_dir(dir, &device)?;
+
+    // `prompt` is token ids from the checkpoint's own tokenizer.
+    Ok(model.greedy_generate(prompt, 32, &device).await?)
+}
+```
+
+`mummu::cache::ModelSlot` holds one checkpoint across calls and serializes device access, which is
+what keeps a 16 GB card from trying to hold two multi-GB loads at once. GGUF and PyTorch
+checkpoints load through `mummu::gguf` and `mummu::safetensors`; `mummu::registry` turns a model
+into a manifest entry rather than new code.
+
+The two schedulers are usable on their own and depend on nothing:
+[`mummu-schedule`](crates/mummu-schedule) divides work across heterogeneous devices to minimize
+makespan, [`mummu-mix`](crates/mummu-mix) places per-tensor precision under a byte budget.
+
+For a server rather than a library, `mummu-serve` exposes `/api/chat`, `/api/models` and a web chat
+UI; it is built from this repo rather than installed from crates.io.
+
 ## Status — what runs today
 
-- **Workspace + backends** — `crates/mummu` (library) + `crates/mummu-bench` (criterion); one binary
-  compiles both `Wgpu` (with `fusion` + `autotune`) and `burn-flex` (CPU), with a cached runtime GPU probe and a
-  device inventory that records per-adapter/per-API `SHADER_F16`, max buffer size, and **true VRAM
-  capacity** (DXGI on Windows; wgpu exposes no portable query), plus the host CPU's cores and total
-  RAM — the planner's (and settings UIs') device set.
+- **Workspace + backends** — six crates: `mummu` (the library), `mummu-mix` and `mummu-schedule`
+  (the two dependency-free schedulers), `mummu-serve` (HTTP server + chat UI), `mummu-app` (Tauri
+  desktop shell) and `mummu-bench` (criterion). One binary compiles both `Wgpu` (with `fusion` +
+  `autotune`) and `burn-flex` (CPU), with a cached runtime GPU probe and a device inventory that
+  records per-adapter/per-API `SHADER_F16`, max buffer size, and **true VRAM capacity** (NVML,
+  loaded at runtime rather than linked, so its absence degrades to `None` and never to a link
+  error; wgpu exposes no portable query), plus the host CPU's cores and total RAM — the planner's
+  (and settings UIs') device set.
 - **Shared blocks, generic over `B: Backend`** — cache-aware GQA attention (optional per-head q/k
   RMSNorm), manual RoPE, SwiGLU, and LFM2's double-gated causal short-conv with rolling decode state;
   unit tests prove prefill+decode ≡ full-forward for both cache kinds.
@@ -264,3 +312,10 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
 - **[laurelane](https://github.com/physics515/laurelane)** — on-device statement structuring + categorization; Mummu replaces its in-app Burn modules.
 
 Reference GPU: **RTX 4070 Ti SUPER 16 GB**. The plan lives in **[ROADMAP.md](ROADMAP.md)**.
+
+## License
+
+[MIT](LICENSE-MIT).
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in
+this crate by you shall be licensed as above, without any additional terms or conditions.

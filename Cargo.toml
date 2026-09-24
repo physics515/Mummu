@@ -14,7 +14,7 @@ members = [
 [workspace.package]
 version = "0.5.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 repository = "https://github.com/physics515/Mummu"
 
 [workspace.dependencies]
@@ -87,11 +87,18 @@ burn-flex = "0.22.0-pre.3"
 # The two schedulers, as their own crates: A divides work across devices,
 # B decides the precision of the weights on each. Both are dependency-free —
 # see their crate docs — which is why they are separate rather than modules.
-# Exact, `as`-free numeric conversions (see the crate docs): the one thing
-# every crate — the dependency-free schedulers included — shares.
-mummu-num = { path = "crates/mummu-num" }
-mummu-mix = { path = "crates/mummu-mix" }
-mummu-schedule = { path = "crates/mummu-schedule" }
+# `version` beside `path` is what makes these publishable: cargo refuses to
+# publish a crate whose dependency has no version requirement, and on
+# publish it drops the `path` and resolves the version from crates.io. Local
+# builds still take the path. All three must reach crates.io BEFORE `mummu`
+# does, and `mummu-num` before the two schedulers that depend on it.
+#
+# `mummu-num` is the exact, `as`-free numeric conversions (see its crate
+# docs): the one thing every crate shares, the dependency-free schedulers
+# included.
+mummu-num = { version = "0.5.0", path = "crates/mummu-num" }
+mummu-mix = { version = "0.5.0", path = "crates/mummu-mix" }
+mummu-schedule = { version = "0.5.0", path = "crates/mummu-schedule" }
 # Direct handle on burn-store (the same crate burn's `store` feature pulls) to
 # turn on its `pytorch` feature: .pth / pytorch_model.bin state-dict loading
 # for models never re-shipped as safetensors (feature-unified, no duplicate).

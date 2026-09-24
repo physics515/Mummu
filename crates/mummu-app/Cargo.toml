@@ -1,6 +1,9 @@
 [package]
 name = "mummu-app"
-description = "Tauri desktop shell that hosts mummu-serve natively on the Windows host, so wgpu/Vulkan can see every local adapter."
+description = "Tauri desktop shell that hosts mummu-serve natively on the host, so wgpu/Vulkan can see every local adapter."
+# Not published: a desktop application, not a library. Distributed as a
+# built bundle, and publishing it would drag the whole Tauri graph along.
+publish = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true

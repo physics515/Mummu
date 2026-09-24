@@ -1,6 +1,9 @@
 [package]
 name = "mummu"
 description = "From-scratch Burn model runner: import any open model, quantize it to fit, run it on all the hardware you have."
+keywords = ["llm", "inference", "burn", "gguf", "quantization"]
+categories = ["science", "computer-vision", "concurrency"]
+readme = "../../README.md"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
