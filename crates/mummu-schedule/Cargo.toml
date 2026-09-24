@@ -1,6 +1,8 @@
 [package]
 name = "mummu-schedule"
 description = "Scheduler A: divide work across heterogeneous devices to minimize makespan."
+keywords = ["scheduling", "makespan", "heterogeneous", "llm"]
+categories = ["algorithms", "no-std"]
 version.workspace = true
 edition.workspace = true
 license.workspace = true

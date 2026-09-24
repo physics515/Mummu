@@ -85,8 +85,12 @@ burn-flex = "0.22.0-pre.3"
 # The two schedulers, as their own crates: A divides work across devices,
 # B decides the precision of the weights on each. Both are dependency-free —
 # see their crate docs — which is why they are separate rather than modules.
-mummu-mix = { path = "crates/mummu-mix" }
-mummu-schedule = { path = "crates/mummu-schedule" }
+# `version` beside `path` is what makes these publishable: cargo refuses to
+# publish a crate whose dependency has no version requirement, and on
+# publish it drops the `path` and resolves the version from crates.io. Local
+# builds still take the path. Both must reach crates.io BEFORE `mummu` does.
+mummu-mix = { version = "0.4.1", path = "crates/mummu-mix" }
+mummu-schedule = { version = "0.4.1", path = "crates/mummu-schedule" }
 # Direct handle on burn-store (the same crate burn's `store` feature pulls) to
 # turn on its `pytorch` feature: .pth / pytorch_model.bin state-dict loading
 # for models never re-shipped as safetensors (feature-unified, no duplicate).
