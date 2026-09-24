@@ -2974,7 +2974,15 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       been identified; this run bounds the *recovery*, it does not stop the first OOM. And the guard
       is still `Watermark(ambient)` rather than `ambient + measured pool slack + working set`. Both
       want the cubecl memory trace on a first request. Not yet verified on a live 27B — see the
-      placement gate item above.
+      placement gate item above. *(2026-09-24)* **Verified on the live 27B.** Deployed as a8962d0
+      into a production that had spent the previous day answering `ternary-bonsai-2-27b-pq2_0` at
+      0.6 tok/s with 100–280 s prefills (the host-only regime a post-drop ambient misread leaves
+      behind; the persisted residual was 4.15 GiB, not ratcheted). After the deploy: two greedy
+      requests byte-identical to the fork's reference, 31/64 layers on the card (7.33 planned /
+      9.40 resident, ambient 3.1), one benign precision repair, and **no recovery event** through both
+      requests and a two-minute idle window; warm decode 29 s for 48 tokens (1.6 tok/s), prefill
+      1.9 s. The first OOM did not recur in that window either, which says nothing about (1) — it
+      was never deterministic — only that the loop it fed is closed.
 - [ ] **Llama-family decoder port (`llama`)** *(mistral.rs parity)* — the loader that multiplies
       checkpoint coverage most per unit of new surface: Llama 2/3.x and the wide Mistral/TinyLlama-style
       fine-tune space share one architecture shape, and it is strictly a subset of blocks Mummu already
