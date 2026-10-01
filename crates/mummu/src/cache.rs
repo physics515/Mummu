@@ -224,6 +224,29 @@ impl<T> ModelSlot<T> {
         guard.as_mut().map(|entry| f(&entry.key, &mut entry.value))
     }
 
+    /// Look at the slot **without waiting**: `f` sees the resident key and
+    /// model (or `None` when the slot is empty); the answer is `None` when a
+    /// load or generation holds the slot right now, which callers must read
+    /// as "unknown, and busy" — never as "empty".
+    pub fn try_inspect<R>(&self, f: impl FnOnce(Option<(&Path, &T)>) -> R) -> Option<R> {
+        let guard = self.inner.try_lock().ok()?;
+        Some(f(guard.as_ref().map(|e| (e.key.as_path(), &e.value))))
+    }
+
+    /// Wait for the slot and hold it **without loading anything**: whatever
+    /// is resident (or nothing) stays exactly as it is, and no load or
+    /// generation can start until the returned lock drops.
+    ///
+    /// For work that shares the resident model's DEVICE but is not the model:
+    /// mummu-serve runs an embedder's or reranker's forwards on the
+    /// accelerator under this, so their allocations never interleave with a
+    /// generation's on a card the generation's placement filled.
+    pub async fn lock(&self) -> SlotLock<'_, T> {
+        SlotLock {
+            guard: self.inner.lock().await,
+        }
+    }
+
     /// The checkpoint dir currently loaded, if any — for settings UIs.
     ///
     /// A **peek**: `None` when the slot is empty *or* busy serving a
@@ -254,6 +277,19 @@ pub enum Cleared {
     Empty,
     /// Something holds the slot (a load or a generation); nothing was done.
     Busy,
+}
+
+/// A held slot that may be empty (see [`ModelSlot::lock`]).
+pub struct SlotLock<'a, T> {
+    guard: tokio::sync::MutexGuard<'a, Option<Entry<T>>>,
+}
+
+impl<T> SlotLock<'_, T> {
+    /// The resident model's key and value, if one is loaded.
+    #[must_use]
+    pub fn resident(&self) -> Option<(&Path, &T)> {
+        self.guard.as_ref().map(|e| (e.key.as_path(), &e.value))
+    }
 }
 
 /// A held model slot (see [`ModelSlot::acquire`]). Deref to the model;
@@ -463,6 +499,33 @@ mod tests {
 
     /// `try_clear` says what it found, and only that: an empty slot is not a
     /// dropped model, and a held slot is not touched.
+    /// `try_inspect` tells empty from busy (a busy slot is "unknown", never
+    /// "empty"), and `lock` holds the slot without loading or dropping what
+    /// it holds — what serve's retrieval models rely on.
+    #[tokio::test]
+    async fn inspect_tells_empty_from_busy_and_lock_holds_without_loading() {
+        let slot: ModelSlot<u32> = ModelSlot::new();
+        assert_eq!(slot.try_inspect(|m| m.is_some()), Some(false), "empty");
+        let _ = slot
+            .acquire(Path::new("a"), |_| Ok::<_, ()>(7))
+            .await
+            .expect("loads");
+        assert_eq!(
+            slot.try_inspect(|m| m.map(|(k, v)| (k.to_path_buf(), *v))),
+            Some(Some((PathBuf::from("a"), 7)))
+        );
+        let held = slot.lock().await;
+        assert_eq!(
+            held.resident().map(|(_, v)| *v),
+            Some(7),
+            "lock loads nothing, drops nothing"
+        );
+        assert_eq!(slot.try_inspect(|_| ()), None, "busy is not empty");
+        assert!(!slot.clear(), "nothing clears under the lock");
+        drop(held);
+        assert_eq!(slot.loaded_key().as_deref(), Some(Path::new("a")));
+    }
+
     #[tokio::test]
     async fn try_clear_reports_what_it_actually_found() {
         let slot: ModelSlot<u32> = ModelSlot::new();

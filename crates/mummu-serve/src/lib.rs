@@ -26,6 +26,9 @@
 //!   because a proxy that cuts a 100-second HTTP response cannot serve a model
 //!   that takes minutes to load (see `chat_ws`)
 //! - `POST /api/unload`  drop the resident model (frees VRAM/RAM)
+//! - `POST /api/embed`   embed text (ollama's shape; see [`retrieval`])
+//! - `POST /api/rerank`  score documents against a query
+//! - `POST /api/rag`     retrieve grounding passages from request documents
 //!
 //! Configuration is the *caller's* job — addresses are arguments here, not
 //! environment reads, so the binary and the desktop shell can default
@@ -51,6 +54,7 @@ mod fault;
 pub mod logs;
 mod openai;
 pub mod recovery;
+pub mod retrieval;
 mod shim;
 pub mod status;
 mod think;
@@ -401,6 +405,11 @@ pub fn router() -> Router {
         // at 100 s — see `chat_ws`.
         .route("/api/chat/ws", get(chat_ws))
         .route("/api/unload", post(unload))
+        // Retrieval (see `retrieval`): the same handlers the shim serves.
+        .route("/api/embed", post(retrieval::ollama_embed))
+        .route("/api/embeddings", post(retrieval::ollama_embeddings))
+        .route("/api/rerank", post(retrieval::rerank_endpoint))
+        .route("/api/rag", post(retrieval::rag_endpoint))
         // Flame graphs from a profiled generation — see `profile_svg`.
         .route("/api/profile", get(profile_svg))
         .route("/api/profile/folded", get(profile_folded));
@@ -697,27 +706,31 @@ async fn models() -> Response {
     blocking(|| {
         let root = models_root();
         let manager = ModelManager::new(root.clone());
-        let list: Vec<_> = manager
+        let entry = |s: &mummu::registry::ModelSpec| {
+            json!({
+                "name": s.name,
+                "repo": s.repo,
+                "architecture": format!("{:?}", s.architecture),
+                "task": s.task(),
+                "format": match &s.format {
+                    mummu::registry::WeightFormat::Safetensors => "safetensors",
+                    mummu::registry::WeightFormat::Gguf { .. } => "gguf",
+                },
+                "disk_bytes_estimate": s.disk_bytes_estimate,
+                "installed": engine::is_installed(s, &root),
+            })
+        };
+        // `models` stays the chat list (the UI's picker); embedders and
+        // rerankers ride beside it, pullable by the same name.
+        let (chat, retrieval): (Vec<_>, Vec<_>) = manager
             .catalog()
             .iter()
-            .filter(|s| !matches!(s.architecture, mummu::registry::Architecture::MiniLm))
-            .map(|s| {
-                json!({
-                    "name": s.name,
-                    "repo": s.repo,
-                    "architecture": format!("{:?}", s.architecture),
-                    "format": match &s.format {
-                        mummu::registry::WeightFormat::Safetensors => "safetensors",
-                        mummu::registry::WeightFormat::Gguf { .. } => "gguf",
-                    },
-                    "disk_bytes_estimate": s.disk_bytes_estimate,
-                    "installed": engine::is_installed(s, &root),
-                })
-            })
-            .collect();
+            .partition(|s| s.task() == mummu::registry::Task::Generate);
+        let list: Vec<_> = chat.into_iter().map(entry).collect();
+        let retrieval: Vec<_> = retrieval.into_iter().map(entry).collect();
         json_response(
             200,
-            &json!({"models": list, "device": engine::device_label()}),
+            &json!({"models": list, "retrieval": retrieval, "device": engine::device_label()}),
         )
     })
     .await

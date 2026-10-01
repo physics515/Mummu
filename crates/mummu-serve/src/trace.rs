@@ -230,6 +230,14 @@ fn summarize(ring: &VecDeque<RequestTrace>, pred: &dyn Fn(&RequestTrace) -> bool
 /// one cold load is minutes, and averaged into a handful of warm requests
 /// it turns a healthy p50 into a scary one and a real regression into
 /// noise.
+/// A chat request, as opposed to a retrieval one (`embed`, `rerank`, `rag`
+/// — see `crate::retrieval`). Those are in the ring and `/api/requests`, but
+/// not in the chat aggregates: an embedding has no first token and no decode
+/// rate, and a burst of them would read as a TTFT collapse.
+fn is_chat(t: &RequestTrace) -> bool {
+    matches!(t.surface, "openai" | "ollama" | "native")
+}
+
 pub fn stats_json() -> Value {
     // Every aggregate is computed under the lock and the guard dropped at
     // the end of this block, before the response is assembled: serializing
@@ -240,10 +248,10 @@ pub fn stats_json() -> Value {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         (
             ring.len(),
-            summarize(&ring, &|_| true),
-            summarize(&ring, &|t| t.timings.load_ms == 0),
-            summarize(&ring, &|t| t.timings.load_ms > 0),
-            summarize(&ring, &|t| t.images > 0),
+            summarize(&ring, &is_chat),
+            summarize(&ring, &|t| is_chat(t) && t.timings.load_ms == 0),
+            summarize(&ring, &|t| is_chat(t) && t.timings.load_ms > 0),
+            summarize(&ring, &|t| is_chat(t) && t.images > 0),
             summarize(&ring, &|t| t.surface == "openai"),
             summarize(&ring, &|t| t.surface == "ollama"),
             summarize(&ring, &|t| t.surface == "native"),
