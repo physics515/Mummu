@@ -367,6 +367,31 @@ pub fn unload_all() -> bool {
     freed
 }
 
+/// Drop the resident chat model so its next request loads it again, where
+/// the plan then says — the placement watch's answer for a model whose
+/// loader cannot move layers between devices (see `placement::tick`).
+/// `false` when the slot was busy or empty; nothing was done then.
+pub fn evict_for_placement(why: &str) -> bool {
+    match SLOT.try_clear() {
+        mummu::cache::Cleared::Dropped(key) => {
+            RESIDENT
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|(_, d, _)| *d != key);
+            mummu::progress::evicted();
+            for b in [backend_choice(), BackendChoice::Cpu] {
+                device_of(b).memory_cleanup();
+            }
+            eprintln!(
+                "[mummu-serve] placement: unloaded {} — {why}; the next request loads it there",
+                key.display()
+            );
+            true
+        }
+        mummu::cache::Cleared::Empty | mummu::cache::Cleared::Busy => false,
+    }
+}
+
 /// Drop whatever the model slot holds because a device failed, when the
 /// failure was decided somewhere that does not hold the slot itself —
 /// `recovery::contain`'s path for a generation that is not the engine's. The
@@ -1069,6 +1094,9 @@ pub async fn run_chat(
         "[mummu-serve] fit plan for {}: {:?} @ {:?}",
         spec.name, plan.backend, plan.policy
     );
+    // Our GPU use from here on is not a co-tenant's (see `sysmon`): the
+    // queue, the load and the generation all count as ours.
+    let _work = crate::sysmon::DeviceWork::enter();
     // One slot, one device value: the plan picks *where*, not *which type*.
     drive(&SLOT, req, &prompt, plan, on_delta)
         .await
@@ -2628,21 +2656,42 @@ fn probe_projection_ms(
     };
     touch(gemv());
     touch(gemv());
+    // Ramp the clocks before timing anything. An idle card sits in its
+    // lowest power state — measured on the reference card at 210 MHz of
+    // 3150 — and two warm-up calls (which are kernel compilation and
+    // autotune, not load) never move it: the same 2B's card probe read
+    // Q4 14 / Q8 30 GB/s from a cold card and 78 / 152 GB/s from a warm
+    // one, and the cold reading put every layer on the host. A quarter
+    // second of back-to-back work brings the card (and the host's cpufreq)
+    // up to the clock a decode actually runs at.
+    let ramp = std::time::Instant::now();
+    while ramp.elapsed() < std::time::Duration::from_millis(250) {
+        let mut last = None;
+        for _ in 0..8 {
+            last = Some(gemv());
+        }
+        touch(last.expect("eight calls"));
+    }
     // AMORTIZED throughput, one sync for the whole batch — not per-call
     // latency. Production pays one readback per TOKEN (the argmax index),
     // not per projection, so a per-call fence would charge the accelerator
     // ~1.5 ms of sync it never pays at the margin — enough to flip
     // `choose_prefix` to an empty card now that the host's VNNI path runs a
     // projection in ~1 ms. (The host side is synchronous either way; the
-    // amortization changes nothing there.)
-    let reps = 5;
-    let t0 = std::time::Instant::now();
-    let mut last = None;
-    for _ in 0..reps {
-        last = Some(gemv());
+    // amortization changes nothing there.) Best of three batches: a probe
+    // that lands on a co-tenant's burst should not price the device by it.
+    let reps = 8;
+    let mut best = f64::INFINITY;
+    for _ in 0..3 {
+        let t0 = std::time::Instant::now();
+        let mut last = None;
+        for _ in 0..reps {
+            last = Some(gemv());
+        }
+        touch(last.expect("reps >= 1"));
+        best = best.min(t0.elapsed().as_secs_f64() * 1e3 / f64::from(reps));
     }
-    touch(last.expect("reps >= 1"));
-    Some(t0.elapsed().as_secs_f64() * 1e3 / f64::from(reps))
+    Some(best)
 }
 
 /// Sustained host DRAM read bandwidth, GB/s, measured once per process
@@ -3408,15 +3457,24 @@ fn plan_fresh(spec: &ModelSpec, models_root: &Path) -> Result<FitPlan, String> {
     };
 
     // Only the qwen35 loader consumes a policy today; everything else keeps
-    // its classic path on the preferred backend.
+    // its classic path on the preferred backend — unless another process is
+    // using the card's compute (see `sysmon`): a model whose loader cannot
+    // spread over the card and the host then loads on the host, where it
+    // only ever gets idle cycles. The placement watch moves it back when
+    // the card is free again.
+    let whole = if placement::gpu_yielded() {
+        BackendChoice::Cpu
+    } else {
+        preferred
+    };
     let WeightFormat::Gguf { file } = &spec.format else {
-        return Ok(plan(preferred, QuantPolicy::Off));
+        return Ok(plan(whole, QuantPolicy::Off));
     };
     if !matches!(
         spec.architecture,
         Architecture::Qwen35 | Architecture::Olmoe
     ) {
-        return Ok(plan(preferred, QuantPolicy::Off));
+        return Ok(plan(whole, QuantPolicy::Off));
     }
 
     // A load for this same checkpoint is already in flight: its plan is the

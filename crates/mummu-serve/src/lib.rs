@@ -57,6 +57,7 @@ pub mod recovery;
 pub mod retrieval;
 mod shim;
 pub mod status;
+pub mod sysmon;
 mod think;
 pub mod trace;
 
@@ -323,6 +324,9 @@ where
     // And the card: which layers live there, at what precision, follows what
     // the card has free — also without waiting for traffic.
     engine::spawn_placement_watch();
+    // And what everyone else on the machine wants — the co-tenant readings
+    // every resource decision weighs (see `sysmon`).
+    sysmon::spawn();
     // And take the first memory readings now. The VRAM cache answers from its
     // last sample and refreshes behind it, so the first load's baseline would
     // otherwise be "nothing sampled yet" on a server nobody has polled —
@@ -691,6 +695,9 @@ fn health_json(error: Option<&recovery::BackendError>, poisoned: bool) -> serde_
         // making THIS process unhealthy.
         "error": error.map(recovery::BackendError::to_json),
         "device": engine::device_label(),
+        // What other processes want of the machine, and whether we are
+        // yielding to them (see `sysmon`).
+        "pressure": sysmon::pressure(),
         "gpus": gpus,
         "cpu_cores": inv.cpu.logical_cores,
         // "Is the new release deployed?" — asked, and unanswerable from here

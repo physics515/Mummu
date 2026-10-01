@@ -96,6 +96,10 @@ impl Server {
 }
 
 fn main() {
+    // The compute herd yields to everything else on the desktop — this app
+    // shares its machine with whatever the user is doing (see
+    // `mummu_serve::sysmon::install_compute_pool`).
+    mummu_serve::sysmon::install_compute_pool();
     // Our own runtime rather than tauri's implicit one, so the flavor is
     // stated rather than inherited: mummu is CPU-bound across cores and
     // parks whole threads in `spawn_blocking` (hub downloads, device

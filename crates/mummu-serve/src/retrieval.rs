@@ -449,6 +449,8 @@ where
     let queued = Instant::now();
     let outcome = recovery::contain(&name, async move {
         let _run = RUN.lock().await;
+        // Ours, not a co-tenant's, as far as the GPU sampler is concerned.
+        let _work = crate::sysmon::DeviceWork::enter();
         let queue = queued.elapsed();
         let (model, backend, load) = acquire::<T>(&spec, &root)
             .await
