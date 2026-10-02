@@ -24,6 +24,7 @@ pub mod attn_config;
 pub mod attrib;
 pub mod backend;
 pub mod cache;
+pub mod capture;
 pub mod chat;
 pub mod constrain;
 pub mod decode;

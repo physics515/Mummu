@@ -1806,7 +1806,7 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       the card's total capacity from the runtime — a number the live-placement item has been deriving
       from NVML. Also relevant: burn #5678 fixes cross-device tensor moves that silently never wrote
       the destination on wgpu/ROCm/Metal, and left the scales behind on a quantized same-runtime move.*
-- [ ] **Measure burn 0.22's graph capture on the decode step — the named lever for dispatch-bound
+- [x] **Measure burn 0.22's graph capture on the decode step — the named lever for dispatch-bound
       decode.** 0.22.0-pre.3 ships a **graph-capture backend producing `GraphIr`** (plus a fix to
       preserve initializers across capture scopes), and it is now in the tree rather than a
       release-note promise, so the measurement the perf section has been deferring since 2026-08-06 is
@@ -1923,6 +1923,44 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       and into JIT compile time, caching kernel specializations on first compile. That is the same
       dispatch-cost target from a different direction, and nothing in Mummu currently measures it.
       — https://github.com/tracel-ai/cubecl/releases
+      *(2026-10-01) APPLIED — `mummu::capture`, on by default in serve.* Steps (b) and (c) above,
+      for Qwen3 and the production qwen35 family. The decode step is re-laid out so nothing it
+      touches moves: `nn::static_kv` preallocates the KV cache per slot, writes each step's row in
+      place with an index computed on the device from a positions buffer (`scatter_nd` Assign — an
+      assignment, so the capture warm-up's repeated runs are idempotent), attends over a 256-key
+      **bucket** masked per slot, and gathers `RoPE` rows from tables uploaded once. qwen35's
+      `DeltaNet` conv window and recurrent state advance in place (`static_kv::overwrite`), and
+      because they are NOT idempotent the driver copies them before a capture and writes them back
+      after (`StaticState::{mark,rewind}`) — capturing runs the step ~6 times. Token and position
+      are two device buffers rewritten in place between replays (a copying write would leave the
+      graph reading the stale buffer: a replay that repeats a token forever, silently — asserted
+      `can_mut` instead). One graph per bucket; the static state starts at prompt + 512 positions
+      and doubles on demand (graphs dropped first), so memory follows use. cubecl streams are per
+      thread, so a generation runs on one thread (`capture::on_this_thread`: `block_in_place` +
+      `pollster` on tokio's multi-thread runtime). **Gate:** `tests/real_capture.rs` — dynamic,
+      static and captured decodes identical over 160 greedy tokens in **f32** on both models; in
+      **f16** a different reduction order tips a near-tie eventually (the 2B at token 74, a ship's
+      name — and the dynamic path itself flipped between "Gull" and "Siren's Keep" across runs), so
+      f16 is gated on a 48-token shared prefix. CPU legs: toy Qwen3 and toy qwen35 (both block
+      kinds, GQA groups, a 1,100-token decode that grows the state twice) exact in every mode.
+      **The numbers (RTX 4070 Ti SUPER, Vulkan, quiet, warm, `check_mode = "auto"`):**
+      | model, precision | dynamic ms/token | static | captured | speedup |
+      |---|---:|---:|---:|---:|
+      | Qwen3.5-2B f16 (gguf) | 17.1 | 16.6 | 11.7 | 1.46x |
+      | Qwen3.5-2B f32 (gguf) | 20.6 | 18.4 | 16.6 | 1.24x |
+      | Qwen3-0.6B f16 | 14.2-22.8 | 14.8 | 10.1-10.2 | 1.4-2.3x |
+      | Qwen3-0.6B f32 | 35.5 | 34.1 | 33.3 | 1.07x |
+      f32 is kernel-bound (single-row matmuls at ~70 GB/s effective), so capture moves it least;
+      f16 is launch-bound and moves most — the prediction above, now measured. **Through serve**
+      (the 2B from its layered pack, Q8 on the card, 200 tokens via the ollama shim): 24-30
+      ms/token with `MUMMU_GRAPH=off`, **13.0-13.4 captured** (75-77 tok/s), the same text. Two
+      traps found on the way, both in the persistent pool a capture window allocates from: every
+      slice there is exact-fit and is reused only by an allocation of the same size until an
+      explicit cleanup, so (1) a `repeat_kv` copy of the cache per layer per warm-up run made a
+      16-slot graph ~5.6 GB — the static attention now groups each kv head's query heads as the
+      rows of one matmul instead — and (2) a process that sees many batch shapes held every shape's
+      working set (16 GB card OOM at 16 slots) — graphs are dropped with an explicit
+      `memory_cleanup`. `MUMMU_GRAPH=off|static` are the A/B arms.
 - [x] Silence the pre-existing `LNK4098` (LIBCMT defaultlib conflict) the 2026-07 nightly toolchain's
       new `linker_messages` lint now surfaces when linking the `mummu` lib-test binary — find which
       native dep object embeds the static-CRT directive (tokenizers' C++ deps are the suspects) and
@@ -3714,7 +3752,9 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       every one of them off; the gate is that an options struct with the new fields at their defaults
       produces **byte-identical** streams to today (greedy AND seeded-sampled replay), so no existing
       parity leg moves. *(2026-08-21, mistral.rs scan.)*
-- [ ] **Batched forward (N sequences, one dispatch)** *(mistral.rs parity — the honest subset)* — the
+- [ ] **Batched forward (N sequences, one dispatch)** *(2026-10-01: the decode half done as
+      `capture::generate_batch_greedy`; serve does not batch yet — see "A decode thread per GPU
+      model")* *(mistral.rs parity — the honest subset)* — the
       decode driver is strictly batch-1. Full continuous batching is a serving-stack feature and stays
       a non-goal (single-user consumers, no request queue to schedule), but a fixed-N batched forward
       through the KV cache is the shared prerequisite for two things already wanted: the
@@ -3724,6 +3764,27 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       unusually attractive: N sequences per dispatch amortizes exactly the cost the Performance section
       measures as dominant. Gate: batch-of-1 byte-identical to the unbatched path; batch-of-N equal to
       N independent runs. *(2026-08-21, mistral.rs scan.)*
+      *(2026-10-01) The static decode step is batched by construction — every slot its own sequence
+      at its own position, its own mask row and KV rows (and `DeltaNet` state) — so N prompts decode
+      in one dispatch per step, captured per bucket. Gate held: each slot equal to its solo run,
+      exactly in f32 (Qwen3-0.6B and Qwen3.5-2B, 96 greedy tokens), 48-token prefix in f16.
+      Aggregate tokens/s at 1/2/4/8/16 slots: **2B f16 54 → 80 → 148 → 289 → 461**, 2B f32
+      42 → 68 → 106 → 160 → 218, 0.6B f16 61 → 108 → 210 → 377 → 639 — the step time grows only
+      1.3-1.9x across a 16x batch. Bulk embedding and speculative verify still need their own
+      batched forwards (prefill-shaped, not decode-shaped).*
+- [ ] **A decode thread per GPU model: graphs kept across requests, concurrent requests batched**
+      *(2026-10-01)* — serve captures a fresh graph per request (~0.3-0.55 s, the step run ~6 times
+      plus recording) because a graph replays on its recording thread's cubecl stream and requests
+      land on whichever tokio worker. Give each model wholly on the card one owning decode thread
+      (the shape the P5 "owning worker thread with a channel API" item names): it keeps the static
+      state and the per-bucket graphs alive between requests, and admits concurrent requests into
+      free slots of one batched step (continuous batching — the 461 tok/s above is what 16 waiting
+      requests would share). Needs: per-slot sampling out of `generate_loop` (temperature, top-k/p,
+      penalties and the grammar constraint per sequence), slot admission/retirement while graphs
+      live (seeding writes in place already), a graph per (active-slot count, bucket) or slot
+      compaction so one request does not pay a 16-slot step, and seeded sampling still
+      reproducible per request. Gate: a request's tokens independent of what else is in the batch
+      (exact in f32).
 - [ ] **In-memory prompt-prefix KV reuse** *(mistral.rs parity; the warm sibling of P9's KV-cache
       persistence)* — agent loops re-send system prompt + growing history every turn and Mummu
       re-prefills from token zero each time. Keep the last (or LRU-few) prefill's KV in the `ModelSlot`
@@ -3737,6 +3798,17 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
 ### P6 — Hardware planner: precision, placement & full utilization
 The "use all the hardware" phase — inventory the machine, then pick the precision and the device placement
 that fits the model AND uses every device to the fullest.
+- [x] **A tied head takes its table to the card** *(2026-10-01)* — the joint solve reserved card
+      room for `output.weight` only, and the token table always loaded on the host as "a gather".
+      For a tied checkpoint the table IS the head: a matmul over the whole vocabulary every token.
+      Measured on the 2B with all 24 layers on the card: **86 ms/token against a predicted 5.0** —
+      a host read of the table per token. `placement::Live::measure` now reserves the table as the
+      head when there is no `output.weight` (`head_is_table`), and the load puts the table wherever
+      the head lands; residency counts it (`head_bytes_on_card`). Same session, same 200 tokens:
+      **24-30 ms/token** dynamic, **13.0-13.4** with the captured step (which needs the whole model
+      on one device and so only engaged after this). Still open: neither head nor table follows
+      the scheduler's later moves (they stay where the load put them — 1 GB of the 2B's table on
+      the card while a game holds it).
 - [x] **Whole-system scheduling, stages 1-2: use only the capacity nobody else wants — and all of it**
       *(2026-10-01)*. `serve::sysmon` samples every second what OTHER processes want: host CPU from
       `/proc/stat` less `/proc/self/stat`, GPU compute from NVML utilization scaled by SM clock / max
