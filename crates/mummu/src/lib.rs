@@ -28,6 +28,10 @@ pub mod chat;
 pub mod constrain;
 pub mod decode;
 pub mod diskcache;
+/// Sentence embeddings over every embedder in the zoo, conventions read from
+/// the checkpoint's sentence-transformers files.
+///
+pub mod embed;
 /// Host CPU kernels: the packed-nibble Q4 GEMV at the DRAM roofline
 /// (AVX-512 VNNI) and its calibration machinery (SPEC 1).
 pub mod flex;
@@ -57,7 +61,14 @@ pub mod prof;
 ///
 pub mod progress;
 pub mod quant;
+/// Retrieval-augmented generation, the model-free half: chunking, an exact
+/// vector index, grounded prompts.
+///
+pub mod rag;
 pub mod registry;
+/// Cross-encoder reranking with the Qwen3-Reranker family.
+///
+pub mod rerank;
 pub mod safetensors;
 /// Scheduler A — dividing work across devices (crate `mummu-schedule`).
 pub use mummu_schedule as schedule;

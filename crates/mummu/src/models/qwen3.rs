@@ -14,7 +14,7 @@
 //! stays `[ ]` in the roadmap until Mummu's parity gate (P7) re-verifies it
 //! against a same-weights reference; loading and decoding are proven here.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use burn::module::Module;
 use burn::nn::{Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig};
@@ -22,9 +22,11 @@ use burn::store::{ModuleAdapter, PyTorchToBurnAdapter, SafetensorsStore};
 use burn::tensor::{Device, Int, Tensor, TensorData};
 
 use crate::attn_config::{RopeScaling, check_sliding_window, sliding_window_from_gguf};
+use crate::embed::Pooling;
 use crate::gguf::{GgufFile, GgufMap, GgufTensorInfo, GgufValue};
 use crate::import::{
-    DequantSink, FloatCastAdapter, ImportError, gguf_store, load_checked, required_file,
+    DequantSink, FloatCastAdapter, ImportError, gguf_store, load_checked, load_checked_shards,
+    required_file,
 };
 use crate::models::CausalLm;
 use crate::models::qwen2::{EosIds, gguf_f32, gguf_usize};
@@ -230,6 +232,15 @@ pub struct LoadedQwen3 {
 }
 
 fn build(cfg: &Qwen3Config, device: &Device) -> Qwen3 {
+    build_with_head(cfg, device, !cfg.tie_word_embeddings)
+}
+
+/// [`build`] with the lm-head's presence chosen by the caller: a separate
+/// head when `untied_head`, none otherwise. The trunk-only encoder load
+/// passes `false` whatever the tie flag says — it never reads the head, and
+/// an embedding checkpoint saved as `Qwen3Model` (Qwen3-Embedding-8B) declares
+/// an untied head it does not ship.
+fn build_with_head(cfg: &Qwen3Config, device: &Device, untied_head: bool) -> Qwen3 {
     let attn_cfg = GqaAttentionConfig {
         hidden_size: cfg.hidden_size,
         num_heads: cfg.num_attention_heads,
@@ -256,7 +267,7 @@ fn build(cfg: &Qwen3Config, device: &Device) -> Qwen3 {
             post_attention_layernorm: norm(device),
         })
         .collect();
-    let lm_head = (!cfg.tie_word_embeddings).then(|| {
+    let lm_head = untied_head.then(|| {
         LinearConfig::new(cfg.hidden_size, cfg.vocab_size)
             .with_bias(false)
             .init(device)
@@ -282,25 +293,71 @@ fn install_remaps(store: SafetensorsStore) -> SafetensorsStore {
         .with_key_remapping(r"^norm\.weight$", "norm.gamma")
 }
 
-/// Build from `dir/config.json` and load `dir/model.safetensors`, checked.
-///
-/// # Errors
-///
-/// Returns an [`ImportError`] when `config.json` or `model.safetensors` is
-/// missing, when the config is unreadable or invalid, when the sibling
-/// tokenizer metadata contradicts it, or when the checked load finds the
-/// checkpoint incomplete or mismatched.
-pub fn load_from_dir(dir: &Path, device: &Device) -> Result<LoadedQwen3, ImportError> {
+/// Every safetensors shard of the checkpoint in `dir`: the one
+/// `model.safetensors`, or the shards `model.safetensors.index.json` names
+/// (Qwen3-4B and up ship split — the 4B reranker in two shards, the 8B
+/// embedder in four).
+fn weight_shards(dir: &Path) -> Result<Vec<PathBuf>, ImportError> {
+    crate::safetensors::checkpoint_shards(dir).map_err(|e| match e {
+        crate::safetensors::SafetensorsError::NoCheckpoint(_) => {
+            ImportError::MissingFile(dir.join("model.safetensors"))
+        }
+        other => ImportError::Parse {
+            file: dir.to_path_buf(),
+            reason: other.to_string(),
+        },
+    })
+}
+
+/// `dir/config.json`, parsed and validated.
+fn read_config(dir: &Path) -> Result<Qwen3Config, ImportError> {
     let cfg_path = required_file(dir, "config.json")?;
-    let weights = required_file(dir, "model.safetensors")?;
     let cfg_bytes = std::fs::read(&cfg_path).map_err(|e| ImportError::Parse {
         file: cfg_path.clone(),
         reason: e.to_string(),
     })?;
-    let config = Qwen3Config::from_json_bytes(&cfg_bytes).map_err(|reason| ImportError::Parse {
+    Qwen3Config::from_json_bytes(&cfg_bytes).map_err(|reason| ImportError::Parse {
         file: cfg_path,
         reason,
-    })?;
+    })
+}
+
+/// Load `shards` into `model` through the remap chain, checked across all
+/// of them.
+fn load_shards(model: &mut Qwen3, shards: &[PathBuf], device: &Device) -> Result<(), ImportError> {
+    // The float dtype comes from the DEVICE — burn 0.22 keeps the element
+    // type there as a runtime setting, not on a backend type. Creation sites
+    // still name it explicitly rather than riding the unspecified default.
+    let target_float = crate::backend::float_dtype(device);
+    let stores = shards
+        .iter()
+        .map(|path| {
+            let store = install_remaps(
+                SafetensorsStore::from_file(path.clone())
+                    .with_from_adapter(
+                        PyTorchToBurnAdapter.chain(FloatCastAdapter::to(target_float)),
+                    )
+                    .allow_partial(true),
+            );
+            (store, path.clone())
+        })
+        .collect();
+    load_checked_shards(model, stores)
+}
+
+/// Build from `dir/config.json` and load the safetensors checkpoint beside
+/// it (one `model.safetensors` or an indexed set of shards), checked.
+///
+/// # Errors
+///
+/// Returns an [`ImportError`] when `config.json` or the weights are
+/// missing, when the config is unreadable or invalid, when the sibling
+/// tokenizer metadata contradicts it, or when the checked load finds the
+/// checkpoint incomplete or mismatched.
+pub fn load_from_dir(dir: &Path, device: &Device) -> Result<LoadedQwen3, ImportError> {
+    let _ = required_file(dir, "config.json")?;
+    let shards = weight_shards(dir)?;
+    let config = read_config(dir)?;
 
     // Cross-check the sibling metadata (when present) before touching weights:
     // tokenizer_config.json's EOS must agree with config.json's, its chat-template
@@ -322,20 +379,65 @@ pub fn load_from_dir(dir: &Path, device: &Device) -> Result<LoadedQwen3, ImportE
     );
 
     let mut model = build(&config, device);
-    // The float dtype comes from the DEVICE — burn 0.22 keeps the element
-    // type there as a runtime setting, not on a backend type. Creation sites
-    // still name it explicitly rather than riding the unspecified default.
-    let target_float = crate::backend::float_dtype(device);
-    let mut store = install_remaps(
-        SafetensorsStore::from_file(weights.clone())
-            .with_from_adapter(PyTorchToBurnAdapter.chain(FloatCastAdapter::to(target_float)))
-            .allow_partial(true),
-    );
-    load_checked(&mut model, &mut store, &weights)?;
+    load_shards(&mut model, &shards, device)?;
     Ok(LoadedQwen3 {
         model,
         config,
         tokenizer_config,
+    })
+}
+
+/// Load a Qwen3 checkpoint as an **encoder**: the trunk alone, no lm-head.
+///
+/// What an embedding checkpoint is — `Qwen3-Embedding-*` and
+/// `harrier-oss-v1-0.6b` are saved as `Qwen3Model` (no `model.` prefix, no
+/// `lm_head.weight`), and the 8B declares `tie_word_embeddings: false` for a
+/// head it does not ship, so the generative [`load_from_dir`] would refuse
+/// it as incomplete. A causal-LM checkpoint loads here too; its head is
+/// simply not read.
+///
+/// The tokenizer metadata gate is [`crate::tokenizer::validate_tokenizer_ids`]
+/// rather than the generative one: an encoder never stops on an EOS or
+/// renders a chat (see that function for the real checkpoint this admits).
+///
+/// # Errors
+///
+/// As [`load_from_dir`], minus the EOS / chat-template agreement checks.
+pub fn load_trunk_from_dir(dir: &Path, device: &Device) -> Result<Qwen3Trunk, ImportError> {
+    let _ = required_file(dir, "config.json")?;
+    let shards = weight_shards(dir)?;
+    let config = read_config(dir)?;
+    let tokenizer_config = crate::tokenizer::validate_tokenizer_ids(dir)?;
+    let mut model = build_with_head(&config, device, false);
+    load_shards(&mut model, &shards, device)?;
+    Ok(Qwen3Trunk {
+        model,
+        config,
+        tokenizer_config,
+    })
+}
+
+/// [`load_trunk_from_dir`] for a single **GGUF** file (the `*-Embedding-GGUF`
+/// releases). An `output.weight` in the file is left unread.
+///
+/// # Errors
+///
+/// As [`load_from_gguf`].
+pub fn load_trunk_from_gguf(path: &Path, device: &Device) -> Result<Qwen3Trunk, ImportError> {
+    let parse = |reason: String| ImportError::Parse {
+        file: path.to_path_buf(),
+        reason,
+    };
+    let f = GgufFile::open(path).map_err(|e| parse(e.to_string()))?;
+    let config = Qwen3Config::from_gguf(&f).map_err(parse)?;
+    let (base, _scratch) = gguf_store(&f, &gguf_tensor_to_hf, DequantSink::Auto, device)?;
+    let mut model = build_with_head(&config, device, false);
+    let mut store = install_remaps(base);
+    load_checked(&mut model, &mut store, path)?;
+    Ok(Qwen3Trunk {
+        model,
+        config,
+        tokenizer_config: None,
     })
 }
 
@@ -425,46 +527,8 @@ impl CausalLm for LoadedQwen3 {
         device: &Device,
     ) -> Tensor<2> {
         let t = new_ids.len();
-        assert!(t >= 1, "Qwen3 forward: need at least one token");
-        assert!(
-            cache.len() == self.config.num_hidden_layers,
-            "Qwen3 forward: cache has {} layers, model has {}",
-            cache.len(),
-            self.config.num_hidden_layers
-        );
         let cfg = &self.config;
-
-        // Dtype pinned to the backend TYPE, never the per-device policy.
-        let ids32: Vec<i32> = new_ids
-            .iter()
-            .map(|&i| i32::try_from(i).expect("token id fits i32"))
-            .collect();
-        let input = Tensor::<1, Int>::from_data(
-            TensorData::new(ids32, [t]),
-            (device, crate::backend::int_dtype(device)),
-        )
-        .reshape([1, t]);
-        let mut x = self.model.embed_tokens.forward(input); // [1, t, hidden]
-
-        let (cos, sin) = rope_tables(t, past, cfg.head_dim, cfg.rope_theta, device);
-        let mask = (t > 1).then(|| causal_mask(t, past, device));
-
-        for (layer, kv) in self.model.layers.iter().zip(cache.iter_mut()) {
-            let h = layer.input_layernorm.forward(x.clone());
-            let shape = HeadShape {
-                num_heads: cfg.num_attention_heads,
-                num_kv_heads: cfg.num_key_value_heads,
-                head_dim: cfg.head_dim,
-            };
-            let h = layer
-                .self_attn
-                .forward(h, shape, &cos, &sin, mask.as_ref(), kv);
-            x = x.add(h);
-            let h2 = layer.post_attention_layernorm.forward(x.clone());
-            x = x.add(layer.mlp.forward(h2));
-        }
-        let x = self.model.norm.forward(x);
-
+        let x = trunk(&self.model, cfg, new_ids, past, cache, device);
         let last = x.narrow(1, t - 1, 1).reshape([1, cfg.hidden_size]);
         debug_assert!(
             self.model.lm_head.is_some() != cfg.tie_word_embeddings,
@@ -476,6 +540,196 @@ impl CausalLm for LoadedQwen3 {
             let w = self.model.embed_tokens.weight.val(); // [vocab, hidden]
             last.matmul(w.swap_dims(0, 1)) // [1, vocab]
         }
+    }
+}
+
+/// The decoder trunk — embed, every layer, final norm — over `new_ids` at
+/// positions `past..past + t`, updating `cache`. Returns the normed hidden
+/// state of every new position, `[1, t, hidden]`: what the lm-head reads,
+/// and what an embedder pools.
+///
+/// # Panics
+///
+/// When `new_ids` is empty, a token id does not fit `i32`, or `cache` does
+/// not hold one entry per layer.
+fn trunk(
+    model: &Qwen3,
+    cfg: &Qwen3Config,
+    new_ids: &[u32],
+    past: usize,
+    cache: &mut [LayerKv],
+    device: &Device,
+) -> Tensor<3> {
+    let t = new_ids.len();
+    assert!(t >= 1, "Qwen3 forward: need at least one token");
+    assert!(
+        cache.len() == cfg.num_hidden_layers,
+        "Qwen3 forward: cache has {} layers, model has {}",
+        cache.len(),
+        cfg.num_hidden_layers
+    );
+
+    // Dtype pinned to the backend TYPE, never the per-device policy.
+    let ids32: Vec<i32> = new_ids
+        .iter()
+        .map(|&i| i32::try_from(i).expect("token id fits i32"))
+        .collect();
+    let input = Tensor::<1, Int>::from_data(
+        TensorData::new(ids32, [t]),
+        (device, crate::backend::int_dtype(device)),
+    )
+    .reshape([1, t]);
+    let mut x = model.embed_tokens.forward(input); // [1, t, hidden]
+
+    let (cos, sin) = rope_tables(t, past, cfg.head_dim, cfg.rope_theta, device);
+    let mask = (t > 1).then(|| causal_mask(t, past, device));
+
+    for (layer, kv) in model.layers.iter().zip(cache.iter_mut()) {
+        let h = layer.input_layernorm.forward(x.clone());
+        let shape = HeadShape {
+            num_heads: cfg.num_attention_heads,
+            num_kv_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+        };
+        let h = layer
+            .self_attn
+            .forward(h, shape, &cos, &sin, mask.as_ref(), kv);
+        x = x.add(h);
+        let h2 = layer.post_attention_layernorm.forward(x.clone());
+        x = x.add(layer.mlp.forward(h2));
+    }
+    model.norm.forward(x)
+}
+
+/// Prefill chunk for [`pooled_hidden`]: long inputs run through the KV cache
+/// this many tokens at a time, so the attention score matrix stays
+/// `chunk x (past + chunk)` instead of growing with the square of the input.
+const POOL_CHUNK: usize = 512;
+
+/// One `[1, hidden]` vector for the whole of `ids`, pooled from the trunk's
+/// final hidden states as `pooling` says. Prefills in [`POOL_CHUNK`] pieces
+/// through a throwaway cache (exact: chunked prefill ≡ one-shot, the same
+/// invariant the decode driver rests on).
+///
+/// # Panics
+///
+/// When `ids` is empty or a token id does not fit `i32`.
+fn pooled_hidden(
+    model: &Qwen3,
+    cfg: &Qwen3Config,
+    ids: &[u32],
+    pooling: Pooling,
+    device: &Device,
+) -> Tensor<2> {
+    assert!(!ids.is_empty(), "pooled_hidden: empty input");
+    let mut cache: Vec<LayerKv> = (0..cfg.num_hidden_layers).map(|_| None).collect();
+    let mut past = 0;
+    let mut first: Option<Tensor<2>> = None;
+    let mut sum: Option<Tensor<2>> = None;
+    let mut last: Option<Tensor<2>> = None;
+    for chunk in ids.chunks(POOL_CHUNK) {
+        let x = trunk(model, cfg, chunk, past, &mut cache, device); // [1, t, h]
+        let t = chunk.len();
+        match pooling {
+            Pooling::Cls => {
+                if first.is_none() {
+                    first = Some(x.narrow(1, 0, 1).reshape([1, cfg.hidden_size]));
+                }
+            }
+            Pooling::Mean => {
+                let chunk_sum = x.sum_dim(1).reshape([1, cfg.hidden_size]);
+                sum = Some(match sum {
+                    None => chunk_sum,
+                    Some(s) => s.add(chunk_sum),
+                });
+            }
+            Pooling::LastToken => {
+                last = Some(x.narrow(1, t - 1, 1).reshape([1, cfg.hidden_size]));
+            }
+        }
+        past += t;
+    }
+    match pooling {
+        Pooling::Cls => first.expect("at least one chunk"),
+        Pooling::Mean => sum
+            .expect("at least one chunk")
+            .div_scalar(mummu_num::f32_from_usize(ids.len())),
+        Pooling::LastToken => last.expect("at least one chunk"),
+    }
+}
+
+impl LoadedQwen3 {
+    /// Logits for the vocabulary rows `rows` only, at `hidden` (`[1, hidden]`,
+    /// a final-normed state): `[1, rows.len()]`, in `rows` order.
+    ///
+    /// The head projection restricted to the rows a caller will read — a
+    /// yes/no relevance judgement reads two of Qwen3's 151 669, so the full
+    /// head is ~75 000x more work than the answer needs. Mathematically the
+    /// same numbers as those columns of [`CausalLm::forward`]'s logits.
+    ///
+    /// # Panics
+    ///
+    /// When `rows` is empty, or a row is not a vocabulary index.
+    #[must_use]
+    pub fn head_rows(&self, hidden: Tensor<2>, rows: &[u32], device: &Device) -> Tensor<2> {
+        assert!(!rows.is_empty(), "head_rows: no rows");
+        assert!(
+            rows.iter()
+                .all(|&r| usize::try_from(r).is_ok_and(|r| r < self.config.vocab_size)),
+            "head_rows: a row is outside the vocabulary ({})",
+            self.config.vocab_size
+        );
+        let idx: Vec<i32> = rows
+            .iter()
+            .map(|&r| i32::try_from(r).expect("row fits i32"))
+            .collect();
+        let idx = Tensor::<1, Int>::from_data(
+            TensorData::new(idx, [rows.len()]),
+            (device, crate::backend::int_dtype(device)),
+        );
+        if let Some(head) = &self.model.lm_head {
+            // burn's Linear stores [d_in, d_out] = [hidden, vocab].
+            hidden.matmul(head.weight.val().select(1, idx))
+        } else {
+            let w = self.model.embed_tokens.weight.val(); // [vocab, hidden]
+            hidden.matmul(w.select(0, idx).swap_dims(0, 1))
+        }
+    }
+
+    /// The final-normed hidden state at the last position of `ids`,
+    /// `[1, hidden]` — the input [`Self::head_rows`] projects.
+    ///
+    /// # Panics
+    ///
+    /// When `ids` is empty or a token id does not fit `i32`.
+    #[must_use]
+    pub fn last_hidden(&self, ids: &[u32], device: &Device) -> Tensor<2> {
+        pooled_hidden(&self.model, &self.config, ids, Pooling::LastToken, device)
+    }
+}
+
+/// A Qwen3 checkpoint loaded as an encoder (see [`load_trunk_from_dir`]).
+///
+/// The trunk, with `model.lm_head` always `None`. Deliberately not a
+/// [`CausalLm`] — without its head an untied checkpoint has no logits to
+/// give, and borrowing the embedding matrix instead would answer wrong.
+pub struct Qwen3Trunk {
+    pub model: Qwen3,
+    pub config: Qwen3Config,
+    /// As on [`LoadedQwen3`]: the parsed sibling `tokenizer_config.json`.
+    pub tokenizer_config: Option<crate::tok_config::TokenizerConfig>,
+}
+
+impl Qwen3Trunk {
+    /// `ids` pooled to one `[1, hidden]` vector from the final hidden states
+    /// (not normalized — that is the embedder's call).
+    ///
+    /// # Panics
+    ///
+    /// When `ids` is empty or a token id does not fit `i32`.
+    #[must_use]
+    pub fn pooled(&self, ids: &[u32], pooling: Pooling, device: &Device) -> Tensor<2> {
+        pooled_hidden(&self.model, &self.config, ids, pooling, device)
     }
 }
 
@@ -763,6 +1017,92 @@ mod tests {
         // Qwen3 has no q/k/v bias — a bias tensor is unrecognized (loud error).
         assert_eq!(qwen3_gguf_name("blk.0.attn_q.bias"), None);
         assert_eq!(qwen3_gguf_name("rope_freqs.weight"), None);
+    }
+
+    fn to_vec(t: Tensor<2>) -> Vec<f32> {
+        t.into_data().convert::<f32>().try_to_vec::<f32>().unwrap()
+    }
+
+    /// The head restricted to some rows is those columns of the full logits,
+    /// for a tied head and an untied one alike.
+    #[test]
+    fn head_rows_are_the_matching_columns_of_the_full_logits() {
+        let device = crate::backend::cpu_device();
+        for tied in [true, false] {
+            let mut cfg = toy_config();
+            cfg.tie_word_embeddings = tied;
+            let loaded = LoadedQwen3 {
+                model: build(&cfg, &device),
+                config: cfg,
+                tokenizer_config: None,
+            };
+            let ids = [5u32, 9, 3, 33];
+            let mut cache = loaded.new_cache();
+            let full = to_vec(loaded.forward(&ids, 0, &mut cache, &device));
+            let rows = [7u32, 2, 63];
+            let some = to_vec(loaded.head_rows(loaded.last_hidden(&ids, &device), &rows, &device));
+            for (k, &r) in rows.iter().enumerate() {
+                let want = full[usize::try_from(r).unwrap()];
+                assert!(
+                    (some[k] - want).abs() < 1e-4,
+                    "tied={tied} row {r}: {} vs {want}",
+                    some[k]
+                );
+            }
+        }
+    }
+
+    /// Pooling prefills long inputs in chunks through the cache; the pooled
+    /// vector must be the one-shot one, for every pooling mode.
+    #[test]
+    fn chunked_pooling_matches_one_shot() {
+        let device = crate::backend::cpu_device();
+        let cfg = toy_config();
+        let model = build(&cfg, &device);
+        let ids: Vec<u32> = (0..u32::try_from(POOL_CHUNK + 37).unwrap())
+            .map(|i| (i * 7 + 3) % 64)
+            .collect();
+        let mut cache: Vec<LayerKv> = (0..cfg.num_hidden_layers).map(|_| None).collect();
+        let all = trunk(&model, &cfg, &ids, 0, &mut cache, &device); // [1, t, h]
+        let t = ids.len();
+        let h = cfg.hidden_size;
+        let want_last = to_vec(all.clone().narrow(1, t - 1, 1).reshape([1, h]));
+        let want_first = to_vec(all.clone().narrow(1, 0, 1).reshape([1, h]));
+        let want_mean = to_vec(
+            all.sum_dim(1)
+                .reshape([1, h])
+                .div_scalar(mummu_num::f32_from_usize(t)),
+        );
+        for (pooling, want) in [
+            (Pooling::LastToken, want_last),
+            (Pooling::Cls, want_first),
+            (Pooling::Mean, want_mean),
+        ] {
+            let got = to_vec(pooled_hidden(&model, &cfg, &ids, pooling, &device));
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    (g - w).abs() < 1e-3,
+                    "{pooling:?} elem {i}: chunked {g} vs one-shot {w}"
+                );
+            }
+        }
+    }
+
+    /// The encoder build never carries a head, whatever the tie flag says —
+    /// Qwen3-Embedding-8B declares an untied head it does not ship.
+    #[test]
+    fn the_trunk_build_has_no_head_even_when_untied() {
+        let device = crate::backend::cpu_device();
+        let mut cfg = toy_config();
+        cfg.tie_word_embeddings = false;
+        let trunk_only = Qwen3Trunk {
+            model: build_with_head(&cfg, &device, false),
+            config: cfg,
+            tokenizer_config: None,
+        };
+        assert!(trunk_only.model.lm_head.is_none());
+        let v = trunk_only.pooled(&[1, 2, 3], Pooling::LastToken, &device);
+        assert_eq!(v.dims(), [1, 16]);
     }
 
     #[tokio::test]

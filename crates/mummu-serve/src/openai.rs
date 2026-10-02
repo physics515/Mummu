@@ -61,6 +61,12 @@ pub fn router() -> Router {
         .route("/chat/completions", post(chat_completions))
         .route("/v1/models", get(models))
         .route("/models", get(models))
+        .route("/v1/embeddings", post(crate::retrieval::openai_embeddings))
+        .route("/embeddings", post(crate::retrieval::openai_embeddings))
+        // Not OpenAI's, but where every rerank client (Jina, Cohere,
+        // llama.cpp, Open WebUI's external reranker) posts.
+        .route("/v1/rerank", post(crate::retrieval::rerank_endpoint))
+        .route("/rerank", post(crate::retrieval::rerank_endpoint))
         // Per-request visibility (see `crate::trace`). Served here as well as
         // on the native API because this is the listener the public
         // hostname reaches.

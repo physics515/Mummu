@@ -1569,6 +1569,8 @@ pub(super) fn forget(pack_dir: Option<&Path>) {
 /// One idle look: feed the guard, drop an idle tower, and re-plan if the
 /// model is free.
 fn tick() {
+    // Idle retrieval models: theirs goes back too (see `crate::retrieval`).
+    crate::retrieval::drop_idle();
     // Idle tower: its VRAM goes back to layers.
     let idle_tower = TOWER_USED
         .lock()

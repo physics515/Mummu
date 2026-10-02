@@ -349,6 +349,44 @@ pub fn validate_checkpoint_dir(
     Ok(cfg)
 }
 
+/// The half of [`validate_checkpoint_dir`] that holds for every checkpoint,
+/// generative or not.
+///
+/// The sibling `tokenizer_config.json` (optional) must parse, and every
+/// added-token id it declares must match `tokenizer.json`.
+///
+/// What it leaves out is the generation contract — EOS agreement with
+/// `config.json` and the chat-template's tool-call convention. An encoder
+/// never stops on an EOS and never renders a chat, and real embedding
+/// checkpoints do disagree there harmlessly: `Qwen3-Embedding-0.6B` declares
+/// `<|endoftext|>` as EOS in `config.json` and `<|im_end|>` in its tokenizer
+/// config. Refusing that would refuse a correct embedder over a field it
+/// never reads; mis-numbered special tokens, by contrast, would corrupt every
+/// input it tokenizes, and stay refused.
+///
+/// # Errors
+///
+/// [`ImportError::Parse`] when a present `tokenizer_config.json` or
+/// `tokenizer.json` is malformed; [`ImportError::Inconsistent`] when a
+/// declared added-token id disagrees with the tokenizer.
+///
+/// # Panics
+///
+/// When `dir` is the empty path.
+pub fn validate_tokenizer_ids(dir: &Path) -> Result<Option<TokenizerConfig>, ImportError> {
+    assert!(
+        !dir.as_os_str().is_empty(),
+        "validate_tokenizer_ids: empty dir"
+    );
+    let cfg = match TokenizerConfig::from_dir(dir) {
+        Ok(cfg) => cfg,
+        Err(ImportError::MissingFile(_)) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    check_added_token_ids(dir, &cfg)?;
+    Ok(Some(cfg))
+}
+
 /// Cross-check every added-token id `cfg` declares against the id the sibling
 /// `dir/tokenizer.json` assigns that content. `Ok` when the tokenizer file is
 /// absent (nothing to cross-check) or every id agrees; an

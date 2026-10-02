@@ -179,7 +179,23 @@ fn announced_sha256(url: &str) -> Result<Option<String>, HubError> {
 /// ship it. Neither is universal on the Hub, so a 404 is a legitimate answer —
 /// but not asking for them at all silently disarms those gates for every model
 /// installed through this path.
-const OPTIONAL_FILES: [&str; 2] = ["tokenizer_config.json", "chat_template.jinja"];
+///
+/// The sentence-transformers files are the same kind of sibling for an
+/// embedder or reranker: they say how it pools, whether it normalizes, which
+/// instruction a query gets, and which token ids a reranker scores
+/// ([`crate::embed::SentenceConfig`], [`crate::rerank::Reranker`]). Without
+/// them an embedder still loads on its architecture's defaults — and embeds
+/// every query without the instruction it was trained and evaluated with,
+/// which is quietly worse retrieval rather than an error.
+const OPTIONAL_FILES: [&str; 7] = [
+    "tokenizer_config.json",
+    "chat_template.jinja",
+    "modules.json",
+    "config_sentence_transformers.json",
+    "sentence_bert_config.json",
+    "1_Pooling/config.json",
+    "1_LogitScore/config.json",
+];
 
 /// Does the repo actually ship `url`?
 ///
@@ -614,6 +630,10 @@ mod tests {
     fn optional_files_cover_the_siblings_the_import_gates_read() {
         assert!(OPTIONAL_FILES.contains(&"tokenizer_config.json"));
         assert!(OPTIONAL_FILES.contains(&"chat_template.jinja"));
+        // The embedder's query instruction and pooling, the reranker's ids.
+        assert!(OPTIONAL_FILES.contains(&"config_sentence_transformers.json"));
+        assert!(OPTIONAL_FILES.contains(&"1_Pooling/config.json"));
+        assert!(OPTIONAL_FILES.contains(&"1_LogitScore/config.json"));
         for file in OPTIONAL_FILES {
             assert!(
                 !["config.json", "tokenizer.json"].contains(&file),

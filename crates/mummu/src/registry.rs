@@ -29,6 +29,38 @@ pub enum Architecture {
     /// `models::qwen35` — Qwen3.5/3.8 hybrid: Gated `DeltaNet` linear
     /// attention + gated full attention every 4th layer. GGUF import only.
     Qwen35,
+    /// `embed::Embedder` over a `models::qwen3` trunk — a decoder embedder
+    /// (`harrier-oss-v1`, `Qwen3-Embedding`): last-token pooling, an
+    /// instruction on the query side, both read from the checkpoint's
+    /// sentence-transformers files.
+    Qwen3Embed,
+    /// `rerank::Reranker` — a Qwen3-Reranker cross-encoder: the qwen3 causal
+    /// LM scoring "yes" against "no" per (query, document) pair.
+    Qwen3Rerank,
+}
+
+/// What a model is for — which API surface can serve it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Task {
+    /// Chat / completion: a causal LM.
+    Generate,
+    /// Text → vector.
+    Embed,
+    /// (query, documents) → relevance scores.
+    Rerank,
+}
+
+impl Architecture {
+    /// The task every checkpoint of this architecture serves.
+    #[must_use]
+    pub const fn task(self) -> Task {
+        match self {
+            Self::Qwen2 | Self::Qwen3 | Self::Lfm2 | Self::Olmoe | Self::Qwen35 => Task::Generate,
+            Self::MiniLm | Self::Qwen3Embed => Task::Embed,
+            Self::Qwen3Rerank => Task::Rerank,
+        }
+    }
 }
 
 /// How the checkpoint's weights are stored — which fetch + load path a spec
@@ -103,6 +135,12 @@ impl ModelSpec {
         Ok(())
     }
 
+    /// What this model is for (see [`Architecture::task`]).
+    #[must_use]
+    pub const fn task(&self) -> Task {
+        self.architecture.task()
+    }
+
     /// The cache directory this model lives in under `models_root`.
     #[must_use]
     pub fn dir(&self, models_root: &Path) -> PathBuf {
@@ -166,6 +204,7 @@ pub fn catalog() -> Vec<ModelSpec> {
         qwen3_entries(),
         olmoe_entries(),
         qwen35_entries(),
+        retrieval_entries(),
     ]
     .concat();
     debug_assert!(
@@ -383,9 +422,73 @@ fn qwen35_entries() -> Vec<ModelSpec> {
     ]
 }
 
+/// The retrieval tier: the strongest embedder and rerankers that run
+/// locally, all on the qwen3 trunk this crate already parity-verifies.
+///
+/// Chosen 2026-10-01 against the public leaderboards:
+///
+/// - **`harrier-oss-v1-0.6b`** (Microsoft, MIT, `Qwen3Model`) scores 69.0 on
+///   MTEB Multilingual v2 — level with `Qwen3-Embedding-4B` (69.45) at a
+///   seventh of the size, and 4.7 points over `Qwen3-Embedding-0.6B` (64.33),
+///   the same architecture at the same size. It is the default embedder.
+///   The two models above it are not worth their cost here:
+///   `Qwen3-Embedding-8B` (70.58) costs 13x the compute for +1.6, and
+///   harrier's own 27B (74.3) is Gemma 3, an architecture this crate has no
+///   port of.
+/// - **`Qwen3-Reranker-4B`** — MMTEB-R 72.74 against the 8B's 72.94 at half
+///   the weights, and 6.4 points over the 0.6B (66.36). The quality pick.
+/// - **`Qwen3-Reranker-0.6B`** — the fast tier, for a host with no
+///   accelerator to spare: a reranker scores every candidate with a full
+///   forward, so its cost is per document, not per query.
+///
+/// Revisions are pinned: an embedder's vectors are only comparable with
+/// vectors from the same weights, so a silent upstream update would quietly
+/// invalidate every index built before it.
+fn retrieval_entries() -> Vec<ModelSpec> {
+    vec![
+        ModelSpec {
+            name: "harrier-oss-v1-0.6b".into(),
+            repo: "microsoft/harrier-oss-v1-0.6b".into(),
+            revision: "f9b9dc8d367d443f2479d27aa5d8d2850c0774ee".into(),
+            architecture: Architecture::Qwen3Embed,
+            format: WeightFormat::Safetensors,
+            disk_bytes_estimate: 1_210_000_000,
+        },
+        ModelSpec {
+            name: "qwen3-reranker-4b".into(),
+            repo: "Qwen/Qwen3-Reranker-4B".into(),
+            revision: "22e683669bc0f0bd69640a1354a6d0aebcfeede5".into(),
+            architecture: Architecture::Qwen3Rerank,
+            format: WeightFormat::Safetensors,
+            disk_bytes_estimate: 8_050_000_000,
+        },
+        ModelSpec {
+            name: "qwen3-reranker-0.6b".into(),
+            repo: "Qwen/Qwen3-Reranker-0.6B".into(),
+            revision: "e61197ed45024b0ed8a2d74b80b4d909f1255473".into(),
+            architecture: Architecture::Qwen3Rerank,
+            format: WeightFormat::Safetensors,
+            disk_bytes_estimate: 1_210_000_000,
+        },
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_task_has_a_catalog_model_and_tasks_follow_the_architecture() {
+        let cat = catalog();
+        for task in [Task::Generate, Task::Embed, Task::Rerank] {
+            assert!(cat.iter().any(|s| s.task() == task), "no {task:?} model");
+        }
+        assert_eq!(Architecture::MiniLm.task(), Task::Embed);
+        assert_eq!(Architecture::Qwen3Embed.task(), Task::Embed);
+        assert_eq!(Architecture::Qwen3Rerank.task(), Task::Rerank);
+        assert_eq!(Architecture::Qwen3.task(), Task::Generate);
+        assert_eq!(serde_json::to_string(&Task::Rerank).unwrap(), r#""rerank""#);
+    }
 
     #[test]
     fn builtin_catalog_validates_and_names_are_unique() {

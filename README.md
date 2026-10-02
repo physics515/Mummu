@@ -14,7 +14,12 @@ It exists because two local-first apps — **[laurelane](https://github.com/phys
 - **Fast** — per-layer KV cache (+ conv-state cache for hybrids), on-GPU argmax (sync only the winning index), sampling, **token streaming**, cooperative cancellation; kernel `fusion` + `autotune`; an **f16** path (f32 attention-score island for numeric safety) that halves VRAM at full speed.
 - **A full model-import suite** — pull a model from HuggingFace (by repo id) or from disk and load it: **safetensors**, **PyTorch** state dicts, and **GGUF** (llama.cpp, dequantized) weights; `config.json`-driven hyperparameters; tokenizer + chat-template import (HF `tokenizers` / SentencePiece / BPE); per-architecture weight-name remapping with a **checked load** (fail loudly on a key mismatch, never silently zero-init); resumable, shard-aware downloads into a per-user cache; and a declarative **model registry** so adding a model is a manifest entry, not new code.
 - **Quantize to fit, fill the hardware** — a planner probes every GPU + the CPU (VRAM / RAM), then imports or **quantizes on the fly** (GGUF K-quants, GPTQ / AWQ, or Burn's own int8/int4) and chooses precision + **layer placement** so the *largest model that fits* runs and every device is used — sharded across GPUs, spilling cold layers to CPU when needed. Plus a model-management API (download progress, disk usage, remove) apps surface in their settings UI.
-- **Local embeddings** — a from-scratch MiniLM-class sentence embedder (CPU) for fully-offline semantic search.
+- **Local embeddings, reranking and RAG** — the strongest retrieval models that run locally, on the
+  Qwen3 trunk the zoo already parity-verifies: **harrier-oss-v1-0.6b** embeddings (MTEB Multilingual v2
+  69.0 — level with Qwen3-Embedding-4B at a seventh of its size) and **Qwen3-Reranker 4B / 0.6B**
+  cross-encoders, both matching HuggingFace `transformers` to ~1e-7. A model-free RAG core (chunking, an
+  exact vector index, grounded prompts) ties them to any chat model, served on the ollama, OpenAI and
+  Jina/Cohere surfaces, as one-call `/api/rag`, and as 📎 Documents in the chat UI.
 
 ## Use it
 
@@ -58,8 +63,34 @@ The two schedulers are usable on their own and depend on nothing:
 [`mummu-schedule`](crates/mummu-schedule) divides work across heterogeneous devices to minimize
 makespan, [`mummu-mix`](crates/mummu-mix) places per-tensor precision under a byte budget.
 
-For a server rather than a library, `mummu-serve` exposes `/api/chat`, `/api/models` and a web chat
-UI; it is built from this repo rather than installed from crates.io.
+For a server rather than a library, `mummu-serve` exposes `/api/chat`, `/api/models`, embeddings
+(`/api/embed`, `/v1/embeddings`), reranking (`/v1/rerank`), retrieval for RAG (`/api/rag`) and a web
+chat UI; it is built from this repo rather than installed from crates.io.
+
+Embedding and reranking from the library — the checkpoint's own sentence-transformers files decide the
+pooling, the normalization and the instruction a query gets:
+
+```rust
+use mummu::embed::{Embedder, TextKind};
+use mummu::rerank::Reranker;
+
+async fn search(dir: &std::path::Path, rr: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    let device = mummu::backend::cpu_device();
+    let embedder = Embedder::load_from_dir(dir, &device)?; // e.g. harrier-oss-v1-0.6b
+    let q = embedder.embed("capital of France?", TextKind::Query, None, &device).await?;
+    let d = embedder.embed("Paris is the capital of France.", TextKind::Document, None, &device).await?;
+    println!("cosine {}", mummu::embed::cosine(&q.vector, &d.vector));
+
+    let reranker = Reranker::load_from_dir(rr, &device)?; // e.g. qwen3-reranker-0.6b
+    let ranked = reranker
+        .rank("capital of France?", &["Paris is in France.", "The Nile is long."], None, &device, |_| {
+            std::ops::ControlFlow::Continue(())
+        })
+        .await?;
+    println!("best: document {} at P(yes) {}", ranked[0].index, ranked[0].relevance);
+    Ok(())
+}
+```
 
 ## Status — what runs today
 
@@ -173,7 +204,12 @@ UI; it is built from this repo rather than installed from crates.io.
   same file. **OLMoE-1B-7B** passes the same llama.cpp gate on its own Q4_K_M (`olmoe` leg): top-5 ids
   exact in order, 24-token greedy byte-identical, max |Δlogprob| 3.7e-1 — so the MoE router and expert
   bank are verified against a reference, not just plausible. The MiniLM embedder matches its Candle
-  reference at cosine 0.99999994 (max |Δcomponent| 1.2e-7, `tests/real_minilm.rs`).
+  reference at cosine 0.99999994 (max |Δcomponent| 1.2e-7, `tests/real_minilm.rs`). The **retrieval
+  tier** is held to HuggingFace `transformers` (f32, the model cards' own recipes;
+  `tools/retrieval_reference.py` → `tests/real_retrieval.rs`): harrier-oss-v1-0.6b token ids exact and
+  embeddings at worst cosine 0.99999988 / max |Δcomponent| 1.3e-7 (CPU) and 4.0e-7 (GPU), a 1057-token
+  document included so the 512-token chunked prefill is held to the one-shot reference; Qwen3-Reranker
+  prompt ids exact and P(yes) within 2.4e-7 (0.6B) / 8.3e-7 (4B) over 15 pairs each.
   **The f16 path is parity-verified too** (`tests/parity_f16.rs`, its own binary because `GpuF16`
   locks Burn's per-device dtype policy): the same llama.cpp comparison with our side loaded onto
   `GpuF16` passes for Qwen2.5-1.5B and Qwen3-0.6B — top-5 ids exact in order, 24-token greedy
@@ -296,6 +332,37 @@ UI; it is built from this repo rather than installed from crates.io.
   a per-chunk progress callback; verified end-to-end by downloading all-MiniLM and embedding with it.
 - **Process-lifetime model cache** — `ModelSlot` loads a checkpoint once per process, switches models by
   key, and `clear()`s to free VRAM; Burn's `Param` isn't `Sync`, so access serializes behind its mutex.
+
+- **Embeddings, reranking and RAG** *(2026-10-01)* — `mummu::embed::Embedder` runs every embedder in
+  the zoo behind one call: MiniLM's masked-mean BERT, and **decoder embedders on a Qwen3 trunk** —
+  `qwen3::load_trunk_from_dir` loads a `Qwen3Model` checkpoint with no lm-head (the 8B declares an
+  untied head it does not ship), pooled at the last token through a 512-token chunked prefill. Pooling,
+  normalization and the query instruction are read from the checkpoint's sentence-transformers files
+  (`modules.json`, `1_Pooling/`, `config_sentence_transformers.json`), which the hub downloader now
+  fetches beside the weights, and a custom task instruction is spliced into the checkpoint's own prompt
+  shape (Qwen3-Embedding's `Query:` vs harrier's `Query: ` — one byte apart, both kept). Sharded
+  safetensors load shard by shard (`import::load_checked_shards`: a param is missing only when no shard
+  has it). `mummu::rerank::Reranker` scores (query, document) pairs with Qwen3-Reranker exactly as its
+  template renders them, computing only the two head rows it reads (`LoadedQwen3::head_rows`, of
+  151 669). `mummu::rag` is the model-free glue: sentence-respecting chunking with overlaps that open on
+  a whole sentence, an exact cosine `Index` with an atomic on-disk format, and the grounding system
+  prompt (numbered sources, cite inline, say so when the sources do not hold the answer). Catalog
+  entries (pinned revisions — an index is only valid against the exact weights that built it):
+  `harrier-oss-v1-0.6b`, `qwen3-reranker-4b`, `qwen3-reranker-0.6b`. Measured on the reference box,
+  warm: an embedding of a short text ~0.24 s on the CPU, ~75 ms on the GPU; a rerank pair of ~90 tokens
+  0.41 s (0.6B) / 2.2 s (4B) on the CPU, ~47 ms (0.6B) on the GPU.
+  In `mummu-serve`: ollama `/api/embed` + `/api/embeddings`, OpenAI `/v1/embeddings` (float or base64,
+  token-id input, `dimensions`), a `/v1/rerank` that Jina, Cohere and llama.cpp clients all accept, and
+  stateless **`/api/rag`** — chunk the request's documents, embed, keep the nearest, rerank, and answer
+  with the passages plus the grounding message to send with a chat; the chat UI's **📎 Documents**
+  does exactly that per question and shows the sources under the answer. Text is embedded as sent
+  unless the request says `input_type` (`query` / `document`, Cohere's and Voyage's spellings
+  accepted). Retrieval models live in slots of their own, so they never evict the chat model — and
+  **the card is the chat model's**: a retrieval model goes on the accelerator only while no chat model
+  holds it, a chat load evicts it first, and otherwise it runs on the host beside the chat. (Sharing
+  the card was tried and measured: a second model's freed-but-held pool pages read as free to the chat
+  planner, which counts bytes in use, and the next chat load ran out of device memory.) With nothing
+  named, a request gets the best installed model that would land on the accelerator, else the smallest.
 
 ## Design principles
 

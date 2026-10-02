@@ -2991,7 +2991,7 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       breadth-for-breadth — recorded here because when the next port is picked, this one buys the most,
       and Llama 3.x is the natural `rope_type: llama3` test vector for the scaling item above.
       *(2026-08-21, mistral.rs scan.)*
-- [ ] **Qwen3-Embedding on the existing qwen3 port** *(mistral.rs parity)* — mistral.rs serves
+- [x] **Qwen3-Embedding on the existing qwen3 port** *(mistral.rs parity)* — mistral.rs serves
       `Qwen/Qwen3-Embedding-0.6B` through its ordinary Qwen3 loader; the checkpoint IS the qwen3 dense
       arch Mummu already runs and parity-verifies, used as an embedder: last-token (EOS) pooling over
       the final hidden state instead of MiniLM's masked mean, an instruction-prefixed query format,
@@ -2999,6 +2999,45 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       cost of a pooling fn + a fixture; MiniLM stays as the tiny tier. Gate: cosine parity vs the HF
       reference, same discipline as `real_minilm`. *(2026-08-21, mistral.rs scan.)* —
       https://huggingface.co/Qwen/Qwen3-Embedding-0.6B
+      *(2026-10-01) **Shipped as the retrieval tier — embeddings, reranking and RAG** (README "Status").
+      The catalog's embedder is not Qwen3-Embedding-0.6B but the same architecture's best checkpoint:
+      Microsoft's **harrier-oss-v1-0.6b** (MIT, `Qwen3Model`), MTEB Multilingual v2 69.0 against
+      Qwen3-Embedding-0.6B's 64.33 and -4B's 69.45 — the board as of 2026-09: harrier-27b 74.3 (Gemma 3,
+      no port), Qwen3-Embedding-8B 70.58 (13x the compute for +1.6, not taken). Qwen3-Embedding-0.6B
+      itself loads through the same trunk (`real_retrieval::qwen3_embedding_06b_loads_and_retrieves`)
+      despite its config/tokenizer EOS disagreement, which is why encoders get the ids-only tokenizer
+      gate (`tokenizer::validate_tokenizer_ids`). Rerankers: **Qwen3-Reranker-4B** (MMTEB-R 72.74, the
+      8B's 72.94 at half the weights) and **-0.6B** (66.36) — still the strongest open family; jina v3 /
+      v3.5 are CC-BY-NC with a listwise head, mxbai-rerank-v2 trails. Gate against HuggingFace
+      `transformers` (torch 2.11 CPU in the llama.cpp `full` image, f32, eager): token ids exact;
+      harrier worst cosine 0.99999988, max |Δ| 1.3e-7 CPU / 4.0e-7 GPU (a 1057-token document holds
+      the chunked prefill to the one-shot reference); reranker P(yes) within 2.4e-7 (0.6B) / 8.3e-7
+      (4B). Two findings on the way, both fixed in this change: a chunk overlap that backs up to a WORD
+      boundary hands a reader the tail of the previous record (a 0.6B chat model answered "clerk 2, day
+      48" for entry 17 from such a chunk) — overlaps now open on a sentence or not at all; and a
+      retrieval model sharing the card with the chat model OOMed the next chat load (the P6 item
+      below).*
+- [ ] **f16 retrieval weights on the accelerator** — Qwen3-Reranker-4B is the quality pick but at f32
+      it is 15 GiB, which a 16 GB card cannot hold beside anything, so on the reference box it only
+      ever runs on the host: ~30 s cold load, ~2.2 s per 90-token pair, ~23 s per 1100-token pair —
+      fine for a handful of candidates, not for the default 20. At f16 it is 7.5 GiB and fits an idle
+      card. The vision tower already keeps its weights at the checkpoint's width per tensor
+      (`vision::half_precision`); the qwen3 trunk would need the same plus an f32 attention-score
+      island (the GpuF16 recipe). Gate: `real_retrieval` at f16 within a looser, measured bound, and
+      the ranking decisions unchanged. Until then the default-model rule picks the 0.6B whenever
+      everything would land on the host.
+- [ ] **Batched retrieval forwards** — every embedding and every rerank pair is its own batch-1
+      prefill. Short inputs are dispatch-bound (a 27-token query costs ~0.24 s on the host, of which
+      the arithmetic is a fraction), and RAG ingestion embeds hundreds of chunks. Padded batches with
+      a key-padding mask (left-padded for last-token pooling) through the trunk; this is the
+      embedding half of the P5 "Batched forward" item. Gate: batch-of-N ≡ N single forwards on the
+      `real_retrieval` fixture.
+- [ ] **Server-side RAG collections** — deliberately NOT shipped. `/api/rag` is stateless (documents
+      ride in the request) because every listener in the live deployment is reachable without
+      authentication, and a persistent document store there would be readable by anyone who finds the
+      hostname. Needs an auth story first; apps already persist with `rag::Index::{save, load}`.
+- [ ] **Text extraction beyond plain text in the chat UI** — 📎 Documents accepts text files only
+      (a binary read as text is refused). PDF and DOCX are where most real documents live.
 - [x] A `Model` trait so new architectures (Hermes-class function-callers, Gemma, Qwen3, …) slot in.
       *(2026-07-10) `models::CausalLm<B>` — associated `Cache` type; a port supplies `new_cache` /
       `forward` / `is_eos` and inherits `generate` / `greedy_generate` / `first_token` from the shared
@@ -3693,6 +3732,18 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
 ### P6 — Hardware planner: precision, placement & full utilization
 The "use all the hardware" phase — inventory the machine, then pick the precision and the device placement
 that fits the model AND uses every device to the fullest.
+- [ ] **The card budget counts pool bytes in use, not bytes held** — found by the retrieval tier
+      (2026-10-01). `placement::free_for_new` is `capacity − in_use`: pages our pool has freed but still
+      reserves read as free. They are not free to a large new allocation: with two 0.6B retrieval
+      models resident (4.4 GiB of weights) the process held 7.7 GiB after `memory_cleanup`, the fit
+      planner put qwen3-0.6b on the same card, and its load died reserving a 2 GiB page
+      (`out of device memory`, recovery reload, measured twice on wgpu). The retrieval tier sidesteps it
+      — a retrieval model only takes the card while no chat model holds it, and a chat load evicts it
+      first — but the assumption is the planner's: any second tenant of our pool (the vision tower
+      included) leaves slack it counts as room. Candidate fix: budget against `reserved` after a
+      cleanup, or measure the slack (`reserved − in_use` post-cleanup) as a reserve like
+      `VISION_RESERVE`. Gate: retrieval models resident on the card + a chat load on the same card, no
+      OOM, on the 27B as well as a small model.
 - [ ] **Device inventory** — enumerate every GPU (`wgpu` adapters: name, backend, VRAM) and the CPU (cores,
       RAM); a stable device set cached at startup, reported so the apps can show it in settings.
       *(2026-07-11)* Everything but true VRAM shipped: `DeviceInventory` now carries per-adapter
@@ -4499,7 +4550,8 @@ as an item above precisely so the answer can be automatic instead).
 
 Each app depends on Mummu (path/git dep) and keeps its own glue:
 - **Nanna** — wire Mummu as `Provider::Local` (top-priority tier in the complexity router); stream tokens
-  to channels + Tauri events; use Mummu embeddings for the memory `embed_fn` and dreaming `summarize_fn`.
+  to channels + Tauri events; use Mummu embeddings for the memory `embed_fn` (`embed::Embedder` over
+  harrier-oss-v1-0.6b, with `rerank::Reranker` for recall) and dreaming `summarize_fn`.
 - **laurelane** — replace `src/llm_burn.rs` / `src/lfm2_burn.rs` / `src/categorize_burn.rs` with Mummu;
   keep statement structuring, the reconciliation-gated extraction oracle, and the learning categorizer app-side.
 

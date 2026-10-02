@@ -224,6 +224,19 @@ fn resident_in(backend: BackendChoice) -> Option<(std::path::PathBuf, u64)> {
         .map(|(_, d, n)| (d.clone(), *n))
 }
 
+/// Does a chat model hold (or is one loading onto) an accelerator? Then the
+/// card is its: a retrieval model goes to the host instead (see
+/// `crate::retrieval`), because the chat model's placement spends the card
+/// down to its measured margin and cannot see a second model's pool slack.
+///
+/// Read off the slot itself — the planner's `RESIDENT` book only covers the
+/// families it plans (qwen35, `OLMoE`). A slot busy with a load or a
+/// generation counts as on the card whenever this server's backend is one.
+pub fn chat_on_accelerator() -> bool {
+    SLOT.try_inspect(|m| m.is_some_and(|(_, m)| m.backend != BackendChoice::Cpu))
+        .unwrap_or_else(|| backend_choice() != BackendChoice::Cpu)
+}
+
 /// The load currently bringing a model up, if any: (model dir, its plan).
 /// Set by the slot's load closure for exactly as long as the load runs.
 /// Two consumers: `plan_fit` answers a same-model request from this instead
@@ -342,6 +355,7 @@ pub fn load_in_flight() -> Option<std::path::PathBuf> {
 /// declines to touch a working phase in any case.
 pub fn unload_all() -> bool {
     clear_tiers();
+    crate::retrieval::unload_all();
     let freed = SLOT.clear();
     if freed {
         RESIDENT
@@ -562,8 +576,8 @@ fn load_any(
                 Architecture::Olmoe => {
                     AnyLm::Olmoe(olmoe::load_from_dir(&dir, device).map_err(|e| e.to_string())?)
                 }
-                Architecture::MiniLm => {
-                    return Err("all-MiniLM is an embedding model — not chat-servable".into());
+                Architecture::MiniLm | Architecture::Qwen3Embed | Architecture::Qwen3Rerank => {
+                    return Err(not_chat_servable(spec));
                 }
                 Architecture::Qwen35 => {
                     return Err("qwen35 loads from GGUF only (no safetensors import yet)".into());
@@ -590,8 +604,8 @@ fn load_any(
                 Architecture::Qwen35 => {
                     load_qwen35_gguf(&dir, &path, spec, device, policy, backend)?
                 }
-                Architecture::MiniLm => {
-                    return Err("all-MiniLM is an embedding model — not chat-servable".into());
+                Architecture::MiniLm | Architecture::Qwen3Embed | Architecture::Qwen3Rerank => {
+                    return Err(not_chat_servable(spec));
                 }
             };
             Ok((lm, tokenizer))
@@ -790,10 +804,31 @@ fn template(arch: Architecture) -> Result<Template, String> {
             calls: None,
             thinks: false,
         },
-        Architecture::MiniLm => {
-            return Err("all-MiniLM is an embedding model — not chat-servable".into());
+        Architecture::MiniLm | Architecture::Qwen3Embed => {
+            return Err(
+                "an embedding model — not chat-servable (use /api/embed or /v1/embeddings)".into(),
+            );
+        }
+        Architecture::Qwen3Rerank => {
+            return Err("a reranker — not chat-servable (use /v1/rerank)".into());
         }
     })
+}
+
+/// What a chat request naming a retrieval model is told: what the model is
+/// for, and the endpoint that serves it.
+pub fn not_chat_servable(spec: &ModelSpec) -> String {
+    match spec.task() {
+        mummu::registry::Task::Embed => format!(
+            "{} is an embedding model — not chat-servable; use /api/embed or /v1/embeddings",
+            spec.name
+        ),
+        mummu::registry::Task::Rerank => format!(
+            "{} is a reranker — not chat-servable; use /v1/rerank",
+            spec.name
+        ),
+        mummu::registry::Task::Generate => format!("{} is a chat model", spec.name),
+    }
 }
 
 /// The family's tool-call convention, or `None` when it is not offered tools.
@@ -999,6 +1034,20 @@ pub async fn run_chat(
         needs_tower,
     );
     let offered_tools = !req.tools.is_empty();
+    // A chat model about to LOAD takes the card back from any retrieval
+    // model on it, before the planner measures the card: two models'
+    // pools on one card is the out-of-device-memory this server keeps
+    // paying for, and a 0.6B embedder reloads in seconds (on the host, now
+    // that the card is the chat model's).
+    let dir = spec.dir(models_root);
+    // Busy reads as "may load": the request queues behind whatever holds the
+    // slot, and the model that comes out of it may not be this one.
+    let already = SLOT
+        .try_inspect(|m| m.is_some_and(|(key, _)| key == dir))
+        .unwrap_or(false);
+    if !already {
+        crate::retrieval::evict_from_accelerator();
+    }
     // Land a line in the log the moment a request enters the engine: the fit
     // planning below can legitimately take minutes on a busy disk, and a
     // request that logs nothing until it finishes reads as a hang (it did,
@@ -3206,6 +3255,24 @@ pub fn set_vision_reserve(bytes: u64) {
     VISION_RESERVE.store(bytes, SeqCst);
 }
 
+/// Bytes this process may still place on `backend`'s card, measured live
+/// (see `placement::free_for_new`): what a retrieval model may take there
+/// without squeezing the chat model's placement. 0 for the CPU.
+pub fn accelerator_room(backend: BackendChoice) -> u64 {
+    if backend == BackendChoice::Cpu {
+        return 0;
+    }
+    placement::free_for_new(backend)
+}
+
+/// Hold the model slot without loading anything — the chat model (if any)
+/// stays resident and no generation can run until the lock drops. What a
+/// retrieval model's accelerator forwards run under (see
+/// [`mummu::cache::ModelSlot::lock`]).
+pub async fn hold_slot() -> mummu::cache::SlotLock<'static, Loaded> {
+    SLOT.lock().await
+}
+
 fn backend_budget(backend: BackendChoice) -> u64 {
     // The tower is loaded onto the accelerator AFTER the planner has placed
     // layers to fill this budget, so it has to come out of it here — the one
@@ -4886,13 +4953,15 @@ pub fn placeholders(
 mod template_tests {
     use super::*;
 
-    const EVERY_FAMILY: [Architecture; 6] = [
+    const EVERY_FAMILY: [Architecture; 8] = [
         Architecture::Qwen2,
         Architecture::Qwen3,
         Architecture::Qwen35,
         Architecture::Lfm2,
         Architecture::Olmoe,
         Architecture::MiniLm,
+        Architecture::Qwen3Embed,
+        Architecture::Qwen3Rerank,
     ];
 
     fn a_tool() -> Vec<mummu::chat::ToolSpec> {
@@ -4912,14 +4981,19 @@ mod template_tests {
         for arch in EVERY_FAMILY {
             let with_tools = render_prompt_with_tools(arch, &a_tool(), &turns);
             assert_eq!(with_tools.is_ok(), supports_tools(arch), "{arch:?}");
-            if arch != Architecture::MiniLm {
+            if arch.task() == mummu::registry::Task::Generate {
                 assert!(
                     render_prompt_with_tools(arch, &[], &turns).is_ok(),
                     "{arch:?}"
                 );
+            } else {
+                assert!(!supports_tools(arch) && !thinks(arch), "{arch:?}");
+                assert!(
+                    render_prompt_with_tools(arch, &[], &turns).is_err(),
+                    "{arch:?}"
+                );
             }
         }
-        assert!(!supports_tools(Architecture::MiniLm) && !thinks(Architecture::MiniLm));
     }
 
     fn answered(text: &str) -> ChatResult {

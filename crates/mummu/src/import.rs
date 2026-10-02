@@ -223,6 +223,89 @@ where
     Ok(())
 }
 
+/// [`load_checked`] over a checkpoint split across safetensors shards.
+///
+/// Each store is one shard, built with `allow_partial(true)`: on its own it
+/// applies what it holds and reports the rest missing, which for a shard is
+/// the normal case rather than an error. A param is missing from the
+/// *checkpoint* only when **no** shard supplied it, so the verdict is the
+/// intersection of the per-shard missing sets — the same fail-loud contract
+/// as [`load_checked`], without fusing the shards into one file first (which
+/// would cost the checkpoint's size again in temp space). One shard is
+/// exactly [`load_checked`].
+///
+/// # Errors
+///
+/// [`ImportError::Load`] when a shard's store fails; [`ImportError::Incomplete`]
+/// when any shard reports an errored param, or when some module param is
+/// supplied by no shard.
+///
+/// # Panics
+///
+/// When `shards` is empty: a checkpoint has at least one weights file.
+pub fn load_checked_shards<M, S>(
+    module: &mut M,
+    shards: Vec<(S, PathBuf)>,
+) -> Result<(), ImportError>
+where
+    M: Module + ModuleSnapshot,
+    S: ModuleStore,
+{
+    assert!(!shards.is_empty(), "load_checked_shards: no shards");
+    if shards.len() == 1 {
+        let (mut store, path) = shards.into_iter().next().expect("one shard");
+        return load_checked(module, &mut store, &path);
+    }
+    let first = shards[0].1.clone();
+    let mut applied = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+    let mut missing: Option<std::collections::BTreeSet<String>> = None;
+    for (mut store, path) in shards {
+        let report = module
+            .load_from(&mut store)
+            .map_err(|e| ImportError::Load {
+                file: path.clone(),
+                reason: e.to_string(),
+            })?;
+        applied += report.applied.len();
+        errors.extend(
+            report
+                .errors
+                .iter()
+                .map(|e| format!("{}: {e}", path.display())),
+        );
+        let here: std::collections::BTreeSet<String> =
+            report.missing.iter().map(|(p, _)| p.clone()).collect();
+        missing = Some(match missing {
+            None => here,
+            Some(before) => before.intersection(&here).cloned().collect(),
+        });
+    }
+    let missing = missing.unwrap_or_default();
+    if !errors.is_empty() || !missing.is_empty() {
+        let mut report = String::new();
+        for m in missing.iter().take(32) {
+            report.push_str("missing: ");
+            report.push_str(m);
+            report.push('\n');
+        }
+        for e in errors.iter().take(32) {
+            report.push_str("error: ");
+            report.push_str(e);
+            report.push('\n');
+        }
+        return Err(ImportError::Incomplete {
+            file: first,
+            applied,
+            missing: missing.len(),
+            errors: errors.len(),
+            report,
+        });
+    }
+    debug_assert!(applied > 0, "a successful sharded load applied something");
+    Ok(())
+}
+
 /// Largest f32 payload [`DequantSink::Auto`] will let a dequant hold in RAM.
 ///
 /// The in-memory sink's peak is ~2x the payload (the blob, plus the model

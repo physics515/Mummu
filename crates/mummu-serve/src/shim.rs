@@ -32,7 +32,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete as delete_route, get, post};
 use mummu::chat::{ToolCall, ToolSpec};
 use mummu::manage::ModelManager;
-use mummu::registry::{Architecture, ModelSpec, WeightFormat};
+use mummu::registry::{ModelSpec, WeightFormat};
 use mummu_num::{f64_from_u64, trunc_i64};
 use serde::Deserialize;
 use serde_json::json;
@@ -61,8 +61,12 @@ pub fn router() -> Router {
         .route("/api/generate", post(generate))
         .route("/api/pull", post(pull))
         .route("/api/delete", delete_route(delete))
-        .route("/api/embed", post(no_embeddings))
-        .route("/api/embeddings", post(no_embeddings))
+        .route("/api/embed", post(crate::retrieval::ollama_embed))
+        .route("/api/embeddings", post(crate::retrieval::ollama_embeddings))
+        // Not ollama's — it has no rerank — but the shim is the listener
+        // RAG clients (Open WebUI's external reranker) are pointed at.
+        .route("/api/rerank", post(crate::retrieval::rerank_endpoint))
+        .route("/api/rag", post(crate::retrieval::rag_endpoint))
         .route("/api/create", post(unsupported))
         .route("/api/copy", post(unsupported))
         .route("/api/push", post(unsupported))
@@ -82,13 +86,6 @@ async fn root() -> &'static str {
 
 async fn version() -> Response {
     json_response(200, &json!({"version": "0.1.0"}))
-}
-
-async fn no_embeddings() -> Response {
-    json_response(
-        501,
-        &json!({"error": "embeddings are not supported by the mummu-serve shim"}),
-    )
 }
 
 async fn unsupported() -> Response {
@@ -222,7 +219,10 @@ fn build_tags() -> serde_json::Value {
     let models: Vec<_> = manager
         .catalog()
         .iter()
-        .filter(|s| !matches!(s.architecture, mummu::registry::Architecture::MiniLm))
+        // Chat models and embedders, as ollama lists both. A reranker is
+        // left out: ollama has no such model, and a chat UI offering one
+        // would only invite a chat it refuses.
+        .filter(|s| s.task() != mummu::registry::Task::Rerank)
         .filter(|s| engine::is_installed(s, &root))
         .map(|s| model_entry(s, &root))
         .collect();
@@ -276,15 +276,24 @@ async fn ps() -> Response {
         let root = models_root();
         let manager = ModelManager::new(root.clone());
         let resident = engine::resident_dirs();
+        // The retrieval models resident beside the chat model, with what
+        // they actually hold and where (`size_vram` 0 on the host, as
+        // ollama reports a CPU-resident model).
+        let retrieval = crate::retrieval::resident();
         let models: Vec<_> = manager
             .catalog()
             .iter()
-            .filter(|s| resident.iter().any(|d| *d == s.dir(&root)))
-            .map(|s| {
+            .filter_map(|s| {
                 let mut entry = model_entry(s, &root);
                 entry["expires_at"] = json!(now_rfc3339());
-                entry["size_vram"] = entry["size"].clone();
-                entry
+                if resident.iter().any(|d| *d == s.dir(&root)) {
+                    entry["size_vram"] = entry["size"].clone();
+                    return Some(entry);
+                }
+                let (_, _, device, bytes) = retrieval.iter().find(|r| r.0 == s.name)?;
+                entry["size"] = json!(bytes);
+                entry["size_vram"] = json!(if device.starts_with("CPU") { 0 } else { *bytes });
+                Some(entry)
             })
             .collect();
         json_response(200, &json!({"models": models}))
@@ -305,13 +314,15 @@ struct NameRequest {
 /// Each is what a request to THIS server gets, not what the checkpoint could
 /// do in principle: [`engine::supports_vision`], [`engine::supports_tools`]
 /// and [`engine::thinks`] read the same places a request is served from.
-/// all-MiniLM is an embedder, which is what ollama reports for `all-minilm`;
-/// it cannot chat here, so "completion" would only invite a chat that fails
-/// (`/api/embed` answers 501 and says why).
+/// An embedder reports "embedding" alone, as ollama does for `all-minilm`;
+/// it cannot chat, so "completion" would only invite a chat that fails. A
+/// reranker has no ollama word, so it gets its own.
 fn capabilities(spec: &ModelSpec, root: &Path) -> Vec<&'static str> {
     let arch = spec.architecture;
-    if arch == Architecture::MiniLm {
-        return vec!["embedding"];
+    match spec.task() {
+        mummu::registry::Task::Embed => return vec!["embedding"],
+        mummu::registry::Task::Rerank => return vec!["rerank"],
+        mummu::registry::Task::Generate => {}
     }
     let mut caps = vec!["completion"];
     if engine::supports_vision(spec, root) {
@@ -679,6 +690,12 @@ pub fn plan(
     };
     if !engine::is_installed(&spec, &root) {
         return Err(Box::new(not_found(model)));
+    }
+    if spec.task() != mummu::registry::Task::Generate {
+        return Err(Box::new(json_response(
+            400,
+            &json!({"error": engine::not_chat_servable(&spec)}),
+        )));
     }
     // Images are decoded and sized BEFORE the turns are rendered: the number
     // of placeholder tokens a prompt must reserve is a function of each
@@ -1417,6 +1434,7 @@ async fn pull(body: Bytes) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mummu::registry::Architecture;
 
     /// The read that failed every chat after the 2026-09-18 load.
     const INVALID_READ: &str = "bytes: host access failed: Read(\"The server is in an invalid \
@@ -1609,7 +1627,8 @@ mod tests {
                 Architecture::Qwen3 | Architecture::Qwen35 => &["completion", "tools", "thinking"],
                 // OLMoE's Tulu template has no tool convention at all.
                 Architecture::Olmoe => &["completion"],
-                Architecture::MiniLm => &["embedding"],
+                Architecture::MiniLm | Architecture::Qwen3Embed => &["embedding"],
+                Architecture::Qwen3Rerank => &["rerank"],
             };
             assert_eq!(capabilities(&spec, &root), expected, "{}", spec.name);
         }
@@ -1649,7 +1668,7 @@ mod tests {
     fn tools_are_advertised_exactly_where_a_request_may_carry_them() {
         let root = scratch_root("offer");
         for spec in mummu::registry::catalog() {
-            if spec.architecture == Architecture::MiniLm {
+            if spec.task() != mummu::registry::Task::Generate {
                 continue; // not chat-servable: `plan` never gets this far
             }
             let name = spec.name.clone();
@@ -2252,7 +2271,7 @@ mod tests {
         let root = scratch_root("think");
         let (mut accepted, mut refused) = (0, 0);
         for spec in mummu::registry::catalog() {
-            if spec.architecture == Architecture::MiniLm {
+            if spec.task() != mummu::registry::Task::Generate {
                 continue; // not chat-servable: `plan` never gets this far
             }
             let name = spec.name.clone();
