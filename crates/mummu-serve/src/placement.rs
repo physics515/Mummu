@@ -994,6 +994,9 @@ pub(super) struct Live {
     /// reserved in the solve that decided so).
     head_card_bytes: u64,
     pub head_on_card: bool,
+    /// The head is the token table (a tied checkpoint): where the head goes,
+    /// the table goes — see [`Self::measure`].
+    pub head_is_table: bool,
 }
 
 pub(super) static LIVE: Mutex<Option<Live>> = Mutex::new(None);
@@ -1005,7 +1008,19 @@ impl Live {
         let cfg = qwen35::Qwen35Config::from_gguf(&pack.header()?)?;
         let source_bits = super::source_bits_per_param(&pack);
         let ceiling = QuantPolicy::ceiling_for_source(source_bits);
-        let head_card_bytes = pack.entry("output.weight").map_or(0, |e| {
+        // A tied checkpoint has no `output.weight`: its head is a matmul
+        // against the token table, every token, wherever the table is. Left
+        // on the host as a mere gather, the table made the head a host read
+        // of the whole vocabulary per token — the 2B, all 24 layers on the
+        // card, decoded at 86 ms/token against a predicted 5. So a tied
+        // head reserves the table, and the table follows it.
+        let head_is_table = pack.entry("output.weight").is_none();
+        let head_entry = pack.entry(if head_is_table {
+            "token_embd.weight"
+        } else {
+            "output.weight"
+        });
+        let head_card_bytes = head_entry.map_or(0, |e| {
             let bytes = blob_bytes(e, trunk_precision(e, source_bits)).unwrap_or(0);
             // The card's pool padding, as for the layers.
             trunc_u64(f64_from_u64(bytes) * 1.05)
@@ -1079,6 +1094,7 @@ impl Live {
             source_bits,
             head_card_bytes,
             head_on_card: false,
+            head_is_table,
         })
     }
 
@@ -1269,6 +1285,16 @@ impl Live {
     /// Card bytes the placement's layers occupy — the residency check's plan.
     pub fn planned_card_bytes(&self) -> u64 {
         self.planned_bytes(1)
+    }
+
+    /// The head's card bytes when the load put it there, else 0 — beside
+    /// [`Self::planned_card_bytes`] for what a load should leave resident.
+    pub const fn head_bytes_on_card(&self) -> u64 {
+        if self.head_on_card {
+            self.head_card_bytes
+        } else {
+            0
+        }
     }
 
     /// Host bytes the placement's layers occupy.

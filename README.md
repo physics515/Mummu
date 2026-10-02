@@ -373,6 +373,17 @@ async fn search(dir: &std::path::Path, rr: &std::path::Path) -> Result<(), Box<d
   the card and a busy GPU sends them to the host; a co-tenant saturating the GPU gets all of it (a
   6 GiB torch matmul hog ran at its solo 82-84 TFLOPS); and the card is taken back within about a
   minute of it leaving. `/api/health` carries the readings as `pressure`.
+- **Captured decode and batched decode** *(2026-10-01)* — `mummu::capture` records a decode step
+  once per 256-key bucket and replays it every token (`burn::tensor::capture`; a software graph on
+  Vulkan, a real one on CUDA), over a static state laid out so nothing a step touches moves: KV
+  preallocated per slot and written in place, qwen35's `DeltaNet` state advanced in place, token
+  and position read from device buffers rewritten between replays. It is the serve default for
+  Qwen3 and qwen35 models wholly on the card (`MUMMU_GRAPH=off` restores the ordinary step): the
+  Qwen3.5-2B decodes at **13 ms/token through serve, against 24-30 uncaptured** (it was 86 before
+  its tied head's table moved to the card with it — `placement`), identical tokens in f32.
+  `capture::generate_batch_greedy` steps N sequences in one dispatch, each exactly its solo
+  decode: 16 slots of the 2B in f16 decode **461 tokens/s together against 54 alone**.
+  `tests/real_capture.rs` is the gate and the benchmark.
 
 ## Design principles
 

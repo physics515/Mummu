@@ -30,6 +30,7 @@ use crate::import::{
 };
 use crate::models::CausalLm;
 use crate::models::qwen2::{EosIds, gguf_f32, gguf_usize};
+use crate::nn::static_kv::{StaticKv, StaticKvConfig};
 use crate::nn::{
     GqaAttention, GqaAttentionConfig, HeadShape, LayerKv, SwiGluMlp, SwiGluMlpConfig, causal_mask,
     rope_tables,
@@ -705,6 +706,104 @@ impl LoadedQwen3 {
     #[must_use]
     pub fn last_hidden(&self, ids: &[u32], device: &Device) -> Tensor<2> {
         pooled_hidden(&self.model, &self.config, ids, Pooling::LastToken, device)
+    }
+}
+
+impl crate::capture::StaticDecode for LoadedQwen3 {
+    type State = StaticKv;
+
+    /// One device holds the whole model; the step must run there.
+    fn static_supported(&self, device: &Device) -> bool {
+        self.model.embed_tokens.weight.val().device() == *device
+    }
+
+    fn static_state(&self, slots: usize, max_ctx: usize, device: &Device) -> StaticKv {
+        StaticKv::new(
+            StaticKvConfig {
+                slots,
+                max_ctx,
+                layers: self.config.num_hidden_layers,
+                kv_heads: self.config.num_key_value_heads,
+                head_dim: self.config.head_dim,
+                rope_dim: self.config.head_dim,
+                rope_theta: self.config.rope_theta,
+            },
+            device,
+        )
+    }
+
+    fn trained_context(&self) -> Option<usize> {
+        self.config.max_position_embeddings
+    }
+
+    fn forward_static(
+        &self,
+        tokens: &Tensor<2, Int>,
+        positions: &Tensor<1, Int>,
+        kv: &mut StaticKv,
+        len: usize,
+    ) -> Tensor<2> {
+        let cfg = &self.config;
+        let [slots, one] = tokens.dims();
+        assert_eq!(one, 1, "forward_static: one token per slot");
+        let step = kv.step_inputs(positions, len);
+        let mut x = self.model.embed_tokens.forward(tokens.clone()); // [slots, 1, hidden]
+        let shape = HeadShape {
+            num_heads: cfg.num_attention_heads,
+            num_kv_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+        };
+        for (l, layer) in self.model.layers.iter().enumerate() {
+            let h = layer.input_layernorm.forward(x.clone());
+            let h = layer
+                .self_attn
+                .forward_static(h, shape, &step, kv.layer_mut(l));
+            x = x.add(h);
+            let h2 = layer.post_attention_layernorm.forward(x.clone());
+            x = x.add(layer.mlp.forward(h2));
+        }
+        let last = self.model.norm.forward(x).reshape([slots, cfg.hidden_size]);
+        if let Some(head) = &self.model.lm_head {
+            head.forward(last)
+        } else {
+            let w = self.model.embed_tokens.weight.val();
+            last.matmul(w.swap_dims(0, 1))
+        }
+    }
+
+    fn seed_static(&self, kv: &mut StaticKv, slot: usize, cache: &Self::Cache) {
+        for (l, layer) in cache.iter().enumerate() {
+            let (k, v) = layer.as_ref().expect("seed_static: a prefilled cache");
+            kv.seed(l, slot, k.clone(), v.clone());
+        }
+    }
+}
+
+/// A small random Qwen3 with no EOS (a decode always runs its full length),
+/// for tests elsewhere in the crate.
+#[cfg(test)]
+pub(crate) fn toy_for_tests(device: &Device) -> LoadedQwen3 {
+    let config = Qwen3Config {
+        vocab_size: 64,
+        hidden_size: 16,
+        intermediate_size: 32,
+        num_hidden_layers: 2,
+        num_attention_heads: 4,
+        num_key_value_heads: 2,
+        head_dim: 6,
+        rms_norm_eps: 1e-6,
+        rope_theta: 1e6,
+        rope_scaling: None,
+        max_position_embeddings: Some(512),
+        sliding_window: None,
+        use_sliding_window: false,
+        tie_word_embeddings: true,
+        eos_token_id: EosIds::None,
+    };
+    LoadedQwen3 {
+        model: build(&config, device),
+        config,
+        tokenizer_config: None,
     }
 }
 

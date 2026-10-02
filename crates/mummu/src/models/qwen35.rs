@@ -658,6 +658,78 @@ impl GatedAttention {
         };
         qlinear(&self.o_proj, gated)
     }
+
+    /// [`Self::forward`] for one token per slot over a static cache (see
+    /// [`crate::capture`]): `x` `[slots, 1, hidden]`, the slots' `RoPE` rows,
+    /// cache rows and bucket mask in `step`, and this layer's preallocated
+    /// `kv`, written in place. The same arithmetic as the dynamic step,
+    /// except that each kv head's query heads attend as the rows of one
+    /// matmul instead of through a `group`-fold copy of the cache.
+    pub(crate) fn forward_static(
+        &self,
+        x: Tensor<3>,
+        cfg: &Qwen35Config,
+        step: &crate::nn::static_kv::StepInputs,
+        kv: &mut LayerKv,
+        had: Option<&LayerHadamard>,
+    ) -> Tensor<3> {
+        let [b, t, _] = x.dims();
+        assert_eq!(t, 1, "forward_static: one token per slot");
+        let (nh, nkv, hd) = (
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+        );
+        let xr = had.and_then(|layer_had| layer_had.input_pair(&x));
+        let folds = had.map_or_else(LayerFolds::default, |layer_had| layer_had.folds);
+        let (xq, xk, xv) = (
+            pick(folds.has(Fold::Q), xr.as_ref(), &x),
+            pick(folds.has(Fold::K), xr.as_ref(), &x),
+            pick(folds.has(Fold::V), xr.as_ref(), &x),
+        );
+        drop(xr);
+        drop(x);
+
+        let qg = qlinear(&self.q_proj, xq).reshape([b, t, nh, 2, hd]);
+        let query = qg.clone().narrow(3, 0, 1).reshape([b, t, nh, hd]);
+        let gate = qg.narrow(3, 1, 1).reshape([b, t, nh, hd]);
+        let query = self.q_norm.forward(query).swap_dims(1, 2); // [b, nh, 1, hd]
+        let k_new = qlinear(&self.k_proj, xk).reshape([b, t, nkv, hd]);
+        let k_new = self.k_norm.forward(k_new).swap_dims(1, 2);
+        let v_new = qlinear(&self.v_proj, xv)
+            .reshape([b, t, nkv, hd])
+            .swap_dims(1, 2);
+        let rope = |heads: Tensor<4>| -> Tensor<4> {
+            let rot = heads.clone().narrow(3, 0, cfg.rope_dim);
+            let rest = heads.narrow(3, cfg.rope_dim, hd - cfg.rope_dim);
+            let rot = crate::nn::apply_rope(rot, &step.cos, &step.sin);
+            Tensor::cat(vec![rot, rest], 3)
+        };
+        let query = rope(query);
+        let k_new = rope(k_new);
+
+        let ambient = query.dtype();
+        let (keys, values) =
+            crate::nn::static_kv::write_and_view(kv, k_new, v_new, &step.write_rows, step.len);
+        // `repeat_kv` puts query head `h` on kv head `h / group`: exactly
+        // this reshape's grouping (one query token per slot).
+        let query = query.reshape([b, nkv, nh / nkv, hd]);
+        let scale = 1.0 / f32_from_usize(hd).sqrt();
+        let scores = query
+            .cast(DType::F32)
+            .matmul(keys.cast(DType::F32).swap_dims(2, 3))
+            .mul_scalar(scale)
+            .add(step.mask.clone().cast(DType::F32));
+        let probs = activation::softmax(scores, 3).cast(ambient);
+        let ctx = probs.matmul(values.cast(ambient)).reshape([b, t, nh, hd]);
+
+        let gated = ctx.mul(activation::sigmoid(gate)).reshape([b, t, nh * hd]);
+        let gated = match had {
+            Some(layer_had) if layer_had.folds.has(Fold::O) => layer_had.consts.forward(gated),
+            _ => gated,
+        };
+        qlinear(&self.o_proj, gated)
+    }
 }
 
 /// The position-dependent inputs of one attention call: the [`rope_tables`]
@@ -832,6 +904,48 @@ impl GatedDeltaNet {
         cache.state = Some(s_new); // [b, hv, ds, ds]; out_heads is [b, hv, t, ds]
         drop(prof_recur);
         let _s = crate::prof::scope("delta.out");
+        self.gated_output(out_heads, gate_z, cfg, had)
+    }
+
+    /// [`Self::forward`]'s decode step (`t == 1`, the tensor path) for every
+    /// slot at once, over a state whose buffers it advances **in place**:
+    /// a captured graph reads and writes the buffers it recorded.
+    pub(crate) fn forward_static(
+        &self,
+        x: Tensor<3>,
+        cfg: &Qwen35Config,
+        st: &mut DeltaStatic,
+        had: Option<&LayerHadamard>,
+    ) -> Tensor<3> {
+        assert_eq!(x.dims()[1], 1, "forward_static: one token per slot");
+        let kk = cfg.conv_kernel;
+        let DeltaProjections {
+            mixed,
+            gate: gate_z,
+            beta,
+            decay,
+        } = self.project(x, cfg, had);
+        // The dynamic decode branch of `causal_conv`: the window is the
+        // cached `kk - 1` columns plus this one, and the new cache is its
+        // last `kk - 1`.
+        let mix_cm = mixed.swap_dims(1, 2); // [slots, conv_dim, 1]
+        let conv_dim = mix_cm.dims()[1];
+        let window = Tensor::cat(vec![st.conv.clone(), mix_cm], 2);
+        let taps = self.conv1d.weight.val().reshape([1, conv_dim, kk]);
+        let conv_out = window.clone().mul(taps).sum_dim(2);
+        crate::nn::static_kv::overwrite(&mut st.conv, window.narrow(2, 1, kk - 1));
+        let conv_out = activation::silu(conv_out.swap_dims(1, 2)); // [slots, 1, conv_dim]
+        let (query, keys, values) = split_qkv(conv_out, cfg);
+        let inputs = RecurrenceInputs {
+            q: &query,
+            k: &keys,
+            v: &values,
+            g: &decay,
+            beta: &beta,
+        };
+        let scale = 1.0 / f32_from_usize(cfg.d_state).sqrt();
+        let (out_heads, s_new) = gdn_recurrence_sequential(&inputs, st.state.clone(), scale);
+        crate::nn::static_kv::overwrite(&mut st.state, s_new);
         self.gated_output(out_heads, gate_z, cfg, had)
     }
 
@@ -3200,6 +3314,219 @@ impl LoadedQwen35 {
     }
 }
 
+/// One `DeltaNet` layer's decode state at a fixed shape, for the static step:
+/// the conv window `[slots, conv_dim, conv_kernel - 1]` and the recurrent
+/// memory `[slots, n_v_heads, d_state, d_state]`.
+pub struct DeltaStatic {
+    conv: Tensor<3>,
+    state: Tensor<4>,
+}
+
+/// What [`LoadedQwen35`]'s static step runs over (see [`crate::capture`]):
+/// the attention layers' preallocated KV and every `DeltaNet` layer's state.
+pub struct Qwen35Static {
+    kv: crate::nn::static_kv::StaticKv,
+    delta: Vec<DeltaStatic>,
+    /// Layer → its entry in `kv` (attention) or `delta` (`DeltaNet`).
+    index: Vec<usize>,
+}
+
+impl crate::capture::StaticState for Qwen35Static {
+    /// Copies of every `DeltaNet` state: the recurrence advances whenever
+    /// the step runs, unlike the KV writes.
+    type Mark = Vec<(Tensor<3>, Tensor<4>)>;
+
+    fn mark(&self) -> Self::Mark {
+        self.delta
+            .iter()
+            .map(|d| {
+                (
+                    crate::nn::static_kv::copy_of(&d.conv),
+                    crate::nn::static_kv::copy_of(&d.state),
+                )
+            })
+            .collect()
+    }
+
+    fn rewind(&mut self, mark: Self::Mark) {
+        for (d, (conv, state)) in self.delta.iter_mut().zip(mark) {
+            crate::nn::static_kv::overwrite(&mut d.conv, conv);
+            crate::nn::static_kv::overwrite(&mut d.state, state);
+        }
+    }
+
+    /// Only attention grows with the context; a `DeltaNet` state is the
+    /// same size at any length.
+    fn grow(&mut self, max_ctx: usize) {
+        self.kv.grow(max_ctx);
+    }
+}
+
+impl crate::capture::StaticDecode for LoadedQwen35 {
+    type State = Qwen35Static;
+
+    /// Only when the whole model — table, every layer, final norm and head —
+    /// is on `device` and runs the plain forward: a remote FFN pool and the
+    /// reference-arithmetic diagnostic stay on the dynamic path.
+    fn static_supported(&self, device: &Device) -> bool {
+        let here = |d: Device| d == *device;
+        here(self.model.embed_tokens.weight.val().device())
+            && here(self.model.norm.gamma.val().device())
+            && self
+                .model
+                .layers
+                .iter()
+                .all(|l| here(l.input_norm.gamma.val().device()))
+            && self
+                .model
+                .lm_head
+                .as_ref()
+                .is_none_or(|h| here(h.weight.val().device()))
+            && self.ffn_pool.is_none()
+            && !crate::nn::refarith::enabled()
+    }
+
+    fn static_state(&self, slots: usize, max_ctx: usize, device: &Device) -> Qwen35Static {
+        let cfg = &self.config;
+        let mut index = Vec::with_capacity(cfg.num_layers);
+        let (mut attn, mut delta) = (0, Vec::new());
+        let dtype = crate::backend::float_dtype(device);
+        for li in 0..cfg.num_layers {
+            if cfg.is_attention(li) {
+                index.push(attn);
+                attn += 1;
+            } else {
+                index.push(delta.len());
+                delta.push(DeltaStatic {
+                    conv: Tensor::<3>::zeros(
+                        [slots, cfg.conv_dim(), cfg.conv_kernel - 1],
+                        (device, dtype),
+                    ),
+                    state: Tensor::<4>::zeros(
+                        [slots, cfg.n_v_heads, cfg.d_state, cfg.d_state],
+                        (device, dtype),
+                    ),
+                });
+            }
+        }
+        let kv = crate::nn::static_kv::StaticKv::new(
+            crate::nn::static_kv::StaticKvConfig {
+                slots,
+                max_ctx,
+                layers: attn.max(1),
+                kv_heads: cfg.num_key_value_heads,
+                head_dim: cfg.head_dim,
+                rope_dim: cfg.rope_dim,
+                rope_theta: cfg.rope_theta,
+            },
+            device,
+        );
+        Qwen35Static { kv, delta, index }
+    }
+
+    fn trained_context(&self) -> Option<usize> {
+        None
+    }
+
+    fn forward_static(
+        &self,
+        tokens: &Tensor<2, Int>,
+        positions: &Tensor<1, Int>,
+        state: &mut Qwen35Static,
+        len: usize,
+    ) -> Tensor<2> {
+        let cfg = &self.config;
+        let [slots, one] = tokens.dims();
+        assert_eq!(one, 1, "forward_static: one token per slot");
+        let device = tokens.device();
+        let step = state.kv.step_inputs(positions, len);
+        let mut x = self.model.embed_tokens.forward(tokens.clone()); // [slots, 1, hidden]
+        if let Some(had) = &cfg.hadamard
+            && had.embed_inverse
+        {
+            x = had.runtime.on(&device).inverse(x);
+        }
+        for (li, layer) in self.model.layers.iter().enumerate() {
+            let lh = cfg.hadamard.as_ref().map(|had| LayerHadamard {
+                consts: had.runtime.on(&device),
+                folds: had.layers[li],
+            });
+            let h = layer.input_norm.forward(x.clone());
+            let at = state.index[li];
+            let h = match (&layer.self_attn, &layer.linear_attn) {
+                (Some(attn), None) => {
+                    attn.forward_static(h, cfg, &step, state.kv.layer_mut(at), lh.as_ref())
+                }
+                (None, Some(delta)) => {
+                    delta.forward_static(h, cfg, &mut state.delta[at], lh.as_ref())
+                }
+                _ => unreachable!("qwen35 static step: a layer with both or neither mixer"),
+            };
+            x = x.add(h);
+            let h2 = layer.post_attn_norm.forward(x.clone());
+            let (_, ffn) = mlp_forward(layer, &h2, lh.as_ref());
+            x = x.add(ffn);
+        }
+        // `head_logits` for every slot's one position.
+        let last = self.model.norm.forward(x).reshape([slots, cfg.hidden_size]);
+        let last = match &cfg.hadamard {
+            Some(had) if had.head => had.runtime.on(&device).forward(last),
+            _ => last,
+        };
+        if let Some(head) = &self.model.lm_head {
+            qlinear2(head, last)
+        } else {
+            last.matmul(self.model.embed_tokens.weight.val().swap_dims(0, 1))
+        }
+    }
+
+    fn seed_static(&self, state: &mut Qwen35Static, slot: usize, cache: &Self::Cache) {
+        let cfg = &self.config;
+        for (li, entry) in cache.iter().enumerate() {
+            let at = state.index[li];
+            match entry {
+                Qwen35Kv::Attn(Some((k, v))) => state.kv.seed(at, slot, k.clone(), v.clone()),
+                Qwen35Kv::Attn(None) => panic!("seed_static: layer {li} was never prefilled"),
+                Qwen35Kv::Delta(d) => {
+                    let st = &mut state.delta[at];
+                    let device = st.conv.device();
+                    let kk1 = cfg.conv_kernel - 1;
+                    let (hv, ds, conv_dim) = (cfg.n_v_heads, cfg.d_state, cfg.conv_dim());
+                    // The fused host path keeps the state as host twins.
+                    let conv = d.conv.clone().or_else(|| {
+                        d.host_conv.as_ref().map(|hc| {
+                            Tensor::<1>::from_data(
+                                TensorData::new(hc.clone(), [conv_dim * kk1]),
+                                &device,
+                            )
+                            .reshape([1, conv_dim, kk1])
+                        })
+                    });
+                    let memory = d.state.clone().or_else(|| {
+                        d.host_state.as_ref().map(|hs| {
+                            Tensor::<1>::from_data(
+                                TensorData::new(hs.clone(), [hv * ds * ds]),
+                                &device,
+                            )
+                            .reshape([1, hv, ds, ds])
+                        })
+                    });
+                    let (Some(conv), Some(memory)) = (conv, memory) else {
+                        panic!("seed_static: DeltaNet layer {li} was never prefilled");
+                    };
+                    let (cd, sd) = (st.conv.dtype(), st.state.dtype());
+                    st.conv.inplace(|c| {
+                        c.slice_assign([slot..slot + 1, 0..conv_dim, 0..kk1], conv.cast(cd))
+                    });
+                    st.state.inplace(|s| {
+                        s.slice_assign([slot..slot + 1, 0..hv, 0..ds, 0..ds], memory.cast(sd))
+                    });
+                }
+            }
+        }
+    }
+}
+
 /// The lookahead-verify tally (`MUMMU_LOOKAHEAD=verify`): how many layers'
 /// speculative post-attention states were scored, the worst relative
 /// error, and how many landed under each acceptance threshold.
@@ -4250,5 +4577,132 @@ mod tests {
                 "logit {i}: tensor {x} vs fused-then-tensor {y}"
             );
         }
+    }
+
+    /// The static step (both block kinds, several slots at once) computes
+    /// the dynamic decode's logits: each slot prefilled on the dynamic path
+    /// and seeded, then teacher-forced through the same tokens as a
+    /// dynamic cache per slot. The tensor `DeltaNet` path on both sides
+    /// (the fused host step is a different evaluation order).
+    #[test]
+    fn static_step_matches_the_dynamic_decode_per_slot() {
+        use crate::capture::StaticDecode;
+        let _serial = FUSED_TOGGLE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::flex::gdn::force_disable(true);
+        let _restore = RestoreFused;
+        let m = toy_model();
+        let device = crate::backend::cpu_device();
+        let int = crate::backend::int_dtype(&device);
+        let prompts: [&[u32]; 2] = [&[3, 17, 42], &[9, 60, 11, 5, 23]];
+        let forced: [[u32; 4]; 2] = [[8, 13, 2, 40], [31, 7, 7, 19]];
+        assert!(m.static_supported(&device), "one device, plain forward");
+        let mut state = m.static_state(2, 64, &device);
+        let mut dynamic: Vec<_> = prompts
+            .iter()
+            .enumerate()
+            .map(|(slot, p)| {
+                let mut cache = m.new_cache();
+                let _ = m.forward(p, 0, &mut cache, &device);
+                m.seed_static(&mut state, slot, &cache);
+                cache
+            })
+            .collect();
+        for step in 0..4 {
+            let ids: Vec<i32> = (0..2)
+                .map(|s| i32::try_from(forced[s][step]).unwrap())
+                .collect();
+            let pos: Vec<i32> = (0..2)
+                .map(|s| i32::try_from(prompts[s].len() + step).unwrap())
+                .collect();
+            let max_pos = usize::try_from(*pos.iter().max().unwrap()).unwrap();
+            let tokens = Tensor::<2, Int>::from_data(TensorData::new(ids, [2, 1]), (&device, int));
+            let positions = Tensor::<1, Int>::from_data(TensorData::new(pos, [2]), (&device, int));
+            let len = crate::nn::static_kv::bucket(max_pos, 64);
+            let got = m
+                .forward_static(&tokens, &positions, &mut state, len)
+                .into_data()
+                .try_to_vec::<f32>()
+                .unwrap();
+            let vocab = m.config.vocab_size;
+            for (slot, cache) in dynamic.iter_mut().enumerate() {
+                let want = m
+                    .forward(
+                        &[forced[slot][step]],
+                        prompts[slot].len() + step,
+                        cache,
+                        &device,
+                    )
+                    .into_data()
+                    .try_to_vec::<f32>()
+                    .unwrap();
+                for (i, (g, w)) in got[slot * vocab..(slot + 1) * vocab]
+                    .iter()
+                    .zip(&want)
+                    .enumerate()
+                {
+                    assert!(
+                        (g - w).abs() < 1e-4,
+                        "step {step} slot {slot} logit {i}: static {g} vs dynamic {w}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Through the capture driver: the dynamic, static and captured decodes
+    /// pick the same tokens, the captured one included — a replay that
+    /// re-advanced the recurrent state during capture (the warm-up runs the
+    /// step several times) would drift from the first token on.
+    #[test]
+    fn every_static_mode_decodes_the_same_tokens() {
+        use crate::capture::{StepMode, generate_batch_greedy, greedy_decode};
+        let _serial = FUSED_TOGGLE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::flex::gdn::force_disable(true);
+        let _restore = RestoreFused;
+        let mut m = toy_model();
+        m.config.eos_token_id = EosIds::One(u32::MAX);
+        let device = crate::backend::cpu_device();
+        let prompt = [3u32, 14, 15, 9, 26];
+        let runs: Vec<Vec<u32>> = [StepMode::Dynamic, StepMode::Static, StepMode::Captured]
+            .into_iter()
+            .map(|mode| greedy_decode(&m, &prompt, 12, &device, mode))
+            .collect();
+        assert_eq!(runs[0].len(), 12);
+        assert_eq!(runs[0], runs[1], "static step");
+        assert_eq!(runs[0], runs[2], "captured step");
+        let batch =
+            generate_batch_greedy(&m, &[&prompt, &[7, 7, 1]], 12, &device, StepMode::Captured)
+                .expect("batch");
+        assert_eq!(batch[0], runs[0], "slot 0 of a batch");
+        let alone = greedy_decode(&m, &[7, 7, 1], 12, &device, StepMode::Dynamic);
+        assert_eq!(batch[1], alone, "slot 1 of a batch");
+    }
+
+    /// A generation past the static state's first size (prompt + 512, in
+    /// 256-key buckets) grows it — new buffers, graphs dropped and
+    /// recaptured — and decodes on exactly as the dynamic path does: the
+    /// KV rows and the `DeltaNet` state both carried across.
+    #[test]
+    fn outgrowing_the_static_state_changes_nothing() {
+        use crate::capture::{StepMode, greedy_decode};
+        let _serial = FUSED_TOGGLE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::flex::gdn::force_disable(true);
+        let _restore = RestoreFused;
+        let mut m = toy_model();
+        m.config.eos_token_id = EosIds::One(u32::MAX);
+        let device = crate::backend::cpu_device();
+        let prompt = [3u32, 14, 15, 9, 26];
+        let dynamic = greedy_decode(&m, &prompt, 1100, &device, StepMode::Dynamic);
+        assert_eq!(dynamic.len(), 1100);
+        let static_step = greedy_decode(&m, &prompt, 1100, &device, StepMode::Static);
+        assert_eq!(static_step, dynamic, "static");
+        let captured = greedy_decode(&m, &prompt, 1100, &device, StepMode::Captured);
+        assert_eq!(captured, dynamic, "captured");
     }
 }

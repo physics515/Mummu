@@ -295,6 +295,85 @@ impl GqaAttention {
     }
 }
 
+impl GqaAttention {
+    /// The fixed-shape decode step (see [`super::static_kv`]): one new token
+    /// per slot, `x` `[slots, 1, hidden]`, its k/v written into the static
+    /// cache at each slot's position, attention over the step's bucket with
+    /// the keys past each slot's position masked out. Same projections, norms,
+    /// `RoPE` and f32 score island as [`Self::forward`] — only where the cache
+    /// lives and how far attention spans differ, and a masked key contributes
+    /// exactly zero.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::forward`], plus when `x` holds more than one token per slot
+    /// or the layer's cache is checked out.
+    pub fn forward_static(
+        &self,
+        x: Tensor<3>,
+        shape: HeadShape,
+        step: &super::static_kv::StepInputs,
+        kv: &mut LayerKv,
+    ) -> Tensor<3> {
+        let [b, t, _h] = x.dims();
+        assert_eq!(t, 1, "forward_static: one token per slot");
+        let HeadShape {
+            num_heads: nh,
+            num_kv_heads: nkv,
+            head_dim: hd,
+        } = shape;
+        assert!(
+            nkv >= 1 && nh.is_multiple_of(nkv),
+            "GQA forward: num_heads ({nh}) must be a positive multiple of num_kv_heads ({nkv})"
+        );
+        let query = self.q_proj.forward(x.clone());
+        let query = match &self.q_norm {
+            Some(norm) => qk_norm_forward(norm, query, nh, hd),
+            None => query.reshape([b, t, nh, hd]),
+        }
+        .swap_dims(1, 2);
+        let k_new = self.k_proj.forward(x.clone());
+        let k_new = match &self.k_norm {
+            Some(norm) => qk_norm_forward(norm, k_new, nkv, hd),
+            None => k_new.reshape([b, t, nkv, hd]),
+        }
+        .swap_dims(1, 2);
+        let v_new = self
+            .v_proj
+            .forward(x)
+            .reshape([b, t, nkv, hd])
+            .swap_dims(1, 2);
+
+        let query = apply_rope(query, &step.cos, &step.sin);
+        let k_new = apply_rope(k_new, &step.cos, &step.sin);
+
+        let ambient = query.dtype();
+        let (keys, values) =
+            super::static_kv::write_and_view(kv, k_new, v_new, &step.write_rows, step.len);
+        // One query token, so each kv head's `group` query heads are the
+        // rows of one matmul against that head's keys — no `repeat_kv`.
+        // Expanding the cache `group`-fold every step was most of the step's
+        // memory traffic at a few slots, and most of a captured graph's
+        // footprint (32 MiB per layer per k/v at 16 slots × 256 keys).
+        // `repeat_kv` puts query head `h` on kv head `h / group`, which is
+        // exactly this reshape's grouping.
+        let group = nh / nkv;
+        let query = query.reshape([b, nkv, group, hd]);
+
+        // The f32 island, as in `forward`; the mask `[b, 1, 1, len]`
+        // broadcasts over the kv heads and their groups.
+        let scale = 1.0 / f32_from_usize(hd).sqrt();
+        let scores = query
+            .cast(DType::F32)
+            .matmul(keys.cast(DType::F32).swap_dims(2, 3))
+            .mul_scalar(scale)
+            .add(step.mask.clone().cast(DType::F32));
+        let probs = activation::softmax(scores, 3).cast(ambient);
+        let ctx = probs.matmul(values.cast(ambient)).reshape([b, t, nh * hd]);
+        self.o_proj.forward(ctx)
+    }
+}
+
 /// Is the half-precision KV cache on?
 ///
 /// Storage-only: scores keep their f32

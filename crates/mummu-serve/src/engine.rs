@@ -81,7 +81,7 @@ impl AnyLm {
                 .await
             }
             Self::Qwen3(m) => {
-                mummu::models::generate_constrained(
+                decode_captured(
                     m, prompt_ids, max_tokens, opts, device, on_token, constraint,
                 )
                 .await
@@ -105,13 +105,55 @@ impl AnyLm {
                 .await
             }
             Self::Qwen35(m) => {
-                mummu::models::generate_constrained(
+                decode_captured(
                     m, prompt_ids, max_tokens, opts, device, on_token, constraint,
                 )
                 .await
             }
         }
     }
+}
+
+/// Decode with the step captured and replayed (`mummu::capture`) where that
+/// applies, and on the ordinary path everywhere else.
+///
+/// It applies to a model wholly on the accelerator: there a decode token is
+/// a thousand-odd kernel launches whose CPU-side cost the replay removes
+/// (the 2B: 17.1 → 11.7 ms/token in f16). The host keeps the ordinary path —
+/// no launches to save, and its fused `DeltaNet` step and packed kernels are
+/// what make CPU decode fast. A model split across the two is not on one
+/// device, so the capture driver itself falls back (`static_state` says no).
+/// `MUMMU_GRAPH=off` turns it off.
+async fn decode_captured<M: mummu::capture::StaticDecode + Sync>(
+    m: &M,
+    prompt_ids: &[u32],
+    max_tokens: usize,
+    opts: &SamplerOptions,
+    device: &Device,
+    on_token: impl FnMut(u32) -> ControlFlow<()>,
+    constraint: Option<&mut dyn mummu::constrain::Constraint>,
+) -> Result<Vec<u32>, String> {
+    let req = mummu::capture::DecodeRequest {
+        prompt_ids,
+        max_tokens,
+        opts,
+        device,
+        mode: mummu::capture::step_mode(),
+    };
+    if mummu::backend::is_flex(device) || !mummu::capture::applies(m, &req) {
+        return mummu::models::generate_constrained(
+            m, prompt_ids, max_tokens, opts, device, on_token, constraint,
+        )
+        .await;
+    }
+    // A graph replays on the stream of the thread that recorded it, so the
+    // whole generation stays on this thread.
+    // Boxed: the captured driver's state would otherwise sit inline in
+    // every request's future.
+    mummu::capture::on_this_thread(Box::pin(mummu::capture::generate(
+        m, req, on_token, constraint,
+    )))
+    .await
 }
 
 /// Which backend serves generations, decided once per process.
@@ -1690,16 +1732,21 @@ fn build_layered_qwen35(
         }
     };
 
-    // Embedding on the host (a gather; see `pack_trunk_bytes`), and the head
-    // where the placement put it: with the last layer on the card only when
-    // its bytes were reserved there (`placement::plan_load`).
-
+    // The head where the placement put it: with the last layer on the card
+    // only when its bytes were reserved there (`placement::plan_load`). The
+    // embedding is a gather and stays on the host — unless it IS the head
+    // (a tied checkpoint), which computes over the whole table every token.
     let head = if live.head_on_card {
         device.clone()
     } else {
         host.clone()
     };
-    let placed = live.planned_card_bytes();
+    let embed = if live.head_is_table {
+        head.clone()
+    } else {
+        host.clone()
+    };
+    let placed = live.planned_card_bytes() + live.head_bytes_on_card();
     // Host room for what stays behind, plus slack.
     ensure_host_room(live.planned_host_bytes() + (6u64 << 30), main);
     let choose = live.loader_precision();
@@ -1708,7 +1755,7 @@ fn build_layered_qwen35(
     // this line runs with the model slot lock held, and a wedged card's
     // `nvmlDeviceGetMemoryInfo` parks for seconds — see `status::vram_baseline`.
     let vram_before = crate::status::vram_baseline(RESIDENCY_BASELINE_BUDGET);
-    let model = qwen35::load_from_pack_layered(pack_dir, &dev_for, &host, &head, &choose)
+    let model = qwen35::load_from_pack_layered(pack_dir, &dev_for, &embed, &head, &choose)
         .map_err(|e| e.to_string())?;
     let secs = started.elapsed().as_secs_f32();
     eprintln!("[mummu-serve] layered model resident in {secs:.0}s");

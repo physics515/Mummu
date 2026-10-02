@@ -10,6 +10,7 @@ mod conv;
 mod mlp;
 mod moe;
 mod rope;
+pub mod static_kv;
 
 pub use attention::{
     GqaAttention, GqaAttentionConfig, HeadShape, LayerKv, causal_mask, kv_append, kv_append_as,
