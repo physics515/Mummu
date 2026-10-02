@@ -37,6 +37,7 @@ use crate::capture::{
     StaticDecode, StaticState, Step, StepMode, capture_rewound, index, initial_ctx, lock, write_all,
 };
 use crate::constrain::Constraint;
+pub use crate::decode::Finish;
 use crate::decode::{Picker, SamplerOptions, prefill_chunk_len};
 use crate::nn::MAX_CONTEXT_TOKENS;
 use crate::nn::static_kv::bucket;
@@ -98,19 +99,6 @@ pub enum Event {
     Token(u32),
     /// It stopped, and has left the batch.
     Done(Finish),
-}
-
-/// Why a sequence stopped.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Finish {
-    /// It picked an end-of-sequence id (not emitted).
-    Eos,
-    /// It emitted its `max_tokens`.
-    Length,
-    /// Its constraint's value closed.
-    Complete,
-    /// It reached the model's context.
-    Context,
 }
 
 /// One sequence to admit.

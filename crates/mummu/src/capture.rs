@@ -40,7 +40,7 @@ use std::sync::Mutex;
 use burn::tensor::{Device, Int, Tensor, TensorData};
 
 use crate::constrain::Constraint;
-use crate::decode::{SamplerOptions, generate_loop};
+use crate::decode::{Generated, SamplerOptions, generate_loop};
 use crate::models::CausalLm;
 use crate::nn::MAX_CONTEXT_TOKENS;
 use crate::nn::static_kv::{BUCKET, StaticKv, bucket};
@@ -368,7 +368,7 @@ pub async fn generate<M: StaticDecode + Sync>(
     req: DecodeRequest<'_>,
     on_token: impl FnMut(u32) -> ControlFlow<()>,
     constraint: Option<&mut dyn Constraint>,
-) -> Result<Vec<u32>, String> {
+) -> Result<Generated, String> {
     let DecodeRequest {
         prompt_ids,
         max_tokens,
@@ -549,7 +549,9 @@ pub(crate) fn greedy_decode<M: StaticDecode + Sync>(
         device,
         mode,
     };
-    pollster::block_on(generate(model, req, |_| ControlFlow::Continue(()), None)).expect("decodes")
+    pollster::block_on(generate(model, req, |_| ControlFlow::Continue(()), None))
+        .expect("decodes")
+        .ids
 }
 
 #[cfg(test)]

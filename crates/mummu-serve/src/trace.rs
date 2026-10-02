@@ -20,6 +20,7 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
+use mummu::decode::Finish;
 use mummu_num::{f64_from_u64, f64_from_usize, trunc_usize};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -107,8 +108,26 @@ pub struct RequestTrace {
     /// padded (see `crate::keepalive_json`). Its status went out as 200
     /// before the outcome was known.
     pub padded: bool,
+    /// Why decoding stopped ([`finish_name`]): `length` is an answer the
+    /// token budget cut off. `None` for a request that failed, or one that
+    /// does not decode (an embedding, a rerank).
+    pub finish: Option<&'static str>,
     /// `ok`, or the error text the client received.
     pub outcome: String,
+}
+
+/// Why decoding stopped, as mummu's own records name it — this trace and
+/// the native API's `done` frame: every cause, where ollama's `done_reason`
+/// and `OpenAI`'s `finish_reason` fold them into `stop` and `length`.
+#[must_use]
+pub const fn finish_name(finish: Finish) -> &'static str {
+    match finish {
+        Finish::Eos => "eos",
+        Finish::Length => "length",
+        Finish::Complete => "complete",
+        Finish::Context => "context",
+        Finish::Cancelled => "cancelled",
+    }
 }
 
 /// How many recent requests are kept for `/api/requests`.
@@ -129,7 +148,15 @@ pub struct Begin {
 
 impl Begin {
     /// Record the finished request: log one line and keep it in the ring.
-    pub fn finish(self, device: &str, timings: Timings, padded: bool, outcome: Result<(), &str>) {
+    /// `outcome` is why decoding stopped, for a request that decoded (an
+    /// embedding or a rerank has `None`), or the error the client received.
+    pub fn finish(
+        self,
+        device: &str,
+        timings: Timings,
+        padded: bool,
+        outcome: Result<Option<Finish>, &str>,
+    ) {
         let total_ms = crate::millis(self.started.elapsed());
         let trace = RequestTrace {
             seq: SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -145,8 +172,9 @@ impl Begin {
             timings,
             total_ms,
             padded,
+            finish: outcome.ok().flatten().map(finish_name),
             outcome: match outcome {
-                Ok(()) => "ok".into(),
+                Ok(_) => "ok".into(),
                 Err(e) => e.to_string(),
             },
         };
@@ -218,6 +246,12 @@ fn summarize(ring: &VecDeque<RequestTrace>, pred: &dyn Fn(&RequestTrace) -> bool
         "count": picked.len(),
         "errors": picked.iter().filter(|t| t.outcome != "ok").count(),
         "padded": picked.iter().filter(|t| t.padded).count(),
+        // Answers the token budget or the context cut off: a client whose
+        // cap is too small for the model it talks to shows up here.
+        "cut_off": picked
+            .iter()
+            .filter(|t| matches!(t.finish, Some("length" | "context")))
+            .count(),
         "ttft_ms": {"p50": percentile(&mut ttft.clone(), 50.0), "p95": percentile(&mut ttft, 95.0)},
         "total_ms": {"p50": percentile(&mut total.clone(), 50.0), "p95": percentile(&mut total, 95.0)},
         "tokens_per_second": {"p50": percentile(&mut tps.clone(), 50.0), "p95": percentile(&mut tps, 95.0)},

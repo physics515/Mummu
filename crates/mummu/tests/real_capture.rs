@@ -149,7 +149,8 @@ fn run<M: StaticDecode + Sync>(model: &M, prompt: &[u32], mode: StepMode) -> Run
         },
         None,
     ))
-    .expect("decodes");
+    .expect("decodes")
+    .ids;
     stop.store(true, Ordering::SeqCst);
     let busy = mean(&watcher.join().expect("GPU sampler"));
     // Per-token time from the second token on: the first carries the prefill.

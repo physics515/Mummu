@@ -35,7 +35,7 @@ use mummu::batch::{Admission, Batcher, Event, SeqId};
 use mummu::cache::SlotGuard;
 use mummu::capture::{StaticDecode, StepMode};
 use mummu::constrain::Constraint;
-use mummu::decode::SamplerOptions;
+use mummu::decode::{Finish, SamplerOptions};
 use mummu::models::{qwen3, qwen35};
 use tokenizers::Tokenizer;
 
@@ -82,9 +82,10 @@ pub(super) enum Update {
     /// is planned for when it gets it.
     Bounced,
     Token(u32),
-    /// The generation is over: it stopped, or it failed. A device failure
-    /// arrives already decided (the model was evicted on the thread).
-    Done(Result<(), ChatError>),
+    /// The generation is over: it stopped, and why, or it failed. A device
+    /// failure arrives already decided (the model was evicted on the
+    /// thread).
+    Done(Result<Finish, ChatError>),
 }
 
 /// What a request needs of the session its generation runs in.
@@ -778,7 +779,7 @@ fn gib(bytes: u64) -> f64 {
 fn deliver(tx: &tokio::sync::mpsc::UnboundedSender<Update>, e: Event) -> bool {
     let update = match e {
         Event::Token(t) => Update::Token(t),
-        Event::Done(_) => Update::Done(Ok(())),
+        Event::Done(why) => Update::Done(Ok(why)),
     };
     tx.send(update).is_ok()
 }

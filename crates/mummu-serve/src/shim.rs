@@ -783,6 +783,19 @@ fn with_placeholders(messages: &[ChatMessage], marks: &[String]) -> Vec<ChatMess
         .collect()
 }
 
+/// Ollama's `done_reason` for why decoding stopped, as its runner reports
+/// the same causes: `"length"` when the answer was cut off — it spent its
+/// `num_predict`, or reached the model's context — and `"stop"` when the
+/// model ended it (EOS, or a `format` value that closed). A cancelled
+/// generation's client is gone; nothing reads what it is told.
+const fn done_reason(finish: mummu::decode::Finish) -> &'static str {
+    use mummu::decode::Finish::{Cancelled, Complete, Context, Eos, Length};
+    match finish {
+        Length | Context => "length",
+        Eos | Complete | Cancelled => "stop",
+    }
+}
+
 /// Ollama's final frame: timing in nanoseconds.
 fn done_value(model: &str, r: &engine::ChatResult, started: Instant) -> serde_json::Value {
     let total_ns = crate::nanos(started.elapsed());
@@ -791,7 +804,7 @@ fn done_value(model: &str, r: &engine::ChatResult, started: Instant) -> serde_js
         "model": model,
         "created_at": now_rfc3339(),
         "done": true,
-        "done_reason": "stop",
+        "done_reason": done_reason(r.finish),
         "total_duration": total_ns,
         "load_duration": 0,
         "prompt_eval_count": 0,
@@ -929,7 +942,12 @@ async fn run(p: RunPlan, stream: bool, wrap: Wrap, finish: Finish) -> Response {
             // grace — the condition `keepalive_json` pads on.
             let padded = !stream && begin.started.elapsed() >= crate::KEEPALIVE_GRACE;
             match &r {
-                Ok(res) => begin.finish(res.device, res.timings.clone(), padded, Ok(())),
+                Ok(res) => begin.finish(
+                    res.device,
+                    res.timings.clone(),
+                    padded,
+                    Ok(Some(res.finish)),
+                ),
                 Err(e) => begin.finish(
                     "",
                     crate::trace::Timings::default(),
@@ -1600,6 +1618,7 @@ mod tests {
             elapsed_ms: 0,
             timings: crate::trace::Timings::default(),
             tool_calls,
+            finish: mummu::decode::Finish::Eos,
         }
     }
 
@@ -2166,6 +2185,69 @@ mod tests {
             json!("Step one, step two</thi")
         );
         assert_eq!(body["message"]["content"], json!(""));
+    }
+
+    /// Why decoding stopped, in ollama's words: `"length"` is a cut-off —
+    /// `num_predict`, or the model's context — and never the model ending
+    /// the answer.
+    #[test]
+    fn done_reason_says_length_only_for_an_answer_that_was_cut_off() {
+        use mummu::decode::Finish::{Cancelled, Complete, Context, Eos, Length};
+        for (finish, reason) in [
+            (Eos, "stop"),
+            (Complete, "stop"),
+            (Cancelled, "stop"),
+            (Length, "length"),
+            (Context, "length"),
+        ] {
+            assert_eq!(done_reason(finish), reason, "{finish:?}");
+        }
+    }
+
+    /// The 2026-10-02 production case: `think: false`, hidden reasoning that
+    /// spent the whole `num_predict`, and an empty answer. Its final line —
+    /// streamed or buffered, /api/chat or /api/generate — says it was cut
+    /// off; with `"stop"` a client cannot tell it from a model that had
+    /// nothing to say. One the model ended still says `"stop"`.
+    #[tokio::test]
+    async fn an_answer_cut_off_by_num_predict_ends_on_done_reason_length() {
+        let _serial = crate::progress_serial().await;
+        let endpoints: [(Wrap, Finish); 2] =
+            [(chat_delta, chat_done), (generate_delta, generate_done)];
+        for (wrap, finish) in endpoints {
+            for (stopped, reason) in [
+                (mummu::decode::Finish::Length, "length"),
+                (mummu::decode::Finish::Eos, "stop"),
+            ] {
+                for stream in [true, false] {
+                    let response = respond(
+                        "m".into(),
+                        stream,
+                        false,
+                        None,
+                        wrap,
+                        finish,
+                        move |_| async move {
+                            Ok(engine::ChatResult {
+                                tokens: 48,
+                                finish: stopped,
+                                ..answered("", Vec::new())
+                            })
+                        },
+                    )
+                    .await;
+                    let body = body_text(response).await;
+                    let last = ndjson(&body).pop().expect("a final line");
+                    assert_eq!(last["done"], json!(true), "{body}");
+                    assert_eq!(
+                        last["done_reason"],
+                        json!(reason),
+                        "{stopped:?}, stream = {stream}: {body}"
+                    );
+                    assert_eq!(last["eval_count"], json!(48), "{body}");
+                }
+            }
+        }
     }
 
     /// Thinking and tools together. The thinking is split out first and only
