@@ -799,29 +799,42 @@ mod tests {
     /// A generation that spends its budget stops before the next forward:
     /// the prefill, then one step per token after the first — not one more,
     /// whose logits nothing would read. Each step feeds the token it was
-    /// given at the position after the last.
+    /// given at the position after the last. A one-token probe is the
+    /// prefill alone, where the wasted step had doubled its cost.
     #[tokio::test]
     async fn generate_loop_does_not_step_past_its_budget() {
+        /// The `(ids, past)` of every `step` call, in order.
+        type Steps = Vec<(Vec<u32>, usize)>;
         let device = crate::backend::cpu_device();
-        let mut toy = toy_step(&device);
-        let mut steps = Vec::new();
-        let out = generate_loop(
-            |ids: &[u32], past: usize, need_logits: bool| {
-                steps.push((ids.to_vec(), past));
-                toy(ids, past, need_logits)
-            },
-            &[1, 1],
-            3,
-            &SamplerOptions::greedy(),
-            |_| false,
-            |_| std::ops::ControlFlow::Continue(()),
-            None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(out.ids, vec![2, 3, 2]);
-        assert_eq!(out.finish, Finish::Length);
-        assert_eq!(steps, vec![(vec![1, 1], 0), (vec![2], 2), (vec![3], 3)]);
+        let expected: [(usize, Vec<u32>, Steps); 2] = [
+            (
+                3,
+                vec![2, 3, 2],
+                vec![(vec![1, 1], 0), (vec![2], 2), (vec![3], 3)],
+            ),
+            (1, vec![2], vec![(vec![1, 1], 0)]),
+        ];
+        for (budget, ids, want) in expected {
+            let mut toy = toy_step(&device);
+            let mut steps = Vec::new();
+            let out = generate_loop(
+                |ids: &[u32], past: usize, need_logits: bool| {
+                    steps.push((ids.to_vec(), past));
+                    toy(ids, past, need_logits)
+                },
+                &[1, 1],
+                budget,
+                &SamplerOptions::greedy(),
+                |_| false,
+                |_| std::ops::ControlFlow::Continue(()),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(out.ids, ids, "budget {budget}");
+            assert_eq!(out.finish, Finish::Length, "budget {budget}");
+            assert_eq!(steps, want, "budget {budget}");
+        }
     }
 
     /// Accepts anything; its value closes after `.0` tokens.
