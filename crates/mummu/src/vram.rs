@@ -53,6 +53,50 @@ pub fn memory() -> Option<Memory> {
     nvml::memory()
 }
 
+/// How busy the primary GPU is, every process on it included (this one too).
+///
+/// Percentages over NVML's last sample period (between 1/6 s and 1 s
+/// depending on the product): `gpu` is the share of that period in which a
+/// kernel was running, `memory` the share the memory controller was busy.
+/// This is how a co-tenant that wants the card's COMPUTE — a game holding
+/// little VRAM but every SM — is told apart from an idle desktop; memory
+/// readings alone cannot see it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Utilization {
+    pub gpu: u32,
+    pub memory: u32,
+    /// The SM clock now and its maximum, MHz, when the driver says.
+    pub sm_clock: Option<(u32, u32)>,
+}
+
+impl Utilization {
+    /// How much of the card's compute is actually being used, 0..1: the
+    /// busy share scaled by the clock it was busy at.
+    ///
+    /// The raw busy share alone cannot tell a desktop from a game. It counts
+    /// any period in which ANY kernel ran, against whatever clock the card
+    /// happens to be at — measured on the reference box at idle: 14-18 %
+    /// "busy" from the compositor while the card sat at 210 MHz of 3150 in
+    /// its lowest power state, drawing 18 W of 285. Scaled by the clock that
+    /// is ~1 %; a game at full clocks reads close to its busy share. Without
+    /// a clock reading the raw share stands (conservative: it over-states).
+    #[must_use]
+    pub fn effective(&self) -> f64 {
+        let busy = f64::from(self.gpu) / 100.0;
+        match self.sm_clock {
+            Some((now, max)) if max > 0 => busy * (f64::from(now) / f64::from(max)).min(1.0),
+            _ => busy,
+        }
+    }
+}
+
+/// The primary GPU's [`Utilization`], or `None` when nothing will say (no
+/// NVIDIA driver, or a driver without the entry point).
+#[must_use]
+pub fn utilization() -> Option<Utilization> {
+    nvml::utilization()
+}
+
 /// NVML, loaded by hand so its absence is a `None` and not a link error.
 #[cfg(windows)]
 mod nvml {
@@ -73,6 +117,20 @@ mod nvml {
     type HandleByIndex = unsafe extern "C" fn(u32, *mut *mut c_void) -> i32;
     type GetMemoryInfo = unsafe extern "C" fn(*mut c_void, *mut NvmlMemory) -> i32;
 
+    /// `nvmlUtilization_t`, verbatim layout.
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct NvmlUtilization {
+        gpu: u32,
+        memory: u32,
+    }
+
+    type GetUtilization = unsafe extern "C" fn(*mut c_void, *mut NvmlUtilization) -> i32;
+    /// `nvmlDeviceGetClockInfo` / `nvmlDeviceGetMaxClockInfo`: device, clock
+    /// type (`NVML_CLOCK_SM` = 1), out MHz.
+    type GetClock = unsafe extern "C" fn(*mut c_void, i32, *mut u32) -> i32;
+    const NVML_CLOCK_SM: i32 = 1;
+
     #[link(name = "kernel32", kind = "raw-dylib")]
     unsafe extern "system" {
         fn LoadLibraryA(name: *const c_char) -> *mut c_void;
@@ -83,6 +141,10 @@ mod nvml {
     struct Api {
         handle_by_index: HandleByIndex,
         get_memory_info: GetMemoryInfo,
+        /// Optional: a driver without it still answers memory readings.
+        get_utilization: Option<GetUtilization>,
+        get_clock: Option<GetClock>,
+        get_max_clock: Option<GetClock>,
     }
 
     // SAFETY: the fields are function pointers into a DLL that is never
@@ -131,6 +193,12 @@ mod nvml {
                     core::mem::transmute(symbol(c"nvmlDeviceGetHandleByIndex_v2")?);
                 let get_memory_info: GetMemoryInfo =
                     core::mem::transmute(symbol(c"nvmlDeviceGetMemoryInfo")?);
+                let get_utilization = symbol(c"nvmlDeviceGetUtilizationRates")
+                    .map(|p| core::mem::transmute::<*mut c_void, GetUtilization>(p));
+                let get_clock = symbol(c"nvmlDeviceGetClockInfo")
+                    .map(|p| core::mem::transmute::<*mut c_void, GetClock>(p));
+                let get_max_clock = symbol(c"nvmlDeviceGetMaxClockInfo")
+                    .map(|p| core::mem::transmute::<*mut c_void, GetClock>(p));
                 // NVML_SUCCESS is 0. Init is idempotent and refcounted; we
                 // never shut down, matching the never-unloaded module above.
                 if init() != 0 {
@@ -139,6 +207,9 @@ mod nvml {
                 Some(Api {
                     handle_by_index,
                     get_memory_info,
+                    get_utilization,
+                    get_clock,
+                    get_max_clock,
                 })
             }
         })()
@@ -164,6 +235,32 @@ mod nvml {
                 total: mem.total,
                 used: mem.used,
                 free: mem.free,
+            })
+        }
+    }
+
+    pub fn utilization() -> Option<super::Utilization> {
+        let api = api()?;
+        let get = api.get_utilization?;
+        // SAFETY: as `memory`: NVML initialised, out-pointers to stack
+        // locals, every result checked against NVML_SUCCESS before use.
+        unsafe {
+            let mut device: *mut c_void = core::ptr::null_mut();
+            if (api.handle_by_index)(0, &raw mut device) != 0 || device.is_null() {
+                return None;
+            }
+            let mut u = NvmlUtilization::default();
+            if get(device, &raw mut u) != 0 {
+                return None;
+            }
+            let clock = |f: Option<GetClock>| {
+                let mut mhz = 0u32;
+                (f?(device, NVML_CLOCK_SM, &raw mut mhz) == 0).then_some(mhz)
+            };
+            Some(super::Utilization {
+                gpu: u.gpu.min(100),
+                memory: u.memory.min(100),
+                sm_clock: clock(api.get_clock).zip(clock(api.get_max_clock)),
             })
         }
     }
@@ -196,6 +293,20 @@ mod nvml {
     type HandleByIndex = unsafe extern "C" fn(u32, *mut *mut c_void) -> i32;
     type GetMemoryInfo = unsafe extern "C" fn(*mut c_void, *mut NvmlMemory) -> i32;
 
+    /// `nvmlUtilization_t`, verbatim layout.
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct NvmlUtilization {
+        gpu: u32,
+        memory: u32,
+    }
+
+    type GetUtilization = unsafe extern "C" fn(*mut c_void, *mut NvmlUtilization) -> i32;
+    /// `nvmlDeviceGetClockInfo` / `nvmlDeviceGetMaxClockInfo`: device, clock
+    /// type (`NVML_CLOCK_SM` = 1), out MHz.
+    type GetClock = unsafe extern "C" fn(*mut c_void, i32, *mut u32) -> i32;
+    const NVML_CLOCK_SM: i32 = 1;
+
     // `dlopen`/`dlsym` declared by hand.
     //
     // mummu has no `libc` dependency and this is not worth adding one for: two
@@ -217,6 +328,10 @@ mod nvml {
     struct Api {
         handle_by_index: HandleByIndex,
         get_memory_info: GetMemoryInfo,
+        /// Optional: a driver without it still answers memory readings.
+        get_utilization: Option<GetUtilization>,
+        get_clock: Option<GetClock>,
+        get_max_clock: Option<GetClock>,
     }
 
     // SAFETY: the fields are function pointers into a library that is never
@@ -272,6 +387,12 @@ mod nvml {
                 core::mem::transmute(symbol(c"nvmlDeviceGetHandleByIndex_v2")?);
             let get_memory_info: GetMemoryInfo =
                 core::mem::transmute(symbol(c"nvmlDeviceGetMemoryInfo")?);
+            let get_utilization = symbol(c"nvmlDeviceGetUtilizationRates")
+                .map(|p| core::mem::transmute::<*mut c_void, GetUtilization>(p));
+            let get_clock = symbol(c"nvmlDeviceGetClockInfo")
+                .map(|p| core::mem::transmute::<*mut c_void, GetClock>(p));
+            let get_max_clock = symbol(c"nvmlDeviceGetMaxClockInfo")
+                .map(|p| core::mem::transmute::<*mut c_void, GetClock>(p));
             // NVML_SUCCESS is 0. Init is idempotent and refcounted; we never
             // shut down, matching the never-unloaded module above. A container
             // that has the library but no device reaches here and fails, which
@@ -282,6 +403,9 @@ mod nvml {
             Some(Api {
                 handle_by_index,
                 get_memory_info,
+                get_utilization,
+                get_clock,
+                get_max_clock,
             })
         }
     }
@@ -309,6 +433,32 @@ mod nvml {
             })
         }
     }
+
+    pub fn utilization() -> Option<super::Utilization> {
+        let api = api()?;
+        let get = api.get_utilization?;
+        // SAFETY: as `memory`: NVML initialised, out-pointers to stack
+        // locals, every result checked against NVML_SUCCESS before use.
+        unsafe {
+            let mut device: *mut c_void = core::ptr::null_mut();
+            if (api.handle_by_index)(0, &raw mut device) != 0 || device.is_null() {
+                return None;
+            }
+            let mut u = NvmlUtilization::default();
+            if get(device, &raw mut u) != 0 {
+                return None;
+            }
+            let clock = |f: Option<GetClock>| {
+                let mut mhz = 0u32;
+                (f?(device, NVML_CLOCK_SM, &raw mut mhz) == 0).then_some(mhz)
+            };
+            Some(super::Utilization {
+                gpu: u.gpu.min(100),
+                memory: u.memory.min(100),
+                sm_clock: clock(api.get_clock).zip(clock(api.get_max_clock)),
+            })
+        }
+    }
 }
 
 /// Neither Windows nor unix: no NVML, and no `dlopen` to look for one with.
@@ -317,6 +467,10 @@ mod nvml {
     use super::Memory;
 
     pub fn memory() -> Option<Memory> {
+        None
+    }
+
+    pub fn utilization() -> Option<super::Utilization> {
         None
     }
 }
@@ -328,6 +482,38 @@ mod tests {
     /// Whatever NVML reports has to be internally consistent and match the
     /// card. This is the guard against a wrong struct layout or a mis-resolved
     /// symbol, both of which would return plausible-looking nonsense.
+    /// A utilization reading, when there is one, is two percentages and an
+    /// effective share in 0..=1.
+    #[test]
+    fn reported_utilization_is_a_pair_of_percentages() {
+        if let Some(u) = utilization() {
+            assert!(u.gpu <= 100 && u.memory <= 100, "{u:?}");
+            assert!((0.0..=1.0).contains(&u.effective()), "{u:?}");
+        }
+    }
+
+    /// The measured desktop-idle reading is ~1 % effective, not 15 %.
+    #[test]
+    fn effective_share_scales_busy_by_clock() {
+        let idle = Utilization {
+            gpu: 15,
+            memory: 24,
+            sm_clock: Some((210, 3150)),
+        };
+        assert!(idle.effective() < 0.011, "{}", idle.effective());
+        let game = Utilization {
+            gpu: 98,
+            memory: 70,
+            sm_clock: Some((2790, 3150)),
+        };
+        assert!(game.effective() > 0.85, "{}", game.effective());
+        let unknown = Utilization {
+            sm_clock: None,
+            ..idle
+        };
+        assert!((unknown.effective() - 0.15).abs() < 1e-12);
+    }
+
     #[test]
     fn reported_memory_is_self_consistent() {
         let Some(m) = memory() else {

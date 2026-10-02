@@ -48,48 +48,10 @@ async fn main() -> ExitCode {
         }
     }
 
-    // Demote the gemm herd before flex ever touches the global rayon pool:
-    // the pool's spinners at NORMAL priority starved every microsecond-
-    // scale service thread in the process — cubecl's unnamed poll thread
-    // (which signals readback-map completions; measured 26.5 -> 8.7 ms of
-    // per-layer fence latency once only the named DSD threads were
-    // boosted), the device servers, and the drain workers. BELOW_NORMAL
-    // for the herd inverts that: services preempt, and an uncontended box
-    // still gives the pool every core.
-    {
-        #[cfg(windows)]
-        fn demote_current_thread() {
-            #[link(name = "kernel32.dll", kind = "raw-dylib", modifiers = "+verbatim")]
-            unsafe extern "system" {
-                fn GetCurrentThread() -> isize;
-                fn SetThreadPriority(handle: isize, priority: i32) -> i32;
-            }
-            // SAFETY: plain kernel32 calls on the current thread's pseudo
-            // handle; -1 = THREAD_PRIORITY_BELOW_NORMAL.
-            unsafe {
-                SetThreadPriority(GetCurrentThread(), -1);
-            }
-        }
-        #[cfg(not(windows))]
-        const fn demote_current_thread() {}
-        // BELOW_NORMAL is the measured default (fence 26.5 -> 8.7 ms), but
-        // it is also one axis of the in-situ ANOVA (SPEC P1.1): the live
-        // host GEMV runs 2-3x slower than quiet, and thread priority under
-        // desktop load is a suspect the sweep must be able to vary.
-        // `MUMMU_GEMM_PRIORITY=normal` runs the herd un-demoted for that
-        // A/B; anything else (or unset) keeps the proven demotion.
-        let demote =
-            !std::env::var("MUMMU_GEMM_PRIORITY").is_ok_and(|v| v.eq_ignore_ascii_case("normal"));
-        let mut builder = rayon::ThreadPoolBuilder::new();
-        if demote {
-            builder = builder.start_handler(|_| demote_current_thread());
-        }
-        if let Err(e) = builder.build_global() {
-            eprintln!(
-                "[mummu-serve] rayon pool was already initialized ({e}); gemm herd keeps default priority"
-            );
-        }
-    }
+    // Before flex ever touches the global rayon pool: the compute herd runs
+    // below every service thread, and on Linux only on idle cycles (see
+    // `sysmon::install_compute_pool`).
+    mummu_serve::sysmon::install_compute_pool();
 
     let addr = std::env::var("MUMMU_ADDR").unwrap_or_else(|_| mummu_serve::DEFAULT_ADDR.into());
     let shim_addr = std::env::var("MUMMU_OLLAMA_ADDR")

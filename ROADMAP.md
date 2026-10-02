@@ -826,12 +826,17 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
         and it is replaced by the measurement — but it is still one number for every model. Derive a
         prior from the model's shapes (the analytic act/KV terms plus a measured per-architecture pool
         factor) and keep the persisted per-model value as the first source.
-      - [ ] **An idle server holds improvements.** The horizon `H` is tokens served in the last hour
+      - [x] **An idle server holds improvements.** The horizon `H` is tokens served in the last hour
         (floor 256), so after a co-tenant leaves a quiet server keeps its degraded placement until
         traffic returns (live: `30 -> 36 layers would save 33.5 ms/token, 8.6 s over the 256-token
         horizon — less than re-reading 1.35 GiB (13.5 s at 107 MB/s)`). Right by (4) as written, but the
         first request after the quiet pays it. Consider pricing idle re-reads only by the disk
         contention they cause, not by request latency they do not add.
+        *(2026-10-01) Fixed by the system scheduler: idle improvements are priced over a 65 536-token
+        horizon (`IDLE_HORIZON_TOKENS`), so a free card is taken back two layers a tick. It was costing
+        production the whole card: the 27B slid to 0/64 layers on 2026-09-30 after a co-tenant took
+        VRAM, and every regrowth after was held against re-reads priced at 9 MB/s (`2 -> 8 layers would
+        save 39.2 ms/token … less than re-reading 2.36 GiB (288.8s at 9 MB/s)`).*
       - [ ] **Card Q4 is the slow kernel.** The CUDA probe measured Q8 at 450-490 GB/s against Q4 at
         86-290 GB/s, so the packed Q4 GEMV on the card is slower per byte than Q8; a roomy card now
         prefers Q8, and a tight one pays for Q4's slowness. A kernel look (and a warm-cache re-probe:
@@ -3732,6 +3737,56 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
 ### P6 — Hardware planner: precision, placement & full utilization
 The "use all the hardware" phase — inventory the machine, then pick the precision and the device placement
 that fits the model AND uses every device to the fullest.
+- [x] **Whole-system scheduling, stages 1-2: use only the capacity nobody else wants — and all of it**
+      *(2026-10-01)*. `serve::sysmon` samples every second what OTHER processes want: host CPU from
+      `/proc/stat` less `/proc/self/stat`, GPU compute from NVML utilization scaled by SM clock / max
+      (`vram::Utilization::effective` — the raw busy share reads 14-18 % for the idle compositor at
+      210 MHz; scaled it is ~1 %), counted only from samples with none of our device work in flight
+      (`sysmon::DeviceWork`), plus `MemAvailable` and PSI. Hysteresis per resource (GPU: 60 % for 3 s
+      to yield, 25 % for 15 s to take back). On top of it:
+      - the compute herd (the global rayon pool flex and gemm run on) is in Linux's **idle scheduling
+        class** — it runs only on cycles nothing else wants, preempted at once; the Windows
+        BELOW_NORMAL demotion it replaces was a no-op on Linux, and the desktop app never demoted at
+        all. Measured: a 16-core throughput hog kept 593 M iter/s beside it (alone 567-585); a
+        frame-paced "game" (5 ms of work per 8 ms frame on 16 threads) missed 0.1 % of frames beside
+        it — its own baseline — against 0.3 % beside the old normal-priority herd, while mummu kept
+        82 % of its solo embedding rate in the leftover cycles;
+      - placement rates are **scaled by each device's live free share** (`placement::contended`;
+        time-sliced on the card, square-root on the DRAM-bound host — 4/8/16 threads read
+        26.3/30/37.4 GB/s) and **probes are normalized to a free device** and **taken at working
+        clocks** (a quarter second of ramp: the card probed cold at 210 MHz read 14/30 GB/s, warm
+        78-319). So a busy CPU sends layers to the card, a busy GPU sends them to the host: the 2B
+        went 0 → 24/24 on the card while a hog held all 16 cores;
+      - a co-tenant saturating the GPU **zeroes the card's capacity**: Repair moves every layer to the
+        host, retrieval models leave the card, a qwen2/qwen3/lfm2 chat model (no relocation) is
+        unloaded to reload on the host, and nothing new is planned onto the card. A torch matmul hog
+        holding 6 GiB ran 82-84 TFLOPS throughout — its solo rate;
+      - **reclaim**: the tick is 2 s, the ambient guard is fed by time (2 s) with a one-minute window
+        and 30 s of quiet before it shrinks (was ten minutes, fed per call), and idle improvements are
+        priced over a long horizon (item above). After the GPU hog, the 2B was back to 24/24 two
+        layers a tick.
+- [ ] **Scheduler stage 3: one problem for every resident model.** `placement::LIVE` holds one
+      model; joint's `Problem` should take every tenant's layers (chat, embedder, reranker) with a
+      weight from recent demand, sharing one card capacity — which needs the pool-slack item below
+      fixed first.
+- [ ] **Scheduler stage 4: qwen3 joins** — packs from safetensors (`pack::import_gguf` generalized
+      over a tensor source), a layered qwen3 loader with live relocation, quantized linears in the
+      shared `nn` blocks (`qlinear` moved out of qwen35). Then the retrieval models and small chat
+      models split across devices like the 27B and shrink to host Q4 when idle; Q8/Q4 retrieval
+      quality gated against the HF fixture.
+- [ ] **A yield onto a busy host is slow.** Moving the 2B's 24 layers card → host took 141.9 s while
+      a hog held all 16 cores: every apply re-packs the VNNI twins of EVERY host layer
+      (`warm_host_twins(lm, 0)` after `flex::registry::clear()`), on the idle-class herd. Re-pack only
+      the moved layers; and when both devices are saturated and the model is idle, unloading is the
+      cheaper "almost nothing" than moving.
+- [ ] **A game that starts mid-generation is not seen until the generation ends.** GPU samples count
+      only when none of our device work is in flight, so a long decode holds the last clean estimate.
+      Per-process NVML utilization would attribute it, but inside a container NVML's pids are the
+      host's. Also GPU decode crawls when the host is saturated (2B on the card: 9.6 → 2.8 tok/s
+      beside a 16-core hog) — the dispatch thread is ours and normal priority, and that is the right
+      side of the trade.
+- [ ] **The head stays on the card under a GPU yield** — placed once at load (existing P6 item); the
+      yield frees every layer but not the 0.7 GiB head.
 - [ ] **The card budget counts pool bytes in use, not bytes held** — found by the retrieval tier
       (2026-10-01). `placement::free_for_new` is `capacity − in_use`: pages our pool has freed but still
       reserves read as free. They are not free to a large new allocation: with two 0.6B retrieval

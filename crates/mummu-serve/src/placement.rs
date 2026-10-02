@@ -90,8 +90,25 @@ use mummu_num::{f64_from_u64, f64_from_usize, trunc_u64};
 
 use super::{AnyLm, BackendChoice, Loaded, SLOT, device_of, gib, label_of, layer_index};
 
-/// How often the idle rebalancer looks.
-const TICK: Duration = Duration::from_secs(5);
+/// How often the idle rebalancer looks. Two seconds: a co-tenant that
+/// starts wanting the card (a game launching) is answered within a tick of
+/// `sysmon` deciding so, and the guard is fed at this cadence (see
+/// [`GUARD_PERIOD`]).
+const TICK: Duration = Duration::from_secs(2);
+/// Tokens an IDLE improvement is priced over, at least.
+///
+/// `H` is the tokens served in the last hour, floored at 256 — on a server
+/// that has been quiet, (4) then prices "take the card back" at 256 tokens
+/// of saving against a full pack re-read, and the re-read wins: an idle
+/// server held 30 layers where 36 fit, indefinitely (ROADMAP P6). At idle the
+/// re-read costs nobody anything but disk time, and the rule is to use all
+/// the capacity nobody else wants — so idle improvements are priced over a
+/// long horizon and a free card is taken back, two layers a tick.
+const IDLE_HORIZON_TOKENS: f64 = 65_536.0;
+/// The guard is fed at most this often, so its window is a TIME window: it
+/// used to be fed on every capacity call, which made "120 samples" mean
+/// anything from ten minutes to ten seconds.
+const GUARD_PERIOD: Duration = Duration::from_secs(2);
 /// Ticks an improvement must be wanted on before it starts.
 const IMPROVE_DWELL: u32 = 3;
 /// Layers an improvement may move per tick.
@@ -165,26 +182,38 @@ pub(super) fn card(backend: BackendChoice) -> Option<Card> {
     }
 }
 
-/// The chance-constrained guard on ambient VRAM (SPEC 3), fed on every call.
+/// The chance-constrained guard on ambient VRAM (SPEC 3), fed once per
+/// [`GUARD_PERIOD`] (a call inside the period reads the current guard).
 fn guard(ambient: u64) -> u64 {
     use mummu::schedule::watermark::{Watermark, WatermarkConfig};
-    static WM: Mutex<Option<Watermark>> = Mutex::new(None);
-    feed_guard(
-        WM.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get_or_insert_with(|| {
-                Watermark::new(WatermarkConfig {
-                    floor_bytes: 1 << 30,
-                    frag_slack_bytes: 512 << 20,
-                    // Ten minutes of 5 s polls: long enough to cover a
-                    // co-tenant's bursts, short enough that one that left
-                    // gives the card back.
-                    window: 120,
-                    ..WatermarkConfig::default()
-                })
+    static WM: Mutex<Option<(Watermark, Option<Instant>)>> = Mutex::new(None);
+    let mut g = WM.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (wm, fed) = g.get_or_insert_with(|| {
+        (
+            Watermark::new(WatermarkConfig {
+                floor_bytes: 1 << 30,
+                frag_slack_bytes: 512 << 20,
+                // A minute of 2 s samples, and half a minute of quiet before
+                // any shrink: covers a co-tenant's bursts within that minute
+                // (a game streaming textures, a browser tab), and gives the
+                // card back about a minute after one leaves. Was ten
+                // minutes, which left a card a game had quit idle for ten
+                // minutes — the opposite of using all the excess.
+                window: 30,
+                hysteresis_window: 15,
+                ..WatermarkConfig::default()
             }),
-        ambient,
-    )
+            None,
+        )
+    });
+    let out = if fed.is_some_and(|t| t.elapsed() < GUARD_PERIOD) {
+        wm.guard_bytes().max(ambient)
+    } else {
+        *fed = Some(Instant::now());
+        feed_guard(wm, ambient)
+    };
+    drop(g);
+    out
 }
 
 /// One observation into the watermark, and the guard it now asks for.
@@ -316,6 +345,14 @@ fn correct_ambient(
     corrected
 }
 
+/// Is another process using the card's compute right now (`sysmon`'s
+/// hysteresis decided so)? Then the card is theirs: no layer stays on it,
+/// nothing new goes onto it, and our work runs on the host — where it only
+/// ever gets idle cycles (`sysmon::install_compute_pool`).
+pub(super) fn gpu_yielded() -> bool {
+    crate::sysmon::pressure().gpu == crate::sysmon::Yield::Yield
+}
+
 /// `K = total − G`: what this process may occupy on the card.
 pub(super) fn capacity(c: &Card) -> u64 {
     c.total.saturating_sub(guard(ambient(c)))
@@ -325,6 +362,10 @@ pub(super) fn capacity(c: &Card) -> u64 {
 /// resident layers to count (the fit planner, the precision mix, the `MoE`
 /// tiers) spends: `K − in_use − V_pending`.
 pub(super) fn free_for_new(backend: BackendChoice) -> u64 {
+    // A co-tenant is using the card's compute: nothing new goes there.
+    if gpu_yielded() {
+        return 0;
+    }
     let Some(c) = card(backend) else {
         return 0;
     };
@@ -812,6 +853,59 @@ struct DeviceModel {
     resident: Vec<(QuantPolicy, f64)>,
 }
 
+/// The least share of a device we plan on having. Below it the device is as
+/// good as gone, and a smaller number would only make the solver's
+/// arithmetic explode.
+const MIN_FREE_SHARE: f64 = 0.02;
+
+/// How a device's speed falls with the share of it that is free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scaling {
+    /// A co-tenant's kernels time-slice the card: half the time, half the
+    /// speed.
+    TimeSliced,
+    /// The host GEMV is DRAM-bound, so fewer cores lose less than their
+    /// share — measured on the reference box (in-situ ANOVA, SPEC P1.1):
+    /// 4 / 8 / 16 threads read 26.3 / 30 / 37.4 GB/s, i.e. a quarter of the
+    /// cores keeps 70 % of the speed. The square root is the simple curve
+    /// through those points (0.50 / 0.71 / 1.0 against 0.70 / 0.80 / 1.0)
+    /// that still errs slow — the safe side for a host that is being
+    /// claimed by someone else.
+    MemoryBound,
+}
+
+impl Scaling {
+    fn speed(self, free: f64) -> f64 {
+        let free = free.clamp(MIN_FREE_SHARE, 1.0);
+        match self {
+            Self::TimeSliced => free,
+            Self::MemoryBound => free.sqrt(),
+        }
+    }
+}
+
+/// `rate` (seconds per byte on a FREE device) for a device of which only
+/// `free` is ours: our compute herd runs only on idle cycles
+/// (`sysmon::install_compute_pool`), and a co-tenant's kernels time-slice
+/// the card, so a busy device takes longer per byte. This is what turns one
+/// solver into the whole-system schedule: a busy CPU makes the card the
+/// cheap place for a layer, a busy GPU the host, and both busy make
+/// everything slow — and the hysteresis above keeps it from chasing noise.
+fn contended(rate: &[(QuantPolicy, f64)], free: f64, how: Scaling) -> Vec<(QuantPolicy, f64)> {
+    let speed = how.speed(free);
+    rate.iter().map(|&(q, s)| (q, s / speed)).collect()
+}
+
+/// The inverse: a rate PROBED while only `free` of the device was ours, as
+/// the rate of the free device. Without it the probe's contention is
+/// counted twice — once in the reading, once by [`contended`] — and kept
+/// after the co-tenant leaves: a 2B probed while other builds held the host
+/// read 11.6 GB/s where a quiet host reads ~40.
+fn uncontended(rate: &[(QuantPolicy, f64)], free: f64, how: Scaling) -> Vec<(QuantPolicy, f64)> {
+    let speed = how.speed(free);
+    rate.iter().map(|&(q, s)| (q, s * speed)).collect()
+}
+
 /// Time a real projection at each level `device` can run, as seconds per
 /// pack byte. The host's reading is clamped to its DRAM floor.
 fn measure_device(
@@ -918,12 +1012,17 @@ impl Live {
         });
         let maps = layer_maps(&pack, cfg.num_layers, ceiling);
         let host_dev = mummu::backend::cpu_device();
-        let host = measure_device(
+        // The probes run under whatever the rest of the machine is doing;
+        // the rates are kept as the FREE device's (see `uncontended`), and
+        // the live share is applied per plan.
+        let probed_under = crate::sysmon::pressure();
+        let mut host = measure_device(
             &pack,
             &host_dev,
             true,
             &[Precision::Q4, Precision::Q8, Precision::F16],
         );
+        host.rate = uncontended(&host.rate, probed_under.cpu_free, Scaling::MemoryBound);
         let (accel, crossing_s) = if backend == BackendChoice::Cpu {
             (DeviceModel::default(), 0.0)
         } else {
@@ -936,10 +1035,9 @@ impl Live {
                 BackendChoice::Cuda => &[Precision::Q4, Precision::Q8, Precision::F16],
                 _ => &[Precision::Q4, Precision::Q8],
             };
-            (
-                measure_device(&pack, &dev, false, levels),
-                measure_crossing(cfg.hidden_size, &dev),
-            )
+            let mut accel = measure_device(&pack, &dev, false, levels);
+            accel.rate = uncontended(&accel.rate, probed_under.gpu_free, Scaling::TimeSliced);
+            (accel, measure_crossing(cfg.hidden_size, &dev))
         };
         let model = pack_dir.parent().and_then(|p| p.file_name()).map_or_else(
             || pack_dir.display().to_string(),
@@ -1037,7 +1135,11 @@ impl Live {
         let mut devices = vec![joint::Device {
             capacity: host_cap,
             fixed: act_bytes(&self.cfg, ctx),
-            rate: self.host.rate.clone(),
+            rate: contended(
+                &self.host.rate,
+                crate::sysmon::pressure().cpu_free,
+                Scaling::MemoryBound,
+            ),
             resident: self.host.resident.clone(),
         }];
         if let Some(c) = card
@@ -1051,11 +1153,18 @@ impl Live {
             let ours_layers = self.planned_card_bytes();
             // N: what we hold on the card that is not a layer.
             let non_layer = c.in_use.saturating_sub(ours_layers);
-            let k = capacity(c);
+            // A co-tenant using the card's compute gets all of it: capacity
+            // 0 makes the current placement infeasible, and Repair moves
+            // every layer to the host at once.
+            let k = if gpu_yielded() { 0 } else { capacity(c) };
             devices.push(joint::Device {
                 capacity: k.saturating_sub(non_layer),
                 fixed: act_bytes(&self.cfg, ctx) + residual_for(Some(c.total)) + tower_pending,
-                rate: self.accel.rate.clone(),
+                rate: contended(
+                    &self.accel.rate,
+                    crate::sysmon::pressure().gpu_free,
+                    Scaling::TimeSliced,
+                ),
                 resident: self.accel.resident.clone(),
             });
         }
@@ -1294,6 +1403,9 @@ fn apply(
     if changed.is_empty() {
         return Ok(0);
     }
+    // A move streams layers onto and off the card: our GPU use, not a
+    // co-tenant's (see `crate::sysmon`).
+    let _work = crate::sysmon::DeviceWork::enter();
     // Releases: leaving the card, or shrinking on it. Everything else is an
     // arrival or a host-side change.
     let pb = live.problem(idle_context(), false, None);
@@ -1431,9 +1543,12 @@ fn replan_and_apply(
         // assuming pressure demotes a model that was running fine.
         return Ok(());
     }
-    let pb = live.problem(ctx, needs_tower, reading.as_ref());
+    let mut pb = live.problem(ctx, needs_tower, reading.as_ref());
     if pb.devices.len() < 2 && live.layers_on_card() > 0 {
         return Ok(());
+    }
+    if idle {
+        pb.horizon_tokens = pb.horizon_tokens.max(IDLE_HORIZON_TOKENS);
     }
     let (verdict, out) = joint::replan(&pb, &live.assignment);
     let limit = match verdict {
@@ -1571,6 +1686,16 @@ pub(super) fn forget(pack_dir: Option<&Path>) {
 fn tick() {
     // Idle retrieval models: theirs goes back too (see `crate::retrieval`).
     crate::retrieval::drop_idle();
+    // A co-tenant using the card's compute gets all of it: retrieval models
+    // leave it now, and the chat model's layers below.
+    let yielded = gpu_yielded();
+    if yielded {
+        crate::retrieval::evict_from_accelerator();
+    }
+    // A chat model whose loader cannot move layers (qwen2/qwen3/lfm2) is
+    // moved whole: unloaded, so its next request loads it where the plan
+    // then says — the host while yielding, the card again after.
+    let mut move_whole: Option<&'static str> = None;
     // Idle tower: its VRAM goes back to layers.
     let idle_tower = TOWER_USED
         .lock()
@@ -1587,6 +1712,15 @@ fn tick() {
                 "[mummu-serve] placement: vision tower idle for {}s — its VRAM goes back to layers",
                 TOWER_IDLE.as_secs()
             );
+        }
+        if matches!(m.lm, AnyLm::Qwen2(_) | AnyLm::Qwen3(_) | AnyLm::Lfm2(_)) {
+            let on_card = m.backend != BackendChoice::Cpu;
+            if yielded && on_card {
+                move_whole = Some("another process is using the GPU's compute");
+            } else if !yielded && !on_card && super::backend_choice() != BackendChoice::Cpu {
+                move_whole = Some("the GPU is free again");
+            }
+            return;
         }
         let AnyLm::Qwen35(lm) = &mut m.lm else { return };
         let ctx = idle_context();
@@ -1614,6 +1748,9 @@ fn tick() {
             }
         }
     });
+    if let Some(why) = move_whole {
+        let _ = super::evict_for_placement(why);
+    }
     // A panic mid-move leaves a layer half on each device: the model is not
     // servable. Decide it as a device failure and drop the model, so the next
     // request reloads it whole.
@@ -1659,6 +1796,112 @@ mod tests {
 
     fn cfg_27b() -> qwen35::Qwen35Config {
         super::super::cfg_27b_for_tests()
+    }
+
+    /// A small model's problem with the rates measured on the reference box
+    /// for qwen3.5-2b (host Q4 37 GB/s, card Q8 30 GB/s, Q4 14 GB/s).
+    fn small_model(host_free: f64, card_free: f64, card_capacity: u64) -> joint::Problem {
+        let gib = 1u64 << 30;
+        let part = |kind| joint::Part {
+            params: 30_000_000,
+            kind,
+            levels: vec![(QuantPolicy::Q4, 19 << 20), (QuantPolicy::Q8, 34 << 20)],
+        };
+        let layer = joint::Layer {
+            parts: vec![part(Kind::Attention), part(Kind::Ffn)],
+            fixed_bytes: 1 << 20,
+            state_bytes: 4 << 20,
+        };
+        let per = |gbs: f64| 1.0 / (gbs * 1e9);
+        joint::Problem {
+            layers: vec![layer; 24],
+            devices: vec![
+                joint::Device {
+                    capacity: 64 * gib,
+                    fixed: 256 << 20,
+                    rate: contended(
+                        &[(QuantPolicy::Q4, per(37.4)), (QuantPolicy::Q8, per(15.1))],
+                        host_free,
+                        Scaling::MemoryBound,
+                    ),
+                    resident: vec![],
+                },
+                joint::Device {
+                    capacity: card_capacity,
+                    fixed: gib,
+                    rate: contended(
+                        &[(QuantPolicy::Q4, per(14.0)), (QuantPolicy::Q8, per(30.2))],
+                        card_free,
+                        Scaling::TimeSliced,
+                    ),
+                    resident: vec![],
+                },
+            ],
+            crossing_s: 0.000_628,
+            disk_s_per_byte: 1.0 / 150e6,
+            horizon_tokens: IDLE_HORIZON_TOKENS,
+            tolerance: PRECISION_TOLERANCE,
+            floor: QuantPolicy::Q4,
+        }
+    }
+
+    fn on_card(a: &joint::Assignment) -> usize {
+        a.layers.iter().filter(|c| c.device == 1).count()
+    }
+
+    /// The whole-system schedule, at the solver: a free host is the faster
+    /// place for a small model, a host whose cores another process holds
+    /// sends the layers to the card, and a card another process is using
+    /// (capacity 0 while yielding) sends them back — onto a host that is
+    /// itself busy, which is "almost nothing", but nothing is stolen.
+    #[test]
+    fn layers_follow_whichever_device_nobody_else_wants() {
+        let gib = 1u64 << 30;
+        let free = joint::solve(&small_model(1.0, 1.0, 12 * gib));
+        assert_eq!(on_card(&free.assignment), 0, "a free host wins for a 2B");
+        let busy_host = joint::solve(&small_model(0.02, 1.0, 12 * gib));
+        assert_eq!(
+            on_card(&busy_host.assignment),
+            24,
+            "a busy host sends it all to the card"
+        );
+        let both = joint::solve(&small_model(0.02, 0.0, 0));
+        assert_eq!(on_card(&both.assignment), 0, "a yielded card holds nothing");
+        assert!(both.feasible);
+        assert!(
+            both.time_s > free.time_s * 5.0,
+            "and it is slow, which is the point"
+        );
+    }
+
+    #[test]
+    fn a_contended_rate_is_divided_by_the_free_speed_and_floored() {
+        let r = [(QuantPolicy::Q4, 1e-9)];
+        let t = Scaling::TimeSliced;
+        assert!((contended(&r, 1.0, t)[0].1 - 1e-9).abs() < 1e-18);
+        assert!((contended(&r, 0.5, t)[0].1 - 2e-9).abs() < 1e-18);
+        assert!((contended(&r, 0.0, t)[0].1 - 1e-9 / MIN_FREE_SHARE).abs() < 1e-15);
+        // The host loses less than its share of cores (DRAM-bound).
+        let m = Scaling::MemoryBound;
+        assert!((contended(&r, 0.25, m)[0].1 - 2e-9).abs() < 1e-18);
+    }
+
+    /// A probe taken on a busy device is stored as the free device's rate,
+    /// so applying the same share again gets the probe back — counted once.
+    #[test]
+    fn a_probe_under_contention_is_counted_once() {
+        let probed = [(QuantPolicy::Q4, 3e-9), (QuantPolicy::Q8, 7e-9)];
+        for how in [Scaling::TimeSliced, Scaling::MemoryBound] {
+            for free in [1.0, 0.6, 0.3, 0.05] {
+                let stored = uncontended(&probed, free, how);
+                let back = contended(&stored, free, how);
+                for (a, b) in back.iter().zip(&probed) {
+                    assert!((a.1 - b.1).abs() < 1e-18, "{how:?} {free}");
+                }
+                // And a free device is faster than the busy one it was probed on.
+                assert!(stored[0].1 <= probed[0].1);
+            }
+        }
     }
 
     /// KV grows with context on attention layers; recurrent state does not.

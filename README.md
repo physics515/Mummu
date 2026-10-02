@@ -364,6 +364,16 @@ async fn search(dir: &std::path::Path, rr: &std::path::Path) -> Result<(), Box<d
   planner, which counts bytes in use, and the next chat load ran out of device memory.) With nothing
   named, a request gets the best installed model that would land on the accelerator, else the smallest.
 
+- **Use only the capacity nobody else wants — and all of it** *(2026-10-01)* — `mummu-serve` samples
+  what other processes want of the machine every second (host CPU less ours, GPU compute as busy
+  share × clock so an idle compositor reads ~1 % rather than 15 %, free RAM, pressure-stall) and acts
+  on it: the compute herd runs in Linux's idle scheduling class (a frame-paced game beside it missed
+  frames at its own baseline rate while mummu kept 82 % of its speed in the gaps); placement rates are
+  scaled by each device's live free share and probed at working clocks, so a busy CPU sends layers to
+  the card and a busy GPU sends them to the host; a co-tenant saturating the GPU gets all of it (a
+  6 GiB torch matmul hog ran at its solo 82-84 TFLOPS); and the card is taken back within about a
+  minute of it leaving. `/api/health` carries the readings as `pressure`.
+
 ## Design principles
 
 - **Local-first, offline, private** — your own hardware is the whole story; the cloud is never a dependency.
