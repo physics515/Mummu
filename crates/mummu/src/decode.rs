@@ -354,8 +354,7 @@ pub async fn generate_loop(
     assert!(!prompt_ids.is_empty(), "generate_loop: empty prompt");
     assert!(max_tokens >= 1, "generate_loop: max_tokens must be >= 1");
 
-    let mut rng = Pcg32::new(opts.seed);
-    let greedy = opts.temperature == 0.0;
+    let mut picker = Picker::new(opts);
     let mut logits = {
         let _s = crate::prof::scope("prefill");
         // Chunked prefill: feeding the prompt in slices bounds the widest
@@ -392,49 +391,9 @@ pub async fn generate_loop(
         // is the sync point, so GPU-side FFN time surfaces HERE, not in the
         // scopes that enqueued it.
         let readback_started = std::time::Instant::now();
-        let next = match constraint.as_deref() {
-            // Unconstrained: unchanged. Greedy keeps its argmax on-device and
-            // never reads a vocabulary back.
-            None => {
-                if greedy {
-                    argmax_id(logits).await?
-                } else {
-                    let v = read_logits(logits).await?;
-                    sample_id(&v, opts, &mut rng)
-                }
-            }
-            Some(c) => {
-                // EOS counts as legal only once the value is complete — the
-                // rule that stops a model abandoning an object halfway and
-                // handing the client something that cannot parse.
-                let legal = |id: u32| {
-                    if is_eos(id) {
-                        c.is_complete()
-                    } else {
-                        c.allows(id)
-                    }
-                };
-                if greedy {
-                    // Fast path: test the model's own pick, which costs one
-                    // automaton replay. A model already emitting valid JSON
-                    // never pays for the readback the slow path needs.
-                    let probe = argmax_id(logits.clone()).await?;
-                    if probe < vocab && legal(probe) {
-                        probe
-                    } else {
-                        let v = read_logits(logits).await?;
-                        best_allowed(&v, legal).ok_or_else(|| no_legal_token(past))?
-                    }
-                } else {
-                    // Sampling already reads the vocabulary back, so masking
-                    // inside the top-k is the whole added cost.
-                    let v = read_logits(logits).await?;
-                    sample_id_filtered(&v, opts, &mut rng, legal)
-                        .or_else(|| best_allowed(&v, legal))
-                        .ok_or_else(|| no_legal_token(past))?
-                }
-            }
-        };
+        let next = picker
+            .pick(logits, None, constraint.as_deref(), past, &is_eos)
+            .await?;
         crate::prof::record("logits_readback+sample", readback_started.elapsed());
         // A GPU argmax over NaN logits can return an out-of-range sentinel
         // (observed: exactly `vocab` on f16 numeric collapse) — fail loudly
@@ -474,6 +433,110 @@ pub async fn generate_loop(
     }
     debug_assert!(out.len() <= max_tokens);
     Ok(out)
+}
+
+/// One sequence's token choice: its sampler options and RNG, applied to a
+/// row of logits — [`generate_loop`]'s pick, and every batched sequence's.
+///
+/// The constraint is the caller's (it also decides when to stop), and so is
+/// EOS handling: a pick may BE the EOS id, which the caller does not emit.
+pub struct Picker {
+    opts: SamplerOptions,
+    rng: Pcg32,
+}
+
+impl Picker {
+    /// # Panics
+    ///
+    /// When `opts` is invalid (see [`sample_id_filtered`]).
+    #[must_use]
+    pub fn new(opts: &SamplerOptions) -> Self {
+        opts.validate();
+        Self {
+            opts: opts.clone(),
+            rng: Pcg32::new(opts.seed),
+        }
+    }
+
+    /// Whether picks are greedy (an argmax) rather than sampled.
+    #[must_use]
+    pub fn greedy(&self) -> bool {
+        self.opts.temperature == 0.0
+    }
+
+    /// The next id from `[1, vocab]` logits for position `past`.
+    /// `argmax`, when the caller already read it back (a batch reads every
+    /// row's at once), saves the on-device argmax and its sync; a sampled
+    /// pick never uses it.
+    ///
+    /// # Errors
+    ///
+    /// A failed readback, or a constraint that rejects every token.
+    ///
+    /// # Panics
+    ///
+    /// Only when the vocabulary does not fit `u32`, which no model this crate
+    /// loads comes near.
+    pub async fn pick(
+        &mut self,
+        logits: Tensor<2>,
+        argmax: Option<u32>,
+        constraint: Option<&dyn Constraint>,
+        past: usize,
+        is_eos: impl Fn(u32) -> bool,
+    ) -> Result<u32, String> {
+        let greedy = self.greedy();
+        let argmax_of = |l: Tensor<2>| async move {
+            match argmax {
+                Some(id) => Ok(id),
+                None => argmax_id(l).await,
+            }
+        };
+        let vocab = u32::try_from(logits.dims()[1]).expect("vocab size fits u32");
+        Ok(match constraint {
+            // Unconstrained: greedy keeps its argmax on-device and never
+            // reads a vocabulary back.
+            None => {
+                if greedy {
+                    argmax_of(logits).await?
+                } else {
+                    let v = read_logits(logits).await?;
+                    sample_id(&v, &self.opts, &mut self.rng)
+                }
+            }
+            Some(c) => {
+                // EOS counts as legal only once the value is complete — the
+                // rule that stops a model abandoning an object halfway and
+                // handing the client something that cannot parse.
+                let legal = |id: u32| {
+                    if is_eos(id) {
+                        c.is_complete()
+                    } else {
+                        c.allows(id)
+                    }
+                };
+                if greedy {
+                    // Fast path: test the model's own pick, which costs one
+                    // automaton replay. A model already emitting valid JSON
+                    // never pays for the readback the slow path needs.
+                    let probe = argmax_of(logits.clone()).await?;
+                    if probe < vocab && legal(probe) {
+                        probe
+                    } else {
+                        let v = read_logits(logits).await?;
+                        best_allowed(&v, legal).ok_or_else(|| no_legal_token(past))?
+                    }
+                } else {
+                    // Sampling already reads the vocabulary back, so masking
+                    // inside the top-k is the whole added cost.
+                    let v = read_logits(logits).await?;
+                    sample_id_filtered(&v, &self.opts, &mut self.rng, legal)
+                        .or_else(|| best_allowed(&v, legal))
+                        .ok_or_else(|| no_legal_token(past))?
+                }
+            }
+        })
+    }
 }
 
 /// Pull a `[1, vocab]` logit row back to the host as f32.

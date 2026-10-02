@@ -114,7 +114,15 @@ const IMPROVE_DWELL: u32 = 3;
 /// Layers an improvement may move per tick.
 pub(super) const IMPROVE_STEP: usize = 2;
 /// Fraction of token time precision upgrades may cost (joint `tolerance`).
-const PRECISION_TOLERANCE: f64 = 0.01;
+///
+/// Wider than the probes' noise, so that where two levels run about as fast
+/// the better one wins rather than whichever the last probe favoured. On
+/// this card the 2B's Q8 and Q4 decode within a few percent of each other
+/// (Q8 at the memory's bandwidth, Q4 at its unpacking), and at 1 % the
+/// choice flipped from load to load — at Q4 the 2B misbehaved (a think
+/// block it was told not to open). A model stored at Q4 has nothing to
+/// upgrade to, so the big quantized checkpoints are untouched.
+const PRECISION_TOLERANCE: f64 = 0.10;
 /// How long a resident vision tower may sit unused before its VRAM goes back
 /// to layers.
 const TOWER_IDLE: Duration = Duration::from_secs(600);
@@ -530,14 +538,141 @@ fn remember_residual() {
     else {
         return;
     };
+    update_evidence(&path, |e| e["residual_bytes"] = serde_json::json!(v));
+}
+
+/// Rewrite one field of the placement evidence file, keeping the others
+/// (best effort, like everything written there).
+fn update_evidence(path: &Path, change: impl FnOnce(&mut serde_json::Value)) {
+    let mut evidence = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    change(&mut evidence);
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(
-        &path,
-        serde_json::json!({ "residual_bytes": v }).to_string(),
-    );
+    let _ = std::fs::write(path, evidence.to_string());
 }
+
+// ---------------------------------------------------------------------------
+// Remembered rates
+// ---------------------------------------------------------------------------
+
+/// The levels a rate can be remembered for, by name.
+const RATE_LEVELS: [QuantPolicy; 4] = [
+    QuantPolicy::Q4,
+    QuantPolicy::Q8,
+    QuantPolicy::F16,
+    QuantPolicy::Off,
+];
+
+/// Where a build's rates are kept in the evidence file: a new build may
+/// have new kernels, so it starts its own record.
+fn rates_key(backend: BackendChoice) -> String {
+    format!("{}/{}", env!("CARGO_PKG_VERSION"), label_of(backend))
+}
+
+/// The best rates (seconds per byte) this build has measured for the
+/// model's probe tensor, host and accelerator, if any were remembered.
+fn recall_rates(path: &Path, backend: BackendChoice) -> Option<[Vec<(QuantPolicy, f64)>; 2]> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let evidence = serde_json::from_str::<serde_json::Value>(&text).ok()?;
+    let rec = &evidence["rates"][rates_key(backend)];
+    let side = |name: &str| -> Vec<(QuantPolicy, f64)> {
+        RATE_LEVELS
+            .iter()
+            .filter_map(|&q| {
+                rec[name][format!("{q:?}")]
+                    .as_f64()
+                    .filter(|s| s.is_finite() && *s > 0.0)
+                    .map(|s| (q, s))
+            })
+            .collect()
+    };
+    let (host, accel) = (side("host"), side("accel"));
+    (!host.is_empty() || !accel.is_empty()).then_some([host, accel])
+}
+
+fn remember_rates(
+    path: &Path,
+    backend: BackendChoice,
+    host: &[(QuantPolicy, f64)],
+    accel: &[(QuantPolicy, f64)],
+) {
+    let side = |rates: &[(QuantPolicy, f64)]| -> serde_json::Value {
+        rates
+            .iter()
+            .map(|(q, s)| (format!("{q:?}"), serde_json::json!(s)))
+            .collect::<serde_json::Map<_, _>>()
+            .into()
+    };
+    update_evidence(path, |e| {
+        if !e["rates"].is_object() {
+            e["rates"] = serde_json::json!({});
+        }
+        e["rates"][rates_key(backend)] =
+            serde_json::json!({ "host": side(host), "accel": side(accel) });
+    });
+}
+
+/// Per level, the faster of a fresh measurement and the remembered best.
+///
+/// A rate is what the device does free (the live share is applied per
+/// plan, see [`contended`]), and anything that slows a probe — a co-tenant
+/// starting, a card still clocking up — only ever makes it slower. A probe
+/// taken in such a moment once pinned the 2B at Q4 for its whole life:
+/// measured card Q8 90 GB/s against its usual 309 made Q4 the faster
+/// level, and the Q4 2B opened a think block even when told not to. Only
+/// the levels measured now are kept: one that failed to probe stays out.
+fn best_rates(
+    measured: &[(QuantPolicy, f64)],
+    remembered: &[(QuantPolicy, f64)],
+) -> Vec<(QuantPolicy, f64)> {
+    measured
+        .iter()
+        .map(|&(q, s)| {
+            let best = remembered
+                .iter()
+                .find(|(r, _)| *r == q)
+                .map_or(s, |&(_, r)| r.min(s));
+            (q, best)
+        })
+        .collect()
+}
+
+/// Whether any measured level ran slower than `margin` × its remembered
+/// best — the probe met something it should not have.
+fn slower_than_remembered(
+    measured: &[(QuantPolicy, f64)],
+    remembered: &[(QuantPolicy, f64)],
+    margin: f64,
+) -> bool {
+    measured.iter().any(|&(q, s)| {
+        remembered
+            .iter()
+            .find(|(r, _)| *r == q)
+            .is_some_and(|&(_, r)| s > r * margin)
+    })
+}
+
+/// How much slower than its best a probe may run before the load asks for a
+/// quiet re-probe.
+const REPROBE_MARGIN: f64 = 1.25;
+
+/// The least free share of each device at which an idle re-probe runs.
+const QUIET_SHARE: f64 = 0.8;
+
+/// The most of the card other processes may use for it to count as quiet,
+/// percent, from a reading at most [`QUIET_READING_AGE`] old.
+const QUIET_OTHERS_PERCENT: u32 = 20;
+const QUIET_READING_AGE: u64 = 10;
+
+/// How long after a load before a re-probe: the pressure readings start at
+/// "all free" and need samples to say otherwise — a re-probe in the first
+/// seconds ran with a co-tenant's matmuls still on the card.
+const REPROBE_SETTLE: Duration = Duration::from_secs(15);
 
 /// A device ran out of memory under a placement this module made: the
 /// working set was bigger than ε̂ said. Double it (and let the guard count a
@@ -929,7 +1064,7 @@ fn measure_device(
         let ms = if host {
             ms.max(super::host_probe_floor_ms(pack, p).unwrap_or(0.0))
         } else {
-            ms
+            ms.max(super::card_probe_floor_ms(pack, p).unwrap_or(0.0))
         };
         let q = policy_of(p);
         let bytes = f64_from_u64(bytes);
@@ -955,6 +1090,50 @@ fn measure_device(
         m.resident.push((q, resident / bytes));
     }
     m
+}
+
+/// Probe the host's rates at its levels, normalized to a free host.
+///
+/// The probes run under whatever the rest of the machine is doing; the
+/// rates are kept as the FREE device's (see `uncontended`), and the live
+/// share is applied per plan.
+fn probe_host(pack: &Pack) -> DeviceModel {
+    let probed_under = crate::sysmon::pressure();
+    let mut host = measure_device(
+        pack,
+        &mummu::backend::cpu_device(),
+        true,
+        &[Precision::Q4, Precision::Q8, Precision::F16],
+    );
+    host.rate = uncontended(&host.rate, probed_under.cpu_free, Scaling::MemoryBound);
+    host
+}
+
+/// [`probe_host`] for the accelerator; empty without one.
+fn probe_card(pack: &Pack, backend: BackendChoice) -> DeviceModel {
+    if backend == BackendChoice::Cpu {
+        return DeviceModel::default();
+    }
+    let probed_under = crate::sysmon::pressure();
+    // f32-widened float weights exceed wgpu's 256 MiB max buffer on the big
+    // projections (1015 failed reservations, 2026-08); the integer levels
+    // are the card's.
+    let levels: &[Precision] = match backend {
+        #[cfg(feature = "cuda")]
+        BackendChoice::Cuda => &[Precision::Q4, Precision::Q8, Precision::F16],
+        _ => &[Precision::Q4, Precision::Q8],
+    };
+    let mut accel = measure_device(pack, &device_of(backend), false, levels);
+    accel.rate = uncontended(&accel.rate, probed_under.gpu_free, Scaling::TimeSliced);
+    accel
+}
+
+fn show_rates(m: &DeviceModel) -> String {
+    m.rate
+        .iter()
+        .map(|(q, s)| format!("{q:?} {:.2} GB/s", 1.0 / s / 1e9))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// One activation round trip host -> card -> host, seconds.
@@ -997,6 +1176,13 @@ pub(super) struct Live {
     /// The head is the token table (a tied checkpoint): where the head goes,
     /// the table goes — see [`Self::measure`].
     pub head_is_table: bool,
+    /// Whether the load's probes may not have seen the free host / card (no
+    /// remembered best to compare with, or slower than it): each is probed
+    /// again at the first idle tick that finds it quiet. See [`best_rates`].
+    reprobe_wanted: [bool; 2],
+    /// When the load measured: the pressure readings need a while to be
+    /// worth trusting with "quiet" (they start at "all free").
+    measured_at: Instant,
 }
 
 pub(super) static LIVE: Mutex<Option<Live>> = Mutex::new(None);
@@ -1026,52 +1212,50 @@ impl Live {
             trunc_u64(f64_from_u64(bytes) * 1.05)
         });
         let maps = layer_maps(&pack, cfg.num_layers, ceiling);
-        let host_dev = mummu::backend::cpu_device();
-        // The probes run under whatever the rest of the machine is doing;
-        // the rates are kept as the FREE device's (see `uncontended`), and
-        // the live share is applied per plan.
-        let probed_under = crate::sysmon::pressure();
-        let mut host = measure_device(
-            &pack,
-            &host_dev,
-            true,
-            &[Precision::Q4, Precision::Q8, Precision::F16],
-        );
-        host.rate = uncontended(&host.rate, probed_under.cpu_free, Scaling::MemoryBound);
-        let (accel, crossing_s) = if backend == BackendChoice::Cpu {
-            (DeviceModel::default(), 0.0)
+        let mut host = probe_host(&pack);
+        let mut accel = probe_card(&pack, backend);
+        let crossing_s = if backend == BackendChoice::Cpu {
+            0.0
         } else {
-            let dev = device_of(backend);
-            // f32-widened float weights exceed wgpu's 256 MiB max buffer on
-            // the big projections (1015 failed reservations, 2026-08); the
-            // integer levels are the card's.
-            let levels: &[Precision] = match backend {
-                #[cfg(feature = "cuda")]
-                BackendChoice::Cuda => &[Precision::Q4, Precision::Q8, Precision::F16],
-                _ => &[Precision::Q4, Precision::Q8],
-            };
-            let mut accel = measure_device(&pack, &dev, false, levels);
-            accel.rate = uncontended(&accel.rate, probed_under.gpu_free, Scaling::TimeSliced);
-            (accel, measure_crossing(cfg.hidden_size, &dev))
+            measure_crossing(cfg.hidden_size, &device_of(backend))
         };
+        // What the devices have shown at their best before, for this model
+        // and build: a probe can only be slowed, never sped up, by what it
+        // meets (see `best_rates`).
+        let evidence = residual_file_for(pack_dir);
+        let remembered = evidence.as_deref().and_then(|p| recall_rates(p, backend));
+        let reprobe_wanted =
+            remembered
+                .as_ref()
+                .map_or([true, backend != BackendChoice::Cpu], |[h, a]| {
+                    [
+                        slower_than_remembered(&host.rate, h, REPROBE_MARGIN),
+                        slower_than_remembered(&accel.rate, a, REPROBE_MARGIN),
+                    ]
+                });
+        if let Some([h, a]) = &remembered {
+            host.rate = best_rates(&host.rate, h);
+            accel.rate = best_rates(&accel.rate, a);
+        }
+        if let Some(path) = &evidence {
+            remember_rates(path, backend, &host.rate, &accel.rate);
+        }
         let model = pack_dir.parent().and_then(|p| p.file_name()).map_or_else(
             || pack_dir.display().to_string(),
             |n| n.to_string_lossy().into_owned(),
         );
         let n = cfg.num_layers;
-        let show = |m: &DeviceModel| {
-            m.rate
-                .iter()
-                .map(|(q, s)| format!("{q:?} {:.2} GB/s", 1.0 / s / 1e9))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
         eprintln!(
-            "[mummu-serve] placement rates: host [{}]; {} [{}]; crossing {:.3} ms",
-            show(&host),
+            "[mummu-serve] placement rates: host [{}]; {} [{}]; crossing {:.3} ms{}",
+            show_rates(&host),
             label_of(backend),
-            show(&accel),
-            crossing_s * 1e3
+            show_rates(&accel),
+            crossing_s * 1e3,
+            if remembered.is_some() {
+                " (each the better of this probe and the remembered best)"
+            } else {
+                ""
+            }
         );
         Ok(Self {
             pack_dir: pack_dir.to_path_buf(),
@@ -1095,7 +1279,49 @@ impl Live {
             head_card_bytes,
             head_on_card: false,
             head_is_table,
+            reprobe_wanted,
+            measured_at: Instant::now(),
         })
+    }
+
+    /// Probe the devices `quiet` says are free again — idle — and keep the
+    /// better rate per level. A load whose probes met a co-tenant asks for
+    /// this; the idle re-plan that follows then sees the devices as they are.
+    /// One device at a time: on a machine whose CPU is never quiet the card
+    /// still gets its second look.
+    fn reprobe(&mut self, quiet: [bool; 2]) {
+        if self.measured_at.elapsed() < REPROBE_SETTLE {
+            return;
+        }
+        let due = [0, 1].map(|d| self.reprobe_wanted[d] && quiet[d]);
+        if !due.contains(&true) {
+            return;
+        }
+        let Ok(pack) = Pack::open(&self.pack_dir) else {
+            return;
+        };
+        if due[0] {
+            self.host.rate = best_rates(&probe_host(&pack).rate, &self.host.rate);
+            self.reprobe_wanted[0] = false;
+        }
+        if due[1] {
+            self.accel.rate = best_rates(&probe_card(&pack, self.backend).rate, &self.accel.rate);
+            self.reprobe_wanted[1] = false;
+        }
+        if let Some(path) = residual_file_for(&self.pack_dir) {
+            remember_rates(&path, self.backend, &self.host.rate, &self.accel.rate);
+        }
+        eprintln!(
+            "[mummu-serve] placement rates re-probed on a quiet {}: host [{}]; {} [{}]",
+            match due {
+                [true, true] => "machine",
+                [true, false] => "host",
+                _ => "card",
+            },
+            show_rates(&self.host),
+            label_of(self.backend),
+            show_rates(&self.accel)
+        );
     }
 
     fn layers_on_card(&self) -> usize {
@@ -1344,7 +1570,7 @@ pub(super) fn plan_load(pack_dir: &Path, backend: BackendChoice) -> Result<Live,
     if backend != BackendChoice::Cpu {
         // Whatever the previous model left in the pool goes back to the
         // driver before we read what is free.
-        device_of(backend).memory_cleanup();
+        mummu::backend::return_memory(&device_of(backend));
     }
     recall_residual(pack_dir);
     let mut live = Live::measure(pack_dir, backend)?;
@@ -1410,6 +1636,16 @@ pub(super) fn plan_load(pack_dir: &Path, backend: BackendChoice) -> Result<Live,
 // Moving layers
 // ---------------------------------------------------------------------------
 
+/// Moves of the resident model's weights so far: a captured graph records
+/// the buffers it read, so one recorded before a move must not be replayed
+/// after it (see `decoder`).
+static EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The current weight-move count (see [`EPOCH`]).
+pub(super) fn epoch() -> u64 {
+    EPOCH.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Apply `target` to the resident model, releases first. `limit` bounds the
 /// layers moved (an improvement's step); a repair passes `None`.
 ///
@@ -1469,6 +1705,12 @@ fn apply(
     let mut bytes = 0u64;
     let mut host_touched = false;
     let mut pages_to_return = false;
+    if !order.is_empty() {
+        EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // The decode thread's cached graphs read the buffers being replaced;
+        // its state goes too — a move answers pressure.
+        super::decoder::release();
+    }
     for &l in &order {
         let from = live.assignment.layers[l].device;
         let to = target.layers[l].clone();
@@ -1476,7 +1718,7 @@ fn apply(
         // arrival allocates — so the arrival sees them, and so would a
         // co-tenant if the arrival never comes.
         if to.device == 1 && pages_to_return && backend != BackendChoice::Cpu {
-            device_of(backend).memory_cleanup();
+            mummu::backend::return_memory(&device_of(backend));
             pages_to_return = false;
         }
         let dev = if to.device == 1 {
@@ -1717,6 +1959,10 @@ fn tick() {
     let yielded = gpu_yielded();
     if yielded {
         crate::retrieval::evict_from_accelerator();
+        // The decode thread's batch stops admitting (its live sequences
+        // finish, and the slot comes free for the moves below) and its
+        // cached graphs and state leave the card.
+        super::decoder::release();
     }
     // A chat model whose loader cannot move layers (qwen2/qwen3/lfm2) is
     // moved whole: unloaded, so its next request loads it where the plan
@@ -1733,7 +1979,7 @@ fn tick() {
             *TOWER_USED
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-            device_of(m.backend).memory_cleanup();
+            mummu::backend::return_memory(&device_of(m.backend));
             eprintln!(
                 "[mummu-serve] placement: vision tower idle for {}s — its VRAM goes back to layers",
                 TOWER_IDLE.as_secs()
@@ -1750,12 +1996,30 @@ fn tick() {
         }
         let AnyLm::Qwen35(lm) = &mut m.lm else { return };
         let ctx = idle_context();
+        let pressure = crate::sysmon::pressure();
+        // The card's probe needs the host too: every one of its kernels is
+        // launched from here, and with other processes on 15 of 16 cores a
+        // quiet card measured Q8 at 67 GB/s.
+        let host_quiet = pressure.cpu.is_some() && pressure.cpu_free >= QUIET_SHARE;
+        let quiet = [
+            host_quiet,
+            host_quiet
+                && !yielded
+                && pressure.gpu_free >= QUIET_SHARE
+                && pressure
+                    .gpu_others
+                    .is_some_and(|o| o <= QUIET_OTHERS_PERCENT)
+                && pressure
+                    .gpu_others_age_s
+                    .is_some_and(|a| a <= QUIET_READING_AGE),
+        ];
         let replanned = LIVE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_mut()
             .filter(|l| l.pack_dir.starts_with(key))
             .map(|live| {
+                live.reprobe(quiet);
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     replan_and_apply(live, lm, ctx, false, true)
                 }));
@@ -2125,5 +2389,58 @@ mod tests {
         let jitter = correct_ambient(&reading(12_500, 9_400), &mut last, &mut flight, t);
         assert_eq!(jitter, 3_100 * MIB);
         assert!(flight.is_none(), "100 MiB is under the release floor");
+    }
+
+    /// A probe slowed by something on the machine never lowers a rate: per
+    /// level the faster of now and the remembered best is kept, a level not
+    /// measured now stays out, and a slow probe is recognized as one.
+    #[test]
+    fn rates_keep_the_best_the_device_has_shown() {
+        let ns = |gbps: f64| 1.0 / (gbps * 1e9);
+        let remembered = [(QuantPolicy::Q4, ns(109.0)), (QuantPolicy::Q8, ns(309.0))];
+        // The 2B's contended load: card Q4 64 GB/s, Q8 90.
+        let measured = [(QuantPolicy::Q4, ns(64.0)), (QuantPolicy::Q8, ns(90.0))];
+        let best = best_rates(&measured, &remembered);
+        assert_eq!(best, remembered.to_vec());
+        assert!(slower_than_remembered(
+            &measured,
+            &remembered,
+            REPROBE_MARGIN
+        ));
+        // A faster probe wins; a level the probe did not produce is dropped.
+        let faster = [(QuantPolicy::Q8, ns(400.0))];
+        assert_eq!(
+            best_rates(&faster, &remembered),
+            vec![(QuantPolicy::Q8, ns(400.0))]
+        );
+        assert!(!slower_than_remembered(
+            &faster,
+            &remembered,
+            REPROBE_MARGIN
+        ));
+        // Within the margin is noise, not contention.
+        let noisy = [(QuantPolicy::Q8, ns(260.0))];
+        assert!(!slower_than_remembered(&noisy, &remembered, REPROBE_MARGIN));
+    }
+
+    /// The evidence file holds the residual and each build's rates side by
+    /// side: writing one keeps the other.
+    #[test]
+    fn evidence_keeps_rates_and_residual_together() {
+        let dir = std::env::temp_dir().join(format!("mummu-rates-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("placement-x.json");
+        update_evidence(&path, |e| e["residual_bytes"] = serde_json::json!(123));
+        let host = [(QuantPolicy::Q4, 2.5e-11), (QuantPolicy::F16, 9.0e-11)];
+        let accel = [(QuantPolicy::Q8, 3.2e-12)];
+        remember_rates(&path, BackendChoice::Wgpu, &host, &accel);
+        update_evidence(&path, |e| e["residual_bytes"] = serde_json::json!(456));
+        let [h, a] = recall_rates(&path, BackendChoice::Wgpu).expect("rates kept");
+        assert_eq!([h, a], [host.to_vec(), accel.to_vec()]);
+        let text = std::fs::read_to_string(&path).expect("written");
+        let v: serde_json::Value = serde_json::from_str(&text).expect("json");
+        assert_eq!(v["residual_bytes"].as_u64(), Some(456));
+        assert!(recall_rates(&dir.join("absent.json"), BackendChoice::Wgpu).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

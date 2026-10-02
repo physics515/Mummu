@@ -3772,19 +3772,41 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       42 → 68 → 106 → 160 → 218, 0.6B f16 61 → 108 → 210 → 377 → 639 — the step time grows only
       1.3-1.9x across a 16x batch. Bulk embedding and speculative verify still need their own
       batched forwards (prefill-shaped, not decode-shaped).*
-- [ ] **A decode thread per GPU model: graphs kept across requests, concurrent requests batched**
-      *(2026-10-01)* — serve captures a fresh graph per request (~0.3-0.55 s, the step run ~6 times
-      plus recording) because a graph replays on its recording thread's cubecl stream and requests
-      land on whichever tokio worker. Give each model wholly on the card one owning decode thread
-      (the shape the P5 "owning worker thread with a channel API" item names): it keeps the static
-      state and the per-bucket graphs alive between requests, and admits concurrent requests into
-      free slots of one batched step (continuous batching — the 461 tok/s above is what 16 waiting
-      requests would share). Needs: per-slot sampling out of `generate_loop` (temperature, top-k/p,
-      penalties and the grammar constraint per sequence), slot admission/retirement while graphs
-      live (seeding writes in place already), a graph per (active-slot count, bucket) or slot
-      compaction so one request does not pay a 16-slot step, and seeded sampling still
-      reproducible per request. Gate: a request's tokens independent of what else is in the batch
-      (exact in f32).
+- [x] **A decode thread per GPU model: graphs kept across requests, concurrent requests batched**
+      *(2026-10-01, done the same day)* — serve captured a fresh graph per request (~0.3-0.55 s)
+      because a graph replays on its recording thread's cubecl stream and requests land on whichever
+      tokio worker. Now `mummu::batch::Batcher` holds one static state with room for several
+      sequences: `admit` prefills a prompt on the ordinary path and seeds it into the next slot,
+      `step` advances every live one in one dispatch, and a sequence that stops leaves its slot (the
+      last live one moves into it, `StaticState::move_slot`), so a step runs only the first
+      `next_power_of_two(live)` slots — one graph per (slot tier, bucket), kept until the weights move
+      (`set_epoch`) or the batcher is released. Per-sequence token choice is `decode::Picker`
+      (`generate_loop`'s own pick, factored out: sampler, seeded RNG, the grammar constraint, the
+      batch's one argmax readback as a hint). Serve's `decoder` thread owns the model slot while a
+      session runs: the request that took the slot hands it over with its generation, every request
+      for the same model arriving meanwhile joins between steps — including ones already queued on
+      the slot, which watch for a session to start — and the slot goes back when the batch empties
+      (or after 30 s of admitting, so placement maintenance is never starved). The batcher stays
+      cached for the next session on the same load (120 s idle). Failures are decided on the thread
+      as `serve_held` decides them. **Gates:** CPU — late arrivals, sequences stopping at different
+      lengths (slot moves), a cancel, seeded sampling in a batch, all equal to their solo decodes,
+      on Qwen3 and on qwen35 (whose `DeltaNet` state moves with its slot); GPU — the batch test runs
+      through the `Batcher`; serve — four concurrent requests decode in one batch with text
+      identical to the same four run one at a time (greedy), a JSON-constrained request and a
+      seeded sampled one are identical alone and in a batch, and a client that disconnects
+      mid-stream leaves the batch while the others finish unchanged. **Measured** (2B, Q8 pack,
+      busy box): the second and later requests skip the capture — 12.7-12.9 ms/token against
+      23.9 for the first; four concurrent 150-token requests 5.15 s against 8.85 s one after
+      another (116 vs 68 tok/s). Open: a joiner's context is not planned for (`before_request`
+      runs only for the request that took the slot), and a session's state is sized for its
+      widest moment until released.
+- [x] **Batch memory goes back to the driver** *(2026-10-01)* — after each batch shape the 2B's
+      process held 4.3-6.6 GB on the card against 4.0 GB after one, although the allocator had
+      returned everything: wgpu frees a dropped buffer only at its next sync. A model load in that
+      window ran the card out of memory. `backend::return_memory` (cleanup + sync) is now what every
+      release uses — the batcher, the capture driver, serve's evictions, the load planner's reading
+      of free memory, and placement's release-before-arrival. Gate: `batch_memory_returns_to_the_driver`
+      (4009 MiB after every shape, 1 to 16 slots).
 - [ ] **In-memory prompt-prefix KV reuse** *(mistral.rs parity; the warm sibling of P9's KV-cache
       persistence)* — agent loops re-send system prompt + growing history every turn and Mummu
       re-prefills from token zero each time. Keep the last (or LRU-few) prefill's KV in the `ModelSlot`
@@ -3798,6 +3820,22 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
 ### P6 — Hardware planner: precision, placement & full utilization
 The "use all the hardware" phase — inventory the machine, then pick the precision and the device placement
 that fits the model AND uses every device to the fullest.
+- [x] **Precision follows the device, not the probe's noise** *(2026-10-01)* — a server started
+      right after a heavy test answered every no-thinking request with an endless think block. Its
+      load-time probes had met contention (card Q8 90 GB/s against a usual 309, host Q8 1.2 against
+      14), Q4 measured faster, the solver put 46 of the 2B's 48 parts at Q4 — and the Q4 2B opens a
+      think block when told not to. The decision then held for the model's life. Four changes: the
+      card probe batches until a batch outlasts its fence ≥5 ms (a fixed 8 calls of the 2B's 40 µs
+      projection timed the fence: Q8 read 90-309 GB/s load to load); the card's rates are floored at
+      its memory's peak bandwidth (NVML bus width × clock — the 12 MB probe weight lives in the
+      48 MB L2 and read at 1 TB/s); each model remembers the best rate every device has shown per
+      level in its placement evidence (a probe is only ever slowed by what it meets), and plans from
+      the better of that and the fresh probe; and a load whose probe ran slower than that best, or
+      had none to compare with, re-probes each device at the first idle tick that finds it quiet
+      (the card's needs the host quiet too — every kernel is launched from it). The precision
+      tolerance widened from 1 % to 10 % so that where two levels run within the probes' noise of
+      each other the better one wins. Reproduced and fixed: after the same heavy test, a fresh
+      server now plans Q8 and answers directly.
 - [x] **A tied head takes its table to the card** *(2026-10-01)* — the joint solve reserved card
       room for `output.weight` only, and the token table always loaded on the host as "a gather".
       For a tied checkpoint the table IS the head: a matmul over the whole vocabulary every token.

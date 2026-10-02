@@ -65,9 +65,9 @@ pub trait StaticDecode: CausalLm {
     /// sized past it.
     fn trained_context(&self) -> Option<usize>;
 
-    /// One decode step for every slot: `tokens` `[slots, 1]` at `positions`
-    /// `[slots]`, attending over a bucket of `len` keys. Returns the logits,
-    /// `[slots, vocab]`. Must touch nothing but device tensors (no uploads):
+    /// One decode step for the state's first `k` slots: `tokens` `[k, 1]`
+    /// at `positions` `[k]`, attending over a bucket of `len` keys. Returns
+    /// the logits, `[k, vocab]`. Must touch nothing but device tensors (no uploads):
     /// it runs inside a capture window. Every buffer of `state` it advances
     /// it must advance in place.
     fn forward_static(
@@ -96,10 +96,24 @@ pub trait StaticState {
     fn mark(&self) -> Self::Mark;
     fn rewind(&mut self, mark: Self::Mark);
 
-    /// Make room for `max_ctx` positions, keeping every slot's contents.
-    /// New buffers: every graph captured over the old ones must be dropped
-    /// first.
-    fn grow(&mut self, max_ctx: usize);
+    /// Slots and positions the state holds.
+    fn shape(&self) -> (usize, usize);
+
+    /// Reshape to `slots` slots of `max_ctx` positions (`max_ctx` never
+    /// shrinks), keeping every slot both shapes have. New buffers: every
+    /// graph captured over the old ones must be dropped first.
+    fn resize(&mut self, slots: usize, max_ctx: usize);
+
+    /// Make room for `max_ctx` positions, keeping every slot's contents (see
+    /// [`Self::resize`]).
+    fn grow(&mut self, max_ctx: usize) {
+        self.resize(self.shape().0, max_ctx);
+    }
+
+    /// Copy slot `from` over slot `to`, in place — the buffers a captured
+    /// graph recorded stay the ones it reads. What keeps a batch's live
+    /// sequences in its first slots when one ahead of them finishes.
+    fn move_slot(&mut self, from: usize, to: usize);
 }
 
 /// Attention alone: its writes are assignments, nothing to undo.
@@ -107,8 +121,15 @@ impl StaticState for StaticKv {
     type Mark = ();
     fn mark(&self) {}
     fn rewind(&mut self, (): ()) {}
-    fn grow(&mut self, max_ctx: usize) {
-        Self::grow(self, max_ctx);
+    fn shape(&self) -> (usize, usize) {
+        let c = self.config();
+        (c.slots, c.max_ctx)
+    }
+    fn resize(&mut self, slots: usize, max_ctx: usize) {
+        Self::resize(self, slots, max_ctx);
+    }
+    fn move_slot(&mut self, from: usize, to: usize) {
+        Self::move_slot(self, from, to);
     }
 }
 
@@ -161,7 +182,7 @@ pub async fn on_this_thread<T>(fut: impl Future<Output = T>) -> T {
 /// replay that decodes the previous token forever, silently. A shared buffer
 /// cannot be written in place, so that is a loud failure here, not a quiet
 /// one later.
-fn write_all<const D: usize>(
+pub(crate) fn write_all<const D: usize>(
     slot: &Mutex<Tensor<D, Int>>,
     values: Vec<i32>,
     shape: [usize; D],
@@ -181,14 +202,14 @@ fn write_all<const D: usize>(
     t.inplace(|x| x.slice_assign(at, new));
 }
 
-fn index(v: impl TryInto<i32>) -> i32 {
+pub(crate) fn index(v: impl TryInto<i32>) -> i32 {
     v.try_into()
         .unwrap_or_else(|_| panic!("token ids and positions fit i32"))
 }
 
 /// `Send` so that a generation's future is: the engine awaits it on a
 /// current-thread runtime, where it cannot move (see [`on_this_thread`]).
-type Step<'a> = Box<dyn FnMut() -> Tensor<2> + Send + 'a>;
+pub(crate) type Step<'a> = Box<dyn FnMut() -> Tensor<2> + Send + 'a>;
 type Graphs<'a> = HashMap<usize, burn::tensor::Graph<Tensor<2>, Step<'a>>>;
 
 /// How many times a step runs uncaptured before it is recorded: the first
@@ -220,7 +241,7 @@ fn capture_step<'a>(
 /// [`capture_step`] with the state rewound to before it (see
 /// [`StaticState`]): the step runs several times while capturing, and the
 /// replay that follows must start from the state the driver left.
-fn capture_rewound<'a, S: StaticState>(
+pub(crate) fn capture_rewound<'a, S: StaticState>(
     state: &Mutex<S>,
     device: &Device,
     step: Step<'a>,
@@ -246,10 +267,10 @@ fn drop_graphs(graphs: &mut Graphs<'_>, device: &Device) {
         return;
     }
     graphs.clear();
-    device.memory_cleanup();
+    crate::backend::return_memory(device);
 }
 
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
@@ -269,7 +290,7 @@ fn ceiling<M: StaticDecode>(model: &M, total: usize) -> Option<usize> {
 }
 
 /// The first size of a static state that must hold `start` positions.
-fn initial_ctx(start: usize, ceiling: usize) -> usize {
+pub(crate) fn initial_ctx(start: usize, ceiling: usize) -> usize {
     start
         .saturating_add(INITIAL_ROOM)
         .div_ceil(BUCKET)
@@ -439,13 +460,8 @@ pub async fn generate<M: StaticDecode + Sync>(
 }
 
 /// Greedy-decode several prompts together: one slot each, every decode step
-/// one dispatch for all of them.
-///
-/// Captured per bucket when `mode` is [`StepMode::Captured`]. Each prompt is prefilled on its own (the dynamic
-/// path) and copied into its slot; then all slots step in lockstep, each at
-/// its own position. A slot that reaches EOS or `max_tokens` stops
-/// collecting tokens while the others finish (its step still runs — the
-/// batch shape is fixed; its output is discarded).
+/// one dispatch for all of them — a [`crate::batch::Batcher`] that admits
+/// them all and steps until each has stopped.
 ///
 /// Each slot decodes what it would alone: the batch shares weight reads and
 /// dispatches, not state — the gate in `tests/real_capture.rs` (exact in
@@ -461,104 +477,49 @@ pub async fn generate<M: StaticDecode + Sync>(
 ///
 /// When `prompts` is empty or a prompt is empty; the single-thread contract
 /// of the module docs applies.
-pub fn generate_batch_greedy<M: StaticDecode + Sync>(
+pub fn generate_batch_greedy<M: StaticDecode + Sync + 'static>(
     model: &M,
     prompts: &[&[u32]],
     max_tokens: usize,
     device: &Device,
     mode: StepMode,
 ) -> Result<Vec<Vec<u32>>, String> {
+    use crate::batch::{Admission, Batcher, Event};
     assert!(!prompts.is_empty(), "generate_batch_greedy: no prompts");
-    assert!(
-        prompts.iter().all(|p| !p.is_empty()),
-        "generate_batch_greedy: an empty prompt"
-    );
-    let slots = prompts.len();
-    let longest = prompts.iter().map(|p| p.len()).max().unwrap_or(0);
-    let ceiling = ceiling(model, longest.saturating_add(max_tokens))
-        .ok_or_else(|| "the batch would not fit the model's context".to_owned())?;
-    let mut max_ctx = initial_ctx(longest, ceiling);
-    let int = crate::backend::int_dtype(device);
-    if mode == StepMode::Dynamic || !model.static_supported(device) {
-        return Err("this model cannot take the static decode path as placed".to_owned());
-    }
-    let state = model.static_state(slots, max_ctx, device);
-    let kv = Mutex::new(state);
-    let mut next = Vec::with_capacity(slots);
-    // Prefill each slot on the dynamic path; its first token comes from the
-    // prefill's own logits.
-    for (slot, prompt) in prompts.iter().enumerate() {
-        let mut cache = model.new_cache();
-        let logits = model.forward(prompt, 0, &mut cache, device);
-        model.seed_static(&mut lock(&kv), slot, &cache);
-        let id = logits
-            .argmax(1)
-            .into_data()
-            .convert::<i64>()
-            .try_to_vec::<i64>()
-            .map_err(|e| format!("prefill readback: {e:?}"))?[0];
-        next.push(u32::try_from(id).map_err(|_| "token id out of range".to_owned())?);
-    }
-    let mut out: Vec<Vec<u32>> = next.iter().map(|&id| vec![id]).collect();
-    let mut done: Vec<bool> = next
-        .iter()
-        .map(|&id| model.is_eos(id) || max_tokens <= 1)
-        .collect();
-    let mut pos: Vec<usize> = prompts.iter().map(|p| p.len()).collect();
-    let tokens = Mutex::new(Tensor::<2, Int>::zeros([slots, 1], (device, int)));
-    let positions = Mutex::new(Tensor::<1, Int>::zeros([slots], (device, int)));
-    let mut graphs: Graphs<'_> = HashMap::new();
-    while !done.iter().all(|&d| d) {
-        let furthest = pos.iter().copied().max().unwrap_or(0);
-        ensure_room(&kv, &mut graphs, &mut max_ctx, furthest, ceiling, device);
-        // Rewrite both input buffers in place (see `write_all`).
-        write_all(
-            &tokens,
-            next.iter().map(|&id| index(id)).collect(),
-            [slots, 1],
-            device,
-        );
-        write_all(
-            &positions,
-            pos.iter().map(|&p| index(p)).collect(),
-            [slots],
-            device,
-        );
-        let _ = Device::sync(device);
-        let len = bucket(furthest, max_ctx);
-        let logits = if mode == StepMode::Captured {
-            let graph = graphs.entry(len).or_insert_with(|| {
-                let (kv, tokens, positions) = (&kv, &tokens, &positions);
-                let record: Step<'_> = Box::new(move || {
-                    model.forward_static(&lock(tokens), &lock(positions), &mut lock(kv), len)
-                });
-                capture_rewound(kv, device, record)
-            });
-            // SAFETY: as in `generate` — every buffer outlives `graphs` (or
-            // `ensure_room` dropped them first), one thread, refreshes
-            // synced before the replay.
-            unsafe { graph.replay() }.clone()
-        } else {
-            model.forward_static(&lock(&tokens), &lock(&positions), &mut lock(&kv), len)
-        };
-        let ids = logits
-            .argmax(1)
-            .into_data()
-            .convert::<i64>()
-            .try_to_vec::<i64>()
-            .map_err(|e| format!("decode readback: {e:?}"))?;
-        for slot in 0..slots {
-            if done[slot] {
-                continue;
-            }
-            let id = u32::try_from(ids[slot]).map_err(|_| "token id out of range".to_owned())?;
-            out[slot].push(id);
-            next[slot] = id;
-            pos[slot] += 1;
-            done[slot] = model.is_eos(id) || out[slot].len() >= max_tokens || pos[slot] >= ceiling;
+    let mut batch = Batcher::new(model, device, prompts.len(), mode)
+        .ok_or_else(|| "this model cannot take the static decode path as placed".to_owned())?;
+    let greedy = SamplerOptions::greedy();
+    let mut out: Vec<Vec<u32>> = vec![Vec::new(); prompts.len()];
+    let mut ids = Vec::with_capacity(prompts.len());
+    let take = |out: &mut Vec<Vec<u32>>, ids: &[crate::batch::SeqId], id, event| {
+        if let (Some(i), Event::Token(t)) = (ids.iter().position(|&s| s == id), event) {
+            out[i].push(t);
+        }
+    };
+    for prompt in prompts {
+        if !batch.fits(prompt.len(), max_tokens) {
+            return Err("the batch would not fit the model's context".to_owned());
+        }
+        let (id, events) = batch.admit(
+            model,
+            Admission {
+                prompt_ids: prompt,
+                max_tokens,
+                opts: &greedy,
+                constraint: None,
+            },
+        )?;
+        ids.push(id);
+        for e in events {
+            take(&mut out, &ids, id, e);
         }
     }
-    drop_graphs(&mut graphs, device);
+    while batch.active() > 0 {
+        for (id, e) in batch.step(model)? {
+            take(&mut out, &ids, id, e);
+        }
+    }
+    batch.release();
     Ok(out)
 }
 

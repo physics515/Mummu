@@ -32,10 +32,18 @@ use crate::status::mem_available_bytes;
 #[path = "placement.rs"]
 mod placement;
 
+#[path = "decoder.rs"]
+mod decoder;
+
 /// One chat-servable model: the architecture-erased LM plus its tokenizer.
 pub struct Loaded {
     pub lm: AnyLm,
-    pub tokenizer: Tokenizer,
+    /// Shared with the decode thread's sessions (see `decoder`), which hand
+    /// it to every request that joins them.
+    pub tokenizer: Arc<Tokenizer>,
+    /// This load's number in the process: a batcher the decode thread keeps
+    /// between sessions is for one load of one model.
+    load_id: u64,
     /// [`crate::recovery::fault_epoch`] when this model's load began. Any
     /// device failure since then may have left its weights pointing at
     /// device memory that was never initialized, so a model whose stamp is
@@ -396,6 +404,7 @@ pub fn load_in_flight() -> Option<std::path::PathBuf> {
 /// the slot — no load can have been in flight — and `progress::evicted`
 /// declines to touch a working phase in any case.
 pub fn unload_all() -> bool {
+    decoder::release_wait(RELEASE_BUDGET);
     clear_tiers();
     crate::retrieval::unload_all();
     let freed = SLOT.clear();
@@ -414,6 +423,7 @@ pub fn unload_all() -> bool {
 /// loader cannot move layers between devices (see `placement::tick`).
 /// `false` when the slot was busy or empty; nothing was done then.
 pub fn evict_for_placement(why: &str) -> bool {
+    decoder::release_wait(RELEASE_BUDGET);
     match SLOT.try_clear() {
         mummu::cache::Cleared::Dropped(key) => {
             RESIDENT
@@ -422,7 +432,7 @@ pub fn evict_for_placement(why: &str) -> bool {
                 .retain(|(_, d, _)| *d != key);
             mummu::progress::evicted();
             for b in [backend_choice(), BackendChoice::Cpu] {
-                device_of(b).memory_cleanup();
+                mummu::backend::return_memory(&device_of(b));
             }
             eprintln!(
                 "[mummu-serve] placement: unloaded {} — {why}; the next request loads it there",
@@ -452,6 +462,7 @@ pub fn evict_for_placement(why: &str) -> bool {
 ///   notes are not touched, and whatever it holds that was loaded before
 ///   the failure is refused by the fault stamp at its next acquire.
 pub fn evict_after_device_failure() -> mummu::cache::Cleared {
+    decoder::release_wait(RELEASE_BUDGET);
     let outcome = SLOT.try_clear();
     match &outcome {
         mummu::cache::Cleared::Dropped(_) => {
@@ -1774,7 +1785,7 @@ fn build_layered_qwen35(
     // driver: what the pool holds after this is the model, so the working
     // set the first generation measures is the generation's own.
     if main != BackendChoice::Cpu {
-        device.memory_cleanup();
+        mummu::backend::return_memory(&device);
     }
     placement::adopt(live);
     Ok(model)
@@ -2727,19 +2738,36 @@ fn probe_projection_ms(
     // projection in ~1 ms. (The host side is synchronous either way; the
     // amortization changes nothing there.) Best of three batches: a probe
     // that lands on a co-tenant's burst should not price the device by it.
-    let reps = 8;
-    let mut best = f64::INFINITY;
-    for _ in 0..3 {
+    //
+    // As many calls per batch as it takes for the batch to outlast its one
+    // fence several times over. A small model's projection is tens of
+    // microseconds on the card, and a fixed eight left the readback most of
+    // the batch: the 2B's card read Q8 at 90 to 309 GB/s from one load to
+    // the next, near the 2:1 ratio where Q4 overtakes Q8 — so its precision
+    // flipped with the noise, and at Q4 it misbehaved.
+    let batch = |reps: u32| {
         let t0 = std::time::Instant::now();
         let mut last = None;
         for _ in 0..reps {
             last = Some(gemv());
         }
         touch(last.expect("reps >= 1"));
-        best = best.min(t0.elapsed().as_secs_f64() * 1e3 / f64::from(reps));
+        t0.elapsed().as_secs_f64() * 1e3
+    };
+    let mut reps = 8u32;
+    while reps < PROBE_MAX_REPS && batch(reps) < PROBE_BATCH_MS {
+        reps *= 2;
     }
-    Some(best)
+    let best = (0..3).map(|_| batch(reps)).fold(f64::INFINITY, f64::min);
+    Some(best / f64::from(reps))
 }
+
+/// The least a timed probe batch should take, ms: long enough that the
+/// batch's single readback fence is a small part of it.
+const PROBE_BATCH_MS: f64 = 5.0;
+
+/// The most calls a probe batch grows to.
+const PROBE_MAX_REPS: u32 = 1024;
 
 /// Sustained host DRAM read bandwidth, GB/s, measured once per process
 /// (threaded sum over a 512 MiB buffer — past every cache on this part).
@@ -2785,6 +2813,31 @@ fn host_probe_floor_ms(pack: &mummu::pack::Pack, precision: mummu::pack::Precisi
         mummu::pack::Precision::F16 | mummu::pack::Precision::F32 => numel * 4.0,
     };
     Some(bytes / (host_dram_gbps() * 1e6))
+}
+
+/// The floor an accelerator projection probe may not report under: the
+/// card twin of [`host_probe_floor_ms`]. The probe repeats one tensor, and a
+/// small model's (the 2B's Q8 gate projection is 12 MB) lives in the card's
+/// 48 MB L2 once it is warm — read at 950-1050 GB/s on a card whose memory
+/// peaks at 672. A decode cycles every layer, so the honest cost is at
+/// least the bytes over the memory's peak bandwidth (NVML; no floor on a
+/// card nothing reports for). Timing it here instead was not possible:
+/// fusion merged repeated reads of one buffer, and the "measured" card
+/// streamed at 10 TB/s.
+fn card_probe_floor_ms(pack: &mummu::pack::Pack, precision: mummu::pack::Precision) -> Option<f64> {
+    let entry = pack.entry("blk.0.ffn_gate.weight")?;
+    let &[k, n] = entry.shape.as_slice() else {
+        return None;
+    };
+    let numel = f64_from_usize(k * n);
+    let bytes = match precision {
+        // Packed nibbles / bytes plus f32 scales per 32-block.
+        mummu::pack::Precision::Q4 => numel * (0.5 + 4.0 / 32.0),
+        mummu::pack::Precision::Q8 => numel * (1.0 + 4.0 / 32.0),
+        mummu::pack::Precision::F16 => numel * 2.0,
+        mummu::pack::Precision::F32 => numel * 4.0,
+    };
+    Some(bytes / mummu::vram::memory_bandwidth()? * 1e3)
 }
 
 /// Check that the accelerator actually holds what the plan placed there.
@@ -3647,14 +3700,21 @@ fn plan_fresh(spec: &ModelSpec, models_root: &Path) -> Result<FitPlan, String> {
 }
 
 async fn drive(
-    slot: &ModelSlot<Loaded>,
+    slot: &'static ModelSlot<Loaded>,
     req: &GenerationRequest<'_>,
     prompt: &str,
     plan: FitPlan,
-    on_delta: impl FnMut(&str) -> ControlFlow<()>,
+    mut on_delta: impl FnMut(&str) -> ControlFlow<()>,
 ) -> Result<ChatResult, ChatError> {
     let (spec, models_root) = (req.spec, req.models_root);
     let key = spec.dir(models_root);
+    // A batch already decoding this model takes the request between steps;
+    // so does one that starts while this request waits for the slot below.
+    let mut sessions = decoder::subscribe();
+    sessions.mark_unchanged();
+    if let Some(r) = join_session(&key, req, prompt, &mut on_delta).await {
+        return r;
+    }
     // Is this request likely to pay for a load? `loaded_key_async` waits for
     // the slot rather than reporting busy, so the answer is the truth and not
     // "busy, can't tell".
@@ -3664,7 +3724,27 @@ async fn drive(
     // again; anything that evicts in between (`POST /api/unload`, the 5 s
     // host-pressure watcher) turns a warm answer into a real load. This is
     // only used for the tier bookkeeping, which is idempotent either way.
-    let likely_cold = slot.loaded_key_async().await.as_deref() != Some(key.as_path());
+    // It waits for the slot, so a session that starts meanwhile is joined
+    // from here too (the wait has no side effect to abandon).
+    let loaded = {
+        let look = slot.loaded_key_async();
+        tokio::pin!(look);
+        loop {
+            tokio::select! {
+                biased;
+                k = &mut look => break k,
+                changed = sessions.changed() => {
+                    if changed.is_err() {
+                        break (&mut look).await;
+                    }
+                    if let Some(r) = join_session(&key, req, prompt, &mut on_delta).await {
+                        return r;
+                    }
+                }
+            }
+        }
+    };
+    let likely_cold = loaded.as_deref() != Some(key.as_path());
     if likely_cold && tiers_pack_in(&key).is_none() {
         // This slot is about to evict its occupant; if that was the tiered
         // model, its experts on the *other* devices go with it.
@@ -3718,8 +3798,8 @@ async fn drive(
     let load_ms = std::sync::atomic::AtomicU64::new(0);
     let load_ms_ref = &load_ms;
     let acquire_started = Instant::now();
-    let m = slot
-        .acquire_valid(
+    let m = {
+        let acquire = slot.acquire_valid(
             &key,
             |resident| {
                 let valid = resident.fault_epoch == recovery::fault_epoch();
@@ -3741,8 +3821,27 @@ async fn drive(
                 load_ms_ref.store(crate::millis(t.elapsed()), SeqCst);
                 r
             },
-        )
-        .await?;
+        );
+        tokio::pin!(acquire);
+        // Waiting for the slot and watching for a session to join, whichever
+        // comes first. Abandoning the wait is safe only while it IS a wait: once
+        // `acquire_valid` holds the lock it runs its load to the end without an
+        // await, so it never stops halfway through one.
+        loop {
+            tokio::select! {
+                biased;
+                m = &mut acquire => break m?,
+                changed = sessions.changed() => {
+                    if changed.is_err() {
+                        break (&mut acquire).await?;
+                    }
+                    if let Some(r) = join_session(&key, req, prompt, &mut on_delta).await {
+                        return r;
+                    }
+                }
+            }
+        }
+    };
     let acquire_ms = crate::millis(acquire_started.elapsed());
     let load_ms = load_ms.load(SeqCst);
     let queue_ms = acquire_ms.saturating_sub(load_ms);
@@ -3786,7 +3885,7 @@ async fn drive(
 /// HERE, reversed: the progress guard settles the phase before the slot is
 /// released (see `drive`, which hands them over).
 async fn serve_held(
-    mut m: mummu::cache::SlotGuard<'_, Loaded>,
+    mut m: mummu::cache::SlotGuard<'static, Loaded>,
     progress: LoadProgress,
     req: &GenerationRequest<'_>,
     prompt: &str,
@@ -3841,15 +3940,58 @@ async fn serve_held(
     // like one that fails under a token.
     let outcome = AssertUnwindSafe(async {
         let before = placement::before_request(&mut m, key, ctx, needs_tower);
-        let r = generate_on(&m, req, prompt, &device, label, &progress, &mut on_delta).await;
-        (r, before)
+        // A model wholly on the card decodes on the decode thread, in a batch
+        // with whatever else arrives for it: the slot goes there with this
+        // request's generation, and failures from here on are decided there.
+        let batched = match prepare_batched(&m, req, prompt) {
+            Ok(b) => b,
+            Err(e) => return (Err(e), before),
+        };
+        let Some(prepared) = batched else {
+            let r = generate_on(&m, req, prompt, &device, label, &progress, &mut on_delta).await;
+            return (r.map(GenerationOutcome::Done), before);
+        };
+        (Ok(GenerationOutcome::Batched(prepared)), before)
     })
     .catch_unwind()
     .await;
     let failure = match outcome {
-        Ok((Ok(result), before)) => {
+        Ok((Ok(GenerationOutcome::Done(result)), before)) => {
             placement::after_request(ctx, result.tokens, before);
             return Ok(result);
+        }
+        Ok((Ok(GenerationOutcome::Batched(prepared)), before)) => {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let Prepared {
+                prompt_ids,
+                keep,
+                constraint,
+            } = prepared;
+            let prompt_tokens = prompt_ids.len();
+            let job = decoder::Job {
+                prompt_ids,
+                max_tokens: req.max_tokens,
+                opts: req.opts.clone(),
+                constraint,
+                updates: tx,
+            };
+            let started = Instant::now();
+            let info = decoder::start(m, key, &spec.name, job);
+            let r = generate_batched(
+                &info,
+                rx,
+                prompt_tokens,
+                &keep,
+                req,
+                Some(&progress),
+                started,
+                &mut on_delta,
+            )
+            .await;
+            if let Ok(result) = &r {
+                placement::after_request(ctx, result.tokens, before);
+            }
+            return r;
         }
         Ok((Err(e), _)) if e.needs_decision() => e.message,
         Ok((Err(e), _)) => return Err(e),
@@ -3944,9 +4086,14 @@ fn head_k_for(req: &GenerationRequest<'_>) -> usize {
 /// embeds its own BOS (the `real_olmoe.rs` pattern), so Olmoe is the one
 /// family that does not ask for them again.
 fn encode_prompt(m: &Loaded, spec: &ModelSpec, prompt: &str) -> Result<Vec<u32>, ChatError> {
+    encode_with(&m.tokenizer, spec, prompt)
+}
+
+/// [`encode_prompt`] with the tokenizer in hand (a request that joins a
+/// decode session has the session's, not the model).
+fn encode_with(tok: &Tokenizer, spec: &ModelSpec, prompt: &str) -> Result<Vec<u32>, ChatError> {
     let add_special = spec.architecture != Architecture::Olmoe;
-    let ids = m
-        .tokenizer
+    let ids = tok
         .encode(prompt, add_special)
         .map_err(|e| format!("prompt encode: {e}"))?
         .get_ids()
@@ -3955,6 +4102,194 @@ fn encode_prompt(m: &Loaded, spec: &ModelSpec, prompt: &str) -> Result<Vec<u32>,
         return Err("prompt encoded to zero tokens".into());
     }
     Ok(ids)
+}
+
+/// How a held request's generation went: decoded here, or to be handed to
+/// the decode thread with the slot.
+enum GenerationOutcome {
+    Done(ChatResult),
+    Batched(Prepared),
+}
+
+/// What a generation needs before its first forward, from the tokenizer.
+struct Prepared {
+    prompt_ids: Vec<u32>,
+    /// The family's call tags, which this build may type special.
+    keep: Vec<u32>,
+    /// The grammar, if one was asked for.
+    constraint: Option<Box<dyn mummu::constrain::Constraint>>,
+}
+
+fn prepare(
+    tok: &Tokenizer,
+    req: &GenerationRequest<'_>,
+    prompt: &str,
+) -> Result<Prepared, ChatError> {
+    let spec = req.spec;
+    let prompt_ids = encode_with(tok, spec, prompt)?;
+    let constraint = req.format.map(|f| match f {
+        crate::OutputFormat::Json => Box::new(mummu::constrain::JsonConstraint::new(
+            token_bytes_for(&spec.name, tok),
+        )) as Box<dyn mummu::constrain::Constraint>,
+    });
+    Ok(Prepared {
+        prompt_ids,
+        keep: preserved_tokens(tok, spec.architecture),
+        constraint,
+    })
+}
+
+/// The prepared generation, when `m` decodes it on the decode thread (see
+/// `decoder::applies`); `None` for the ordinary path.
+fn prepare_batched(
+    m: &Loaded,
+    req: &GenerationRequest<'_>,
+    prompt: &str,
+) -> Result<Option<Prepared>, ChatError> {
+    if !req.images.is_empty() || mummu::capture::step_mode() == mummu::capture::StepMode::Dynamic {
+        return Ok(None);
+    }
+    let prepared = prepare(&m.tokenizer, req, prompt)?;
+    Ok(decoder::applies(m, prepared.prompt_ids.len(), req.max_tokens, false).then_some(prepared))
+}
+
+/// A generation the decode thread runs (see `decoder`): its tokens arrive
+/// through `updates`; the rest — the think filter, the stream, the answer
+/// and its timings — is this request's own, as in [`generate_on`].
+/// Dropping `updates` (the client went away, or `on_delta` broke) is what
+/// cancels the sequence in the batch.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one generation's pieces, all distinct"
+)]
+async fn generate_batched(
+    info: &decoder::SessionInfo,
+    mut updates: tokio::sync::mpsc::UnboundedReceiver<decoder::Update>,
+    prompt_tokens: usize,
+    keep: &[u32],
+    req: &GenerationRequest<'_>,
+    progress: Option<&LoadProgress>,
+    started: Instant,
+    on_delta: &mut impl FnMut(&str) -> ControlFlow<()>,
+) -> Result<ChatResult, ChatError> {
+    let mut thinking = (!req.think).then(crate::think::Filter::default);
+    let mut ids: Vec<u32> = Vec::new();
+    let mut emitted = String::new();
+    let mut first_token_at: Option<Instant> = None;
+    let mut finished = false;
+    while let Some(update) = updates.recv().await {
+        match update {
+            decoder::Update::Token(id) => {
+                if ids.is_empty() {
+                    if let Some(p) = progress {
+                        p.ready();
+                    }
+                    recovery::generation_succeeded(&info.devices);
+                }
+                first_token_at.get_or_insert_with(Instant::now);
+                ids.push(id);
+                let flow = emit_delta(
+                    &info.tokenizer,
+                    &ids,
+                    keep,
+                    &mut emitted,
+                    thinking.as_mut(),
+                    on_delta,
+                );
+                if flow.is_break() {
+                    finished = true;
+                    break;
+                }
+            }
+            decoder::Update::Done(result) => {
+                result?;
+                finished = true;
+                break;
+            }
+        }
+    }
+    drop(updates);
+    if !finished {
+        return Err(ChatError::request(
+            "the decode thread stopped mid-generation",
+        ));
+    }
+    let text = decode_answer(&info.tokenizer, &ids, keep).map_err(|e| format!("decode: {e}"))?;
+    let text = conclude(thinking, text, req.max_tokens, on_delta)?;
+    let elapsed_ms = crate::millis(started.elapsed());
+    observe_placement(ids.len(), elapsed_ms);
+    let generation_done = Instant::now();
+    let first = first_token_at.unwrap_or(generation_done);
+    let timings = crate::trace::Timings {
+        prefill_ms: crate::millis(first.duration_since(started)),
+        decode_ms: crate::millis(generation_done.duration_since(first)),
+        prompt_tokens,
+        completion_tokens: ids.len(),
+        ..crate::trace::Timings::default()
+    };
+    Ok(ChatResult {
+        text,
+        tokens: ids.len(),
+        device: label_of(info.backend),
+        elapsed_ms,
+        timings,
+        tool_calls: Vec::new(),
+    })
+}
+
+/// Join the decode session running on model `key`, when there is one and
+/// this request can take it: decoded in its batch, never queueing for the
+/// slot. `None` when the request should take the ordinary path.
+async fn join_session(
+    key: &Path,
+    req: &GenerationRequest<'_>,
+    prompt: &str,
+    on_delta: &mut impl FnMut(&str) -> ControlFlow<()>,
+) -> Option<Result<ChatResult, ChatError>> {
+    if !req.images.is_empty() {
+        return None;
+    }
+    let info = decoder::session(key)?;
+    let prepared = match prepare(&info.tokenizer, req, prompt) {
+        Ok(p) => p,
+        Err(e) => return Some(Err(e)),
+    };
+    if prepared.prompt_ids.len().saturating_add(req.max_tokens) > info.context {
+        return None;
+    }
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let Prepared {
+        prompt_ids,
+        keep,
+        constraint,
+    } = prepared;
+    let prompt_tokens = prompt_ids.len();
+    let job = decoder::Job {
+        prompt_ids,
+        max_tokens: req.max_tokens,
+        opts: req.opts.clone(),
+        constraint,
+        updates: tx,
+    };
+    let started = Instant::now();
+    decoder::join(key, job).ok()?;
+    eprintln!(
+        "[mummu-serve] chat request for {} joined the running decode batch",
+        req.spec.name
+    );
+    Some(
+        generate_batched(
+            &info,
+            rx,
+            prompt_tokens,
+            &keep,
+            req,
+            None,
+            started,
+            on_delta,
+        )
+        .await,
+    )
 }
 
 /// The generation itself, on a model the slot handed out. Everything that
@@ -4248,6 +4583,8 @@ fn load_for_slot(
     }
     // Whatever placement was live described the model this load replaces.
     placement::forget(None);
+    // So did whatever the decode thread kept on the card for it.
+    decoder::release_wait(RELEASE_BUDGET);
     // A plan from `plan_fit`'s "already resident" shortcut assumed a hit: no
     // fit check, a placeholder policy. The slot is loading, so the
     // assumption was wrong — most often because the resident copy predated a
@@ -4341,12 +4678,20 @@ fn load_for_slot(
     recovery::load_succeeded(&spec.name, &keys);
     Ok(Loaded {
         lm,
-        tokenizer,
+        tokenizer: Arc::new(tokenizer),
+        load_id: LOAD_IDS.fetch_add(1, SeqCst),
         fault_epoch: mark.global(),
         backend: plan.backend,
         devices: keys,
     })
 }
+
+/// The next [`Loaded::load_id`].
+static LOAD_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// How long an eviction or a load waits for the decode thread to drop its
+/// cached batch: it answers at once unless it is mid-step.
+const RELEASE_BUDGET: Duration = Duration::from_secs(5);
 
 /// Drop the model `m` holds because a device failed under it — through the
 /// guard, so no request queued on the slot is ever handed it (see
@@ -4685,8 +5030,10 @@ mod observability_tests {
         let code = &src[..src
             .find("\n#[cfg(test)]")
             .expect("engine.rs ends in test modules")];
+        // `m` is bound from the block that waits for the slot (and watches
+        // for a decode session to join meanwhile).
         let slot = code
-            .find("let m = slot")
+            .find("let acquire = slot")
             .expect("drive takes the model slot");
         let moved = code
             .find("let progress = armed;")

@@ -176,16 +176,17 @@ impl StaticKv {
         bucket(max_pos, self.cfg.max_ctx)
     }
 
-    /// The per-step tensors, from the `[slots]` positions buffer, for a
-    /// bucket of `len` keys. Device-side only: safe inside a capture window.
+    /// The per-step tensors, from a `[k]` positions buffer — the first `k`
+    /// slots step — for a bucket of `len` keys. Device-side only: safe
+    /// inside a capture window.
     ///
     /// # Panics
     ///
-    /// When `len` is 0 or past `max_ctx`, or `positions` is not `[slots]`.
+    /// When `len` is 0 or past `max_ctx`, or `k` is 0 or more than the
+    /// cache's slots.
     #[must_use]
     pub fn step_inputs(&self, positions: &Tensor<1, Int>, len: usize) -> StepInputs {
         let StaticKvConfig {
-            slots,
             kv_heads,
             rope_dim,
             max_ctx,
@@ -195,7 +196,14 @@ impl StaticKv {
             len >= 1 && len <= max_ctx,
             "bucket {len} outside 1..={max_ctx}"
         );
-        assert_eq!(positions.dims(), [slots], "positions must be [slots]");
+        // A step may run the first `slots` of the cache's slots: a batch
+        // whose later slots are idle pays only for the ones in use.
+        let [slots] = positions.dims();
+        assert!(
+            slots >= 1 && slots <= self.cfg.slots,
+            "positions for {slots} slots, the cache has {}",
+            self.cfg.slots
+        );
         let cos = self
             .cos
             .clone()
@@ -211,7 +219,7 @@ impl StaticKv {
             .reshape([slots, 1])
             .repeat_dim(1, kv_heads)
             .reshape([slots * kv_heads])
-            .add(self.row_base.clone());
+            .add(self.row_base.clone().narrow(0, 0, slots * kv_heads));
         let after = self
             .key_index
             .clone()
@@ -232,44 +240,78 @@ impl StaticKv {
         }
     }
 
-    /// Room for `max_ctx` positions, every slot's keys and values kept: new
-    /// buffers (a captured graph over the old ones must be dropped first)
-    /// and the tables for the longer range.
+    /// Reshape to `slots` slots of `max_ctx` positions, keeping the keys and
+    /// values of every slot and position both shapes have: new buffers (a
+    /// captured graph over the old ones must be dropped first) and the
+    /// tables for the new range.
     ///
     /// # Panics
     ///
     /// When `max_ctx` is smaller than the current size, or a layer's pair
     /// is checked out.
-    pub fn grow(&mut self, max_ctx: usize) {
-        let old = self.cfg.max_ctx;
+    pub fn resize(&mut self, slots: usize, max_ctx: usize) {
+        let old = self.cfg;
         assert!(
-            max_ctx >= old,
-            "grow: {max_ctx} positions is smaller than {old}"
+            max_ctx >= old.max_ctx,
+            "resize: {max_ctx} positions is smaller than {}",
+            old.max_ctx
         );
-        if max_ctx == old {
+        if slots == old.slots && max_ctx == old.max_ctx {
             return;
         }
         let device = self.cos.device();
         let mut bigger = Self::new(
             StaticKvConfig {
+                slots,
                 max_ctx,
-                ..self.cfg
+                ..old
             },
             &device,
         );
-        let StaticKvConfig {
-            slots,
-            kv_heads,
-            head_dim,
-            ..
-        } = self.cfg;
+        let kept = slots.min(old.slots);
         for (pair, room) in self.layers.iter_mut().zip(&mut bigger.layers) {
-            let (k, v) = pair.take().expect("grow: layer checked out");
+            let (k, v) = pair.take().expect("resize: layer checked out");
             let (kb, vb) = room.take().expect("a fresh cache");
-            let at = [0..slots, 0..kv_heads, 0..old, 0..head_dim];
+            let at = [0..kept, 0..old.kv_heads, 0..old.max_ctx, 0..old.head_dim];
+            let (k, v) = if kept < old.slots {
+                (k.narrow(0, 0, kept), v.narrow(0, 0, kept))
+            } else {
+                (k, v)
+            };
             *room = Some((kb.slice_assign(at.clone(), k), vb.slice_assign(at, v)));
         }
         *self = bigger;
+    }
+
+    /// Room for `max_ctx` positions in every slot (see [`Self::resize`]).
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::resize`].
+    pub fn grow(&mut self, max_ctx: usize) {
+        self.resize(self.cfg.slots, max_ctx);
+    }
+
+    /// Copy slot `from`'s keys and values over slot `to`'s, in place (the
+    /// buffers a captured graph recorded stay the ones it reads).
+    ///
+    /// # Panics
+    ///
+    /// When a slot is out of range or a layer's pair is checked out.
+    pub fn move_slot(&mut self, from: usize, to: usize) {
+        let slots = self.cfg.slots;
+        assert!(
+            from < slots && to < slots,
+            "move_slot {from} -> {to} of {slots}"
+        );
+        if from == to {
+            return;
+        }
+        for pair in &mut self.layers {
+            let (k, v) = pair.as_mut().expect("move_slot: layer checked out");
+            move_row(k, from, to);
+            move_row(v, from, to);
+        }
     }
 
     /// Layer `l`'s cache, for a step to take, write and put back.
@@ -341,33 +383,57 @@ pub fn copy_of<const D: usize>(t: &Tensor<D>) -> Tensor<D> {
     copy
 }
 
-/// Overwrite all of `dst` with `src`, in place: `dst` keeps its buffer, which
-/// is what a captured graph recorded and reads on every replay.
+/// Overwrite the leading rows of `dst` (along dim 0) with `src`, in place.
+///
+/// `dst` keeps its buffer, which is what a captured graph recorded and reads
+/// on every replay. A step over the first `k` slots writes their `k` rows.
 ///
 /// # Panics
 ///
 /// When `dst` is shared (it could not be written in place — a replay would
-/// keep reading the stale buffer), or the shapes differ.
+/// keep reading the stale buffer), or `src` is not `dst`'s shape with at
+/// most as many rows.
 pub fn overwrite<const D: usize>(dst: &mut Tensor<D>, src: Tensor<D>) {
     assert!(
         dst.can_mut(),
         "a static state buffer is shared, so it cannot be written in place"
     );
-    let shape = dst.dims();
-    assert_eq!(src.dims(), shape, "overwrite: shapes differ");
-    let at: [std::ops::Range<usize>; D] = core::array::from_fn(|d| 0..shape[d]);
+    let (shape, rows) = (dst.dims(), src.dims());
+    assert!(
+        rows[0] <= shape[0] && rows[1..] == shape[1..],
+        "overwrite: {rows:?} does not fit {shape:?}"
+    );
+    let at: [std::ops::Range<usize>; D] = core::array::from_fn(|d| 0..rows[d]);
     let store = dst.dtype();
     dst.inplace(|t| t.slice_assign(at, src.cast(store)));
+}
+
+/// Copy row `from` of `t` (along dim 0) over row `to`, in place.
+///
+/// # Panics
+///
+/// As [`overwrite`]: when `t` is shared.
+pub fn move_row<const D: usize>(t: &mut Tensor<D>, from: usize, to: usize) {
+    let shape = t.dims();
+    // A copy first: the source row is a view of the very buffer being written.
+    let row = copy_of(&t.clone().narrow(0, from, 1));
+    assert!(
+        t.can_mut(),
+        "a static state buffer is shared, so it cannot be written in place"
+    );
+    let at: [std::ops::Range<usize>; D] =
+        core::array::from_fn(|d| if d == 0 { to..to + 1 } else { 0..shape[d] });
+    t.inplace(|x| x.slice_assign(at, row));
 }
 
 /// Write one step's k/v into the cache and return the bucket's keys and
 /// values.
 ///
-/// The new k/v are `[slots, kv_heads, 1, head_dim]`, written at `rows`; the
-/// bucket's are `[slots, kv_heads, len, head_dim]`, views of the cache. The
-/// write is in place when the cache pair
-/// is uniquely held, which the step guarantees by moving it out of the
-/// [`StaticKv`] for the duration.
+/// The new k/v are `[k, kv_heads, 1, head_dim]` for the cache's first `k`
+/// slots, written at `rows`; the bucket's are `[k, kv_heads, len, head_dim]`,
+/// views of the cache. The write is in place when the cache pair is uniquely
+/// held, which the step guarantees by moving it out of the [`StaticKv`] for
+/// the duration.
 ///
 /// # Panics
 ///
@@ -381,7 +447,9 @@ pub fn write_and_view(
 ) -> (Tensor<4>, Tensor<4>) {
     let (kc, vc) = kv.take().expect("static cache layer checked out twice");
     let [slots, kv_heads, cap, head_dim] = kc.dims();
-    let flat = slots * kv_heads;
+    // The step's slots: the cache's first `k`.
+    let [k, ..] = k_new.dims();
+    let flat = k * kv_heads;
     let store = kc.dtype();
     // `scatter_nd` with `Assign`: the one indexed write both backends
     // implement as an assignment (`select_assign` only adds on flex), and
@@ -391,7 +459,7 @@ pub fn write_and_view(
     let index = rows.clone().reshape([flat, 1]);
     let put = |cache: Tensor<4>, new: Tensor<4>| {
         cache
-            .reshape([flat * cap, head_dim])
+            .reshape([slots * kv_heads * cap, head_dim])
             .scatter_nd::<2, 2>(
                 index.clone(),
                 new.reshape([flat, head_dim]).cast(store),
@@ -401,8 +469,8 @@ pub fn write_and_view(
     };
     let kc = put(kc, k_new);
     let vc = put(vc, v_new);
-    let keys = kc.clone().narrow(2, 0, len);
-    let values = vc.clone().narrow(2, 0, len);
+    let keys = kc.clone().narrow(0, 0, k).narrow(2, 0, len);
+    let values = vc.clone().narrow(0, 0, k).narrow(2, 0, len);
     *kv = Some((kc, vc));
     (keys, values)
 }
