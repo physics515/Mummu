@@ -3797,9 +3797,23 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       mid-stream leaves the batch while the others finish unchanged. **Measured** (2B, Q8 pack,
       busy box): the second and later requests skip the capture — 12.7-12.9 ms/token against
       23.9 for the first; four concurrent 150-token requests 5.15 s against 8.85 s one after
-      another (116 vs 68 tok/s). Open: a joiner's context is not planned for (`before_request`
-      runs only for the request that took the slot), and a session's state is sized for its
-      widest moment until released.
+      another (116 vs 68 tok/s). *(2026-10-02) A joiner is charged before it joins.* The request
+      that took the slot had its context planned (`before_request`); a joiner's was not, and the
+      batch never asks placement to move layers under it (the static step needs every layer on
+      the card). So the decode thread prices each joiner: the batch's state grown to every live
+      sequence's last position and the joiner's (`Batcher::charge`, from the model's own
+      `static_bytes` — exactly what the batch then allocates, tested), plus the graph of a wider
+      slot tier when it would need one, priced per slot from the graphs captured so far (each
+      capture logs what it holds: 217 MiB per slot on the 2B — the `DeltaNet` recurrence's
+      intermediates, retained by the capture's warm-ups), against placement's free bytes for the
+      card. A joiner that does not fit is turned back before its first token and queues for the
+      slot like any request. That pricing found the batch's real cost: one 8-slot burst held
+      graphs for every tier and bucket it had passed through — 3.2 GB — and ran the card out of
+      memory. Now buckets double (256, 512, 1024 … — five graphs to 4096 keys, not sixteen; the
+      single-stream driver too), a batch holds one graph for tier 1 and one for the wider tier in
+      use, and a shrinking batch keeps its wider tier instead of recapturing at every halving.
+      Same burst: 5.8 GB held against 8.4. Verified: Qwen3-0.6B (f32 KV, 2.8 GiB per widening at
+      4096 tokens) turned joiners back at 2.23 GiB free and served all six requests in turn.
 - [x] **Batch memory goes back to the driver** *(2026-10-01)* — after each batch shape the 2B's
       process held 4.3-6.6 GB on the card against 4.0 GB after one, although the allocator had
       returned everything: wgpu frees a dropped buffer only at its next sync. A model load in that
@@ -3831,11 +3845,23 @@ that fits the model AND uses every device to the fullest.
       48 MB L2 and read at 1 TB/s); each model remembers the best rate every device has shown per
       level in its placement evidence (a probe is only ever slowed by what it meets), and plans from
       the better of that and the fresh probe; and a load whose probe ran slower than that best, or
-      had none to compare with, re-probes each device at the first idle tick that finds it quiet
-      (the card's needs the host quiet too — every kernel is launched from it). The precision
-      tolerance widened from 1 % to 10 % so that where two levels run within the probes' noise of
-      each other the better one wins. Reproduced and fixed: after the same heavy test, a fresh
-      server now plans Q8 and answers directly.
+      had none to compare with, re-probes each device on a schedule. The precision tolerance widened
+      from 1 % to 10 % so that where two levels run within the probes' noise of each other the
+      better one wins. Reproduced and fixed: after the same heavy test, a fresh server now plans
+      Q8 and answers directly. *(2026-10-02) The re-probe runs on a busy machine.* It first waited
+      for a quiet host (≥80 % free), and this box — other routines on 9-15 of 16 cores — never
+      gave it one. What a probe needs is narrower: the card's, no co-tenant on the card and two
+      idle host cores to launch from (24 spinners on 16 cores made a free card read Q8 at
+      14 GB/s; a dozen busy cores do not); the host's, half the host. Each device is re-probed
+      15 s after the load, then at doubling intervals up to 10 min, until two tries confirm the
+      remembered best or six have run. The card probe is now captured and replayed like the
+      decode it prices, its calls chained so a lazy backend cannot skip one, and capped at the
+      card's peak bandwidth after the free-share scaling too (it had lifted 672 GB/s to 748). The
+      host's DRAM floor is re-measured and keeps its best (measured once per process, a server
+      started under a CPU hog floored every later host probe at 1.3 GB/s). Verified end to end:
+      loaded under 24 spinners (card Q4 85 / Q8 69 GB/s, 43 parts at Q4), the hog ends, the card
+      re-probes at Q8 485 then 552 and settles, idle improvement moves every part back to Q8, and
+      the next request answers directly.
 - [x] **A tied head takes its table to the card** *(2026-10-01)* — the joint solve reserved card
       room for `output.weight` only, and the token table always loaded on the host as "a gather".
       For a tied checkpoint the table IS the head: a matmul over the whole vocabulary every token.

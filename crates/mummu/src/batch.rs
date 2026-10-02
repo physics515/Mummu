@@ -130,6 +130,8 @@ struct Seq {
     /// The token the next step feeds, at position `pos`.
     next: u32,
     pos: usize,
+    /// Positions it can reach: its prompt plus its `max_tokens`.
+    limit: usize,
     emitted: usize,
     max_tokens: usize,
 }
@@ -170,8 +172,13 @@ pub struct Batcher<M: StaticDecode> {
     epoch: u64,
     state: Option<Arc<Mutex<M::State>>>,
     inputs: HashMap<usize, Inputs>,
-    /// Per (slot tier, length bucket).
+    /// Per (slot tier, length bucket) — at most one per tier, for tier 1 and
+    /// the tier in use (see [`Batcher::forward`]).
     graphs: HashMap<(usize, usize), burn::tensor::Graph<Tensor<2>, Step<'static>>>,
+    /// The most card memory a captured graph has held per slot of its tier:
+    /// what a wider tier's graph is charged before it exists (see
+    /// [`Batcher::charge`]). 0 until the first capture.
+    graph_per_slot: u64,
     /// Live sequences; index = slot.
     seqs: Vec<Seq>,
     next_id: u64,
@@ -197,6 +204,7 @@ impl<M: StaticDecode + Sync + 'static> Batcher<M> {
             state: None,
             inputs: HashMap::new(),
             graphs: HashMap::new(),
+            graph_per_slot: 0,
             seqs: Vec::new(),
             next_id: 0,
         })
@@ -339,6 +347,7 @@ impl<M: StaticDecode + Sync + 'static> Batcher<M> {
                 constraint,
                 next: id,
                 pos: prompt_len,
+                limit: prompt_len.saturating_add(max_tokens),
                 emitted: 1,
                 max_tokens,
             });
@@ -380,7 +389,7 @@ impl<M: StaticDecode + Sync + 'static> Batcher<M> {
         self.make_room(model, live, furthest);
         let state = Arc::clone(self.state.as_ref().expect("make_room built the state"));
         let (slots, max_ctx) = lock(&state).shape();
-        let tier = live.next_power_of_two().min(slots);
+        let tier = self.tier_for(live, slots);
         let int = crate::backend::int_dtype(&self.device);
         let inputs = self.inputs.entry(tier).or_insert_with(|| Inputs {
             tokens: Arc::new(Mutex::new(Tensor::<2, Int>::zeros(
@@ -407,6 +416,21 @@ impl<M: StaticDecode + Sync + 'static> Batcher<M> {
         if self.mode != StepMode::Captured {
             return model.forward_static(&lock(&tokens), &lock(&positions), &mut lock(&state), len);
         }
+        // Graphs held: one per tier, for tier 1 — a request alone, the common
+        // case — and one wider tier, the last one used. Every graph keeps its
+        // whole working set on the card (on the 2B ~210 MiB per slot of its
+        // tier), so keeping each tier's and each bucket's was the batch's
+        // largest cost: 3.2 GB of graphs for one 8-slot burst, which ran the
+        // card out of memory. A new graph replaces its tier's other bucket,
+        // and a wider tier replaces the wider tier held.
+        if !self.graphs.contains_key(&(tier, len)) {
+            let before = self.graphs.len();
+            self.graphs
+                .retain(|&(t, _), _| t != tier && (tier == 1 || t == 1));
+            if self.graphs.len() != before {
+                crate::backend::return_memory(&self.device);
+            }
+        }
         let graph = self.graphs.entry((tier, len)).or_insert_with(|| {
             let (cell, st, tk, ps) = (
                 Arc::clone(&self.cell),
@@ -418,10 +442,15 @@ impl<M: StaticDecode + Sync + 'static> Batcher<M> {
                 cell.get().forward_static(&lock(&tk), &lock(&ps), &mut lock(&st), len)
             });
             let started = std::time::Instant::now();
+            let reserved = || self.device.memory_pool_usage().map_or(0, |u| u.bytes_reserved);
+            let before = reserved();
             let graph = capture_rewound(&state, &self.device, record);
+            let held = reserved().saturating_sub(before);
+            self.graph_per_slot = self.graph_per_slot.max(held / tier as u64);
             eprintln!(
-                "[mummu] batched decode step captured for {tier} slot(s), a {len}-key bucket, in {:.0} ms",
-                started.elapsed().as_secs_f64() * 1e3
+                "[mummu] batched decode step captured for {tier} slot(s), a {len}-key bucket, in {:.0} ms ({} MiB held)",
+                started.elapsed().as_secs_f64() * 1e3,
+                held >> 20
             );
             graph
         });
@@ -431,6 +460,25 @@ impl<M: StaticDecode + Sync + 'static> Batcher<M> {
         // announced through `set_epoch`, which dropped the graphs. One
         // thread, and the inputs were synced above.
         unsafe { graph.replay() }.clone()
+    }
+
+    /// The slot tier a step over `live` sequences runs: the smallest power of
+    /// two holding them — or, with more than one live, a wider tier whose
+    /// graph is held. A batch shrinking as its sequences finish keeps its
+    /// graph rather than recapturing at every halving: on the 2B an 8-slot
+    /// step costs a few milliseconds more than a 2-slot one, and a capture
+    /// 0.5-0.9 s of every sequence's time.
+    fn tier_for(&self, live: usize, slots: usize) -> usize {
+        let needed = live.next_power_of_two().min(slots);
+        if needed == 1 {
+            return 1;
+        }
+        self.graphs
+            .keys()
+            .map(|&(t, _)| t)
+            .filter(|&t| t >= needed && t <= slots)
+            .min()
+            .unwrap_or(needed)
     }
 
     /// Each live sequence's pick from its row of `logits`, applied: the
@@ -498,15 +546,29 @@ impl<M: StaticDecode + Sync + 'static> Batcher<M> {
     /// Ensure a state with at least `slots` slots and room past position
     /// `pos`, keeping what it holds. New buffers drop the graphs.
     fn make_room(&mut self, model: &M, slots: usize, pos: usize) {
+        let want = self.shape_for(slots, pos);
         let Some(state) = &self.state else {
-            let want = slots.next_power_of_two().min(self.max_slots).max(slots);
-            let ctx = initial_ctx(pos + 1, self.ceiling);
             self.state = Some(Arc::new(Mutex::new(model.static_state(
-                want,
-                ctx,
+                want.0,
+                want.1,
                 &self.device,
             ))));
             return;
+        };
+        if want != lock(state).shape() {
+            let state = Arc::clone(state);
+            self.drop_graphs();
+            lock(&state).resize(want.0, want.1);
+        }
+    }
+
+    /// The state shape that holds `slots` sequences and position `pos`,
+    /// grown from the current one the way [`Self::make_room`] grows it —
+    /// doubling, so what [`Self::bytes_with`] charges is what it allocates.
+    fn shape_for(&self, slots: usize, pos: usize) -> (usize, usize) {
+        let Some(state) = &self.state else {
+            let want = slots.next_power_of_two().min(self.max_slots).max(slots);
+            return (want, initial_ctx(pos + 1, self.ceiling));
         };
         let (have, mut max_ctx) = lock(state).shape();
         let mut want = have;
@@ -516,11 +578,65 @@ impl<M: StaticDecode + Sync + 'static> Batcher<M> {
         while pos >= max_ctx && max_ctx < self.ceiling {
             max_ctx = max_ctx.saturating_mul(2).min(self.ceiling);
         }
-        if (want, max_ctx) != (have, lock(state).shape().1) {
-            let state = Arc::clone(state);
-            self.drop_graphs();
-            lock(&state).resize(want, max_ctx);
+        (want, max_ctx)
+    }
+
+    /// Bytes the batch's state holds now.
+    #[must_use]
+    pub fn bytes(&self, model: &M) -> u64 {
+        self.state.as_ref().map_or(0, |s| {
+            let (slots, ctx) = lock(s).shape();
+            model.static_bytes(slots, ctx, &self.device)
+        })
+    }
+
+    /// What admitting a request of `prompt` tokens and `max_tokens` adds to
+    /// the card at most: its state at full length, the live sequences' grown
+    /// to theirs, and — when the batch would then need a wider slot tier
+    /// than it has a graph for — that tier's graph, priced per slot from the
+    /// graphs captured so far. `None` while that price is unknown (nothing
+    /// captured yet); a caller then waits a step.
+    #[must_use]
+    pub fn charge(&self, model: &M, prompt: usize, max_tokens: usize) -> Option<u64> {
+        let state = self
+            .bytes_with(model, Some((prompt, max_tokens)))
+            .saturating_sub(self.bytes(model));
+        if self.mode != StepMode::Captured {
+            return Some(state);
         }
+        let tier = (self.seqs.len() + 1)
+            .next_power_of_two()
+            .min(self.max_slots);
+        if self.graphs.keys().any(|&(t, _)| t >= tier) {
+            return Some(state);
+        }
+        if self.graph_per_slot == 0 {
+            return None;
+        }
+        Some(state.saturating_add(self.graph_per_slot.saturating_mul(tier as u64)))
+    }
+
+    /// Bytes the batch's state grows to at most — every live sequence run to
+    /// its last position, and, when `extra` is a request's prompt length and
+    /// `max_tokens`, that one admitted too. What a caller that plans the
+    /// card's memory charges a batch before it admits one more.
+    #[must_use]
+    pub fn bytes_with(&self, model: &M, extra: Option<(usize, usize)>) -> u64 {
+        let slots = self.seqs.len() + usize::from(extra.is_some());
+        if slots == 0 {
+            return self.bytes(model);
+        }
+        let last = self
+            .seqs
+            .iter()
+            .map(|s| s.limit)
+            .chain(extra.map(|(prompt, max)| prompt.saturating_add(max)))
+            .max()
+            .unwrap_or(1)
+            .min(self.ceiling)
+            .saturating_sub(1);
+        let (s, ctx) = self.shape_for(slots, last);
+        model.static_bytes(s, ctx, &self.device)
     }
 
     /// Remove the sequence in `slot`; the last live one moves into it.

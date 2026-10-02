@@ -3424,6 +3424,30 @@ impl crate::capture::StaticDecode for LoadedQwen35 {
             && !crate::nn::refarith::enabled()
     }
 
+    fn static_bytes(&self, slots: usize, max_ctx: usize, device: &Device) -> u64 {
+        let cfg = &self.config;
+        let attn = (0..cfg.num_layers).filter(|&l| cfg.is_attention(l)).count();
+        let kv = crate::nn::static_kv::StaticKv::bytes(
+            crate::nn::static_kv::StaticKvConfig {
+                slots,
+                max_ctx,
+                layers: attn.max(1),
+                kv_heads: cfg.num_key_value_heads,
+                head_dim: cfg.head_dim,
+                rope_dim: cfg.rope_dim,
+                rope_theta: cfg.rope_theta,
+            },
+            device,
+        );
+        let per_slot =
+            cfg.conv_dim() * (cfg.conv_kernel - 1) + cfg.n_v_heads * cfg.d_state * cfg.d_state;
+        let width = crate::nn::static_kv::dtype_width(crate::backend::float_dtype(device));
+        let delta = [cfg.num_layers - attn, slots, per_slot, width]
+            .into_iter()
+            .fold(1usize, usize::saturating_mul);
+        kv.saturating_add(delta as u64)
+    }
+
     fn static_state(&self, slots: usize, max_ctx: usize, device: &Device) -> Qwen35Static {
         let cfg = &self.config;
         let mut index = Vec::with_capacity(cfg.num_layers);
@@ -4792,5 +4816,51 @@ mod tests {
                 "admitted at step 2, cancelled before step 5"
             );
         }
+    }
+
+    /// What a batch is charged before it admits a sequence is exactly what
+    /// it allocates by the time every sequence has run to its last position
+    /// — the context doubling on the way included — so a planner that
+    /// admits against the charge never meets an allocation it did not see.
+    #[test]
+    fn a_batch_is_charged_what_it_allocates() {
+        use crate::batch::{Admission, Batcher};
+        use crate::capture::{StaticDecode, StepMode};
+        use crate::decode::SamplerOptions;
+        let _serial = FUSED_TOGGLE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::flex::gdn::force_disable(true);
+        let _restore = RestoreFused;
+        let mut m = toy_model();
+        m.config.eos_token_id = EosIds::One(u32::MAX);
+        let device = crate::backend::cpu_device();
+        let greedy = SamplerOptions::greedy();
+        let mut batch = Batcher::new(&m, &device, 4, StepMode::Static).expect("static path");
+        let charged_a = batch.bytes_with(&m, Some((5, 1000)));
+        let adm = |prompt: &'static [u32], max_tokens| Admission {
+            prompt_ids: prompt,
+            max_tokens,
+            opts: &greedy,
+            constraint: None,
+        };
+        batch
+            .admit(&m, adm(&[3, 14, 15, 9, 26], 1000))
+            .expect("admits");
+        assert!(batch.bytes(&m) < charged_a, "the context grows later");
+        let charged_ab = batch.bytes_with(&m, Some((3, 200)));
+        assert!(charged_ab > charged_a, "a second slot costs");
+        batch.admit(&m, adm(&[7, 7, 1], 200)).expect("admits");
+        let mut most = batch.bytes(&m);
+        while batch.active() > 0 {
+            batch.step(&m).expect("steps");
+            most = most.max(batch.bytes(&m));
+        }
+        assert_eq!(most, charged_ab, "charged {charged_ab}, allocated {most}");
+        assert_eq!(
+            m.static_bytes(2, 1536, &device),
+            most,
+            "two slots, the context doubled once"
+        );
     }
 }

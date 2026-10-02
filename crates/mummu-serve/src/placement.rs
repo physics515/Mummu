@@ -658,21 +658,80 @@ fn slower_than_remembered(
 }
 
 /// How much slower than its best a probe may run before the load asks for a
-/// quiet re-probe.
+/// re-probe, and how close a re-probe must come to the best to confirm it.
 const REPROBE_MARGIN: f64 = 1.25;
 
-/// The least free share of each device at which an idle re-probe runs.
-const QUIET_SHARE: f64 = 0.8;
+/// The least free share of the host at which its idle re-probe runs (its
+/// probe uses every core; the rate is normalized by the share it had).
+const HOST_PROBE_SHARE: f64 = 0.5;
 
-/// The most of the card other processes may use for it to count as quiet,
-/// percent, from a reading at most [`QUIET_READING_AGE`] old.
+/// Host cores that must be idle for the card's re-probe: every kernel it
+/// times is launched from here, and with the host oversubscribed (24
+/// spinners on 16 cores) each launch waits for a time slice — a free card
+/// read Q4 at 30 GB/s and Q8 at 14. A couple of idle cores is all a launch
+/// thread and the device thread need; most of the host is not.
+const CARD_PROBE_IDLE_CORES: f64 = 2.0;
+
+/// The most of the card other processes may use for its re-probe, percent,
+/// from a reading at most [`QUIET_READING_AGE`] old.
 const QUIET_OTHERS_PERCENT: u32 = 20;
 const QUIET_READING_AGE: u64 = 10;
 
-/// How long after a load before a re-probe: the pressure readings start at
-/// "all free" and need samples to say otherwise — a re-probe in the first
-/// seconds ran with a co-tenant's matmuls still on the card.
-const REPROBE_SETTLE: Duration = Duration::from_secs(15);
+/// The first re-probe's delay after a load — also what the pressure
+/// readings need to stop reading "all free" (they start there) — and the
+/// cap the delay doubles up to.
+const REPROBE_FIRST: Duration = Duration::from_secs(15);
+const REPROBE_MAX_WAIT: Duration = Duration::from_secs(600);
+
+/// Re-probes a device gets at most after a load.
+const REPROBE_TRIES: u32 = 6;
+
+/// One device's re-probe schedule after a load whose probe may not have
+/// seen it free (see [`Live::reprobe`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Reprobe {
+    /// When the next try is due; `None` when none is wanted.
+    due: Option<Instant>,
+    /// What the try after it waits.
+    wait: Duration,
+    tries: u32,
+}
+
+impl Reprobe {
+    fn wanted(now: Instant) -> Self {
+        Self {
+            due: Some(now + REPROBE_FIRST),
+            wait: REPROBE_FIRST,
+            tries: 0,
+        }
+    }
+
+    const fn done() -> Self {
+        Self {
+            due: None,
+            wait: REPROBE_FIRST,
+            tries: 0,
+        }
+    }
+
+    fn is_due(&self, now: Instant) -> bool {
+        self.due.is_some_and(|d| now >= d)
+    }
+
+    /// After a try that `confirmed` the remembered best (came within the
+    /// margin of it): finished once a second try confirms — the first may
+    /// itself have raised the best, a later one then saw the same free
+    /// device — or the tries run out; otherwise it waits twice as long.
+    fn after(&mut self, confirmed: bool, now: Instant) {
+        self.tries += 1;
+        if (confirmed && self.tries >= 2) || self.tries >= REPROBE_TRIES {
+            self.due = None;
+            return;
+        }
+        self.wait = (self.wait * 2).min(REPROBE_MAX_WAIT);
+        self.due = Some(now + self.wait);
+    }
+}
 
 /// A device ran out of memory under a placement this module made: the
 /// working set was bigger than ε̂ said. Double it (and let the guard count a
@@ -1125,6 +1184,14 @@ fn probe_card(pack: &Pack, backend: BackendChoice) -> DeviceModel {
     };
     let mut accel = measure_device(pack, &device_of(backend), false, levels);
     accel.rate = uncontended(&accel.rate, probed_under.gpu_free, Scaling::TimeSliced);
+    // Scaled to a free card, a rate still cannot beat the card's memory: the
+    // floor `measure_device` applied is re-applied after the scaling, which
+    // otherwise lifted a 672 GB/s card to 748.
+    if let Some(peak) = mummu::vram::memory_bandwidth() {
+        for (_, s_per_byte) in &mut accel.rate {
+            *s_per_byte = s_per_byte.max(1.0 / peak);
+        }
+    }
     accel
 }
 
@@ -1176,13 +1243,10 @@ pub(super) struct Live {
     /// The head is the token table (a tied checkpoint): where the head goes,
     /// the table goes — see [`Self::measure`].
     pub head_is_table: bool,
-    /// Whether the load's probes may not have seen the free host / card (no
-    /// remembered best to compare with, or slower than it): each is probed
-    /// again at the first idle tick that finds it quiet. See [`best_rates`].
-    reprobe_wanted: [bool; 2],
-    /// When the load measured: the pressure readings need a while to be
-    /// worth trusting with "quiet" (they start at "all free").
-    measured_at: Instant,
+    /// The host's and the card's re-probe schedules: wanted when the load's
+    /// probe may not have seen the device free (no remembered best to
+    /// compare with, or slower than it). See [`Live::reprobe`].
+    reprobe: [Reprobe; 2],
 }
 
 pub(super) static LIVE: Mutex<Option<Live>> = Mutex::new(None);
@@ -1224,15 +1288,21 @@ impl Live {
         // meets (see `best_rates`).
         let evidence = residual_file_for(pack_dir);
         let remembered = evidence.as_deref().and_then(|p| recall_rates(p, backend));
-        let reprobe_wanted =
-            remembered
-                .as_ref()
-                .map_or([true, backend != BackendChoice::Cpu], |[h, a]| {
-                    [
-                        slower_than_remembered(&host.rate, h, REPROBE_MARGIN),
-                        slower_than_remembered(&accel.rate, a, REPROBE_MARGIN),
-                    ]
-                });
+        let wanted = remembered
+            .as_ref()
+            .map_or([true, backend != BackendChoice::Cpu], |[h, a]| {
+                [
+                    slower_than_remembered(&host.rate, h, REPROBE_MARGIN),
+                    slower_than_remembered(&accel.rate, a, REPROBE_MARGIN),
+                ]
+            });
+        let reprobe = wanted.map(|w| {
+            if w {
+                Reprobe::wanted(Instant::now())
+            } else {
+                Reprobe::done()
+            }
+        });
         if let Some([h, a]) = &remembered {
             host.rate = best_rates(&host.rate, h);
             accel.rate = best_rates(&accel.rate, a);
@@ -1279,49 +1349,55 @@ impl Live {
             head_card_bytes,
             head_on_card: false,
             head_is_table,
-            reprobe_wanted,
-            measured_at: Instant::now(),
+            reprobe,
         })
     }
 
-    /// Probe the devices `quiet` says are free again — idle — and keep the
-    /// better rate per level. A load whose probes met a co-tenant asks for
-    /// this; the idle re-plan that follows then sees the devices as they are.
-    /// One device at a time: on a machine whose CPU is never quiet the card
-    /// still gets its second look.
-    fn reprobe(&mut self, quiet: [bool; 2]) {
-        if self.measured_at.elapsed() < REPROBE_SETTLE {
-            return;
-        }
-        let due = [0, 1].map(|d| self.reprobe_wanted[d] && quiet[d]);
+    /// The idle re-probe: each device whose schedule is due, and whose gate
+    /// `open` says it can be measured now, is probed again and keeps the
+    /// better rate per level — a re-probe can only raise a rate. The idle
+    /// re-plan that follows sees the devices as they are, and moves
+    /// precisions with them. Not "wait for a quiet machine": a host that is
+    /// never quiet still gets its card re-measured, because what the card's
+    /// probe needs is a couple of idle cores, not most of the host.
+    fn reprobe(&mut self, open: [bool; 2]) {
+        let now = Instant::now();
+        let due = [0, 1].map(|d| open[d] && self.reprobe[d].is_due(now));
         if !due.contains(&true) {
             return;
         }
         let Ok(pack) = Pack::open(&self.pack_dir) else {
             return;
         };
-        if due[0] {
-            self.host.rate = best_rates(&probe_host(&pack).rate, &self.host.rate);
-            self.reprobe_wanted[0] = false;
-        }
-        if due[1] {
-            self.accel.rate = best_rates(&probe_card(&pack, self.backend).rate, &self.accel.rate);
-            self.reprobe_wanted[1] = false;
+        for d in [0, 1].into_iter().filter(|&d| due[d]) {
+            let (fresh, model) = if d == 0 {
+                (probe_host(&pack), &mut self.host)
+            } else {
+                (probe_card(&pack, self.backend), &mut self.accel)
+            };
+            let confirmed = !slower_than_remembered(&fresh.rate, &model.rate, REPROBE_MARGIN);
+            model.rate = best_rates(&fresh.rate, &model.rate);
+            self.reprobe[d].after(confirmed, now);
+            eprintln!(
+                "[mummu-serve] placement: re-probed the {} (try {}): measured [{}], planning on [{}]{}",
+                if d == 0 {
+                    "host"
+                } else {
+                    label_of(self.backend)
+                },
+                self.reprobe[d].tries,
+                show_rates(&fresh),
+                show_rates(model),
+                if self.reprobe[d].due.is_none() {
+                    " — settled"
+                } else {
+                    ""
+                }
+            );
         }
         if let Some(path) = residual_file_for(&self.pack_dir) {
             remember_rates(&path, self.backend, &self.host.rate, &self.accel.rate);
         }
-        eprintln!(
-            "[mummu-serve] placement rates re-probed on a quiet {}: host [{}]; {} [{}]",
-            match due {
-                [true, true] => "machine",
-                [true, false] => "host",
-                _ => "card",
-            },
-            show_rates(&self.host),
-            label_of(self.backend),
-            show_rates(&self.accel)
-        );
     }
 
     fn layers_on_card(&self) -> usize {
@@ -1996,30 +2072,14 @@ fn tick() {
         }
         let AnyLm::Qwen35(lm) = &mut m.lm else { return };
         let ctx = idle_context();
-        let pressure = crate::sysmon::pressure();
-        // The card's probe needs the host too: every one of its kernels is
-        // launched from here, and with other processes on 15 of 16 cores a
-        // quiet card measured Q8 at 67 GB/s.
-        let host_quiet = pressure.cpu.is_some() && pressure.cpu_free >= QUIET_SHARE;
-        let quiet = [
-            host_quiet,
-            host_quiet
-                && !yielded
-                && pressure.gpu_free >= QUIET_SHARE
-                && pressure
-                    .gpu_others
-                    .is_some_and(|o| o <= QUIET_OTHERS_PERCENT)
-                && pressure
-                    .gpu_others_age_s
-                    .is_some_and(|a| a <= QUIET_READING_AGE),
-        ];
+        let open = probe_gates(&crate::sysmon::pressure(), yielded);
         let replanned = LIVE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_mut()
             .filter(|l| l.pack_dir.starts_with(key))
             .map(|live| {
-                live.reprobe(quiet);
+                live.reprobe(open);
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     replan_and_apply(live, lm, ctx, false, true)
                 }));
@@ -2058,6 +2118,28 @@ fn tick() {
             mummu::progress::evicted();
         }
     }
+}
+
+/// Whether the host and the card can each be re-probed now (see
+/// [`Live::reprobe`]): the host with at least half of it free; the card with
+/// no co-tenant on it (a fresh reading), and a couple of host cores idle to
+/// launch its kernels from.
+fn probe_gates(pressure: &crate::sysmon::Pressure, yielded: bool) -> [bool; 2] {
+    let idle_cores = pressure
+        .cpu
+        .as_ref()
+        .map(|c| f64_from_usize(c.cores) - c.ours - c.others);
+    let card_free = !yielded
+        && pressure
+            .gpu_others
+            .is_some_and(|o| o <= QUIET_OTHERS_PERCENT)
+        && pressure
+            .gpu_others_age_s
+            .is_some_and(|a| a <= QUIET_READING_AGE);
+    [
+        idle_cores.is_some() && pressure.cpu_free >= HOST_PROBE_SHARE,
+        card_free && idle_cores.is_some_and(|i| i >= CARD_PROBE_IDLE_CORES),
+    ]
 }
 
 /// Start the idle rebalancer. One per process.
@@ -2442,5 +2524,71 @@ mod tests {
         assert_eq!(v["residual_bytes"].as_u64(), Some(456));
         assert!(recall_rates(&dir.join("absent.json"), BackendChoice::Wgpu).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A re-probe schedule waits 15 s, then doubles; it settles once a
+    /// second try confirms the best (the first may have raised it), and
+    /// gives up after six.
+    #[test]
+    fn a_reprobe_settles_on_the_second_confirmation() {
+        let t0 = Instant::now();
+        let mut r = Reprobe::wanted(t0);
+        assert!(!r.is_due(t0));
+        assert!(r.is_due(t0 + REPROBE_FIRST));
+        r.after(true, t0);
+        assert_eq!(
+            (r.tries, r.due),
+            (1, Some(t0 + 2 * REPROBE_FIRST)),
+            "one confirmation is not enough"
+        );
+        r.after(true, t0);
+        assert_eq!(r.due, None, "settled");
+        let mut slow = Reprobe::wanted(t0);
+        for _ in 0..REPROBE_TRIES {
+            assert!(slow.due.is_some());
+            slow.after(false, t0);
+        }
+        assert_eq!(slow.due, None, "gave up after {REPROBE_TRIES}");
+        assert!(slow.wait <= REPROBE_MAX_WAIT);
+    }
+
+    /// The card is re-probed on a busy host as long as two cores are idle
+    /// and nobody else is on the card; the host only when half of it is free.
+    #[test]
+    fn the_card_is_reprobed_on_a_busy_host() {
+        let reading = |others: f64, gpu_others: Option<u32>| crate::sysmon::Pressure {
+            cpu: Some(crate::sysmon::CpuShare {
+                cores: 16,
+                ours: 0.0,
+                others,
+            }),
+            gpu_others,
+            gpu_others_age_s: gpu_others.map(|_| 1),
+            cpu_free: 1.0 - others / 16.0,
+            ..crate::sysmon::Pressure::default()
+        };
+        // This box on a normal day: other routines on 11 of 16 cores.
+        assert_eq!(probe_gates(&reading(11.0, Some(2)), false), [false, true]);
+        assert_eq!(probe_gates(&reading(4.0, Some(2)), false), [true, true]);
+        assert_eq!(
+            probe_gates(&reading(15.0, Some(2)), false),
+            [false, false],
+            "oversubscribed"
+        );
+        assert_eq!(
+            probe_gates(&reading(4.0, Some(60)), false),
+            [true, false],
+            "a co-tenant on the card"
+        );
+        assert_eq!(
+            probe_gates(&reading(4.0, Some(2)), true),
+            [true, false],
+            "yielded"
+        );
+        assert_eq!(
+            probe_gates(&reading(4.0, None), false),
+            [true, false],
+            "no clean card reading yet"
+        );
     }
 }

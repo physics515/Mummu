@@ -2758,9 +2758,41 @@ fn probe_projection_ms(
     while reps < PROBE_MAX_REPS && batch(reps) < PROBE_BATCH_MS {
         reps *= 2;
     }
-    let best = (0..3).map(|_| batch(reps)).fold(f64::INFINITY, f64::min);
+    if mummu::backend::is_flex(device) {
+        let best = (0..3).map(|_| batch(reps)).fold(f64::INFINITY, f64::min);
+        return Some(best / f64::from(reps));
+    }
+    // The card's batch is captured and replayed — the path its decode runs
+    // on (`mummu::capture`), with the per-launch CPU work done once. Timed
+    // op by op, the probe was as much the host's dispatch thread as the
+    // card: with other processes on 15 of 16 cores a free card read Q8 at
+    // 67 GB/s. Each call's output is chained into the next sum so that no
+    // call is dead code a lazy backend could skip.
+    let chained = || {
+        let mut acc = gemv();
+        for _ in 1..reps {
+            acc = acc.add(gemv());
+        }
+        acc
+    };
+    let mut graph = burn::tensor::capture(device, chained);
+    let mut best = f64::INFINITY;
+    for _ in 0..PROBE_REPLAYS {
+        let t0 = std::time::Instant::now();
+        // SAFETY: the graph reads `w` and `x`, which outlive it (it is dropped
+        // below, before them), and writes only buffers it owns; one thread,
+        // and nothing refreshes an input between replays.
+        let out = unsafe { graph.replay() }.clone();
+        touch(out);
+        best = best.min(t0.elapsed().as_secs_f64() * 1e3);
+    }
+    drop(graph);
+    mummu::backend::return_memory(device);
     Some(best / f64::from(reps))
 }
+
+/// Replays a captured card probe is timed over (the best counts).
+const PROBE_REPLAYS: usize = 5;
 
 /// The least a timed probe batch should take, ms: long enough that the
 /// batch's single readback fence is a small part of it.
@@ -2769,27 +2801,48 @@ const PROBE_BATCH_MS: f64 = 5.0;
 /// The most calls a probe batch grows to.
 const PROBE_MAX_REPS: u32 = 1024;
 
-/// Sustained host DRAM read bandwidth, GB/s, measured once per process
-/// (threaded sum over a 512 MiB buffer — past every cache on this part).
-/// The denominator for [`host_probe_floor_ms`].
+/// Sustained host DRAM read bandwidth, GB/s: the best this process has
+/// measured (threaded sum over a 512 MiB buffer — past every cache on this
+/// part), re-measured when the last measurement is over
+/// [`DRAM_REMEASURE`] old. The denominator for [`host_probe_floor_ms`].
+///
+/// The best, not the first: measured once per process, a server started
+/// under a CPU hog read 1.3 GB/s, and every host probe after it — the quiet
+/// re-probes included — was floored at that for the process's life.
 fn host_dram_gbps() -> f64 {
-    static BW: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *BW.get_or_init(|| {
-        use rayon::prelude::*;
-        let words = (512usize << 20) / 8;
-        let buf: Vec<u64> = (0..words as u64).collect();
-        let mut best = f64::INFINITY;
-        for _ in 0..3 {
-            let t0 = std::time::Instant::now();
-            let s: u64 = buf
-                .par_chunks(1 << 16)
-                .map(|c| c.iter().fold(0u64, |a, &b| a.wrapping_add(b)))
-                .reduce(|| 0, u64::wrapping_add);
-            std::hint::black_box(s);
-            best = best.min(t0.elapsed().as_secs_f64());
-        }
-        f64_from_usize(words * 8) / best / 1e9
-    })
+    static BEST: Mutex<Option<(f64, Instant)>> = Mutex::new(None);
+    let mut best = BEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((gbps, at)) = *best
+        && at.elapsed() < DRAM_REMEASURE
+    {
+        return gbps;
+    }
+    let measured = measure_host_dram_gbps();
+    let gbps = best.map_or(measured, |(b, _)| b.max(measured));
+    *best = Some((gbps, Instant::now()));
+    gbps
+}
+
+/// How long a DRAM bandwidth reading stands before a probe measures again.
+const DRAM_REMEASURE: Duration = Duration::from_secs(10);
+
+fn measure_host_dram_gbps() -> f64 {
+    use rayon::prelude::*;
+    let words = (512usize << 20) / 8;
+    let buf: Vec<u64> = (0..words as u64).collect();
+    let mut best = f64::INFINITY;
+    for _ in 0..3 {
+        let t0 = std::time::Instant::now();
+        let s: u64 = buf
+            .par_chunks(1 << 16)
+            .map(|c| c.iter().fold(0u64, |a, &b| a.wrapping_add(b)))
+            .reduce(|| 0, u64::wrapping_add);
+        std::hint::black_box(s);
+        best = best.min(t0.elapsed().as_secs_f64());
+    }
+    f64_from_usize(words * 8) / best / 1e9
 }
 
 /// The floor a host-side projection probe may not report under: the probe
@@ -3974,12 +4027,14 @@ async fn serve_held(
                 opts: req.opts.clone(),
                 constraint,
                 updates: tx,
+                joined: false,
             };
             let started = Instant::now();
             let info = decoder::start(m, key, &spec.name, job);
             let r = generate_batched(
                 &info,
                 rx,
+                None,
                 prompt_tokens,
                 &keep,
                 req,
@@ -4165,6 +4220,7 @@ fn prepare_batched(
 async fn generate_batched(
     info: &decoder::SessionInfo,
     mut updates: tokio::sync::mpsc::UnboundedReceiver<decoder::Update>,
+    first: Option<decoder::Update>,
     prompt_tokens: usize,
     keep: &[u32],
     req: &GenerationRequest<'_>,
@@ -4177,8 +4233,19 @@ async fn generate_batched(
     let mut emitted = String::new();
     let mut first_token_at: Option<Instant> = None;
     let mut finished = false;
-    while let Some(update) = updates.recv().await {
+    let mut pending = first;
+    loop {
+        let update = match pending.take() {
+            Some(u) => u,
+            None => match updates.recv().await {
+                Some(u) => u,
+                None => break,
+            },
+        };
         match update {
+            // Only ever an admission's first answer, which `join_session`
+            // reads itself; a starter is never turned back.
+            decoder::Update::Bounced => break,
             decoder::Update::Token(id) => {
                 if ids.is_empty() {
                     if let Some(p) = progress {
@@ -4270,9 +4337,17 @@ async fn join_session(
         opts: req.opts.clone(),
         constraint,
         updates: tx,
+        joined: true,
     };
     let started = Instant::now();
     decoder::join(key, job).ok()?;
+    let mut rx = rx;
+    // The thread answers the admission first: a bounce sends the request
+    // back to the slot queue, anything else is its generation.
+    let first = match rx.recv().await {
+        Some(decoder::Update::Bounced) | None => return None,
+        first => first,
+    };
     eprintln!(
         "[mummu-serve] chat request for {} joined the running decode batch",
         req.spec.name
@@ -4281,6 +4356,7 @@ async fn join_session(
         generate_batched(
             &info,
             rx,
+            first,
             prompt_tokens,
             &keep,
             req,

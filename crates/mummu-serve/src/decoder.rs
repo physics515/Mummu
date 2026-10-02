@@ -68,10 +68,19 @@ pub(super) struct Job {
     pub opts: SamplerOptions,
     pub constraint: Option<Box<dyn Constraint>>,
     pub updates: tokio::sync::mpsc::UnboundedSender<Update>,
+    /// Joined a running session rather than starting it. The starter's
+    /// context was planned for when it took the slot (`before_request`); a
+    /// joiner's is charged at admission (see `Thread::admit`).
+    pub joined: bool,
 }
 
 /// What the thread tells a request about its generation.
 pub(super) enum Update {
+    /// Turned back before its first token: the batch could not take it
+    /// without more of the card than placement leaves free. The request
+    /// takes the ordinary path — it queues for the slot, and its own context
+    /// is planned for when it gets it.
+    Bounced,
     Token(u32),
     /// The generation is over: it stopped, or it failed. A device failure
     /// arrives already decided (the model was evicted on the thread).
@@ -343,11 +352,11 @@ impl Thread {
                 job,
             } => {
                 self.begin(guard, key, model);
-                self.admit(job);
+                self.enqueue(job);
             }
             Msg::Join(job) => {
                 if self.held.is_some() {
-                    self.admit(job);
+                    self.enqueue(job);
                 } else {
                     // Unreachable by the registry protocol; said rather
                     // than dropped.
@@ -414,20 +423,50 @@ impl Thread {
         });
     }
 
-    fn admit(&mut self, job: Job) {
+    /// Admit `job`, or hand it back to wait: the batch is full, or the
+    /// graph a joiner would need is not priced yet (the next step's capture
+    /// prices it).
+    fn admit(&mut self, job: Job) -> Option<Job> {
         let (Some(held), Some(cached)) = (&mut self.held, &mut self.cached) else {
             let _ = job.updates.send(Update::Done(Err(ChatError::request(
                 "this model cannot take the batched decode path",
             ))));
-            return;
+            return None;
         };
         let room = match &cached.batcher {
             AnyBatcher::Qwen3(b) => b.has_room(),
             AnyBatcher::Qwen35(b) => b.has_room(),
         };
         if !room {
-            held.waiting.push_back(job);
-            return;
+            return Some(job);
+        }
+        if job.joined {
+            let live = !held.jobs.is_empty();
+            match charge(&cached.batcher, &held.guard, &job) {
+                Charge::Unknown if live => return Some(job),
+                Charge::Unknown => {
+                    // Nothing in the batch to learn the price from.
+                    let _ = job.updates.send(Update::Bounced);
+                    return None;
+                }
+                Charge::Over { need, free } => {
+                    eprintln!(
+                        "[mummu-serve] decode thread: a request stays out of the batch — its \
+                         context needs {:.2} GiB more of the card, placement leaves {:.2} GiB; it \
+                         queues for the slot instead",
+                        gib(need),
+                        gib(free)
+                    );
+                    let _ = job.updates.send(Update::Bounced);
+                    return None;
+                }
+                Charge::Fits { need, free } => eprintln!(
+                    "[mummu-serve] decode thread: a request joins the batch — charged {:.2} GiB \
+                     of the card at its longest, {:.2} GiB free",
+                    gib(need),
+                    gib(free)
+                ),
+            }
         }
         let Job {
             prompt_ids,
@@ -435,6 +474,7 @@ impl Thread {
             opts,
             constraint,
             updates,
+            ..
         } = job;
         let adm = Admission {
             prompt_ids: &prompt_ids,
@@ -466,6 +506,22 @@ impl Thread {
             Ok(Err(message)) => self.fail(&[updates], message, None),
             Err(payload) => self.fail(&[updates], recovery::payload_text(&*payload), Some(payload)),
         }
+        None
+    }
+
+    /// Admit `job` now, or queue it behind whatever already waits.
+    fn enqueue(&mut self, job: Job) {
+        if self.held.as_ref().is_some_and(|h| !h.waiting.is_empty()) {
+            if let Some(h) = &mut self.held {
+                h.waiting.push_back(job);
+            }
+            return;
+        }
+        if let Some(job) = self.admit(job)
+            && let Some(h) = &mut self.held
+        {
+            h.waiting.push_back(job);
+        }
     }
 
     /// Admit what waited for a slot, while there is room.
@@ -483,7 +539,12 @@ impl Thread {
             else {
                 return;
             };
-            self.admit(job);
+            if let Some(job) = self.admit(job) {
+                if let Some(h) = &mut self.held {
+                    h.waiting.push_front(job);
+                }
+                return;
+            }
         }
     }
 
@@ -658,6 +719,59 @@ impl Thread {
             eprintln!("[mummu-serve] decode thread: dropped the cached graphs and state ({why})");
         }
     }
+}
+
+/// What the card must find room for beside the placement before a batch
+/// may admit `job` from a request that joined it: the batch's state grown
+/// to every live sequence's last position and the job's, less what it holds
+/// already, plus the graph of a wider slot tier when it would need one
+/// (`Batcher::charge`), plus [`BATCH_MARGIN`] — and placement's free bytes for the card
+/// (`free_for_new`: capacity under the guard, less everything in use,
+/// nothing at all while the GPU is yielded). It joins only when the first
+/// fits in the second.
+///
+/// A batch never asks placement to MOVE layers for a joiner: the static
+/// step needs every layer on the card, and a move under a live batch would
+/// break it for every sequence in it.
+fn charge(batcher: &AnyBatcher, guard: &Loaded, job: &Job) -> Charge {
+    let (prompt, max) = (job.prompt_ids.len(), job.max_tokens);
+    let need = match (batcher, &guard.lm) {
+        (AnyBatcher::Qwen3(b), AnyLm::Qwen3(m)) => b.charge(m, prompt, max),
+        (AnyBatcher::Qwen35(b), AnyLm::Qwen35(m)) => b.charge(m, prompt, max),
+        _ => Some(0),
+    };
+    let Some(need) = need else {
+        return Charge::Unknown;
+    };
+    let need = need + BATCH_MARGIN;
+    let free = super::placement::free_for_new(guard.backend);
+    if need > free {
+        Charge::Over { need, free }
+    } else {
+        Charge::Fits { need, free }
+    }
+}
+
+/// A joiner's charge against the card (see [`charge`]).
+enum Charge {
+    Fits {
+        need: u64,
+        free: u64,
+    },
+    Over {
+        need: u64,
+        free: u64,
+    },
+    /// The wider tier's graph is not priced yet: no graph captured so far.
+    Unknown,
+}
+
+/// Headroom a joiner's admission keeps beyond the state it charges: the
+/// wider tier's activations, its logits row and its graph's working set.
+const BATCH_MARGIN: u64 = 128 << 20;
+
+fn gib(bytes: u64) -> f64 {
+    mummu_num::f64_from_u64(bytes) / f64::from(1u32 << 30)
 }
 
 /// Send one batch event to its request; `false` when the request is gone.

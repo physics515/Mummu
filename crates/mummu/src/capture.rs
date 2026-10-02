@@ -57,6 +57,10 @@ pub trait StaticDecode: CausalLm {
     /// otherwise. Cheap: no allocation.
     fn static_supported(&self, device: &Device) -> bool;
 
+    /// The bytes [`Self::static_state`] allocates for that shape on
+    /// `device` — what a caller planning the card's memory charges a batch.
+    fn static_bytes(&self, slots: usize, max_ctx: usize, device: &Device) -> u64;
+
     /// A zeroed static state for `slots` sequences of up to `max_ctx`
     /// positions on `device`, which [`Self::static_supported`] accepted.
     fn static_state(&self, slots: usize, max_ctx: usize, device: &Device) -> Self::State;
@@ -417,6 +421,11 @@ pub async fn generate<M: StaticDecode + Sync>(
                 &mut lock(&kv),
                 len,
             ));
+        }
+        // One graph at a time: the bucket only grows within a generation, and
+        // every graph held keeps its whole working set on the card.
+        if !graphs.contains_key(&len) {
+            drop_graphs(&mut graphs, device);
         }
         let graph = graphs.entry(len).or_insert_with(|| {
             let (kv, tokens, positions) = (&kv, &tokens, &positions);

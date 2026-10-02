@@ -709,6 +709,20 @@ impl LoadedQwen3 {
     }
 }
 
+impl LoadedQwen3 {
+    const fn static_kv_config(&self, slots: usize, max_ctx: usize) -> StaticKvConfig {
+        StaticKvConfig {
+            slots,
+            max_ctx,
+            layers: self.config.num_hidden_layers,
+            kv_heads: self.config.num_key_value_heads,
+            head_dim: self.config.head_dim,
+            rope_dim: self.config.head_dim,
+            rope_theta: self.config.rope_theta,
+        }
+    }
+}
+
 impl crate::capture::StaticDecode for LoadedQwen3 {
     type State = StaticKv;
 
@@ -717,19 +731,12 @@ impl crate::capture::StaticDecode for LoadedQwen3 {
         self.model.embed_tokens.weight.val().device() == *device
     }
 
+    fn static_bytes(&self, slots: usize, max_ctx: usize, device: &Device) -> u64 {
+        StaticKv::bytes(self.static_kv_config(slots, max_ctx), device)
+    }
+
     fn static_state(&self, slots: usize, max_ctx: usize, device: &Device) -> StaticKv {
-        StaticKv::new(
-            StaticKvConfig {
-                slots,
-                max_ctx,
-                layers: self.config.num_hidden_layers,
-                kv_heads: self.config.num_key_value_heads,
-                head_dim: self.config.head_dim,
-                rope_dim: self.config.head_dim,
-                rope_theta: self.config.rope_theta,
-            },
-            device,
-        )
+        StaticKv::new(self.static_kv_config(slots, max_ctx), device)
     }
 
     fn trained_context(&self) -> Option<usize> {

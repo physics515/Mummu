@@ -50,11 +50,10 @@ pub struct StaticKvConfig {
     pub rope_theta: f32,
 }
 
-/// Keys a bucket grows by.
+/// The smallest bucket, keys.
 ///
 /// Small enough that a short chat attends to few masked keys (the cost of a
-/// bucket is its masked tail), large enough that a long generation captures
-/// a handful of graphs, not hundreds.
+/// bucket is its masked tail); buckets above it double (see [`bucket`]).
 pub const BUCKET: usize = 256;
 
 /// Per-step tensors every layer shares, derived on the device from the
@@ -115,13 +114,7 @@ impl StaticKv {
             cfg.rope_dim,
             cfg.head_dim
         );
-        // The dynamic cache's storage rule (`kv_append`): f16 when the
-        // half-precision KV switch is on over f32 compute, else the compute
-        // dtype — so both paths round the same keys the same way.
-        let dtype = match crate::backend::float_dtype(device) {
-            DType::F32 if super::kv_f16_enabled() => DType::F16,
-            compute => compute,
-        };
+        let dtype = kv_dtype(device);
         let shape = [cfg.slots, cfg.kv_heads, cfg.max_ctx, cfg.head_dim];
         let layers = (0..cfg.layers)
             .map(|_| {
@@ -159,14 +152,31 @@ impl StaticKv {
         }
     }
 
+    /// The bytes a cache of `cfg` holds on `device`: keys and values, and
+    /// the `RoPE` tables.
+    #[must_use]
+    pub fn bytes(cfg: StaticKvConfig, device: &Device) -> u64 {
+        let kv = [
+            2,
+            cfg.layers,
+            cfg.slots,
+            cfg.kv_heads,
+            cfg.max_ctx,
+            cfg.head_dim,
+        ]
+        .into_iter()
+        .fold(dtype_width(kv_dtype(device)), usize::saturating_mul);
+        let tables = 2 * cfg.max_ctx * cfg.rope_dim * 4;
+        kv.saturating_add(tables) as u64
+    }
+
     #[must_use]
     pub const fn config(&self) -> StaticKvConfig {
         self.cfg
     }
 
     /// The bucket a step needs when the highest position written this step
-    /// is `max_pos`: the next multiple of [`BUCKET`] holding keys
-    /// `0..=max_pos`, capped at `max_ctx`.
+    /// is `max_pos` (see [`bucket`]).
     ///
     /// # Panics
     ///
@@ -354,9 +364,35 @@ impl StaticKv {
     }
 }
 
-/// The bucket a step needs when the highest position written this step is
-/// `max_pos`, in a cache of `max_ctx` positions: the next multiple of
-/// [`BUCKET`] holding keys `0..=max_pos`, capped at `max_ctx`.
+/// The dtype a static cache stores keys and values in on `device`: the
+/// dynamic cache's rule (`kv_append`) — f16 when the half-precision KV switch
+/// is on over f32 compute, else the compute dtype — so both paths round the
+/// same keys the same way.
+fn kv_dtype(device: &Device) -> DType {
+    match crate::backend::float_dtype(device) {
+        DType::F32 if super::kv_f16_enabled() => DType::F16,
+        compute => compute,
+    }
+}
+
+/// Bytes per element of a float `dtype`.
+#[must_use]
+pub const fn dtype_width(dtype: DType) -> usize {
+    match dtype {
+        DType::F16 | DType::BF16 => 2,
+        DType::F64 => 8,
+        _ => 4,
+    }
+}
+
+/// The bucket a step needs when the highest position written is `max_pos`.
+///
+/// In a cache of `max_ctx` positions: the smallest power of two of at least
+/// [`BUCKET`] keys that holds keys `0..=max_pos`, capped at `max_ctx`.
+/// Powers of two, not multiples of [`BUCKET`]: every bucket is a graph to
+/// capture and hold (on the 2B, ~210 MiB per batch slot), so a long
+/// generation should pass through a handful — five to 4096 keys — not one
+/// per 256.
 ///
 /// # Panics
 ///
@@ -367,10 +403,7 @@ pub fn bucket(max_pos: usize, max_ctx: usize) -> usize {
         max_pos < max_ctx,
         "position {max_pos} is outside a {max_ctx}-position static cache"
     );
-    (max_pos + 1)
-        .div_ceil(BUCKET)
-        .saturating_mul(BUCKET)
-        .min(max_ctx)
+    (max_pos + 1).next_power_of_two().max(BUCKET).min(max_ctx)
 }
 
 /// A copy of `t` in a buffer of its own (a clone shares the buffer), for a
