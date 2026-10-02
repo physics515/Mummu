@@ -146,7 +146,7 @@ fn release<T>(r: Resident<T>) {
     let name = r.name.clone();
     drop(r);
     if backend != BackendChoice::Cpu {
-        engine::device_of(backend).memory_cleanup();
+        mummu::backend::return_memory(&engine::device_of(backend));
     }
     eprintln!("[mummu-serve] retrieval: {name} unloaded");
 }
@@ -366,7 +366,7 @@ async fn acquire<T: Retrieval>(
         // The load's staging buffers (the bf16 → f32 casts) are free pages
         // now; hand them back for the same reason a forward does (see `run`).
         if backend != BackendChoice::Cpu {
-            device.memory_cleanup();
+            mummu::backend::return_memory(&device);
         }
         model
     })
@@ -472,7 +472,7 @@ where
             // card it had planned to fit (measured on this change, before
             // this line: 11.6 GiB held after two 0.6B retrieval models).
             if backend != BackendChoice::Cpu {
-                device.memory_cleanup();
+                mummu::backend::return_memory(&device);
             }
             out
         })

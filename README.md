@@ -384,6 +384,13 @@ async fn search(dir: &std::path::Path, rr: &std::path::Path) -> Result<(), Box<d
   `capture::generate_batch_greedy` steps N sequences in one dispatch, each exactly its solo
   decode: 16 slots of the 2B in f16 decode **461 tokens/s together against 54 alone**.
   `tests/real_capture.rs` is the gate and the benchmark.
+- **Continuous batching in serve** *(2026-10-01)* — `mummu::batch::Batcher` keeps one static state
+  for several sequences and its captured graphs across requests; serve's decode thread holds the
+  model while a batch runs, and every request for that model joins it between steps, each decoding
+  exactly what it would alone (greedy, seeded sampling, JSON-constrained; a disconnecting client
+  just leaves). The 2B's second request onward skips the capture (12.7 ms/token), and four
+  concurrent requests finish in 5.2 s against 8.9 s one after another. `MUMMU_DECODE_SLOTS`
+  (default 8) caps a batch.
 
 ## Design principles
 

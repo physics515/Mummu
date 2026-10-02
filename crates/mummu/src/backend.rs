@@ -816,6 +816,18 @@ pub fn device_label() -> &'static str {
     }
 }
 
+/// Hand what was just dropped back to the driver, not only to the pool.
+///
+/// The explicit cleanup returns the pool's free slices to wgpu, which frees
+/// a buffer only once it next processes completed work — a device sync. In
+/// between, the card still holds it: measured on the 2B, the process held
+/// 4.3-6.6 GB after each batch shape and 4.0 GB after the sync, and a model
+/// load in that window ran the card out of memory.
+pub fn return_memory(device: &burn::tensor::Device) {
+    device.memory_cleanup();
+    let _ = burn::tensor::Device::sync(device);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

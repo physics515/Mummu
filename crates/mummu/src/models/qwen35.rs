@@ -928,9 +928,10 @@ impl GatedDeltaNet {
         // The dynamic decode branch of `causal_conv`: the window is the
         // cached `kk - 1` columns plus this one, and the new cache is its
         // last `kk - 1`.
-        let mix_cm = mixed.swap_dims(1, 2); // [slots, conv_dim, 1]
-        let conv_dim = mix_cm.dims()[1];
-        let window = Tensor::cat(vec![st.conv.clone(), mix_cm], 2);
+        let mix_cm = mixed.swap_dims(1, 2); // [k, conv_dim, 1]
+        // The step's slots are the state's first `k`.
+        let [k, conv_dim, _] = mix_cm.dims();
+        let window = Tensor::cat(vec![st.conv.clone().narrow(0, 0, k), mix_cm], 2);
         let taps = self.conv1d.weight.val().reshape([1, conv_dim, kk]);
         let conv_out = window.clone().mul(taps).sum_dim(2);
         crate::nn::static_kv::overwrite(&mut st.conv, window.narrow(2, 1, kk - 1));
@@ -944,7 +945,8 @@ impl GatedDeltaNet {
             beta: &beta,
         };
         let scale = 1.0 / f32_from_usize(cfg.d_state).sqrt();
-        let (out_heads, s_new) = gdn_recurrence_sequential(&inputs, st.state.clone(), scale);
+        let (out_heads, s_new) =
+            gdn_recurrence_sequential(&inputs, st.state.clone().narrow(0, 0, k), scale);
         crate::nn::static_kv::overwrite(&mut st.state, s_new);
         self.gated_output(out_heads, gate_z, cfg, had)
     }
@@ -3355,10 +3357,46 @@ impl crate::capture::StaticState for Qwen35Static {
         }
     }
 
+    fn shape(&self) -> (usize, usize) {
+        let c = self.kv.config();
+        (c.slots, c.max_ctx)
+    }
+
     /// Only attention grows with the context; a `DeltaNet` state is the
-    /// same size at any length.
-    fn grow(&mut self, max_ctx: usize) {
-        self.kv.grow(max_ctx);
+    /// same size at any length, and only changes its slot count.
+    fn resize(&mut self, slots: usize, max_ctx: usize) {
+        let old = self.kv.config().slots;
+        self.kv.resize(slots, max_ctx);
+        if slots == old {
+            return;
+        }
+        let kept = slots.min(old);
+        for d in &mut self.delta {
+            let [_, channels, taps] = d.conv.dims();
+            let fresh =
+                Tensor::<3>::zeros([slots, channels, taps], (&d.conv.device(), d.conv.dtype()));
+            d.conv = fresh.slice_assign(
+                [0..kept, 0..channels, 0..taps],
+                d.conv.clone().narrow(0, 0, kept),
+            );
+            let [_, heads, keys, values] = d.state.dims();
+            let fresh = Tensor::<4>::zeros(
+                [slots, heads, keys, values],
+                (&d.state.device(), d.state.dtype()),
+            );
+            d.state = fresh.slice_assign(
+                [0..kept, 0..heads, 0..keys, 0..values],
+                d.state.clone().narrow(0, 0, kept),
+            );
+        }
+    }
+
+    fn move_slot(&mut self, from: usize, to: usize) {
+        self.kv.move_slot(from, to);
+        for d in &mut self.delta {
+            crate::nn::static_kv::move_row(&mut d.conv, from, to);
+            crate::nn::static_kv::move_row(&mut d.state, from, to);
+        }
     }
 }
 
@@ -3384,6 +3422,30 @@ impl crate::capture::StaticDecode for LoadedQwen35 {
                 .is_none_or(|h| here(h.weight.val().device()))
             && self.ffn_pool.is_none()
             && !crate::nn::refarith::enabled()
+    }
+
+    fn static_bytes(&self, slots: usize, max_ctx: usize, device: &Device) -> u64 {
+        let cfg = &self.config;
+        let attn = (0..cfg.num_layers).filter(|&l| cfg.is_attention(l)).count();
+        let kv = crate::nn::static_kv::StaticKv::bytes(
+            crate::nn::static_kv::StaticKvConfig {
+                slots,
+                max_ctx,
+                layers: attn.max(1),
+                kv_heads: cfg.num_key_value_heads,
+                head_dim: cfg.head_dim,
+                rope_dim: cfg.rope_dim,
+                rope_theta: cfg.rope_theta,
+            },
+            device,
+        );
+        let per_slot =
+            cfg.conv_dim() * (cfg.conv_kernel - 1) + cfg.n_v_heads * cfg.d_state * cfg.d_state;
+        let width = crate::nn::static_kv::dtype_width(crate::backend::float_dtype(device));
+        let delta = [cfg.num_layers - attn, slots, per_slot, width]
+            .into_iter()
+            .fold(1usize, usize::saturating_mul);
+        kv.saturating_add(delta as u64)
     }
 
     fn static_state(&self, slots: usize, max_ctx: usize, device: &Device) -> Qwen35Static {
@@ -4704,5 +4766,101 @@ mod tests {
         assert_eq!(static_step, dynamic, "static");
         let captured = greedy_decode(&m, &prompt, 1100, &device, StepMode::Captured);
         assert_eq!(captured, dynamic, "captured");
+    }
+
+    /// Continuous batching on both block kinds: sequences admitted while
+    /// others decode, one cancelled and others stopping at different
+    /// lengths, so slots move under live sequences — their `DeltaNet` conv
+    /// windows and recurrent states with them. Each still decodes exactly
+    /// what it decodes alone.
+    #[test]
+    fn a_continuous_batch_decodes_each_sequence_as_alone() {
+        use crate::batch::{Planned, run};
+        use crate::capture::{StepMode, greedy_decode};
+        use crate::decode::SamplerOptions;
+        let _serial = FUSED_TOGGLE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::flex::gdn::force_disable(true);
+        let _restore = RestoreFused;
+        let mut m = toy_model();
+        m.config.eos_token_id = EosIds::One(u32::MAX);
+        let device = crate::backend::cpu_device();
+        let p = |at, prompt, max_tokens, cancel_at| Planned {
+            at,
+            prompt,
+            max_tokens,
+            opts: SamplerOptions::greedy(),
+            cancel_at,
+        };
+        let plan = [
+            p(0, &[3u32, 14, 15][..], 12, None),
+            p(1, &[9, 26, 5, 35], 3, None),
+            p(2, &[1, 2], 10, Some(5)),
+            p(4, &[7, 7, 1, 30, 31], 9, None),
+        ];
+        for mode in [StepMode::Static, StepMode::Captured] {
+            let got = run(&m, &device, 4, mode, &plan);
+            for (i, (pl, g)) in plan.iter().zip(&got).enumerate() {
+                let alone = greedy_decode(&m, pl.prompt, pl.max_tokens, &device, StepMode::Dynamic);
+                let want = if pl.cancel_at.is_some() {
+                    &alone[..g.len()]
+                } else {
+                    &alone[..]
+                };
+                assert_eq!(g, want, "{mode:?}: sequence {i}");
+            }
+            assert_eq!(
+                got[2].len(),
+                4,
+                "admitted at step 2, cancelled before step 5"
+            );
+        }
+    }
+
+    /// What a batch is charged before it admits a sequence is exactly what
+    /// it allocates by the time every sequence has run to its last position
+    /// — the context doubling on the way included — so a planner that
+    /// admits against the charge never meets an allocation it did not see.
+    #[test]
+    fn a_batch_is_charged_what_it_allocates() {
+        use crate::batch::{Admission, Batcher};
+        use crate::capture::{StaticDecode, StepMode};
+        use crate::decode::SamplerOptions;
+        let _serial = FUSED_TOGGLE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::flex::gdn::force_disable(true);
+        let _restore = RestoreFused;
+        let mut m = toy_model();
+        m.config.eos_token_id = EosIds::One(u32::MAX);
+        let device = crate::backend::cpu_device();
+        let greedy = SamplerOptions::greedy();
+        let mut batch = Batcher::new(&m, &device, 4, StepMode::Static).expect("static path");
+        let charged_a = batch.bytes_with(&m, Some((5, 1000)));
+        let adm = |prompt: &'static [u32], max_tokens| Admission {
+            prompt_ids: prompt,
+            max_tokens,
+            opts: &greedy,
+            constraint: None,
+        };
+        batch
+            .admit(&m, adm(&[3, 14, 15, 9, 26], 1000))
+            .expect("admits");
+        assert!(batch.bytes(&m) < charged_a, "the context grows later");
+        let charged_ab = batch.bytes_with(&m, Some((3, 200)));
+        assert!(charged_ab > charged_a, "a second slot costs");
+        batch.admit(&m, adm(&[7, 7, 1], 200)).expect("admits");
+        let mut most = batch.bytes(&m);
+        while batch.active() > 0 {
+            batch.step(&m).expect("steps");
+            most = most.max(batch.bytes(&m));
+        }
+        assert_eq!(most, charged_ab, "charged {charged_ab}, allocated {most}");
+        assert_eq!(
+            m.static_bytes(2, 1536, &device),
+            most,
+            "two slots, the context doubled once"
+        );
     }
 }

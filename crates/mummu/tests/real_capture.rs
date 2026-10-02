@@ -211,7 +211,7 @@ fn compare_modes<M: StaticDecode + Sync>(
 /// of them. Each slot must decode exactly what it decodes alone; the
 /// aggregate tokens/s is what the card gives when it is fed more than one
 /// row per weight read.
-fn batch_scaling<M: StaticDecode + Sync>(model: &M, encode: impl Fn(&str) -> Vec<u32>) {
+fn batch_scaling<M: StaticDecode + Sync + 'static>(model: &M, encode: impl Fn(&str) -> Vec<u32>) {
     let device = gpu();
     let topics = [
         "a lighthouse keeper",
@@ -325,4 +325,51 @@ fn qwen35_captured_decode_matches_and_runs_faster() {
 fn qwen35_batched_decode_matches_each_slot_and_scales() {
     let (model, tok) = qwen35();
     batch_scaling(&model, |user| chat(&tok, user));
+}
+
+/// What this process holds on the card, MiB, per the driver.
+fn card_mib_of_this_process() -> u64 {
+    let out = std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-compute-apps=pid,used_memory",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .expect("nvidia-smi");
+    let pid = std::process::id().to_string();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split_once(", "))
+        .find(|(p, _)| *p == pid)
+        .and_then(|(_, m)| m.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Every batch shape hands its memory back to the DRIVER when it is done,
+/// not only to the pool: wgpu frees a dropped buffer at its next sync, and
+/// before the release synced, the process held 4.3-6.6 GB after each shape
+/// on the 2B against 4.0 after one — enough that the next model load ran
+/// the card out of memory. Measured per process, so a co-tenant on the
+/// card does not move it.
+#[test]
+#[ignore = "needs a local qwen35 GGUF (MUMMU_QWEN35_GGUF) + an NVIDIA GPU"]
+fn batch_memory_returns_to_the_driver() {
+    let (model, tok) = qwen35();
+    let device = gpu();
+    let prompts: Vec<Vec<u32>> = (0..16)
+        .map(|i| chat(&tok, &format!("Count to {i}.")))
+        .collect();
+    let mut baseline = None;
+    for slots in [1usize, 2, 4, 8, 16] {
+        let batch: Vec<&[u32]> = prompts[..slots].iter().map(Vec::as_slice).collect();
+        let _ =
+            generate_batch_greedy(&model, &batch, 32, &device, StepMode::Captured).expect("batch");
+        let held = card_mib_of_this_process();
+        eprintln!("[real_capture] after {slots:>2} slots: {held} MiB held on the card");
+        let base = *baseline.get_or_insert(held);
+        assert!(
+            held <= base + 256,
+            "{slots} slots left {held} MiB on the card against {base} after one"
+        );
+    }
 }

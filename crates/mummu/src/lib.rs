@@ -23,6 +23,7 @@ pub mod attn_config;
 ///
 pub mod attrib;
 pub mod backend;
+pub mod batch;
 pub mod cache;
 pub mod capture;
 pub mod chat;

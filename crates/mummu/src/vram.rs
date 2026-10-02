@@ -97,6 +97,16 @@ pub fn utilization() -> Option<Utilization> {
     nvml::utilization()
 }
 
+/// The primary GPU's peak memory bandwidth, bytes per second, or `None` when
+/// nothing will say.
+///
+/// Bus width times its top memory clock, double data rate. A ceiling: nothing reads the card's memory faster, which is
+/// what makes it the honest floor for a probe that may have hit its cache.
+#[must_use]
+pub fn memory_bandwidth() -> Option<f64> {
+    nvml::memory_bandwidth()
+}
+
 /// NVML, loaded by hand so its absence is a `None` and not a link error.
 #[cfg(windows)]
 mod nvml {
@@ -130,6 +140,10 @@ mod nvml {
     /// type (`NVML_CLOCK_SM` = 1), out MHz.
     type GetClock = unsafe extern "C" fn(*mut c_void, i32, *mut u32) -> i32;
     const NVML_CLOCK_SM: i32 = 1;
+    /// `NVML_CLOCK_MEM`.
+    const NVML_CLOCK_MEM: i32 = 2;
+    /// `nvmlDeviceGetMemoryBusWidth`: device, out bits.
+    type GetBusWidth = unsafe extern "C" fn(*mut c_void, *mut u32) -> i32;
 
     #[link(name = "kernel32", kind = "raw-dylib")]
     unsafe extern "system" {
@@ -145,6 +159,7 @@ mod nvml {
         get_utilization: Option<GetUtilization>,
         get_clock: Option<GetClock>,
         get_max_clock: Option<GetClock>,
+        get_bus_width: Option<GetBusWidth>,
     }
 
     // SAFETY: the fields are function pointers into a DLL that is never
@@ -199,6 +214,8 @@ mod nvml {
                     .map(|p| core::mem::transmute::<*mut c_void, GetClock>(p));
                 let get_max_clock = symbol(c"nvmlDeviceGetMaxClockInfo")
                     .map(|p| core::mem::transmute::<*mut c_void, GetClock>(p));
+                let get_bus_width = symbol(c"nvmlDeviceGetMemoryBusWidth")
+                    .map(|p| core::mem::transmute::<*mut c_void, GetBusWidth>(p));
                 // NVML_SUCCESS is 0. Init is idempotent and refcounted; we
                 // never shut down, matching the never-unloaded module above.
                 if init() != 0 {
@@ -210,6 +227,7 @@ mod nvml {
                     get_utilization,
                     get_clock,
                     get_max_clock,
+                    get_bus_width,
                 })
             }
         })()
@@ -264,6 +282,26 @@ mod nvml {
             })
         }
     }
+
+    pub fn memory_bandwidth() -> Option<f64> {
+        let api = api()?;
+        let (bus, clock) = (api.get_bus_width?, api.get_max_clock?);
+        // SAFETY: as `memory`: NVML initialised, out-pointers to stack
+        // locals, every result checked against NVML_SUCCESS before use.
+        unsafe {
+            let mut device: *mut c_void = core::ptr::null_mut();
+            if (api.handle_by_index)(0, &raw mut device) != 0 || device.is_null() {
+                return None;
+            }
+            let (mut bits, mut mhz) = (0u32, 0u32);
+            if bus(device, &raw mut bits) != 0 || clock(device, NVML_CLOCK_MEM, &raw mut mhz) != 0 {
+                return None;
+            }
+            // Double data rate: the reported clock is half the transfer rate
+            // (10501 MHz on a 256-bit bus is the 4070 Ti SUPER's 672 GB/s).
+            (bits > 0 && mhz > 0).then(|| f64::from(bits) / 8.0 * f64::from(mhz) * 1e6 * 2.0)
+        }
+    }
 }
 
 /// The same thing on unix, through `dlopen`/`dlsym` instead of
@@ -306,6 +344,10 @@ mod nvml {
     /// type (`NVML_CLOCK_SM` = 1), out MHz.
     type GetClock = unsafe extern "C" fn(*mut c_void, i32, *mut u32) -> i32;
     const NVML_CLOCK_SM: i32 = 1;
+    /// `NVML_CLOCK_MEM`.
+    const NVML_CLOCK_MEM: i32 = 2;
+    /// `nvmlDeviceGetMemoryBusWidth`: device, out bits.
+    type GetBusWidth = unsafe extern "C" fn(*mut c_void, *mut u32) -> i32;
 
     // `dlopen`/`dlsym` declared by hand.
     //
@@ -332,6 +374,7 @@ mod nvml {
         get_utilization: Option<GetUtilization>,
         get_clock: Option<GetClock>,
         get_max_clock: Option<GetClock>,
+        get_bus_width: Option<GetBusWidth>,
     }
 
     // SAFETY: the fields are function pointers into a library that is never
@@ -393,6 +436,8 @@ mod nvml {
                 .map(|p| core::mem::transmute::<*mut c_void, GetClock>(p));
             let get_max_clock = symbol(c"nvmlDeviceGetMaxClockInfo")
                 .map(|p| core::mem::transmute::<*mut c_void, GetClock>(p));
+            let get_bus_width = symbol(c"nvmlDeviceGetMemoryBusWidth")
+                .map(|p| core::mem::transmute::<*mut c_void, GetBusWidth>(p));
             // NVML_SUCCESS is 0. Init is idempotent and refcounted; we never
             // shut down, matching the never-unloaded module above. A container
             // that has the library but no device reaches here and fails, which
@@ -406,6 +451,7 @@ mod nvml {
                 get_utilization,
                 get_clock,
                 get_max_clock,
+                get_bus_width,
             })
         }
     }
@@ -459,6 +505,26 @@ mod nvml {
             })
         }
     }
+
+    pub fn memory_bandwidth() -> Option<f64> {
+        let api = api()?;
+        let (bus, clock) = (api.get_bus_width?, api.get_max_clock?);
+        // SAFETY: as `memory`: NVML initialised, out-pointers to stack
+        // locals, every result checked against NVML_SUCCESS before use.
+        unsafe {
+            let mut device: *mut c_void = core::ptr::null_mut();
+            if (api.handle_by_index)(0, &raw mut device) != 0 || device.is_null() {
+                return None;
+            }
+            let (mut bits, mut mhz) = (0u32, 0u32);
+            if bus(device, &raw mut bits) != 0 || clock(device, NVML_CLOCK_MEM, &raw mut mhz) != 0 {
+                return None;
+            }
+            // Double data rate: the reported clock is half the transfer rate
+            // (10501 MHz on a 256-bit bus is the 4070 Ti SUPER's 672 GB/s).
+            (bits > 0 && mhz > 0).then(|| f64::from(bits) / 8.0 * f64::from(mhz) * 1e6 * 2.0)
+        }
+    }
 }
 
 /// Neither Windows nor unix: no NVML, and no `dlopen` to look for one with.
@@ -471,6 +537,10 @@ mod nvml {
     }
 
     pub fn utilization() -> Option<super::Utilization> {
+        None
+    }
+
+    pub fn memory_bandwidth() -> Option<f64> {
         None
     }
 }
