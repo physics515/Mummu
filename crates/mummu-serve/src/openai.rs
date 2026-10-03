@@ -44,6 +44,7 @@ use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use mummu::chat::ToolCall;
+use mummu::decode::Finish;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -603,7 +604,7 @@ where
         let tail = match recovery::contain(&model, run(sink)).await {
             Ok(r) => {
                 // Streaming is never padded: its first chunk is the keep-alive.
-                begin.finish(r.device, r.timings.clone(), false, Ok(()));
+                begin.finish(r.device, r.timings.clone(), false, Ok(Some(r.finish)));
                 let mut held = held
                     .as_ref()
                     .map(|h| h.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
@@ -646,7 +647,7 @@ where
         let padded = begin.started.elapsed() >= crate::KEEPALIVE_GRACE;
         match outcome {
             Ok(r) => {
-                begin.finish(r.device, r.timings.clone(), padded, Ok(()));
+                begin.finish(r.device, r.timings.clone(), padded, Ok(Some(r.finish)));
                 // The model answers a tool request with its family's call
                 // markup, which the engine lifts out of the text (see
                 // `engine::lift_tool_calls`); OpenAI clients expect the calls
@@ -673,7 +674,7 @@ where
                         "choices": [{
                             "index": 0,
                             "message": message,
-                            "finish_reason": finish_reason(calls),
+                            "finish_reason": finish_reason(calls, r.finish),
                         }],
                         "usage": {
                             "prompt_tokens": r.timings.prompt_tokens,
@@ -767,12 +768,23 @@ fn call_json(i: usize, c: &ToolCall) -> serde_json::Value {
 }
 
 /// `"tool_calls"` when the answer made calls, which is what tells a client to
-/// run them and reply, rather than show the answer and stop.
-const fn finish_reason(calls: &[ToolCall]) -> &'static str {
-    if calls.is_empty() {
-        "stop"
-    } else {
-        "tool_calls"
+/// run them and reply, rather than show the answer and stop. Otherwise why
+/// decoding stopped: `"length"` when the answer was cut off — it spent its
+/// `max_tokens`, or reached the model's context — and `"stop"` when the
+/// model ended it (EOS, or a `response_format` value that closed).
+///
+/// Calls win over a cut-off: a call is only here once all of its markup
+/// parsed, so it is whole, and a client that sees `"length"` does not look
+/// for calls to run. A call the budget cut off never parses, and its answer
+/// says `"length"`. A cancelled generation's client is gone; nothing reads
+/// what it is told.
+const fn finish_reason(calls: &[ToolCall], finish: Finish) -> &'static str {
+    if !calls.is_empty() {
+        return "tool_calls";
+    }
+    match finish {
+        Finish::Length | Finish::Context => "length",
+        Finish::Eos | Finish::Complete | Finish::Cancelled => "stop",
     }
 }
 
@@ -803,7 +815,7 @@ fn stream_tail(
         frames.push(chunk(id, model, created, &json!({"tool_calls": [call]})));
     }
     let mut stop = chunk(id, model, created, &json!({}));
-    stop["choices"][0]["finish_reason"] = json!(finish_reason(&r.tool_calls));
+    stop["choices"][0]["finish_reason"] = json!(finish_reason(&r.tool_calls, r.finish));
     frames.push(stop);
     let mut out: String = frames.iter().map(sse).collect();
     out.push_str("data: [DONE]\n\n");
@@ -926,6 +938,7 @@ mod tests {
             elapsed_ms: 0,
             timings: crate::trace::Timings::default(),
             tool_calls,
+            finish: Finish::Eos,
         }
     }
 
@@ -1140,5 +1153,57 @@ mod tests {
                 }],
             })
         );
+    }
+
+    /// Why the answer ended, in `OpenAI`'s words. `"length"` is a cut-off —
+    /// the request's `max_tokens`, or the model's context — and never the
+    /// model ending the answer; calls are `"tool_calls"` whatever stopped
+    /// the decode, since a call only exists once its markup parsed whole.
+    #[test]
+    fn finish_reason_says_length_only_for_an_answer_that_was_cut_off() {
+        for (finish, reason) in [
+            (Finish::Eos, "stop"),
+            (Finish::Complete, "stop"),
+            (Finish::Cancelled, "stop"),
+            (Finish::Length, "length"),
+            (Finish::Context, "length"),
+        ] {
+            assert_eq!(finish_reason(&[], finish), reason, "{finish:?}");
+            assert_eq!(
+                finish_reason(&[weather_call("Paris")], finish),
+                "tool_calls",
+                "{finish:?}"
+            );
+        }
+    }
+
+    /// An answer `max_tokens` cut off says so, streamed and buffered: an
+    /// empty `content` with `"stop"` is indistinguishable from a model that
+    /// had nothing to say (the 2026-10-02 production case, where hidden
+    /// reasoning spent the whole budget).
+    #[tokio::test]
+    async fn an_answer_cut_off_by_max_tokens_finishes_with_length() {
+        let _serial = crate::progress_serial().await;
+        let cut_off = || ChatResult {
+            tokens: 48,
+            finish: Finish::Length,
+            ..answered("", Vec::new())
+        };
+        let response = respond("m".into(), true, None, begin(true), move |_| async move {
+            Ok(cut_off())
+        })
+        .await;
+        let events = sse_events(&body_text(response).await);
+        assert_eq!(finish_reason_of(&events), "length");
+
+        let response = respond("m".into(), false, None, begin(false), move |_| async move {
+            Ok(cut_off())
+        })
+        .await;
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value =
+            serde_json::from_str(&body_text(response).await).expect("JSON");
+        assert_eq!(body["choices"][0]["finish_reason"], json!("length"));
+        assert_eq!(body["usage"]["completion_tokens"], json!(48));
     }
 }

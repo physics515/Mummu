@@ -879,7 +879,7 @@ fn trace(
             ..crate::trace::Timings::default()
         },
         false,
-        outcome,
+        outcome.map(|()| None),
     );
 }
 
