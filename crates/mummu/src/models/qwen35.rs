@@ -3639,6 +3639,17 @@ impl crate::capture::StaticDecode for LoadedQwen35 {
             && !host_fused(device)
     }
 
+    /// A separate head on the host takes the bounded head for one sequence
+    /// (see `forward_static`), as `head_logits` does.
+    fn static_bounded_head(&self) -> bool {
+        crate::flex::head::enabled()
+            && self
+                .model
+                .lm_head
+                .as_ref()
+                .is_some_and(|h| crate::backend::is_flex(&h.weight.val().device()))
+    }
+
     /// The state's bytes on `device` only: what a caller planning that
     /// device's memory charges. A split model's state is on both of its
     /// devices; asked for each, the two add up to the whole.

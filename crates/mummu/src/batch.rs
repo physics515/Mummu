@@ -410,9 +410,14 @@ impl<M: StaticDecode + Sync + 'static> Batcher<M> {
         let len = bucket(furthest, max_ctx);
         // A sequence alone decodes as the ordinary path does, a bounded host
         // head included (`flex::head`): told the k its pick consults. Not
-        // under a constraint, whose legal tokens may lie anywhere.
+        // under a constraint, whose legal tokens may lie anywhere, and only
+        // for a model whose step reads one — the scope is process-wide.
         let _head = match self.seqs.as_slice() {
-            [only] if only.constraint.is_none() && only.picker.consults() >= 1 => {
+            [only]
+                if model.static_bounded_head()
+                    && only.constraint.is_none()
+                    && only.picker.consults() >= 1 =>
+            {
                 Some(crate::flex::head::RequestTopK::set(only.picker.consults()))
             }
             _ => None,

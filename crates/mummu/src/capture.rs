@@ -67,6 +67,14 @@ pub trait StaticDecode: CausalLm {
         self.static_supported(device)
     }
 
+    /// Whether a one-sequence step reads its logits through the bounded
+    /// host head (`crate::flex::head`), which must be told the k the pick
+    /// consults ([`crate::flex::head::RequestTopK`], a process-wide scope).
+    /// The batcher sets that scope only then.
+    fn static_bounded_head(&self) -> bool {
+        false
+    }
+
     /// The bytes [`Self::static_state`] allocates for that shape on
     /// `device` — what a caller planning the card's memory charges a batch.
     fn static_bytes(&self, slots: usize, max_ctx: usize, device: &Device) -> u64;
