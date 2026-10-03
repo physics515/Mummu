@@ -372,7 +372,11 @@ async fn search(dir: &std::path::Path, rr: &std::path::Path) -> Result<(), Box<d
   scaled by each device's live free share and probed at working clocks, so a busy CPU sends layers to
   the card and a busy GPU sends them to the host; a co-tenant saturating the GPU gets all of it (a
   6 GiB torch matmul hog ran at its solo 82-84 TFLOPS); and the card is taken back within about a
-  minute of it leaving. `/api/health` carries the readings as `pressure`.
+  minute of it leaving. `/api/health` carries the readings as `pressure`. Layer moves plan on the
+  last ten minutes of those readings, not the last few seconds, and step only to placements that
+  are faster on their own *(2026-10-02)*: on this box's minute-scale load swings the first version
+  moved the 27B down to 3 of its 64 layers on the card; now it repairs for a co-tenant that
+  arrives and comes back once the card has stayed clear.
 - **Captured decode and batched decode** *(2026-10-01)* — `mummu::capture` records a decode step
   once per 256-key bucket and replays it every token (`burn::tensor::capture`; a software graph on
   Vulkan, a real one on CUDA), over a static state laid out so nothing a step touches moves: KV
@@ -390,7 +394,9 @@ async fn search(dir: &std::path::Path, rr: &std::path::Path) -> Result<(), Box<d
   exactly what it would alone (greedy, seeded sampling, JSON-constrained; a disconnecting client
   just leaves). The 2B's second request onward skips the capture (12.7 ms/token), and four
   concurrent requests finish in 5.2 s against 8.9 s one after another. `MUMMU_DECODE_SLOTS`
-  (default 8) caps a batch.
+  (default 8) caps a batch. A model split across the card and the host batches too
+  *(2026-10-02)*, op by op with each layer's state beside it: four concurrent requests on the
+  Bonsai 27B finish in 84 s against 158 s, each exactly its solo text.
 
 ## Design principles
 
