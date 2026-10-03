@@ -503,6 +503,13 @@ impl Picker {
         self.opts.temperature == 0.0
     }
 
+    /// How many of a row's top logits a pick consults: 1 when greedy, else
+    /// the sampler's `top_k` (0 when it reads the whole row).
+    #[must_use]
+    pub fn consults(&self) -> usize {
+        if self.greedy() { 1 } else { self.opts.top_k }
+    }
+
     /// The next id from `[1, vocab]` logits for position `past`.
     /// `argmax`, when the caller already read it back (a batch reads every
     /// row's at once), saves the on-device argmax and its sync; a sampled

@@ -130,8 +130,9 @@ impl AnyLm {
 /// (the 2B: 17.1 → 11.7 ms/token in f16). The host keeps the ordinary path —
 /// no launches to save, and its fused `DeltaNet` step and packed kernels are
 /// what make CPU decode fast. A model split across the two is not on one
-/// device, so the capture driver itself falls back (`static_state` says no).
-/// `MUMMU_GRAPH=off` turns it off.
+/// device, so the capture driver itself falls back (`static_capturable`
+/// says no); the decode thread batches it instead. `MUMMU_GRAPH=off` turns
+/// it off.
 async fn decode_captured<M: mummu::capture::StaticDecode + Sync>(
     m: &M,
     prompt_ids: &[u32],
@@ -861,7 +862,7 @@ struct Template {
     /// and the client that sent the tools has nothing it can act on.
     calls: Option<CallSyntax>,
     /// The checkpoints open an answer with `<think>…</think>`, which a
-    /// request's `think` shows or suppresses (see `crate::think`).
+    /// request's `think` shows or turns off (see [`NO_THINKING`]).
     thinks: bool,
 }
 
@@ -967,6 +968,14 @@ fn decode_answer(tok: &Tokenizer, ids: &[u32], keep: &[u32]) -> tokenizers::Resu
     }
 }
 
+/// What a thinking family's template writes after the assistant header when
+/// thinking is off (`enable_thinking=false` in Qwen3's, Qwen3.5's and
+/// Qwen3.8's templates): an empty block, so the answer starts at once. The
+/// model never spends a token deliberating, which mummu once suppressed only
+/// on the way out — the reasoning still ran, still used the request's
+/// `max_tokens`, and a 48-token Bonsai answer came back empty (2026-10-02).
+const NO_THINKING: &str = "<think>\n\n</think>\n\n";
+
 /// Render `turns` into the family's prompt string. The `ChatML` families are
 /// mummu's byte-verified renderers; OLMoE-Instruct speaks the Tulu template
 /// (`<|user|>` / `<|assistant|>` behind an `<|endoftext|>` BOS), which has no
@@ -975,11 +984,14 @@ fn decode_answer(tok: &Tokenizer, ids: &[u32], keep: &[u32]) -> tokenizers::Resu
 ///
 /// `tools` are advertised to the model. Empty `tools` renders the plain chat
 /// prompt — the tool block is what the family's template emits only when
-/// there is something to put in it.
+/// there is something to put in it. `think` leaves a thinking family's
+/// answer open for its `<think>` block; without it the block is written
+/// closed and empty ([`NO_THINKING`]).
 fn render_prompt_with_tools(
     arch: Architecture,
     tools: &[mummu::chat::ToolSpec],
     turns: &[Turn],
+    think: bool,
 ) -> Result<String, String> {
     let template = template(arch)?;
     if !tools.is_empty() && template.calls.is_none() {
@@ -988,11 +1000,15 @@ fn render_prompt_with_tools(
         ));
     }
     if let Some(chatml) = template.chatml {
-        return Ok(if tools.is_empty() {
+        let mut prompt = if tools.is_empty() {
             chatml.render(turns)
         } else {
             chatml.render_with_tools(tools, turns)
-        });
+        };
+        if template.thinks && !think {
+            prompt.push_str(NO_THINKING);
+        }
+        return Ok(prompt);
     }
     let mut out = String::from("<|endoftext|>");
     for t in turns {
@@ -1106,7 +1122,7 @@ pub async fn run_chat(
     } else {
         0
     });
-    let prompt = render_prompt_with_tools(spec.architecture, &req.tools, req.turns)?;
+    let prompt = render_prompt_with_tools(spec.architecture, &req.tools, req.turns, req.think)?;
     // The context a load must provision for, before the tokenizer is at
     // hand: ~3 bytes per token over-counts English, which is the safe side
     // of a fit. `drive` replaces it with the exact count once loaded.
@@ -3998,9 +4014,10 @@ async fn serve_held(
     // like one that fails under a token.
     let outcome = AssertUnwindSafe(async {
         let before = placement::before_request(&mut m, key, ctx, needs_tower);
-        // A model wholly on the card decodes on the decode thread, in a batch
-        // with whatever else arrives for it: the slot goes there with this
-        // request's generation, and failures from here on are decided there.
+        // A model on the card — split with the host too — decodes on the
+        // decode thread, in a batch with whatever else arrives for it: the
+        // slot goes there with this request's generation, and failures from
+        // here on are decided there.
         let batched = match prepare_batched(&m, req, prompt) {
             Ok(b) => b,
             Err(e) => return (Err(e), before),
@@ -4398,11 +4415,11 @@ async fn generate_on(
     // The family's call tags, which this build may type special.
     let keep = preserved_tokens(&m.tokenizer, spec.architecture);
     // A reasoning model opens with `<think>…</think>`. Unless the request
-    // asked for it, that is suppressed here — between the decoder and the
-    // client — so it never reaches a sink and never counts against what the
-    // caller sees, and the blank line after it goes with it. `think` passes
-    // it through untouched. What the filter still holds when the model stops
-    // goes out in `conclude`.
+    // asked for it, the prompt closed the block already (`NO_THINKING`);
+    // one the model opens anyway is suppressed here — between the decoder
+    // and the client — so it never reaches a sink, and the blank line after
+    // it goes with it. `think` passes it through untouched. What the filter
+    // still holds when the model stops goes out in `conclude`.
     let mut thinking = (!req.think).then(crate::think::Filter::default);
     // Tell the bounded head how many candidates THIS request's sampler will
     // consult; the guard must outlive the decode, so it is bound here.
@@ -5521,19 +5538,48 @@ mod template_tests {
     fn a_family_renders_tools_exactly_when_it_supports_them() {
         let turns = [Turn::user("weather in Paris?")];
         for arch in EVERY_FAMILY {
-            let with_tools = render_prompt_with_tools(arch, &a_tool(), &turns);
+            let with_tools = render_prompt_with_tools(arch, &a_tool(), &turns, false);
             assert_eq!(with_tools.is_ok(), supports_tools(arch), "{arch:?}");
             if arch.task() == mummu::registry::Task::Generate {
                 assert!(
-                    render_prompt_with_tools(arch, &[], &turns).is_ok(),
+                    render_prompt_with_tools(arch, &[], &turns, false).is_ok(),
                     "{arch:?}"
                 );
             } else {
                 assert!(!supports_tools(arch) && !thinks(arch), "{arch:?}");
                 assert!(
-                    render_prompt_with_tools(arch, &[], &turns).is_err(),
+                    render_prompt_with_tools(arch, &[], &turns, false).is_err(),
                     "{arch:?}"
                 );
+            }
+        }
+    }
+
+    /// A request that did not ask for thinking gets the closed, empty block
+    /// the family's template writes for `enable_thinking=false`, with or
+    /// without tools; one that asked leaves the answer open, and a family
+    /// that does not think is rendered the same either way.
+    #[test]
+    fn thinking_off_closes_the_block_in_the_prompt() {
+        let turns = [Turn::user("weather in Paris?")];
+        for arch in EVERY_FAMILY {
+            if arch.task() != mummu::registry::Task::Generate {
+                continue;
+            }
+            let tool_sets: &[Vec<mummu::chat::ToolSpec>] = if supports_tools(arch) {
+                &[Vec::new(), a_tool()]
+            } else {
+                &[Vec::new()]
+            };
+            for tools in tool_sets {
+                let on = render_prompt_with_tools(arch, tools, &turns, true).unwrap();
+                let off = render_prompt_with_tools(arch, tools, &turns, false).unwrap();
+                if thinks(arch) {
+                    assert_eq!(off, format!("{on}{NO_THINKING}"), "{arch:?}");
+                    assert!(on.ends_with("<|im_start|>assistant\n"), "{arch:?}");
+                } else {
+                    assert_eq!(on, off, "{arch:?}");
+                }
             }
         }
     }

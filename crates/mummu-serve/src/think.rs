@@ -8,11 +8,16 @@
 //! tokens of deliberation and no reply at all, and the calorie tracker this
 //! was written for caps replies at 600.
 //!
-//! So thinking is suppressed unless a request opts in (ollama's `think`,
-//! `OpenAI`'s `reasoning_effort`). Opting in passes it through unchanged, and
-//! the surface decides what to do with it: `OpenAI`'s gets it inline, and the
-//! ollama shim splits it into the `thinking` field ollama clients read
-//! ([`Filter::push_split`]).
+//! So thinking is off unless a request opts in (ollama's `think`, `OpenAI`'s
+//! `reasoning_effort`). Off is the family template's own `enable_thinking`
+//! switch: the prompt closes an empty block and the model answers at once
+//! (`engine::NO_THINKING`). Suppressing the block on the way out, as mummu
+//! first did, still spent the request's tokens on it — a 48-token answer
+//! came back empty on 2026-10-02. This filter stays on such a request for a
+//! model that opens a block anyway. Opting in passes it through unchanged,
+//! and the surface decides what to do with it: `OpenAI`'s gets it inline,
+//! and the ollama shim splits it into the `thinking` field ollama clients
+//! read ([`Filter::push_split`]).
 //!
 //! The filter is streaming, because the deltas it sees are token-shaped and
 //! a tag can be split across any number of them — `<`, `th`, `ink>` is three

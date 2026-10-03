@@ -1,5 +1,8 @@
-//! The decode thread: generations on a model wholly on the card, batched,
-//! with their captured steps kept between requests.
+//! The decode thread: generations on a model on the card, batched, with
+//! their captured steps kept between requests. A qwen35 model split across
+//! the card and the host batches too — its step runs op by op (nothing to
+//! capture with layers on the host), and every sequence in it shares each
+//! host layer's weight read, which is where a split model's token time goes.
 //!
 //! A captured graph replays on the cubecl stream of the thread that recorded
 //! it, and requests land on whichever tokio worker is free — so a graph that
@@ -141,8 +144,8 @@ fn sender() -> &'static mpsc::Sender<Msg> {
 }
 
 /// Whether `m` decodes through the thread for a request of `prompt_len`
-/// tokens and `max_tokens`: a Qwen3 / qwen35 model wholly on the card, a
-/// static step mode, no images.
+/// tokens and `max_tokens`: a Qwen3 / qwen35 model on the card (a qwen35
+/// one may have layers on the host), a static step mode, no images.
 pub(super) fn applies(m: &Loaded, prompt_len: usize, max_tokens: usize, images: bool) -> bool {
     if images || m.backend == BackendChoice::Cpu || mummu::capture::step_mode() == StepMode::Dynamic
     {
@@ -461,6 +464,17 @@ impl Thread {
                     let _ = job.updates.send(Update::Bounced);
                     return None;
                 }
+                Charge::HostOver { need, free } => {
+                    eprintln!(
+                        "[mummu-serve] decode thread: a request stays out of the batch — its \
+                         context needs {:.2} GiB more host memory for the host layers, the host \
+                         has {:.2} GiB above its floor; it queues for the slot instead",
+                        gib(need),
+                        gib(free)
+                    );
+                    let _ = job.updates.send(Update::Bounced);
+                    return None;
+                }
                 Charge::Fits { need, free } => eprintln!(
                     "[mummu-serve] decode thread: a request joins the batch — charged {:.2} GiB \
                      of the card at its longest, {:.2} GiB free",
@@ -731,19 +745,39 @@ impl Thread {
 /// nothing at all while the GPU is yielded). It joins only when the first
 /// fits in the second.
 ///
-/// A batch never asks placement to MOVE layers for a joiner: the static
-/// step needs every layer on the card, and a move under a live batch would
-/// break it for every sequence in it.
+/// A model split across the card and the host keeps its host layers' state
+/// in host memory, so a joiner is charged there too (`Batcher::charge_host`)
+/// against `MemAvailable` above the host-pressure floor — the line below
+/// which the watch starts evicting.
+///
+/// A batch never asks placement to MOVE layers for a joiner: a move under a
+/// live batch would break its state — kept beside each layer — for every
+/// sequence in it.
 fn charge(batcher: &AnyBatcher, guard: &Loaded, job: &Job) -> Charge {
     let (prompt, max) = (job.prompt_ids.len(), job.max_tokens);
-    let need = match (batcher, &guard.lm) {
-        (AnyBatcher::Qwen3(b), AnyLm::Qwen3(m)) => b.charge(m, prompt, max),
-        (AnyBatcher::Qwen35(b), AnyLm::Qwen35(m)) => b.charge(m, prompt, max),
-        _ => Some(0),
+    let (need, host_need) = match (batcher, &guard.lm) {
+        (AnyBatcher::Qwen3(b), AnyLm::Qwen3(m)) => {
+            (b.charge(m, prompt, max), b.charge_host(m, prompt, max))
+        }
+        (AnyBatcher::Qwen35(b), AnyLm::Qwen35(m)) => {
+            (b.charge(m, prompt, max), b.charge_host(m, prompt, max))
+        }
+        _ => (Some(0), 0),
     };
     let Some(need) = need else {
         return Charge::Unknown;
     };
+    if host_need > 0
+        && let Some(available) = super::mem_available_bytes()
+    {
+        let room = available.saturating_sub(super::host_floor_bytes());
+        if host_need > room {
+            return Charge::HostOver {
+                need: host_need,
+                free: room,
+            };
+        }
+    }
     let need = need + BATCH_MARGIN;
     let free = super::placement::free_for_new(guard.backend);
     if need > free {
@@ -760,6 +794,11 @@ enum Charge {
         free: u64,
     },
     Over {
+        need: u64,
+        free: u64,
+    },
+    /// The host layers' state does not fit above the host's floor.
+    HostOver {
         need: u64,
         free: u64,
     },

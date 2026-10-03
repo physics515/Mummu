@@ -52,10 +52,28 @@ pub trait StaticDecode: CausalLm {
     type State: StaticState + Send;
 
     /// Whether the model, as loaded, can take the static path on `device`
-    /// (not with layers on another device, or a feature the static step
-    /// does not implement) — the caller decodes on the ordinary path
-    /// otherwise. Cheap: no allocation.
+    /// (not with a feature the static step does not implement) — the caller
+    /// decodes on the ordinary path otherwise. A model may accept with some
+    /// layers on the host; then its step runs op by op (see
+    /// [`Self::static_capturable`]). Cheap: no allocation.
     fn static_supported(&self, device: &Device) -> bool;
+
+    /// Whether the step can also be captured on `device`: every buffer it
+    /// touches is a tensor there. Not when layers are elsewhere, or when the
+    /// step keeps state in host memory. The batcher steps such a model op by
+    /// op, and the one-sequence driver ([`generate`]) leaves it to the
+    /// ordinary path.
+    fn static_capturable(&self, device: &Device) -> bool {
+        self.static_supported(device)
+    }
+
+    /// Whether a one-sequence step reads its logits through the bounded
+    /// host head (`crate::flex::head`), which must be told the k the pick
+    /// consults ([`crate::flex::head::RequestTopK`], a process-wide scope).
+    /// The batcher sets that scope only then.
+    fn static_bounded_head(&self) -> bool {
+        false
+    }
 
     /// The bytes [`Self::static_state`] allocates for that shape on
     /// `device` — what a caller planning the card's memory charges a batch.
@@ -71,9 +89,10 @@ pub trait StaticDecode: CausalLm {
 
     /// One decode step for the state's first `k` slots: `tokens` `[k, 1]`
     /// at `positions` `[k]`, attending over a bucket of `len` keys. Returns
-    /// the logits, `[k, vocab]`. Must touch nothing but device tensors (no uploads):
-    /// it runs inside a capture window. Every buffer of `state` it advances
-    /// it must advance in place.
+    /// the logits, `[k, vocab]`. Where [`Self::static_capturable`] holds it
+    /// must touch nothing but device tensors (no uploads): it runs inside a
+    /// capture window. Every buffer of `state` it advances it must advance
+    /// in place.
     fn forward_static(
         &self,
         tokens: &Tensor<2, Int>,
@@ -343,7 +362,7 @@ pub struct DecodeRequest<'a> {
 pub fn applies<M: StaticDecode>(model: &M, req: &DecodeRequest<'_>) -> bool {
     req.mode != StepMode::Dynamic
         && ceiling(model, req.prompt_ids.len().saturating_add(req.max_tokens)).is_some()
-        && model.static_supported(req.device)
+        && model.static_capturable(req.device)
 }
 
 /// Generate one sequence with the decode steps on the static path,

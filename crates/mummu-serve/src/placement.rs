@@ -63,19 +63,26 @@
 //!   would not fit beside that, joint repairs it first — the cheapest relief
 //!   per byte — so the request never OOMs the card because it is long or
 //!   carries an image.
-//! * **Every 5 s at idle** (only if nobody holds the model): with the current
+//! * **Every 2 s at idle** (only if nobody holds the model): with the current
 //!   ambient. Ambient grew → repair now. Ambient shrank, or a tower went
 //!   idle and was dropped → improve, but only when (4) says the moved bytes
 //!   pay for themselves over the horizon `H` (tokens served in the last
 //!   hour), and only after the improvement has been wanted on three ticks in
-//!   a row. The watermark only shrinks after a quiet window, so a co-tenant
-//!   that allocates in bursts does not cause a reload storm.
+//!   a row.
+//!
+//! Rates are scaled by how busy each device has been over the last ten
+//! minutes, and an improvement must fit the least room each device left in
+//! that time — the settled view, [`SETTLE_WINDOW`]. Only a repair answers
+//! the card as it is this moment. Planned on the last few seconds, the
+//! placement chased load that flips every minute on the reference box.
 //!
 //! Moves are applied releases-first: layers leaving the card (and in-place
 //! demotions) go before arrivals, the allocator returns the freed pages to
 //! the driver, and only then do layers arrive. An improvement moves at most
 //! [`IMPROVE_STEP`] layers per tick so a request arriving mid-rebalance waits
-//! for seconds, not for the whole move.
+//! for seconds, not for the whole move — and each step is a placement that
+//! is faster on its own ([`joint::step`]), since the next tick may want
+//! something else.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -1076,18 +1083,159 @@ impl Scaling {
             Self::MemoryBound => free.sqrt(),
         }
     }
+
+    /// How many times longer a byte takes with only `free` of the device.
+    fn slowdown(self, free: f64) -> f64 {
+        1.0 / self.speed(free)
+    }
 }
 
-/// `rate` (seconds per byte on a FREE device) for a device of which only
-/// `free` is ours: our compute herd runs only on idle cycles
+/// `rate` (seconds per byte on a FREE device) on a device `slowdown` times
+/// slower: our compute herd runs only on idle cycles
 /// (`sysmon::install_compute_pool`), and a co-tenant's kernels time-slice
 /// the card, so a busy device takes longer per byte. This is what turns one
 /// solver into the whole-system schedule: a busy CPU makes the card the
 /// cheap place for a layer, a busy GPU the host, and both busy make
-/// everything slow — and the hysteresis above keeps it from chasing noise.
+/// everything slow. The slowdown is the settled one ([`SETTLE_WINDOW`]),
+/// not the last few seconds'.
+fn slowed(rate: &[(QuantPolicy, f64)], slowdown: f64) -> Vec<(QuantPolicy, f64)> {
+    rate.iter().map(|&(q, s)| (q, s * slowdown)).collect()
+}
+
+/// [`slowed`] for a device of which only `free` is ours.
+#[cfg(test)]
 fn contended(rate: &[(QuantPolicy, f64)], free: f64, how: Scaling) -> Vec<(QuantPolicy, f64)> {
-    let speed = how.speed(free);
-    rate.iter().map(|&(q, s)| (q, s / speed)).collect()
+    slowed(rate, how.slowdown(free))
+}
+
+/// How far back the readings a placement change plans on reach.
+///
+/// A move re-reads layers off the disk — tens of seconds a layer on the
+/// array — and pays off over the hours the model then serves. The readings
+/// it is decided on used to be the last few seconds': `sysmon`'s free shares
+/// (a three-second average) and this tick's capacities. On the reference
+/// box other routines take 12-15 of the 16 cores and give them back every
+/// 30-60 s, and the desktop's GPU share and free memory swing as fast; the
+/// best placement flipped with them, and the live 27B made 72 layer moves
+/// in its first 70 minutes (2026-10-02), re-reading ~19 GiB to chase load
+/// that had moved on before each move finished. So moves plan on ten
+/// minutes: the mean slowdown each device suffered (the expected cost of a
+/// byte there — not the slowdown of the mean share, which flatters a
+/// device that is busy half the time), and for an improvement, the least
+/// room each device left. A repair still answers the card as it is this
+/// moment: that is the out-of-memory guard, and it cannot wait.
+const SETTLE_WINDOW: Duration = Duration::from_secs(600);
+
+/// Timestamped readings over the last [`SETTLE_WINDOW`], oldest first.
+#[derive(Debug)]
+struct Window<T>(VecDeque<(Instant, T)>);
+
+impl<T: Copy> Window<T> {
+    const fn new() -> Self {
+        Self(VecDeque::new())
+    }
+
+    fn push(&mut self, at: Instant, v: T) {
+        while self
+            .0
+            .front()
+            .is_some_and(|&(t, _)| at.saturating_duration_since(t) > SETTLE_WINDOW)
+        {
+            self.0.pop_front();
+        }
+        self.0.push_back((at, v));
+    }
+
+    fn values(&self) -> impl Iterator<Item = T> + '_ {
+        self.0.iter().map(|&(_, v)| v)
+    }
+}
+
+impl Window<f64> {
+    fn mean(&self) -> Option<f64> {
+        let n = self.0.len();
+        (n > 0).then(|| self.values().sum::<f64>() / f64_from_usize(n))
+    }
+}
+
+impl Window<u64> {
+    /// The least of the window and `now` (which is always counted).
+    fn least(&self, now: u64) -> u64 {
+        self.values().fold(now, u64::min)
+    }
+}
+
+/// The machine as placement changes see it (see [`SETTLE_WINDOW`]).
+#[derive(Debug)]
+struct Settle {
+    /// How many times slower a host byte ran, sample by sample.
+    host_slowdown: Window<f64>,
+    /// The same for the card, while it was ours: a yielded card has no
+    /// capacity at all, which is the repair's business, not a rate.
+    card_slowdown: Window<f64>,
+    /// `K`, what the card let us occupy, while it was ours.
+    card_room: Window<u64>,
+    /// The host's `MemAvailable`.
+    host_room: Window<u64>,
+}
+
+impl Settle {
+    const fn new() -> Self {
+        Self {
+            host_slowdown: Window::new(),
+            card_slowdown: Window::new(),
+            card_room: Window::new(),
+            host_room: Window::new(),
+        }
+    }
+
+    /// One sample of the machine's free shares and memory.
+    fn observe(&mut self, at: Instant, p: &crate::sysmon::Pressure, mem_available: Option<u64>) {
+        self.host_slowdown
+            .push(at, Scaling::MemoryBound.slowdown(p.cpu_free));
+        if p.gpu != crate::sysmon::Yield::Yield {
+            self.card_slowdown
+                .push(at, Scaling::TimeSliced.slowdown(p.gpu_free));
+        }
+        if let Some(m) = mem_available {
+            self.host_room.push(at, m);
+        }
+    }
+
+    /// The settled slowdowns, `(host, card)`; before the first sample, the
+    /// current shares'.
+    fn slowdowns(&self, p: &crate::sysmon::Pressure) -> (f64, f64) {
+        (
+            self.host_slowdown
+                .mean()
+                .unwrap_or_else(|| Scaling::MemoryBound.slowdown(p.cpu_free)),
+            self.card_slowdown
+                .mean()
+                .unwrap_or_else(|| Scaling::TimeSliced.slowdown(p.gpu_free)),
+        )
+    }
+}
+
+static SETTLE: Mutex<Settle> = Mutex::new(Settle::new());
+
+fn settle() -> std::sync::MutexGuard<'static, Settle> {
+    SETTLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Which readings a [`Live::problem`] is built on. Both plan on the settled
+/// rates; they differ in the room they allow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum View {
+    /// The card and host as they are this moment: what a placement must fit
+    /// now — the load, a repair, a move's bytes.
+    Now,
+    /// The least room each device left over [`SETTLE_WINDOW`]: what an
+    /// improvement must fit, so a layer one burst evicted comes back only
+    /// once the card has stayed clear, not at the burst's first pause. Never
+    /// more room than [`View::Now`], so a step it allows fits now too.
+    Settled,
 }
 
 /// The inverse: a rate PROBED while only `free` of the device was ours, as
@@ -1410,7 +1558,13 @@ impl Live {
 
     /// The solver's problem for serving `ctx` tokens, with `card` as the
     /// current reading (None: no accelerator, or no reading at all).
-    fn problem(&self, ctx: usize, needs_tower: bool, card: Option<&Card>) -> joint::Problem {
+    fn problem(
+        &self,
+        ctx: usize,
+        needs_tower: bool,
+        card: Option<&Card>,
+        view: View,
+    ) -> joint::Problem {
         let layers: Vec<joint::Layer> = self
             .maps
             .iter()
@@ -1447,17 +1601,19 @@ impl Live {
                     + l.fixed_bytes
             })
             .sum();
-        let host_cap = super::mem_available_bytes()
+        let pressure = crate::sysmon::pressure();
+        let (host_slowdown, card_slowdown) = settle().slowdowns(&pressure);
+        let mem = super::mem_available_bytes().map(|now| match view {
+            View::Now => now,
+            View::Settled => settle().host_room.least(now),
+        });
+        let host_cap = mem
             .map_or(u64::MAX / 4, |a| a / 100 * 85)
             .saturating_add(host_layers);
         let mut devices = vec![joint::Device {
             capacity: host_cap,
             fixed: act_bytes(&self.cfg, ctx),
-            rate: contended(
-                &self.host.rate,
-                crate::sysmon::pressure().cpu_free,
-                Scaling::MemoryBound,
-            ),
+            rate: slowed(&self.host.rate, host_slowdown),
             resident: self.host.resident.clone(),
         }];
         if let Some(c) = card
@@ -1474,15 +1630,23 @@ impl Live {
             // A co-tenant using the card's compute gets all of it: capacity
             // 0 makes the current placement infeasible, and Repair moves
             // every layer to the host at once.
-            let k = if gpu_yielded() { 0 } else { capacity(c) };
+            let k = if gpu_yielded() {
+                0
+            } else {
+                let k = capacity(c);
+                let mut settled = settle();
+                if view == View::Now {
+                    settled.card_room.push(Instant::now(), k);
+                }
+                match view {
+                    View::Now => k,
+                    View::Settled => settled.card_room.least(k),
+                }
+            };
             devices.push(joint::Device {
                 capacity: k.saturating_sub(non_layer),
                 fixed: act_bytes(&self.cfg, ctx) + residual_for(Some(c.total)) + tower_pending,
-                rate: contended(
-                    &self.accel.rate,
-                    crate::sysmon::pressure().gpu_free,
-                    Scaling::TimeSliced,
-                ),
+                rate: slowed(&self.accel.rate, card_slowdown),
                 resident: self.accel.resident.clone(),
             });
         }
@@ -1634,6 +1798,26 @@ impl Live {
             joint::time_of(pb, &self.assignment) * 1e3
         )
     }
+
+    /// The card's side of (3) at reading `c`, for a repair's log line: what
+    /// shrank, when a repair answers no co-tenant anyone can see.
+    fn card_terms(&self, c: &Card, pb: &joint::Problem) -> String {
+        let Some(dev) = pb.devices.get(1) else {
+            return String::new();
+        };
+        let k = capacity(c);
+        format!(
+            " — card: {:.2} GiB for layers (K {:.2} = total {:.2} − guard {:.2}; non-layer {:.2}), working set {:.2} (ε̂ {:.2}), this placement {:.2}",
+            gib(dev.capacity),
+            gib(k),
+            gib(c.total),
+            gib(c.total.saturating_sub(k)),
+            gib(c.in_use.saturating_sub(self.planned_card_bytes())),
+            gib(dev.fixed),
+            gib(residual_for(Some(c.total))),
+            gib(joint::used_of(pb, &self.assignment)[1]),
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1655,7 +1839,7 @@ pub(super) fn plan_load(pack_dir: &Path, backend: BackendChoice) -> Result<Live,
     // The head follows the last layer. Solve with its bytes reserved on the
     // card first; if the last layer does not land there after all, the head
     // stays on the host and the reservation is given back to layers.
-    let mut pb = live.problem(ctx, tower, reading.as_ref());
+    let mut pb = live.problem(ctx, tower, reading.as_ref(), View::Now);
     let with_head = pb.devices.len() > 1 && live.head_card_bytes > 0;
     if with_head {
         pb.devices[1].fixed += live.head_card_bytes;
@@ -1746,7 +1930,7 @@ fn apply(
     let _work = crate::sysmon::DeviceWork::enter();
     // Releases: leaving the card, or shrinking on it. Everything else is an
     // arrival or a host-side change.
-    let pb = live.problem(idle_context(), false, None);
+    let pb = live.problem(idle_context(), false, None, View::Now);
     let card_bytes = |l: usize, c: &joint::Choice| -> u64 {
         if c.device != 1 {
             return 0;
@@ -1851,27 +2035,28 @@ fn explain_hold(live: &Live, pb: &joint::Problem) {
     *said = Some(key);
     drop(said);
     let reread = joint::changed_bytes(pb, &live.assignment, &target.assignment);
+    let saved_s = (now_t - target.time_s) * pb.horizon_tokens;
+    let reread_s = f64_from_u64(reread) * pb.disk_s_per_byte;
+    // The move-cost gate (4) is one reason; the other is that the room is
+    // not room an improvement may take: it must have lasted the settled
+    // window, with a layer to spare (`joint::replan`'s dead band).
+    let why = if saved_s > reread_s {
+        "the card has not kept that room, with a layer to spare, for the settled window".to_owned()
+    } else {
+        format!(
+            "less than re-reading {:.2} GiB ({reread_s:.1}s at {:.0} MB/s)",
+            gib(reread),
+            1.0 / pb.disk_s_per_byte / 1e6,
+        )
+    };
     eprintln!(
-        "[mummu-serve] placement hold: {} -> {} layers on {} would save {:.1} ms/token, {:.1}s over the {:.0}-token horizon — less than re-reading {:.2} GiB ({:.1}s at {:.0} MB/s)",
+        "[mummu-serve] placement hold: {} -> {} layers on {} would save {:.1} ms/token, {saved_s:.1}s over the {:.0}-token horizon — {why}",
         key.0,
         key.1,
         label_of(live.backend),
         (now_t - target.time_s) * 1e3,
-        (now_t - target.time_s) * pb.horizon_tokens,
         pb.horizon_tokens,
-        gib(reread),
-        f64_from_u64(reread) * pb.disk_s_per_byte,
-        1.0 / pb.disk_s_per_byte / 1e6,
     );
-}
-
-/// What a re-plan decided, for the log.
-const fn verdict_word(v: joint::Verdict) -> &'static str {
-    match v {
-        joint::Verdict::Hold => "hold",
-        joint::Verdict::Repair => "repair",
-        joint::Verdict::Improve => "improve",
-    }
 }
 
 fn replan_and_apply(
@@ -1887,7 +2072,7 @@ fn replan_and_apply(
         // assuming pressure demotes a model that was running fine.
         return Ok(());
     }
-    let mut pb = live.problem(ctx, needs_tower, reading.as_ref());
+    let mut pb = live.problem(ctx, needs_tower, reading.as_ref(), View::Now);
     if pb.devices.len() < 2 && live.layers_on_card() > 0 {
         return Ok(());
     }
@@ -1895,40 +2080,61 @@ fn replan_and_apply(
         pb.horizon_tokens = pb.horizon_tokens.max(IDLE_HORIZON_TOKENS);
     }
     let (verdict, out) = joint::replan(&pb, &live.assignment);
-    let limit = match verdict {
-        joint::Verdict::Hold => {
-            live.improve_wanted = 0;
-            if idle {
-                explain_hold(live, &pb);
-            }
-            return Ok(());
+    if verdict == joint::Verdict::Repair {
+        live.improve_wanted = 0;
+        let room = reading.as_ref().map(|c| live.card_terms(c, &pb));
+        let before = joint::time_of(&pb, &live.assignment);
+        let started = Instant::now();
+        let moved = apply(live, lm, &out.assignment, None)?;
+        eprintln!(
+            "[mummu-serve] placement repair: moved {moved} layer(s) in {:.1}s, {:.1} -> {:.1} ms/token predicted; {}{}",
+            started.elapsed().as_secs_f64(),
+            before * 1e3,
+            joint::time_of(&pb, &live.assignment) * 1e3,
+            live.summary(&pb),
+            room.unwrap_or_default(),
+        );
+        return Ok(());
+    }
+    // Only at idle, and on the settled view: an improvement must still be
+    // one with the last ten minutes' load and room, not just this tick's.
+    if !idle {
+        return Ok(());
+    }
+    let mut settled = live.problem(ctx, needs_tower, reading.as_ref(), View::Settled);
+    settled.horizon_tokens = pb.horizon_tokens;
+    let (verdict, target) = joint::replan(&settled, &live.assignment);
+    if verdict != joint::Verdict::Improve {
+        live.improve_wanted = 0;
+        if verdict == joint::Verdict::Hold {
+            explain_hold(live, &settled);
         }
-        joint::Verdict::Repair => None,
-        joint::Verdict::Improve => {
-            // Only at idle, and only once it has been wanted for a while.
-            if !idle {
-                return Ok(());
-            }
-            live.improve_wanted += 1;
-            if live.improve_wanted < IMPROVE_DWELL {
-                return Ok(());
-            }
-            Some(IMPROVE_STEP)
-        }
+        return Ok(());
+    }
+    // And only once it has been wanted for a while.
+    live.improve_wanted += 1;
+    if live.improve_wanted < IMPROVE_DWELL {
+        return Ok(());
+    }
+    // A step at a time, each one a placement that is faster on its own
+    // (`joint::step`): the next tick may want something else.
+    let Some(step) = joint::step(&settled, &live.assignment, &target.assignment, IMPROVE_STEP)
+    else {
+        live.improve_wanted = 0;
+        return Ok(());
     };
-    let before = joint::time_of(&pb, &live.assignment);
+    let before = joint::time_of(&settled, &live.assignment);
     let started = Instant::now();
-    let moved = apply(live, lm, &out.assignment, limit)?;
-    if live.assignment == out.assignment {
+    let moved = apply(live, lm, &step.assignment, None)?;
+    if live.assignment == target.assignment {
         live.improve_wanted = 0;
     }
     eprintln!(
-        "[mummu-serve] placement {}: moved {moved} layer(s) in {:.1}s, {:.1} -> {:.1} ms/token predicted; {}",
-        verdict_word(verdict),
+        "[mummu-serve] placement improve: moved {moved} layer(s) in {:.1}s, {:.1} -> {:.1} ms/token predicted; {}",
         started.elapsed().as_secs_f64(),
         before * 1e3,
-        joint::time_of(&pb, &live.assignment) * 1e3,
-        live.summary(&pb),
+        joint::time_of(&settled, &live.assignment) * 1e3,
+        live.summary(&settled),
     );
     Ok(())
 }
@@ -2028,6 +2234,11 @@ pub(super) fn forget(pack_dir: Option<&Path>) {
 /// One idle look: feed the guard, drop an idle tower, and re-plan if the
 /// model is free.
 fn tick() {
+    settle().observe(
+        Instant::now(),
+        &crate::sysmon::pressure(),
+        super::mem_available_bytes(),
+    );
     // Idle retrieval models: theirs goes back too (see `crate::retrieval`).
     crate::retrieval::drop_idle();
     // A co-tenant using the card's compute gets all of it: retrieval models
@@ -2173,6 +2384,15 @@ mod tests {
     /// A small model's problem with the rates measured on the reference box
     /// for qwen3.5-2b (host Q4 37 GB/s, card Q8 30 GB/s, Q4 14 GB/s).
     fn small_model(host_free: f64, card_free: f64, card_capacity: u64) -> joint::Problem {
+        small_model_slowed(
+            Scaling::MemoryBound.slowdown(host_free),
+            Scaling::TimeSliced.slowdown(card_free),
+            card_capacity,
+        )
+    }
+
+    /// [`small_model`] with each device's slowdown given directly.
+    fn small_model_slowed(host: f64, card: f64, card_capacity: u64) -> joint::Problem {
         let gib = 1u64 << 30;
         let part = |kind| joint::Part {
             params: 30_000_000,
@@ -2191,20 +2411,18 @@ mod tests {
                 joint::Device {
                     capacity: 64 * gib,
                     fixed: 256 << 20,
-                    rate: contended(
+                    rate: slowed(
                         &[(QuantPolicy::Q4, per(37.4)), (QuantPolicy::Q8, per(15.1))],
-                        host_free,
-                        Scaling::MemoryBound,
+                        host,
                     ),
                     resident: vec![],
                 },
                 joint::Device {
                     capacity: card_capacity,
                     fixed: gib,
-                    rate: contended(
+                    rate: slowed(
                         &[(QuantPolicy::Q4, per(14.0)), (QuantPolicy::Q8, per(30.2))],
-                        card_free,
-                        Scaling::TimeSliced,
+                        card,
                     ),
                     resident: vec![],
                 },
@@ -2244,6 +2462,96 @@ mod tests {
             both.time_s > free.time_s * 5.0,
             "and it is slow, which is the point"
         );
+    }
+
+    /// The reference box on 2026-10-02: other routines take the host for
+    /// 30 s and give it back for 30 s, over and over. Planned on the last
+    /// few seconds, the 2B's best placement flips between all-host and
+    /// all-card with them — what drove the live 27B's 72 moves. Planned on
+    /// the settled view it is one placement, held through every flip once
+    /// the window has filled.
+    #[test]
+    fn minute_scale_load_does_not_move_layers() {
+        let gib = 1u64 << 30;
+        let t0 = Instant::now();
+        let mut settle = Settle::new();
+        let mut instant = std::collections::BTreeSet::new();
+        let mut placed: Option<joint::Assignment> = None;
+        let mut held = 0;
+        for i in 0..600u64 {
+            let at = t0 + Duration::from_secs(2 * i);
+            let busy = (i / 15) % 2 == 0;
+            let p = crate::sysmon::Pressure {
+                cpu_free: if busy { 0.06 } else { 0.8 },
+                gpu_free: 0.7,
+                ..crate::sysmon::Pressure::default()
+            };
+            settle.observe(at, &p, None);
+            let now = joint::solve(&small_model(p.cpu_free, p.gpu_free, 6 * gib));
+            instant.insert(on_card(&now.assignment));
+            if 2 * i < SETTLE_WINDOW.as_secs() {
+                continue;
+            }
+            let (host, card) = settle.slowdowns(&p);
+            let pb = small_model_slowed(host, card, 6 * gib);
+            match &placed {
+                None => placed = Some(joint::solve(&pb).assignment),
+                Some(a) => {
+                    let (v, _) = joint::replan(&pb, a);
+                    assert_eq!(v, joint::Verdict::Hold, "tick {i}");
+                    held += 1;
+                }
+            }
+        }
+        assert!(
+            instant.len() > 1,
+            "the last few seconds do flip: {instant:?}"
+        );
+        assert_eq!(held, 299);
+    }
+
+    /// The window keeps ten minutes and no more, its mean is over what it
+    /// keeps, and its least counts the reading at hand.
+    #[test]
+    fn the_settle_window_forgets_what_is_older_than_ten_minutes() {
+        let t0 = Instant::now();
+        let mut w = Window::<u64>::new();
+        w.push(t0, 3);
+        w.push(t0 + Duration::from_secs(300), 9);
+        assert_eq!(w.least(5), 3);
+        w.push(t0 + SETTLE_WINDOW + Duration::from_secs(1), 7);
+        assert_eq!(w.values().collect::<Vec<_>>(), vec![9, 7]);
+        assert_eq!(w.least(8), 7);
+        assert_eq!(w.least(2), 2);
+        let mut m = Window::<f64>::new();
+        assert!(m.mean().is_none());
+        m.push(t0, 1.0);
+        m.push(t0, 4.0);
+        assert!((m.mean().unwrap() - 2.5).abs() < 1e-12);
+    }
+
+    /// A yielded card leaves its rate and room samples out: while yielding
+    /// it holds nothing at all, which repair handles at once, and averaging
+    /// the 50x slowdown of "no share" would keep layers off it for ten
+    /// minutes after the co-tenant left.
+    #[test]
+    fn a_yielded_card_is_not_averaged_in() {
+        let t0 = Instant::now();
+        let mut settle = Settle::new();
+        let free = crate::sysmon::Pressure {
+            gpu_free: 0.5,
+            ..crate::sysmon::Pressure::default()
+        };
+        let yielded = crate::sysmon::Pressure {
+            gpu: crate::sysmon::Yield::Yield,
+            gpu_free: 0.0,
+            ..crate::sysmon::Pressure::default()
+        };
+        settle.observe(t0, &free, Some(4 << 30));
+        settle.observe(t0 + Duration::from_secs(2), &yielded, Some(2 << 30));
+        let (_, card) = settle.slowdowns(&free);
+        assert!((card - 2.0).abs() < 1e-12);
+        assert_eq!(settle.host_room.least(8 << 30), 2 << 30);
     }
 
     #[test]

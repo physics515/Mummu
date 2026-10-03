@@ -3821,6 +3821,50 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       release uses — the batcher, the capture driver, serve's evictions, the load planner's reading
       of free memory, and placement's release-before-arrival. Gate: `batch_memory_returns_to_the_driver`
       (4009 MiB after every shape, 1 to 16 slots).
+- [x] **Live placement plans on settled readings** *(2026-10-02)* — the whole-system scheduler
+      (2026-10-01) scaled placement rates by `sysmon`'s three-second free shares, and an improvement
+      applied two layers per tick in a fixed order, every layer leaving the card first. On the
+      reference box other routines take 12-15 of 16 cores and give them back every 30-60 s, so the
+      best placement flipped every minute, the first step of each swap was a pure eviction (logged
+      as predicted *slower* than before), and the target changed before the arrivals came: the
+      production Bonsai 27B made 72 layer moves in its first 70 minutes and slid from 25 layers on
+      the card to 6, re-reading ~19 GB off the array. Production was stopped. Now moves plan on
+      ten minutes (`placement::SETTLE_WINDOW`): the mean slowdown each device suffered, and for an
+      improvement the least room the card and the host left (`View::Settled`); a repair still answers
+      the live reading, which is the out-of-memory guard. And an improvement steps by
+      `joint::step` — the best set of at most two of the target's changes that fits and is faster on
+      its own, so a layer leaves the card only together with what it makes room for. Repairs log
+      the card's terms (K, guard, non-layer, ε̂), and a hold says which gate held it. **Measured** on
+      the Bonsai 27B, 20 minutes of a 14-core load flipping every 30 s, another process taking
+      1.5 GiB of VRAM for 4 of them, and three chats: the deployed build repaired on for eight
+      minutes after the VRAM came back and ended at **3/64 layers** (14 layer reloads); the fixed
+      build repaired 27 → 17 as the guard rose 3.09 → 5.47 GiB, held, and ten minutes after the
+      card cleared stepped back to **25/64** in four steps, each predicted faster.
+- [x] **`think: false` turns thinking off in the prompt** *(2026-10-02)* — serve suppressed a
+      thinking family's `<think>` block on the way out, so the model still reasoned and the
+      reasoning still used the request's tokens: a 48-token Bonsai request came back empty, and on
+      a 96-token one the previous build reported that the whole budget went to thinking. The
+      Qwen3, Qwen3.5 and Qwen3.8 templates switch thinking off by closing an empty block after the
+      assistant header (`enable_thinking=false`); serve now renders that (`engine::NO_THINKING`)
+      whenever a request does not ask to see the thinking, and keeps the output filter for a model
+      that opens a block anyway. Same 48-token request: the answer in 19 tokens.
+- [x] **A model split across the card and the host batches** *(2026-10-02)* — the decode thread
+      took only models wholly on the card, so production's 27Bs never batched. `StaticDecode` now
+      separates `static_supported` (on the device, or partly on the host) from `static_capturable`
+      (wholly there, nothing in host memory): qwen35's static state keeps one KV store per device
+      and each `DeltaNet` layer's state beside its layer — on the host as the fused step's flat
+      twins (`DeltaHost`), stepped by `forward_static_host`, whose projections run once for every
+      slot (the packed host GEMM streams each weight once per batch) — and the step moves the
+      activations where the layers change device. The batcher steps such a model op by op; a batch
+      of one takes the bounded host head as the ordinary path does. Joiners are charged on the host
+      too (`Batcher::charge_host`, against `MemAvailable` above the host-pressure floor). **Gates:**
+      a host-only model with the fused step and a four-layer toy split across wgpu and the host
+      (attention and `DeltaNet` on each side, a tied head across them) both decode every sequence of
+      a continuous batch exactly as alone. **Measured** on the Bonsai 27B (Q4): with 22-23 layers on
+      the card, four concurrent greedy requests finished in 84 s against 158 s one at a time, each
+      text identical to its solo run (three joined the running batch, charged 0.12-0.35 GiB of the
+      card each); with 27-28, a request alone decoded at 1.81 tok/s against the previous build's
+      1.61 on the ordinary path (same session, interleaved).
 - [ ] **In-memory prompt-prefix KV reuse** *(mistral.rs parity; the warm sibling of P9's KV-cache
       persistence)* — agent loops re-send system prompt + growing history every turn and Mummu
       re-prefills from token zero each time. Keep the last (or LRU-few) prefill's KV in the `ModelSlot`

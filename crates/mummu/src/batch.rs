@@ -175,12 +175,19 @@ pub struct Batcher<M: StaticDecode> {
 impl<M: StaticDecode + Sync + 'static> Batcher<M> {
     /// A batcher for up to `max_slots` sequences of `model` on `device`, or
     /// `None` when the model cannot take the static path there or `mode` is
-    /// [`StepMode::Dynamic`].
+    /// [`StepMode::Dynamic`]. A model whose step cannot be captured there (a
+    /// split model, see [`StaticDecode::static_capturable`]) steps op by op
+    /// whatever `mode` asks.
     #[must_use]
     pub fn new(model: &M, device: &Device, max_slots: usize, mode: StepMode) -> Option<Self> {
         if mode == StepMode::Dynamic || !model.static_supported(device) {
             return None;
         }
+        let mode = if model.static_capturable(device) {
+            mode
+        } else {
+            StepMode::Static
+        };
         let ceiling = context(model);
         Some(Self {
             device: device.clone(),
@@ -401,6 +408,20 @@ impl<M: StaticDecode + Sync + 'static> Batcher<M> {
         write_all(&positions, fill(|s| s.pos), [tier], &self.device);
         let _ = Device::sync(&self.device);
         let len = bucket(furthest, max_ctx);
+        // A sequence alone decodes as the ordinary path does, a bounded host
+        // head included (`flex::head`): told the k its pick consults. Not
+        // under a constraint, whose legal tokens may lie anywhere, and only
+        // for a model whose step reads one — the scope is process-wide.
+        let _head = match self.seqs.as_slice() {
+            [only]
+                if model.static_bounded_head()
+                    && only.constraint.is_none()
+                    && only.picker.consults() >= 1 =>
+            {
+                Some(crate::flex::head::RequestTopK::set(only.picker.consults()))
+            }
+            _ => None,
+        };
         if self.mode != StepMode::Captured {
             return model.forward_static(&lock(&tokens), &lock(&positions), &mut lock(&state), len);
         }
@@ -569,12 +590,16 @@ impl<M: StaticDecode + Sync + 'static> Batcher<M> {
         (want, max_ctx)
     }
 
-    /// Bytes the batch's state holds now.
+    /// Bytes the batch's state holds now on its device.
     #[must_use]
     pub fn bytes(&self, model: &M) -> u64 {
+        self.bytes_on(model, &self.device)
+    }
+
+    fn bytes_on(&self, model: &M, device: &Device) -> u64 {
         self.state.as_ref().map_or(0, |s| {
             let (slots, ctx) = lock(s).shape();
-            model.static_bytes(slots, ctx, &self.device)
+            model.static_bytes(slots, ctx, device)
         })
     }
 
@@ -604,15 +629,34 @@ impl<M: StaticDecode + Sync + 'static> Batcher<M> {
         Some(state.saturating_add(self.graph_per_slot.saturating_mul(tier as u64)))
     }
 
+    /// [`Self::charge`]'s twin for the host: what admitting the request
+    /// adds at most to the state of the model's layers on the host — a split
+    /// model keeps their KV and recurrent state in host memory. Nothing for
+    /// a model wholly on the batch's device (and a model on the host has
+    /// all of it in [`Self::charge`]).
+    #[must_use]
+    pub fn charge_host(&self, model: &M, prompt: usize, max_tokens: usize) -> u64 {
+        let host = crate::backend::cpu_device();
+        if host == self.device {
+            return 0;
+        }
+        self.bytes_with_on(model, Some((prompt, max_tokens)), &host)
+            .saturating_sub(self.bytes_on(model, &host))
+    }
+
     /// Bytes the batch's state grows to at most — every live sequence run to
     /// its last position, and, when `extra` is a request's prompt length and
     /// `max_tokens`, that one admitted too. What a caller that plans the
     /// card's memory charges a batch before it admits one more.
     #[must_use]
     pub fn bytes_with(&self, model: &M, extra: Option<(usize, usize)>) -> u64 {
+        self.bytes_with_on(model, extra, &self.device)
+    }
+
+    fn bytes_with_on(&self, model: &M, extra: Option<(usize, usize)>, device: &Device) -> u64 {
         let slots = self.seqs.len() + usize::from(extra.is_some());
         if slots == 0 {
-            return self.bytes(model);
+            return self.bytes_on(model, device);
         }
         let last = self
             .seqs
@@ -624,7 +668,7 @@ impl<M: StaticDecode + Sync + 'static> Batcher<M> {
             .min(self.ceiling)
             .saturating_sub(1);
         let (s, ctx) = self.shape_for(slots, last);
-        model.static_bytes(s, ctx, &self.device)
+        model.static_bytes(s, ctx, device)
     }
 
     /// Remove the sequence in `slot`; the last live one moves into it.
