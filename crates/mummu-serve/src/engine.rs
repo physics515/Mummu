@@ -14,7 +14,7 @@ use burn::tensor::Device;
 use futures::FutureExt;
 use mummu::cache::ModelSlot;
 use mummu::chat::{ChatMl, Role, ToolCall, Turn};
-use mummu::decode::SamplerOptions;
+use mummu::decode::{Finish, Generated, SamplerOptions};
 use mummu::gguf::GgufFile;
 use mummu::models::{lfm2, olmoe, qwen2, qwen3, qwen35};
 use mummu::registry::{Architecture, ModelSpec, WeightFormat};
@@ -80,7 +80,7 @@ impl AnyLm {
         device: &Device,
         on_token: impl FnMut(u32) -> ControlFlow<()>,
         constraint: Option<&mut dyn mummu::constrain::Constraint>,
-    ) -> Result<Vec<u32>, String> {
+    ) -> Result<Generated, String> {
         match self {
             Self::Qwen2(m) => {
                 mummu::models::generate_constrained(
@@ -141,7 +141,7 @@ async fn decode_captured<M: mummu::capture::StaticDecode + Sync>(
     device: &Device,
     on_token: impl FnMut(u32) -> ControlFlow<()>,
     constraint: Option<&mut dyn mummu::constrain::Constraint>,
-) -> Result<Vec<u32>, String> {
+) -> Result<Generated, String> {
     let req = mummu::capture::DecodeRequest {
         prompt_ids,
         max_tokens,
@@ -1068,6 +1068,11 @@ pub struct ChatResult {
     /// offered or made, or when the markup did not parse (see
     /// [`lift_tool_calls`]).
     pub tool_calls: Vec<ToolCall>,
+    /// Why decoding stopped: the model ended the answer, or it ran out of
+    /// budget — what a surface reports as ollama's `done_reason` or
+    /// `OpenAI`'s `finish_reason`, so a client can tell a cut-off answer
+    /// from a finished one.
+    pub finish: Finish,
 }
 
 /// One chat completion as a surface hands it to the engine: the model, the
@@ -4249,7 +4254,7 @@ async fn generate_batched(
     let mut ids: Vec<u32> = Vec::new();
     let mut emitted = String::new();
     let mut first_token_at: Option<Instant> = None;
-    let mut finished = false;
+    let mut finish = None;
     let mut pending = first;
     loop {
         let update = match pending.take() {
@@ -4281,25 +4286,24 @@ async fn generate_batched(
                     on_delta,
                 );
                 if flow.is_break() {
-                    finished = true;
+                    finish = Some(Finish::Cancelled);
                     break;
                 }
             }
             decoder::Update::Done(result) => {
-                result?;
-                finished = true;
+                finish = Some(result?);
                 break;
             }
         }
     }
     drop(updates);
-    if !finished {
+    let Some(finish) = finish else {
         return Err(ChatError::request(
             "the decode thread stopped mid-generation",
         ));
-    }
+    };
     let text = decode_answer(&info.tokenizer, &ids, keep).map_err(|e| format!("decode: {e}"))?;
-    let text = conclude(thinking, text, req.max_tokens, on_delta)?;
+    let text = conclude(thinking, text, req.max_tokens, finish, on_delta)?;
     let elapsed_ms = crate::millis(started.elapsed());
     observe_placement(ids.len(), elapsed_ms);
     let generation_done = Instant::now();
@@ -4318,6 +4322,7 @@ async fn generate_batched(
         elapsed_ms,
         timings,
         tool_calls: Vec::new(),
+        finish,
     })
 }
 
@@ -4499,8 +4504,9 @@ async fn generate_on(
         .await?
     };
 
+    let Generated { ids: out, finish } = out;
     let text = decode_answer(&m.tokenizer, &out, &keep).map_err(|e| format!("decode: {e}"))?;
-    let text = conclude(thinking, text, max_tokens, on_delta)?;
+    let text = conclude(thinking, text, max_tokens, finish, on_delta)?;
     let elapsed_ms = crate::millis(start.elapsed());
     after_generation(m, out.len(), elapsed_ms);
     let generation_done = Instant::now();
@@ -4521,6 +4527,7 @@ async fn generate_on(
         elapsed_ms,
         timings,
         tool_calls: Vec::new(),
+        finish,
     })
 }
 
@@ -4620,13 +4627,16 @@ fn after_generation(m: &Loaded, tokens: usize, elapsed_ms: u64) {
 /// stops; the buffered text always had them, and a streamed client gets
 /// them here. The buffered text never went through the streaming filter, so
 /// it is filtered whole — by the same rules, which do not depend on how the
-/// text was cut into deltas, so the two agree. A block the token cap cut
-/// short leaves no answer at all, which is worth saying rather than
-/// returning "".
+/// text was cut into deltas, so the two agree. Thinking that spent the whole
+/// token budget leaves no answer at all, which is worth saying rather than
+/// returning "": a block the cap cut short, and one that closed on the
+/// budget's last tokens with nothing after it (`finish` says the budget
+/// ended it, where the model's own EOS after an empty answer is an answer).
 fn conclude(
     streamed: Option<crate::think::Filter>,
     text: String,
     max_tokens: usize,
+    finish: Finish,
     on_delta: &mut impl FnMut(&str) -> ControlFlow<()>,
 ) -> Result<String, ChatError> {
     let Some(mut streamed) = streamed else {
@@ -4640,11 +4650,15 @@ fn conclude(
     let mut f = crate::think::Filter::default();
     let mut visible = f.push(&text);
     visible.push_str(&f.finish());
-    if visible.trim().is_empty() && f.truncated() {
+    // A block that closed on the budget's last tokens is the 2026-10-02
+    // production case: a greedy Bonsai 27B closed its block within its 48
+    // tokens with nothing but whitespace after it, and came back as a 200
+    // with an empty answer, because only an open block was caught here.
+    let spent = f.truncated() || (f.opened() && finish == Finish::Length);
+    if visible.trim().is_empty() && spent {
         return Err(format!(
-            "the model spent all {max_tokens} tokens inside a <think> block and never \
-             reached an answer — raise the token limit, or set \"think\": true to see the \
-             reasoning"
+            "the model spent all {max_tokens} tokens thinking and never reached an answer — \
+             raise the token limit, or set \"think\": true to see the reasoning"
         )
         .into());
     }
@@ -5578,6 +5592,7 @@ mod template_tests {
             elapsed_ms: 0,
             timings: crate::trace::Timings::default(),
             tool_calls: Vec::new(),
+            finish: Finish::Eos,
         }
     }
 
@@ -5743,6 +5758,8 @@ mod template_tests {
 mod conclude_tests {
     use std::ops::ControlFlow;
 
+    use mummu::decode::Finish;
+
     use super::conclude;
     use crate::think::Filter;
 
@@ -5750,7 +5767,7 @@ mod conclude_tests {
     /// stream's think filter (off when `think` is set), as the decode
     /// callback does, then `conclude`. What the stream was sent, and what
     /// came back for the buffered answer.
-    fn answer(deltas: &[&str], think: bool) -> (String, Result<String, String>) {
+    fn answer(deltas: &[&str], think: bool, finish: Finish) -> (String, Result<String, String>) {
         let mut streamed = String::new();
         let mut on_delta = |d: &str| {
             streamed.push_str(d);
@@ -5766,7 +5783,7 @@ mod conclude_tests {
             }
         }
         let buffered =
-            conclude(thinking, deltas.concat(), 64, &mut on_delta).map_err(|e| e.message);
+            conclude(thinking, deltas.concat(), 64, finish, &mut on_delta).map_err(|e| e.message);
         (streamed, buffered)
     }
 
@@ -5775,7 +5792,7 @@ mod conclude_tests {
     #[test]
     fn a_think_off_answer_does_not_open_on_the_blank_line_after_the_block() {
         let deltas = ["<think>", "\n", "Okay.", "\n", "</think>", "\n\n", "4", "2"];
-        let (streamed, buffered) = answer(&deltas, false);
+        let (streamed, buffered) = answer(&deltas, false, Finish::Eos);
         assert_eq!(streamed, "42");
         assert_eq!(buffered.as_deref(), Ok("42"));
     }
@@ -5786,7 +5803,11 @@ mod conclude_tests {
     #[test]
     fn a_streamed_answer_gets_what_the_filter_held_when_the_model_stopped() {
         for tail in ["<", "<th"] {
-            let (streamed, buffered) = answer(&["<think>x</think>", "\n\n", "5 ", tail], false);
+            let (streamed, buffered) = answer(
+                &["<think>x</think>", "\n\n", "5 ", tail],
+                false,
+                Finish::Eos,
+            );
             let whole = format!("5 {tail}");
             assert_eq!(streamed, whole);
             assert_eq!(buffered, Ok(whole));
@@ -5795,23 +5816,56 @@ mod conclude_tests {
 
     #[test]
     fn an_answer_with_no_block_keeps_its_leading_whitespace() {
-        let (streamed, buffered) = answer(&["\n\n", "  x"], false);
+        let (streamed, buffered) = answer(&["\n\n", "  x"], false, Finish::Eos);
         assert_eq!(streamed, "\n\n  x");
         assert_eq!(buffered.as_deref(), Ok("\n\n  x"));
     }
 
     #[test]
     fn a_block_the_token_cap_cut_off_is_an_error_not_an_empty_answer() {
-        let (streamed, buffered) = answer(&["<think>", "still going"], false);
+        let (streamed, buffered) = answer(&["<think>", "still going"], false, Finish::Length);
         assert_eq!(streamed, "");
         let err = buffered.expect_err("no answer was reached");
         assert!(err.contains("all 64 tokens"), "{err}");
     }
 
+    /// The 2026-10-02 production case, greedy on the Bonsai 27B: the block
+    /// closed within the 48-token budget with only whitespace after it, so
+    /// nothing was cut off mid-block, but the budget still ended the answer
+    /// before it began. Thinking spent it all, which is the same error. The
+    /// same text ended by the model's own EOS is an empty answer it chose.
+    #[test]
+    fn a_block_that_closed_as_the_budget_ran_out_is_the_same_error() {
+        let deltas = [
+            "<think>",
+            "\nThe user wants three rivers in Europe.\n",
+            "</think>",
+            "\n\n",
+        ];
+        let (streamed, buffered) = answer(&deltas, false, Finish::Length);
+        assert_eq!(streamed, "");
+        let err = buffered.expect_err("the budget ended it before any answer");
+        assert!(err.contains("all 64 tokens"), "{err}");
+
+        let (streamed, buffered) = answer(&deltas, false, Finish::Eos);
+        assert_eq!(streamed, "");
+        assert_eq!(buffered.as_deref(), Ok(""));
+    }
+
+    /// A cut-off answer that got past the thinking is an answer: it goes
+    /// out, and its `done_reason` says it was cut off.
+    #[test]
+    fn an_answer_cut_off_after_the_block_is_still_an_answer() {
+        let deltas = ["<think>x</think>", "\n\n", "The Danube"];
+        let (streamed, buffered) = answer(&deltas, false, Finish::Length);
+        assert_eq!(streamed, "The Danube");
+        assert_eq!(buffered.as_deref(), Ok("The Danube"));
+    }
+
     #[test]
     fn think_on_passes_the_text_through_untouched() {
         let deltas = ["<think>x</think>", "\n\n42 <"];
-        let (streamed, buffered) = answer(&deltas, true);
+        let (streamed, buffered) = answer(&deltas, true, Finish::Length);
         assert_eq!(streamed, deltas.concat());
         assert_eq!(buffered, Ok(deltas.concat()));
     }

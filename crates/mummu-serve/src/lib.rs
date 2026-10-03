@@ -1489,6 +1489,9 @@ where
                     "device": r.device,
                     "elapsed_ms": r.elapsed_ms,
                     "tokens_per_second": (f64_from_usize(r.tokens) / secs * 10.0).round() / 10.0,
+                    // Why decoding stopped: `length` is a reply the token
+                    // budget cut off (see `trace::finish_name`).
+                    "finish": trace::finish_name(r.finish),
                 })
             }
             Err(e) => {
@@ -1677,6 +1680,33 @@ mod tests {
         assert!(last.get("recovery").is_none(), "{last}");
         assert!(!recovery::poisoned(), "a bug is not a poisoned GPU");
         recovery::reset_for_tests();
+    }
+
+    /// The `done` frame says why decoding stopped, so a reply the token budget
+    /// cut off is not mistaken for a finished one.
+    #[tokio::test]
+    async fn the_done_frame_says_why_decoding_stopped() {
+        let _serial = progress_serial().await;
+        for (finish, name) in [
+            (mummu::decode::Finish::Length, "length"),
+            (mummu::decode::Finish::Eos, "eos"),
+        ] {
+            let chat = spawn_chat("m".into(), false, move |_| async move {
+                Ok(engine::ChatResult {
+                    text: "The Danube".into(),
+                    tokens: 3,
+                    device: "test",
+                    elapsed_ms: 10,
+                    timings: trace::Timings::default(),
+                    tool_calls: Vec::new(),
+                    finish,
+                })
+            });
+            let frames = sse_frames(sse_response(chat.rx, Some(chat.inflight))).await;
+            let last = frames.last().expect("a frame");
+            assert_eq!(last["type"], json!("done"), "{last}");
+            assert_eq!(last["finish"], json!(name), "{last}");
+        }
     }
 
     /// The belt under the braces: whatever becomes of the worker, the stream

@@ -4,14 +4,17 @@
 //! (~8-17 us of CPU-side launch work). Converting that into ms/token needs the
 //! other factor: the dispatch count of a real decode step. This measures it.
 //!
-//! Method — a DIFFERENTIAL, because a generation is prefill plus N decode
-//! steps and only the decode part scales. Run the same prompt twice at two
-//! token counts and subtract: the prefill, the model load and the warm-up are
-//! identical in both, so
+//! Method — a DIFFERENTIAL, because an N-token generation is prefill plus
+//! N - 1 decode steps (the last token is never fed back) and only the decode
+//! part scales. Run the same prompt twice at two token counts and subtract:
+//! the prefill, the model load and the warm-up are identical in both, so
 //!
 //!     dispatches_per_token = (count_hi - count_lo) / (tokens_hi - tokens_lo)
 //!
-//! and every fixed cost cancels instead of having to be modelled. The count
+//! and every fixed cost cancels instead of having to be modelled. Subtract
+//! only runs whose `tokens_returned` equals `tokens_requested`: a run EOS cut
+//! short fed back every token it returned, one decode step more than a run
+//! the budget capped at the same length, which skews the slope. The count
 //! itself comes from `CubeCL`'s own profiling logger at `minimal`, which logs
 //! exactly the kernels that run and no timing — so this is `CubeCL`'s count, not
 //! an inference of ours.

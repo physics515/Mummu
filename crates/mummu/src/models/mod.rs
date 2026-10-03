@@ -4,7 +4,7 @@
 
 use burn::tensor::{Device, Tensor};
 
-use crate::decode::{SamplerOptions, argmax_id, generate_loop, top_k_ids};
+use crate::decode::{Generated, SamplerOptions, argmax_id, generate_loop, top_k_ids};
 
 pub mod lfm2;
 pub mod minilm;
@@ -95,6 +95,7 @@ pub trait CausalLm {
                 None,
             )
             .await
+            .map(|g| g.ids)
         }
     }
 
@@ -231,7 +232,7 @@ pub trait CausalLm {
     }
 }
 
-/// [`CausalLm::generate`] with an output grammar.
+/// [`CausalLm::generate`] with an output grammar, saying why it stopped.
 ///
 /// A free function rather than a trait method on purpose: the returned
 /// future must stay `Send` for mummu-serve to spawn it, and a trait method
@@ -252,7 +253,7 @@ pub async fn generate_constrained<M>(
     device: &Device,
     on_token: impl FnMut(u32) -> std::ops::ControlFlow<()>,
     constraint: Option<&mut dyn crate::constrain::Constraint>,
-) -> Result<Vec<u32>, String>
+) -> Result<Generated, String>
 where
     // `Sync`, not `Send`: the future holds `&M` across every await, and
     // `&M: Send` is exactly `M: Sync`. Stating it here is what makes the
@@ -323,7 +324,7 @@ pub async fn generate_multimodal(
     prompt: &MultimodalPrompt<'_>,
     on_token: impl FnMut(u32) -> std::ops::ControlFlow<()>,
     constraint: Option<&mut dyn crate::constrain::Constraint>,
-) -> Result<Vec<u32>, String> {
+) -> Result<Generated, String> {
     let mut cache = model.new_cache();
     generate_loop(
         |ids, past, need_logits| {

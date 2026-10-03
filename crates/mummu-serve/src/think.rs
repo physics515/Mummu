@@ -167,7 +167,7 @@ impl Filter {
     }
 
     /// Has a span opened?
-    const fn opened(&self) -> bool {
+    pub(crate) const fn opened(&self) -> bool {
         !self.withheld.is_empty()
     }
 

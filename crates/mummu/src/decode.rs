@@ -310,11 +310,41 @@ pub fn prefill_chunk_len() -> usize {
     })
 }
 
+/// Why a generation stopped — what a client is told as ollama's
+/// `done_reason` or `OpenAI`'s `finish_reason`.
+///
+/// One enum for both decode drivers. [`generate_loop`] never reports
+/// [`Self::Context`] (it has no ceiling of its own), and a batch
+/// ([`crate::batch`]) never reports [`Self::Cancelled`] (a cancelled
+/// sequence just leaves).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Finish {
+    /// It picked an end-of-sequence id (not emitted).
+    Eos,
+    /// It emitted its `max_tokens`.
+    Length,
+    /// Its constraint's value closed.
+    Complete,
+    /// It reached the model's context.
+    Context,
+    /// Its caller stopped it: `on_token` returned `Break`.
+    Cancelled,
+}
+
+/// What [`generate_loop`] decoded: the emitted ids, and why it stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Generated {
+    pub ids: Vec<u32>,
+    pub finish: Finish,
+}
+
 /// The shared decode driver: prefill via `step` (in chunks — see
 /// [`prefill_chunk_len`]), then one token per iteration.
 ///
 /// Emits each accepted token through `on_token`; a `Break` return cancels
-/// cooperatively *before* the next forward. EOS is never emitted.
+/// cooperatively *before* the next forward, and so does the `max_tokens`-th
+/// token (its logits would never be read). EOS is never emitted. The result
+/// says which of these stopped it (see [`Finish`]).
 ///
 /// `step(new_ids, past, need_logits)` advances the cache; it must return
 /// `Some([1, vocab] logits)` for the last position whenever `need_logits`
@@ -349,7 +379,7 @@ pub async fn generate_loop(
     is_eos: impl Fn(u32) -> bool,
     mut on_token: impl FnMut(u32) -> ControlFlow<()>,
     mut constraint: Option<&mut dyn Constraint>,
-) -> Result<Vec<u32>, String> {
+) -> Result<Generated, String> {
     opts.validate();
     assert!(!prompt_ids.is_empty(), "generate_loop: empty prompt");
     assert!(max_tokens >= 1, "generate_loop: max_tokens must be >= 1");
@@ -382,7 +412,9 @@ pub async fn generate_loop(
         last.expect("non-empty prompt")
     };
     let mut out: Vec<u32> = Vec::with_capacity(max_tokens);
-    for past in (prompt_ids.len()..).take(max_tokens) {
+    // The position the picked token is fed at.
+    let mut past = prompt_ids.len();
+    let finish = loop {
         let vocab = u32::try_from(logits.dims()[1]).expect("vocab size fits u32");
         // This span crosses an await, so it must not hold a scope guard
         // (thread-local stack; the future may resume on another worker) —
@@ -404,14 +436,14 @@ pub async fn generate_loop(
             ));
         }
         if is_eos(next) {
-            break;
+            break Finish::Eos;
         }
         out.push(next);
         if let Some(c) = constraint.as_deref_mut() {
             c.accept(next);
         }
         if on_token(next).is_break() {
-            break;
+            break Finish::Cancelled;
         }
         // The constrained value closed. Nothing after it can belong to the
         // value, and letting the model free-associate past the last brace
@@ -420,7 +452,13 @@ pub async fn generate_loop(
             .as_deref()
             .is_some_and(super::constrain::Constraint::is_complete)
         {
-            break;
+            break Finish::Complete;
+        }
+        // The budget is spent. Stopping HERE, before the step, is what saves
+        // a whole forward: its logits would never be read (a token on the
+        // 27B; a batch retires the sequence at the same point).
+        if out.len() == max_tokens {
+            break Finish::Length;
         }
         // Cooperative yield: a CPU-backend decode is a long stretch of
         // blocking compute between awaits, and without this a single
@@ -430,9 +468,10 @@ pub async fn generate_loop(
             let _s = crate::prof::scope("step");
             step(&[next], past, true).expect("step must return logits when need_logits is true")
         };
-    }
+        past += 1;
+    };
     debug_assert!(out.len() <= max_tokens);
-    Ok(out)
+    Ok(Generated { ids: out, finish })
 }
 
 /// One sequence's token choice: its sampler options and RNG, applied to a
@@ -713,7 +752,8 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(out, vec![2], "one token, then EOS never emitted");
+        assert_eq!(out.ids, vec![2], "one token, then EOS never emitted");
+        assert_eq!(out.finish, Finish::Eos);
     }
 
     #[tokio::test]
@@ -738,8 +778,110 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(out.len(), 2, "break after the 2nd token stops the loop");
-        assert_eq!(streamed, out, "every emitted token was streamed");
+        assert_eq!(out.ids.len(), 2, "break after the 2nd token stops the loop");
+        assert_eq!(streamed, out.ids, "every emitted token was streamed");
+        assert_eq!(out.finish, Finish::Cancelled);
+    }
+
+    /// Running out of budget is told apart from the model ending the answer:
+    /// it is what a client sees as `done_reason: "length"`.
+    #[tokio::test]
+    async fn generate_loop_that_spends_its_budget_stops_for_length() {
+        let device = crate::backend::cpu_device();
+        let out = generate_loop(
+            toy_step(&device),
+            &[1],
+            3,
+            &SamplerOptions::greedy(),
+            |_| false,
+            |_| std::ops::ControlFlow::Continue(()),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.ids, vec![2, 3, 2]);
+        assert_eq!(out.finish, Finish::Length);
+    }
+
+    /// A generation that spends its budget stops before the next forward:
+    /// the prefill, then one step per token after the first — not one more,
+    /// whose logits nothing would read. Each step feeds the token it was
+    /// given at the position after the last. A one-token probe is the
+    /// prefill alone, where the wasted step had doubled its cost.
+    #[tokio::test]
+    async fn generate_loop_does_not_step_past_its_budget() {
+        /// The `(ids, past)` of every `step` call, in order.
+        type Steps = Vec<(Vec<u32>, usize)>;
+        let device = crate::backend::cpu_device();
+        let expected: [(usize, Vec<u32>, Steps); 2] = [
+            (
+                3,
+                vec![2, 3, 2],
+                vec![(vec![1, 1], 0), (vec![2], 2), (vec![3], 3)],
+            ),
+            (1, vec![2], vec![(vec![1, 1], 0)]),
+        ];
+        for (budget, ids, want) in expected {
+            let mut toy = toy_step(&device);
+            let mut steps = Vec::new();
+            let out = generate_loop(
+                |ids: &[u32], past: usize, need_logits: bool| {
+                    steps.push((ids.to_vec(), past));
+                    toy(ids, past, need_logits)
+                },
+                &[1, 1],
+                budget,
+                &SamplerOptions::greedy(),
+                |_| false,
+                |_| std::ops::ControlFlow::Continue(()),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(out.ids, ids, "budget {budget}");
+            assert_eq!(out.finish, Finish::Length, "budget {budget}");
+            assert_eq!(steps, want, "budget {budget}");
+        }
+    }
+
+    /// Accepts anything; its value closes after `.0` tokens.
+    struct CloseAfter(usize);
+
+    impl Constraint for CloseAfter {
+        fn allows(&self, _: u32) -> bool {
+            true
+        }
+
+        fn accept(&mut self, _: u32) {
+            self.0 = self.0.saturating_sub(1);
+        }
+
+        fn is_complete(&self) -> bool {
+            self.0 == 0
+        }
+    }
+
+    /// A value that closes stops the answer, not the budget — even when it
+    /// closes on the budget's last token.
+    #[tokio::test]
+    async fn generate_loop_stops_when_the_constrained_value_closes() {
+        let device = crate::backend::cpu_device();
+        for (closes_after, budget) in [(2, 5), (3, 3)] {
+            let mut constraint = CloseAfter(closes_after);
+            let out = generate_loop(
+                toy_step(&device),
+                &[1],
+                budget,
+                &SamplerOptions::greedy(),
+                |_| false,
+                |_| std::ops::ControlFlow::Continue(()),
+                Some(&mut constraint),
+            )
+            .await
+            .unwrap();
+            assert_eq!(out.ids.len(), closes_after);
+            assert_eq!(out.finish, Finish::Complete, "{closes_after} in {budget}");
+        }
     }
 
     #[test]

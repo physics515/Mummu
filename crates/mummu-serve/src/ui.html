@@ -619,8 +619,11 @@ async function send() {
     } else if (ev.type === "done") {
       ended = true;
       renderBody(body, ev.text || acc);
+      // A reply the token budget (or the context) cut off says so: it can
+      // look finished, or be empty when thinking spent the whole budget.
+      const cut = { length: " · cut off at the token limit", context: " · cut off at the context limit" };
       div.querySelector(".meta").textContent =
-        `${ev.tokens} tokens · ${ev.tokens_per_second} tok/s · ${ev.device}`;
+        `${ev.tokens} tokens · ${ev.tokens_per_second} tok/s · ${ev.device}${cut[ev.finish] || ""}`;
       history.push({ role: "assistant", content: ev.text || acc });
     } else if (ev.type === "error") {
       ended = true;
