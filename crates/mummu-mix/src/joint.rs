@@ -605,6 +605,80 @@ pub fn replan(pb: &Problem, current: &Assignment) -> (Verdict, Outcome) {
     }
 }
 
+/// One bounded step from `current` toward `target`.
+///
+/// Of the layers the two place differently, the at most `max_layers` whose
+/// change, adopted alone, fits every device and is fastest — or `None` when
+/// no such subset is faster than `current`.
+///
+/// A step is a placement in its own right, because the move that follows it
+/// may never come: the inputs that chose `target` can change before the
+/// next tick, and a live server then holds whatever the step left. Taking
+/// the target's changes in a fixed order (every layer leaving the card
+/// first, arrivals after) made the first step of a swap a pure eviction.
+/// Measured live on 2026-10-02: with the target re-chosen every minute, the
+/// 27B's improvements took it from 25 layers on the card to 6, each step
+/// predicted slower than the placement it replaced. Here a release is only
+/// ever taken together with what it makes room for, and a step that would
+/// lose time is not taken at all.
+///
+/// Every subset of up to `max_layers` changed layers is tried — `C(n, k)`
+/// evaluations of (2) and (3), a few thousand for the 27B's 64 layers at
+/// `k = 2`. Ties go to the step that re-reads fewer bytes.
+#[must_use]
+pub fn step(
+    pb: &Problem,
+    current: &Assignment,
+    target: &Assignment,
+    max_layers: usize,
+) -> Option<Outcome> {
+    let changed: Vec<usize> = (0..current.layers.len())
+        .filter(|&l| current.layers[l] != target.layers[l])
+        .collect();
+    let base = time_of(pb, current);
+    let mut best: Option<(f64, u64, Outcome)> = None;
+    let mut pick = Vec::with_capacity(max_layers);
+    let mut consider = |pick: &[usize]| {
+        let mut trial = current.clone();
+        for &l in pick {
+            trial.layers[l] = target.layers[l].clone();
+        }
+        let o = outcome(pb, trial);
+        if !o.feasible || o.time_s >= base {
+            return;
+        }
+        let bytes = changed_bytes(pb, current, &o.assignment);
+        if best
+            .as_ref()
+            .is_none_or(|(t, b, _)| o.time_s < *t || (o.time_s <= *t && bytes < *b))
+        {
+            best = Some((o.time_s, bytes, o));
+        }
+    };
+    subsets(&changed, max_layers, 0, &mut pick, &mut consider);
+    best.map(|(_, _, o)| o)
+}
+
+/// Every non-empty subset of `from[start..]` of at most `left` more elements
+/// than `pick` holds, each handed to `f` once.
+fn subsets(
+    from: &[usize],
+    left: usize,
+    start: usize,
+    pick: &mut Vec<usize>,
+    f: &mut impl FnMut(&[usize]),
+) {
+    if left == 0 {
+        return;
+    }
+    for i in start..from.len() {
+        pick.push(from[i]);
+        f(pick);
+        subsets(from, left - 1, i + 1, pick, f);
+        pick.pop();
+    }
+}
+
 /// One layer's worth of `d`: the largest layer at its smallest level there.
 fn band(pb: &Problem, d: usize) -> u64 {
     pb.layers
@@ -970,6 +1044,67 @@ mod tests {
         let (v, o) = replan(&pb, &four);
         assert_eq!(v, Verdict::Improve);
         assert_eq!(on_card(&o.assignment), 5);
+    }
+
+    /// Five small layers fill the card but one; a layer twice their size
+    /// would save more there. The swap is one step — the small layer leaves
+    /// only together with the big one arriving: alone, its leaving loses
+    /// time (the eviction the old fixed order took first), and the arrival
+    /// alone does not fit.
+    #[test]
+    fn a_step_takes_a_release_only_with_its_arrival() {
+        let small = layer(8 * M, 2 * M, 1 << 20);
+        let big = layer(16 * M, 4 * M, 1 << 20);
+        let per = |l: &Layer| {
+            bytes_at(l.parts[1].params, Q4) + bytes_at(l.parts[0].params, Q4) + 4096 + (1 << 20)
+        };
+        let mut pb = problem(6, 0);
+        pb.layers[5] = big.clone();
+        pb.devices[1].capacity = (64 << 20) + 4 * per(&small) + per(&big);
+        let at = |pb: &Problem, l: usize, d: usize| {
+            fastest_choice(&pb.layers[l], d, &pb.devices[d], pb.floor).unwrap()
+        };
+        let current = Assignment {
+            layers: (0..6).map(|l| at(&pb, l, usize::from(l < 5))).collect(),
+        };
+        let mut target = current.clone();
+        target.layers[4] = at(&pb, 4, 0);
+        target.layers[5] = at(&pb, 5, 1);
+        let base = time_of(&pb, &current);
+        let mut evicted = current.clone();
+        evicted.layers[4] = target.layers[4].clone();
+        assert!(
+            time_of(&pb, &evicted) > base,
+            "the release alone loses time"
+        );
+        assert!(step(&pb, &current, &target, 1).is_none());
+        let o = step(&pb, &current, &target, 2).expect("the swap is a step");
+        assert!(o.feasible);
+        assert!(o.time_s < base);
+        assert_eq!(o.assignment, target);
+    }
+
+    /// Stepping toward a target reaches it, every step faster than the one
+    /// before, and never more than the bound at a time.
+    #[test]
+    fn steps_reach_the_target_each_one_faster() {
+        let per = bytes_at(8 * M, Q4) + bytes_at(2 * M, Q4) + 4096 + (1 << 20);
+        let pb = problem(10, (64 << 20) + 7 * per);
+        let target = solve(&pb).assignment;
+        let mut a = solve(&problem(10, 64 << 20)).assignment;
+        let mut t = time_of(&pb, &a);
+        let mut steps = 0;
+        while let Some(o) = step(&pb, &a, &target, 2) {
+            let moved = (0..a.layers.len())
+                .filter(|&l| a.layers[l] != o.assignment.layers[l])
+                .count();
+            assert!((1..=2).contains(&moved));
+            assert!(o.feasible && o.time_s < t);
+            (a, t) = (o.assignment, o.time_s);
+            steps += 1;
+        }
+        assert_eq!(a, target);
+        assert_eq!(steps, on_card(&target).div_ceil(2));
     }
 
     /// Nothing moves when nothing changed: the solver is deterministic, so a
