@@ -165,6 +165,16 @@ impl Drop for RequestTopK {
     }
 }
 
+/// Whether a caller scoped the k it needs ([`RequestTopK`]).
+///
+/// Without one the bounded head walks to [`head_k`]'s safe default, which
+/// costs more than the dense head (see `REQUEST_TOPK`), so a caller that
+/// cannot say which k it needs keeps the dense head.
+#[must_use]
+pub fn request_k_active() -> bool {
+    REQUEST_TOPK.load(std::sync::atomic::Ordering::Relaxed) != 0
+}
+
 /// The k the next head evaluation uses: the request override when one is
 /// active, else the env default.
 #[must_use]

@@ -130,8 +130,9 @@ impl AnyLm {
 /// (the 2B: 17.1 → 11.7 ms/token in f16). The host keeps the ordinary path —
 /// no launches to save, and its fused `DeltaNet` step and packed kernels are
 /// what make CPU decode fast. A model split across the two is not on one
-/// device, so the capture driver itself falls back (`static_state` says no).
-/// `MUMMU_GRAPH=off` turns it off.
+/// device, so the capture driver itself falls back (`static_capturable`
+/// says no); the decode thread batches it instead. `MUMMU_GRAPH=off` turns
+/// it off.
 async fn decode_captured<M: mummu::capture::StaticDecode + Sync>(
     m: &M,
     prompt_ids: &[u32],
@@ -4008,9 +4009,10 @@ async fn serve_held(
     // like one that fails under a token.
     let outcome = AssertUnwindSafe(async {
         let before = placement::before_request(&mut m, key, ctx, needs_tower);
-        // A model wholly on the card decodes on the decode thread, in a batch
-        // with whatever else arrives for it: the slot goes there with this
-        // request's generation, and failures from here on are decided there.
+        // A model on the card — split with the host too — decodes on the
+        // decode thread, in a batch with whatever else arrives for it: the
+        // slot goes there with this request's generation, and failures from
+        // here on are decided there.
         let batched = match prepare_batched(&m, req, prompt) {
             Ok(b) => b,
             Err(e) => return (Err(e), before),
