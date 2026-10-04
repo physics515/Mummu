@@ -2378,6 +2378,56 @@ fn layer_trace() -> bool {
     *ON.get_or_init(|| std::env::var("MUMMU_LAYER_TRACE").is_ok())
 }
 
+/// Allocator trace on? (`MUMMU_POOL_TRACE=1`): every prefill span samples the
+/// accelerator's pool after each of its layers there and reports the peaks
+/// — what a request's working set really is, against what the pool keeps.
+/// Each sample waits for the device, so this slows prefill; diagnosis only.
+fn pool_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MUMMU_POOL_TRACE").is_ok())
+}
+
+/// One forward span's pool readings on its accelerator (see [`pool_trace`]).
+#[derive(Default)]
+struct PoolTrace {
+    device: Option<Device>,
+    start: (u64, u64),
+    peak: (u64, u64),
+}
+
+impl PoolTrace {
+    /// Sample `device` if it is an accelerator: `(reserved, in_use)`.
+    fn sample(&mut self, device: &Device) {
+        if crate::backend::is_flex(device) {
+            return;
+        }
+        let Some(u) = device.memory_pool_usage() else {
+            return;
+        };
+        let now = (u.bytes_reserved, u.bytes_in_use);
+        if self.device.is_none() {
+            self.device = Some(device.clone());
+            self.start = now;
+        }
+        self.peak = (self.peak.0.max(now.0), self.peak.1.max(now.1));
+    }
+
+    fn report(&mut self, t: usize, past: usize) {
+        let Some(device) = self.device.clone() else {
+            return;
+        };
+        self.sample(&device);
+        let mib = |b: u64| b >> 20;
+        eprintln!(
+            "[mummu] pool trace: span of {t} at {past}: reserved {} -> peak {} MiB, in use {} -> peak {} MiB",
+            mib(self.start.0),
+            mib(self.peak.0),
+            mib(self.start.1),
+            mib(self.peak.1),
+        );
+    }
+}
+
 /// Residual-geometry probe on? (`MUMMU_RESIDUAL_PROBE=1`).
 fn residual_probe() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -3121,6 +3171,7 @@ impl LoadedQwen35 {
         // mode is ever legal.
         let mut spec_carry: Option<(usize, Tensor<3>)> = None;
         let mut tally = LookaheadTally::default();
+        let mut pools = (t > 1 && pool_trace()).then(PoolTrace::default);
         for li in 0..n_layers {
             let layer = &self.model.layers[li];
             // Layers may live on different devices (the dense placement puts
@@ -3194,8 +3245,14 @@ impl LoadedQwen35 {
             if layer_trace() {
                 trace_residual(li, &x);
             }
+            if let Some(p) = pools.as_mut() {
+                p.sample(&x.device());
+            }
         }
         tally.report();
+        if let Some(mut p) = pools {
+            p.report(t, past);
+        }
         // Advance-only calls stop here: every cache (KV, conv window,
         // recurrent state) is updated; the final norm and head are the
         // only work skipped, and nothing downstream reads them.
