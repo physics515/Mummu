@@ -828,6 +828,58 @@ pub fn return_memory(device: &burn::tensor::Device) {
     let _ = burn::tensor::Device::sync(device);
 }
 
+/// The most bytes an accelerator's pool held at the end of a prefill since
+/// the last [`take_pool_peak`] — the high-water a request's working set
+/// reached, which a reading after the request can miss: a batch hands its
+/// emptied pages back between the prefill and the request's end.
+static POOL_PEAK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Note `device`'s pool as a prefill ends (see [`take_pool_peak`]). A no-op
+/// on the host. Waits for the device's queued work, so once per prefill.
+pub fn note_pool_peak(device: &burn::tensor::Device) {
+    if is_flex(device) {
+        return;
+    }
+    if let Some(u) = device.memory_pool_usage() {
+        POOL_PEAK.fetch_max(u.bytes_reserved, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The pool's prefill high-water since the last call, and reset it.
+#[must_use]
+pub fn take_pool_peak() -> u64 {
+    POOL_PEAK.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Run `f` with `device`'s allocations persistent: each one exact-size and
+/// its own driver allocation, freed only by an explicit cleanup — on the
+/// host, as is.
+///
+/// For long-lived tensors (weights). The dynamic pools slice 1 GiB pages,
+/// which weights of a model's awkward sizes leave a quarter empty: on the
+/// Bonsai 27B 1.8 GiB of the card was reserved beyond what its 26 layers
+/// held (2026-10-04), and moving layers off left holes no cleanup could
+/// return. Exact-size allocations leave none, and a layer that leaves the
+/// card gives all of its bytes back on the next cleanup.
+///
+/// # Panics
+///
+/// Never in practice: the window runs its task exactly once.
+pub fn persistent<R: Send>(device: &burn::tensor::Device, f: impl FnOnce() -> R + Send) -> R {
+    if is_flex(device) {
+        return f();
+    }
+    let once = std::sync::Mutex::new(Some(f));
+    device.memory_persistent_allocations((), |()| {
+        let f = once
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .expect("the persistent window runs its task once");
+        f()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

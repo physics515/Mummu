@@ -2625,16 +2625,20 @@ pub fn load_from_pack_layered(
         };
         let precision = stored_precision(entry, choose)
             .ok_or_else(|| parse(format!("'{}' has no stored precision", entry.name)))?;
-        let src = match entry.role {
-            Role::Linear | Role::Expert { .. } | Role::Embedding => ParamSrc::Ready2(Box::new(
-                pack.tensor::<2>(entry, precision, &device).map_err(parse)?,
-            )),
-            Role::Vector | Role::Conv => ParamSrc::F32 {
-                values: pack.read_f32(entry).map_err(parse)?,
-                shape: entry.shape.clone(),
-            },
-        };
-        assign_param(&mut model, &path, src, QuantPolicy::Off, &device).map_err(parse)?;
+        // Weights live as long as the placement: exact-size allocations on
+        // an accelerator (`backend::persistent`).
+        crate::backend::persistent(&device, || {
+            let src = match entry.role {
+                Role::Linear | Role::Expert { .. } | Role::Embedding => ParamSrc::Ready2(Box::new(
+                    pack.tensor::<2>(entry, precision, &device).map_err(parse)?,
+                )),
+                Role::Vector | Role::Conv => ParamSrc::F32 {
+                    values: pack.read_f32(entry).map_err(parse)?,
+                    shape: entry.shape.clone(),
+                },
+            };
+            assign_param(&mut model, &path, src, QuantPolicy::Off, &device).map_err(parse)
+        })?;
         assigned += 1;
         // Every tensor, not every 15 s: three relaxed stores next to a
         // multi-megabyte disk read and a dequantize.
@@ -2723,16 +2727,19 @@ pub fn relocate_layers(
         }
         let precision = stored_precision(entry, choose)
             .ok_or_else(|| parse(format!("'{}' has no stored precision", entry.name)))?;
-        let src = match entry.role {
-            Role::Linear | Role::Expert { .. } | Role::Embedding => ParamSrc::Ready2(Box::new(
-                pack.tensor::<2>(entry, precision, device).map_err(parse)?,
-            )),
-            Role::Vector | Role::Conv => ParamSrc::F32 {
-                values: pack.read_f32(entry).map_err(parse)?,
-                shape: entry.shape.clone(),
-            },
-        };
-        assign_param(&mut loaded.model, &path, src, QuantPolicy::Off, device).map_err(parse)?;
+        let model = &mut loaded.model;
+        crate::backend::persistent(device, || {
+            let src = match entry.role {
+                Role::Linear | Role::Expert { .. } | Role::Embedding => ParamSrc::Ready2(Box::new(
+                    pack.tensor::<2>(entry, precision, device).map_err(parse)?,
+                )),
+                Role::Vector | Role::Conv => ParamSrc::F32 {
+                    values: pack.read_f32(entry).map_err(parse)?,
+                    shape: entry.shape.clone(),
+                },
+            };
+            assign_param(model, &path, src, QuantPolicy::Off, device).map_err(parse)
+        })?;
         moved += 1;
     }
     if moved == 0 {
