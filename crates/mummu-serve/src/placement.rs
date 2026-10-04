@@ -28,19 +28,27 @@
 //!   capacity     K  = total − G                                what we may occupy
 //!   non-layer    N  = in_use − Σ_{l on card} resident(l)       head, vision tower, residue
 //!   for layers   C  = K − N                                    joint::Device::capacity
-//!   working set  W  = act(min(ctx, chunk)) + ε̂ + V·[tower needed, not resident]
-//!                                                              joint::Device::fixed
+//!   working set  W  = P(act(min(ctx, chunk)) + T(ctx)) + ε̂
+//!                     + V·[tower needed, not resident]         joint::Device::fixed
 //!   state        s_l = KV_l(ctx)  or  conv_l + S_l              joint::Layer::state_bytes
 //! ```
 //!
 //! `act` is the widest live prefill buffer (three `[chunk, intermediate]`
-//! f32 tensors through `SwiGLU`); `ε̂` is the allocator residual the analytic
-//! terms do not explain — measured after every generation as
-//! `reserved − in_use_before − Σ s_l − act` and tracked as an envelope over
-//! the last requests (vLLM's profiling pass does the same for its KV budget:
-//! run the real workload and budget from the peak it produced, not from a
-//! constant). Before the first measurement ε̂ is a prior of one allocator
-//! page, and it is replaced by what the card shows.
+//! f32 tensors through `SwiGLU`); `T` the card's other prefill transients,
+//! which grow with the context ([`transient_bytes`]: a chunk's attention
+//! scores over the whole context, and one projection dequantized for the
+//! chunk's matmul); `P` rounds them to the pool's pages ([`prefill_reserve`]);
+//! `ε̂` is the allocator residual the analytic terms do not explain — measured
+//! after every generation as `reserved − in_use_before − Σ s_l − P(…)` and
+//! tracked as an envelope
+//! over the last requests (vLLM's profiling pass does the same for its KV
+//! budget: run the real workload and budget from the peak it produced, not
+//! from a constant). Before the first measurement ε̂ is a prior, and it is
+//! replaced by what the card shows. Weights are loaded as exact-size
+//! allocations (`mummu::backend::persistent`) — sliced into the pool's pages
+//! they left 1.8 GiB of the Bonsai 27B's card reserved and empty — and each
+//! generation hands its emptied pages back to the driver once measured, so
+//! one long prompt's pages are not charged again to every request after it.
 //!
 //! `ctx` is the context actually being served: the request's own prompt plus
 //! its token budget when a request is about to run, and the envelope of
@@ -408,6 +416,14 @@ impl Envelope {
 /// ε̂ — the allocator residual, measured after every generation.
 static RESIDUAL: Mutex<Envelope> = Mutex::new(Envelope(VecDeque::new()));
 
+/// The evidence-file key ε̂ is remembered under.
+///
+/// Renamed when ε̂ stopped absorbing the context-dependent transients
+/// ([`transient_bytes`]): the old `residual_bytes` held them too — 5.65 GiB
+/// on the production Bonsai, where a 4786-token prompt needed 3.4 — and read
+/// as the new quantity it would hold that back from layers for good.
+const RESIDUAL_KEY: &str = "residual_base_bytes";
+
 /// ε̂ before anything was measured: a quarter of the card.
 ///
 /// Not a small number on purpose. The first load has to fit BEFORE the first
@@ -464,10 +480,13 @@ fn inventory_vram() -> Option<u64> {
         .max()
 }
 
-/// Non-weight bytes a planner without a model config should hold back:
-/// the measured residual, or before any measurement its prior.
+/// Non-weight bytes a planner without a model config should hold back: the
+/// measured residual, but never less than its prior. ε̂ no longer covers the
+/// prefill transients ([`transient_bytes`]), and such a planner cannot add
+/// them — it has no context and no shapes to add them from.
 pub(super) fn nonweight_estimate() -> u64 {
-    residual_for(inventory_vram())
+    let card = inventory_vram();
+    residual_for(card).max(residual_prior(card))
 }
 
 /// Where ε̂ is kept between processes: a recovery restart must not forget
@@ -503,10 +522,7 @@ fn recall_residual(pack_dir: &Path) {
     let Ok(text) = std::fs::read_to_string(&path) else {
         return;
     };
-    let Some(v) = serde_json::from_str::<serde_json::Value>(&text)
-        .ok()
-        .and_then(|v| v["residual_bytes"].as_u64())
-    else {
+    let Some(v) = remembered_residual(&text) else {
         return;
     };
     // Clamped on the way in: a file written before the ceiling existed — or
@@ -529,6 +545,15 @@ fn recall_residual(pack_dir: &Path) {
     );
 }
 
+/// ε̂ from an evidence file's text, under [`RESIDUAL_KEY`] only: an older
+/// build's `residual_bytes` measured a different quantity.
+fn remembered_residual(text: &str) -> Option<u64> {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()?
+        .get(RESIDUAL_KEY)?
+        .as_u64()
+}
+
 /// Persist the current ε̂ (best effort; a failed write only costs a prior).
 fn remember_residual() {
     let Some(path) = RESIDUAL_FILE
@@ -545,7 +570,7 @@ fn remember_residual() {
     else {
         return;
     };
-    update_evidence(&path, |e| e["residual_bytes"] = serde_json::json!(v));
+    update_evidence(&path, |e| e[RESIDUAL_KEY] = serde_json::json!(v));
 }
 
 /// Rewrite one field of the placement evidence file, keeping the others
@@ -794,8 +819,21 @@ fn idle_context() -> usize {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .max()
-        .map_or(4096, |c| usize::try_from(c).unwrap_or(usize::MAX))
+        .map_or(IDLE_CONTEXT_FLOOR, |c| {
+            usize::try_from(c)
+                .unwrap_or(usize::MAX)
+                .max(IDLE_CONTEXT_FLOOR)
+        })
 }
+
+/// The least context an idle placement keeps room for.
+///
+/// Room for a request's prefill is made before it runs ([`before_request`]),
+/// by moving layers off the card — a re-read of each, seconds to a minute.
+/// An idle placement planned for the short requests that came before would
+/// make the first ordinary-length prompt pay that; planned for at least this
+/// much, only the long ones do.
+const IDLE_CONTEXT_FLOOR: usize = 4096;
 
 /// Tokens served, for the horizon `H`.
 static SERVED: Mutex<VecDeque<(Instant, usize)>> = Mutex::new(VecDeque::new());
@@ -1045,6 +1083,66 @@ pub(super) fn state_bytes(cfg: &qwen35::Qwen35Config, layer: usize, ctx: usize) 
 /// the context.
 pub(super) fn act_bytes(cfg: &qwen35::Qwen35Config, ctx: usize) -> u64 {
     3 * ctx.min(mummu::decode::prefill_chunk_len()).max(1) as u64 * cfg.intermediate_size as u64 * 4
+}
+
+/// Prefill spans up to this many rows run the packed GEMV row by row on the
+/// card; wider ones take the plain matmul, which dequantizes the weight
+/// (`nn::try_q4s_gemv`).
+const GEMV_ROWS: usize = 64;
+
+/// The card's prefill transients beyond [`act_bytes`] at `ctx` tokens.
+///
+/// Attention: a chunk's scores against the whole context, `[heads, chunk,
+/// ctx]` f32, live as scores, masked scores and probabilities at once. And a
+/// span wider than [`GEMV_ROWS`] multiplies by its projection dequantized to
+/// f32, the largest one at a time. Measured on the Bonsai 27B (2026-10-04,
+/// 1024-token chunks): the pool grew 1.73 GiB over a 4786-token prefill,
+/// against 1.84 here with `act` and the state; at 54 tokens 0.08 against
+/// 0.03. Without this term the residual absorbed it — a flat 5.65 GiB that
+/// over-reserved every short request and still under-reserved a 16k one.
+/// The largest page of the card pool's sliced ladder: cubecl's default
+/// layout (`SubSlices`) starts a quarter below its `max_page_size`, itself a
+/// quarter of the device — 1 GiB on a 16 GiB card. Prefill buffers above a
+/// few megabytes are slices of these pages.
+fn pool_page(card_total: u64) -> u64 {
+    (card_total / 16).max(1 << 20)
+}
+
+/// [`act_bytes`] and [`transient_bytes`] as the card's pool reserves them.
+///
+/// A span wider than [`GEMV_ROWS`] takes its buffers as slices of the
+/// largest pages ([`pool_page`]), so what it costs the card is whole pages —
+/// its live bytes rounded up, and one page more for the holes buffers of
+/// different sizes leave in them. Live bytes alone ran a 4786-token prompt
+/// out of device memory (2026-10-04): 1.85 GiB modelled, and the pool asked
+/// the driver for another whole page beyond it.
+pub(super) fn prefill_reserve(cfg: &qwen35::Qwen35Config, ctx: usize, card_total: u64) -> u64 {
+    let live = act_bytes(cfg, ctx) + transient_bytes(cfg, ctx);
+    if ctx.min(mummu::decode::prefill_chunk_len()) <= GEMV_ROWS {
+        return live;
+    }
+    let page = pool_page(card_total);
+    (live.div_ceil(page) + 1) * page
+}
+
+pub(super) fn transient_bytes(cfg: &qwen35::Qwen35Config, ctx: usize) -> u64 {
+    let rows = ctx.min(mummu::decode::prefill_chunk_len()).max(1) as u64;
+    let scores = 3 * cfg.num_attention_heads as u64 * rows * ctx.max(1) as u64 * 4;
+    let hidden = cfg.hidden_size as u64;
+    let widest = [
+        cfg.intermediate_size as u64,
+        2 * (cfg.num_attention_heads * cfg.head_dim) as u64,
+        cfg.conv_dim() as u64,
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0);
+    let dequant = if rows > GEMV_ROWS as u64 {
+        hidden * widest * 4
+    } else {
+        0
+    };
+    scores + dequant
 }
 
 /// A device's measured behaviour.
@@ -1645,7 +1743,9 @@ impl Live {
             };
             devices.push(joint::Device {
                 capacity: k.saturating_sub(non_layer),
-                fixed: act_bytes(&self.cfg, ctx) + residual_for(Some(c.total)) + tower_pending,
+                fixed: prefill_reserve(&self.cfg, ctx, c.total)
+                    + residual_for(Some(c.total))
+                    + tower_pending,
                 rate: slowed(&self.accel.rate, card_slowdown),
                 resident: self.accel.resident.clone(),
             });
@@ -1807,11 +1907,13 @@ impl Live {
         };
         let k = capacity(c);
         format!(
-            " — card: {:.2} GiB for layers (K {:.2} = total {:.2} − guard {:.2}; non-layer {:.2}), working set {:.2} (ε̂ {:.2}), this placement {:.2}",
+            " — card: {:.2} GiB for layers (K {:.2} = total {:.2} − guard {:.2} over ambient {:.2}, ours {:.2} reserved; non-layer {:.2}), working set {:.2} (ε̂ {:.2}), this placement {:.2}",
             gib(dev.capacity),
             gib(k),
             gib(c.total),
             gib(c.total.saturating_sub(k)),
+            gib(c.used.saturating_sub(c.reserved)),
+            gib(c.reserved),
             gib(c.in_use.saturating_sub(self.planned_card_bytes())),
             gib(dev.fixed),
             gib(residual_for(Some(c.total))),
@@ -2157,6 +2259,8 @@ pub(super) fn before_request(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .push(ctx as u64);
     set_request(ctx, needs_tower);
+    // This request's prefill high-water starts here (`after_request`).
+    let _ = mummu::backend::take_pool_peak();
     let AnyLm::Qwen35(lm) = &mut m.lm else {
         return None;
     };
@@ -2184,21 +2288,71 @@ pub(super) fn after_request(ctx: usize, tokens: usize, in_use_before: Option<u64
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .as_ref()
-        .map(|live| live.residual_after(ctx, before));
-    let Some(residual) = residual else { return };
-    RESIDUAL
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push(residual);
+        .map(|live| (live.residual_after(ctx, before), live.backend));
+    let Some((residual, backend)) = residual else {
+        return;
+    };
+    // Measured: the pages this generation emptied go back to the driver, so
+    // the next one's measurement — and the card meanwhile — carries only
+    // what is still in use (a short request after a long one read 3.5 GiB of
+    // the long one's pages as its own).
+    return_pages(backend);
+    let estimate = {
+        let mut env = RESIDUAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        env.push(residual.sample);
+        env.max().unwrap_or(residual.sample)
+    };
+    eprintln!(
+        "[mummu-serve] working set: a {ctx}-token context left the pool at {:.2} GiB reserved ({:.2} in use) from {:.2} in use before; layers' state {:.2}, prefill reserve {:.2} -> residual {:.2} GiB, estimate {:.2}",
+        gib(residual.reserved),
+        gib(residual.in_use),
+        gib(before),
+        gib(residual.state),
+        gib(residual.prefill),
+        gib(residual.sample),
+        gib(estimate),
+    );
     remember_residual();
+}
+
+/// Hand our pool's empty pages back to the driver without them reading as
+/// somebody else's: a reading first, so the next one sees our pool fall and
+/// credits the bytes the driver has not reclaimed yet ([`ambient`]'s window).
+/// Without it a 4 GiB release read as a co-tenant arriving — the guard
+/// jumped 3.4 -> 6.45 GiB and repairs took 14 layers off the card in a
+/// minute (2026-10-04).
+fn return_pages(backend: BackendChoice) {
+    if backend == BackendChoice::Cpu {
+        return;
+    }
+    if let Some(c) = card(backend) {
+        let _ = ambient(&c);
+    }
+    mummu::backend::return_memory(&device_of(backend));
+}
+
+/// One generation's working-set measurement (see [`Live::residual_after`]).
+struct ResidualSample {
+    reserved: u64,
+    in_use: u64,
+    state: u64,
+    /// What [`prefill_reserve`] holds for this context.
+    prefill: u64,
+    /// ε̂'s new evidence.
+    sample: u64,
 }
 
 impl Live {
     /// ε̂ for a generation that just ran at `ctx` tokens, from the pool's
     /// in-use bytes `before` it: what the card holds beyond the layers'
     /// state and the activations.
-    fn residual_after(&self, ctx: usize, before: u64) -> u64 {
-        let (reserved, _) = pool(self.backend);
+    fn residual_after(&self, ctx: usize, before: u64) -> ResidualSample {
+        let (now, in_use) = pool(self.backend);
+        // The prefill's high-water: the pages a batch prefilled into may have
+        // been handed back by now.
+        let reserved = now.max(mummu::backend::take_pool_peak());
         let state: u64 = self
             .assignment
             .layers
@@ -2207,10 +2361,21 @@ impl Live {
             .filter(|(_, c)| c.device == 1)
             .map(|(l, _)| state_bytes(&self.cfg, l, ctx))
             .sum();
-        reserved
-            .saturating_sub(before)
-            .saturating_sub(state)
-            .saturating_sub(act_bytes(&self.cfg, ctx))
+        let total = card(self.backend)
+            .map(|c| c.total)
+            .or_else(inventory_vram)
+            .unwrap_or(0);
+        let prefill = prefill_reserve(&self.cfg, ctx, total);
+        ResidualSample {
+            reserved,
+            in_use,
+            state,
+            prefill,
+            sample: reserved
+                .saturating_sub(before)
+                .saturating_sub(state)
+                .saturating_sub(prefill),
+        }
     }
 }
 
@@ -2598,6 +2763,63 @@ mod tests {
         assert!(state_bytes(&cfg, delta, 1) > 0);
     }
 
+    /// The card's prefill transients against what the Bonsai 27B's pool did
+    /// (2026-10-04, 1024-token chunks): a 4786-token prefill grew it 1.73 GiB
+    /// with 0.08 of it the layers' state. The model covers that, so the
+    /// residual is left with only what it cannot explain; it grows with the
+    /// context, where the flat residual fell short of a long prompt; and a
+    /// span the packed GEMV takes row by row dequantizes nothing.
+    #[test]
+    fn prefill_transients_cover_what_the_card_measured() {
+        let cfg = cfg_27b();
+        let gib = |b: u64| f64_from_u64(b) / f64::from(1u32 << 30);
+        if mummu::decode::prefill_chunk_len() == 1024 {
+            let long = gib(act_bytes(&cfg, 4786) + transient_bytes(&cfg, 4786));
+            assert!(long >= 1.73 - 0.08, "{long:.2} GiB");
+            assert!(long <= 2.2, "and not wildly over: {long:.2} GiB");
+        }
+        let at = |ctx| transient_bytes(&cfg, ctx);
+        assert!(at(16_384) > at(4096) && at(4096) > at(1024));
+        let hidden = cfg.hidden_size as u64;
+        let dequant = hidden * cfg.intermediate_size as u64 * 4;
+        assert!(
+            at(GEMV_ROWS) < dequant,
+            "no dequantized weight at {GEMV_ROWS} rows"
+        );
+        assert!(at(GEMV_ROWS + 1) >= dequant);
+    }
+
+    /// On a 16 GiB card a span past the packed GEMV's rows reserves whole
+    /// 1 GiB pages and one more: the 4786-token prompt that ran out of device
+    /// memory with 2.07 GiB planned now gets 3 GiB; a short prompt keeps its
+    /// live bytes; an idle placement plans for at least 4096 tokens.
+    #[test]
+    fn a_prefill_reserves_whole_pages() {
+        let cfg = cfg_27b();
+        let card = 16u64 << 30;
+        assert_eq!(pool_page(card), 1 << 30);
+        if mummu::decode::prefill_chunk_len() == 1024 {
+            assert_eq!(prefill_reserve(&cfg, 4818, card), 3 << 30);
+        }
+        let short = prefill_reserve(&cfg, 54, card);
+        assert_eq!(short, act_bytes(&cfg, 54) + transient_bytes(&cfg, 54));
+        assert!(short < 64 << 20);
+        assert!(prefill_reserve(&cfg, 16_384, card) > prefill_reserve(&cfg, 4818, card));
+        assert!(idle_context() >= IDLE_CONTEXT_FLOOR);
+    }
+
+    /// ε̂ is recalled from its own key only: the old key's 5.65 GiB held the
+    /// transients too, and read back as the residual it would keep them off
+    /// the card for good.
+    #[test]
+    fn an_older_residual_is_not_recalled() {
+        let old = r#"{"residual_bytes": 6068741336}"#;
+        assert_eq!(remembered_residual(old), None);
+        let new = format!(r#"{{"residual_bytes": 6068741336, "{RESIDUAL_KEY}": 2000000000}}"#);
+        assert_eq!(remembered_residual(&new), Some(2_000_000_000));
+        assert_eq!(remembered_residual("not json"), None);
+    }
+
     /// Prefill is chunked, so the activation term stops growing at the chunk.
     #[test]
     fn activations_are_bounded_by_the_prefill_chunk() {
@@ -2820,16 +3042,16 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mummu-rates-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("placement-x.json");
-        update_evidence(&path, |e| e["residual_bytes"] = serde_json::json!(123));
+        update_evidence(&path, |e| e[RESIDUAL_KEY] = serde_json::json!(123));
         let host = [(QuantPolicy::Q4, 2.5e-11), (QuantPolicy::F16, 9.0e-11)];
         let accel = [(QuantPolicy::Q8, 3.2e-12)];
         remember_rates(&path, BackendChoice::Wgpu, &host, &accel);
-        update_evidence(&path, |e| e["residual_bytes"] = serde_json::json!(456));
+        update_evidence(&path, |e| e[RESIDUAL_KEY] = serde_json::json!(456));
         let [h, a] = recall_rates(&path, BackendChoice::Wgpu).expect("rates kept");
         assert_eq!([h, a], [host.to_vec(), accel.to_vec()]);
         let text = std::fs::read_to_string(&path).expect("written");
         let v: serde_json::Value = serde_json::from_str(&text).expect("json");
-        assert_eq!(v["residual_bytes"].as_u64(), Some(456));
+        assert_eq!(v[RESIDUAL_KEY].as_u64(), Some(456));
         assert!(recall_rates(&dir.join("absent.json"), BackendChoice::Wgpu).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }

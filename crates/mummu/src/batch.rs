@@ -308,6 +308,9 @@ impl<M: StaticDecode + Sync + 'static> Batcher<M> {
             done = end;
         }
         let logits = logits.expect("a non-empty prompt");
+        // The prompt's working set peaks now; it may be handed back before
+        // the request ends.
+        crate::backend::note_pool_peak(&self.device);
         let state = Arc::clone(self.state.as_ref().expect("make_room built the state"));
         model.seed_static(&mut lock(&state), slot, &cache);
         drop(cache);

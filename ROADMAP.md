@@ -3840,6 +3840,24 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       minutes after the VRAM came back and ended at **3/64 layers** (14 layer reloads); the fixed
       build repaired 27 → 17 as the guard rose 3.09 → 5.47 GiB, held, and ten minutes after the
       card cleared stepped back to **25/64** in four steps, each predicted faster.
+- [x] **The card's working set, measured instead of remembered** *(2026-10-04)* — placement held
+      back a flat 5.65 GiB of the 16 GiB card for "the working set": a max over eight requests of
+      what the pool kept after each one, persisted across restarts. Measured per layer on the
+      Bonsai 27B, it was three things: 1.8 GiB of fragmentation (weights sliced into the pool's
+      1 GiB pages, there before any request ran), prefill buffers that grow with the context, and
+      pages the pool never hands back, so a short request after a long one read the long one's
+      pages as its own. Now weights load as exact-size allocations (`backend::persistent`:
+      residency 6.62 GiB planned, 6.50 on the card, against 8.26 and 9.79), prefill is reserved by
+      context in whole pool pages (`placement::prefill_reserve`: a chunk's attention scores over
+      the context and one dequantized projection, rounded to 1 GiB pages plus one — 3.0 GiB for a
+      4786-token prompt, which peaked at 2.96), emptied pages go back after each request without
+      reading as a co-tenant, and ε̂ keeps only the rest (0.16 GiB), under a new key so the old
+      number is not read back. An idle placement keeps room for at least 4096 tokens. Two
+      validations failed on the way and are the reason for the page rounding (live bytes alone ran
+      a 4786-token prompt out of device memory) and the exact-size weights (a constant residual
+      measured at 32 layers ran 39 out). **Validated** on the Bonsai: 31/64 layers at idle against
+      25-27, 169 ms/token predicted against 209, 2.4k- and 4.8k-token prompts served without moving
+      a layer, no out-of-memory.
 - [x] **`think: false` turns thinking off in the prompt** *(2026-10-02)* — serve suppressed a
       thinking family's `<think>` block on the way out, so the model still reasoned and the
       reasoning still used the request's tokens: a 48-token Bonsai request came back empty, and on

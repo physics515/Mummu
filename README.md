@@ -376,7 +376,9 @@ async fn search(dir: &std::path::Path, rr: &std::path::Path) -> Result<(), Box<d
   last ten minutes of those readings, not the last few seconds, and step only to placements that
   are faster on their own *(2026-10-02)*: on this box's minute-scale load swings the first version
   moved the 27B down to 3 of its 64 layers on the card; now it repairs for a co-tenant that
-  arrives and comes back once the card has stayed clear.
+  arrives and comes back once the card has stayed clear. The card's working set is reserved by
+  context *(2026-10-04)* — weights as exact-size allocations, prefill in whole pool pages — instead
+  of a remembered worst case: the Bonsai 27B holds 31 of its layers on the card where it held 26.
 - **Captured decode and batched decode** *(2026-10-01)* — `mummu::capture` records a decode step
   once per 256-key bucket and replays it every token (`burn::tensor::capture`; a software graph on
   Vulkan, a real one on CUDA), over a static state laid out so nothing a step touches moves: KV
