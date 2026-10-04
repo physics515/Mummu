@@ -2277,8 +2277,9 @@ pub(super) fn before_request(
 }
 
 /// After a generation, holding the model: measure the working set it
-/// actually used (ε̂) and count its tokens toward the horizon.
-pub(super) fn after_request(ctx: usize, tokens: usize, in_use_before: Option<u64>) {
+/// actually used (ε̂) and count its tokens toward the horizon. `prompt` is
+/// the part of `ctx` that was prefilled.
+pub(super) fn after_request(ctx: usize, prompt: usize, tokens: usize, in_use_before: Option<u64>) {
     SERVED
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2288,7 +2289,7 @@ pub(super) fn after_request(ctx: usize, tokens: usize, in_use_before: Option<u64
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .as_ref()
-        .map(|live| (live.residual_after(ctx, before), live.backend));
+        .map(|live| (live.residual_after(ctx, prompt, before), live.backend));
     let Some((residual, backend)) = residual else {
         return;
     };
@@ -2305,7 +2306,7 @@ pub(super) fn after_request(ctx: usize, tokens: usize, in_use_before: Option<u64
         env.max().unwrap_or(residual.sample)
     };
     eprintln!(
-        "[mummu-serve] working set: a {ctx}-token context left the pool at {:.2} GiB reserved ({:.2} in use) from {:.2} in use before; layers' state {:.2}, prefill reserve {:.2} -> residual {:.2} GiB, estimate {:.2}",
+        "[mummu-serve] working set: a {ctx}-token context ({prompt} prefilled) left the pool at {:.2} GiB reserved ({:.2} in use) from {:.2} in use before; layers' state {:.2}, prefill reserve {:.2} -> residual {:.2} GiB, estimate {:.2}",
         gib(residual.reserved),
         gib(residual.in_use),
         gib(before),
@@ -2345,10 +2346,14 @@ struct ResidualSample {
 }
 
 impl Live {
-    /// ε̂ for a generation that just ran at `ctx` tokens, from the pool's
-    /// in-use bytes `before` it: what the card holds beyond the layers'
-    /// state and the activations.
-    fn residual_after(&self, ctx: usize, before: u64) -> ResidualSample {
+    /// ε̂ for a generation that just ran at `ctx` tokens, `prompt` of them
+    /// prefilled, from the pool's in-use bytes `before` it: what the card
+    /// holds beyond the layers' state and the prefill. The prefill is the
+    /// prompt's own — reserving by the whole context (prompt and budget),
+    /// as planning must before it knows the split, rounded a 22-token
+    /// prompt with a 48-token budget to 2 GiB of pages and measured every
+    /// short request's residue as nothing (2026-10-04, production).
+    fn residual_after(&self, ctx: usize, prompt: usize, before: u64) -> ResidualSample {
         let (now, in_use) = pool(self.backend);
         // The prefill's high-water: the pages a batch prefilled into may have
         // been handed back by now.
@@ -2365,7 +2370,7 @@ impl Live {
             .map(|c| c.total)
             .or_else(inventory_vram)
             .unwrap_or(0);
-        let prefill = prefill_reserve(&self.cfg, ctx, total);
+        let prefill = prefill_reserve(&self.cfg, prompt.max(1), total);
         ResidualSample {
             reserved,
             in_use,
