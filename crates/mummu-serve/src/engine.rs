@@ -4032,7 +4032,12 @@ async fn serve_held(
     .await;
     let failure = match outcome {
         Ok((Ok(GenerationOutcome::Done(result)), before)) => {
-            placement::after_request(ctx, result.tokens, before);
+            placement::after_request(
+                ctx,
+                ctx.saturating_sub(req.max_tokens),
+                result.tokens,
+                before,
+            );
             return Ok(result);
         }
         Ok((Ok(GenerationOutcome::Batched(prepared)), before)) => {
@@ -4066,7 +4071,12 @@ async fn serve_held(
             )
             .await;
             if let Ok(result) = &r {
-                placement::after_request(ctx, result.tokens, before);
+                placement::after_request(
+                    ctx,
+                    ctx.saturating_sub(req.max_tokens),
+                    result.tokens,
+                    before,
+                );
             }
             return r;
         }
