@@ -822,7 +822,10 @@ fn done_value(model: &str, r: &engine::ChatResult, started: Instant) -> serde_js
         // `prompt_ms` includes it too.
         "prompt_eval_duration": ns(t.vision_ms.saturating_add(t.prefill_ms)),
         "eval_count": r.tokens,
-        "eval_duration": ns(t.decode_ms),
+        // Never zero, though a one-token answer decodes in 0 ms: clients
+        // divide by it, and ollama never sends one — llama-server clamps
+        // `predicted_ms` to 1 µs for exactly this.
+        "eval_duration": ns(t.decode_ms).max(1_000),
     })
 }
 
@@ -2276,6 +2279,20 @@ mod tests {
         assert_eq!(v["prompt_eval_count"], json!(286), "{v}");
         assert_eq!(v["prompt_eval_duration"], json!(10_045_000_000_u64), "{v}");
         assert_eq!(v["eval_duration"], json!(12_915_000_000_u64), "{v}");
+
+        // A one-token answer decodes in 0 ms, and a client divides by it.
+        let one = engine::ChatResult {
+            tokens: 1,
+            timings: crate::trace::Timings {
+                decode_ms: 0,
+                completion_tokens: 1,
+                ..r.timings
+            },
+            ..production_request()
+        };
+        let v = done_value("m", &one, started);
+        assert_eq!(v["eval_count"], json!(1), "{v}");
+        assert_eq!(v["eval_duration"], json!(1_000), "{v}");
     }
 
     /// Every way an ollama answer ends — /api/chat and /api/generate,
