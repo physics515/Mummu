@@ -622,8 +622,13 @@ async function send() {
       // A reply the token budget (or the context) cut off says so: it can
       // look finished, or be empty when thinking spent the whole budget.
       const cut = { length: " · cut off at the token limit", context: " · cut off at the context limit" };
+      // The rate is the decode rate, null below two tokens where there is
+      // none; the prompt's own time is shown beside it, so a long prefill
+      // reads as a long prefill rather than a slow model.
+      const rate = ev.tokens_per_second == null ? "" : ` · ${ev.tokens_per_second} tok/s`;
+      const prefill = ev.prefill_ms == null ? "" : ` · prefill ${(ev.prefill_ms / 1000).toFixed(1)} s`;
       div.querySelector(".meta").textContent =
-        `${ev.tokens} tokens · ${ev.tokens_per_second} tok/s · ${ev.device}${cut[ev.finish] || ""}`;
+        `${ev.tokens} tokens${rate}${prefill} · ${ev.device}${cut[ev.finish] || ""}`;
       history.push({ role: "assistant", content: ev.text || acc });
     } else if (ev.type === "error") {
       ended = true;
