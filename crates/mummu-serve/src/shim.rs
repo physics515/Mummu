@@ -796,21 +796,33 @@ const fn done_reason(finish: mummu::decode::Finish) -> &'static str {
     }
 }
 
-/// Ollama's final frame: timing in nanoseconds.
+/// Ollama's final frame: timing in nanoseconds, split where ollama's runner
+/// splits it (llama-server's `prompt_ms` and `predicted_ms`) — the prompt
+/// up to the first token, then the first token to the last. Clients take
+/// `eval_count / eval_duration` as the decode rate; with prefill in
+/// `eval_duration` (as it was until 2026-10-05) a 30-token prompt that took
+/// 8.8 s to prefill read as 1.1 tok/s instead of 1.9.
+///
+/// `load_duration` is getting the model ready for this request: planning
+/// where it goes, and loading it when it was not resident. Waiting behind
+/// another generation is in `total_duration` only, as it is in ollama's.
 fn done_value(model: &str, r: &engine::ChatResult, started: Instant) -> serde_json::Value {
-    let total_ns = crate::nanos(started.elapsed());
-    let eval_ns = r.elapsed_ms.saturating_mul(1_000_000);
+    let t = &r.timings;
+    let ns = |ms: u64| ms.saturating_mul(1_000_000);
     json!({
         "model": model,
         "created_at": now_rfc3339(),
         "done": true,
         "done_reason": done_reason(r.finish),
-        "total_duration": total_ns,
-        "load_duration": 0,
-        "prompt_eval_count": 0,
-        "prompt_eval_duration": 0,
+        "total_duration": crate::nanos(started.elapsed()),
+        "load_duration": ns(t.plan_ms.saturating_add(t.load_ms)),
+        "prompt_eval_count": t.prompt_tokens,
+        // `prompt_tokens` counts the image tokens, and encoding them through
+        // the vision tower is part of evaluating them — llama-server's
+        // `prompt_ms` includes it too.
+        "prompt_eval_duration": ns(t.vision_ms.saturating_add(t.prefill_ms)),
         "eval_count": r.tokens,
-        "eval_duration": eval_ns,
+        "eval_duration": ns(t.decode_ms),
     })
 }
 
@@ -2201,6 +2213,95 @@ mod tests {
             (Context, "length"),
         ] {
             assert_eq!(done_reason(finish), reason, "{finish:?}");
+        }
+    }
+
+    /// The 2026-10-05 production request: 30 prompt tokens, 8845 ms of
+    /// prefill, 25 tokens in 12915 ms of decode. The frame said
+    /// `prompt_eval_count: 0` and an `eval_duration` of both phases, ~21.8 s,
+    /// so Open `WebUI` showed 1.1 tok/s for a 1.9 tok/s decode.
+    fn production_request() -> engine::ChatResult {
+        engine::ChatResult {
+            tokens: 25,
+            elapsed_ms: 21_760,
+            timings: crate::trace::Timings {
+                plan_ms: 7,
+                queue_ms: 4_000,
+                load_ms: 0,
+                prefill_ms: 8_845,
+                decode_ms: 12_915,
+                prompt_tokens: 30,
+                completion_tokens: 25,
+                ..crate::trace::Timings::default()
+            },
+            ..answered("", Vec::new())
+        }
+    }
+
+    #[test]
+    fn done_value_splits_prefill_from_decode_as_ollama_does() {
+        let r = production_request();
+        let started = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(30))
+            .expect("the monotonic clock is past 30 s");
+        let v = done_value("m", &r, started);
+        assert_eq!(v["prompt_eval_count"], json!(30), "{v}");
+        assert_eq!(v["prompt_eval_duration"], json!(8_845_000_000_u64), "{v}");
+        assert_eq!(v["eval_count"], json!(25), "{v}");
+        assert_eq!(
+            v["eval_duration"],
+            json!(12_915_000_000_u64),
+            "decode only: {v}"
+        );
+        // Resident, so only the plan; the 4 s behind another generation is
+        // in no phase but the total.
+        assert_eq!(v["load_duration"], json!(7_000_000_u64), "{v}");
+        let total = v["total_duration"].as_u64().expect("total_duration");
+        assert!(total >= 30_000_000_000, "{v}");
+
+        // A cold load counts, and so does encoding the images the prompt's
+        // count includes.
+        let cold = engine::ChatResult {
+            timings: crate::trace::Timings {
+                load_ms: 90_000,
+                vision_ms: 1_200,
+                prompt_tokens: 286,
+                image_tokens: 256,
+                ..r.timings
+            },
+            ..production_request()
+        };
+        let v = done_value("m", &cold, started);
+        assert_eq!(v["load_duration"], json!(90_007_000_000_u64), "{v}");
+        assert_eq!(v["prompt_eval_count"], json!(286), "{v}");
+        assert_eq!(v["prompt_eval_duration"], json!(10_045_000_000_u64), "{v}");
+        assert_eq!(v["eval_duration"], json!(12_915_000_000_u64), "{v}");
+    }
+
+    /// Every way an ollama answer ends — /api/chat and /api/generate,
+    /// streamed and buffered — carries the split on its last line.
+    #[tokio::test]
+    async fn every_final_line_reports_the_prompt_and_decode_separately() {
+        let _serial = crate::progress_serial().await;
+        let endpoints: [(Wrap, Finish); 2] =
+            [(chat_delta, chat_done), (generate_delta, generate_done)];
+        for (wrap, finish) in endpoints {
+            for stream in [true, false] {
+                let response = respond("m".into(), stream, false, None, wrap, finish, |_| async {
+                    Ok(production_request())
+                })
+                .await;
+                let body = body_text(response).await;
+                let last = ndjson(&body).pop().expect("a final line");
+                assert_eq!(last["done"], json!(true), "stream = {stream}: {body}");
+                assert_eq!(last["prompt_eval_count"], json!(30), "{body}");
+                assert_eq!(
+                    last["prompt_eval_duration"],
+                    json!(8_845_000_000_u64),
+                    "{body}"
+                );
+                assert_eq!(last["eval_duration"], json!(12_915_000_000_u64), "{body}");
+            }
         }
     }
 
