@@ -796,21 +796,44 @@ const fn done_reason(finish: mummu::decode::Finish) -> &'static str {
     }
 }
 
-/// Ollama's final frame: timing in nanoseconds.
+/// Ollama's final frame — streamed or buffered — with its timing in
+/// nanoseconds, split where ollama splits it (checked 2026-10-05 against
+/// ollama's `server/routes.go` and `llm/llama_server.go`, and llama.cpp's
+/// `tools/server`):
+///
+/// - `load_duration`: ollama times from the request's arrival to the
+///   scheduler handing it a runner, its GGUF reads and any wait on the
+///   scheduler included. Here that is the fit plan, the wait for the slot
+///   and the load.
+/// - `prompt_eval_*`: the prompt up to the first token, image tokens and
+///   their encoding included, as llama.cpp's `prompt_n` / `prompt_ms`.
+/// - `eval_*`: every answer token, the first included, over the time from
+///   the first to the last — llama.cpp's `predicted_n` / `predicted_ms`. The
+///   first token comes out of the prompt's own forward pass, so its time is
+///   the prompt's.
+///
+/// That is [`crate::trace::Timings`]'s own split, so the fields map one to
+/// one. `eval_duration` used to be the whole `elapsed_ms`, prefill
+/// included, so a client's `eval_count / eval_duration` read a long prompt
+/// as a slow model: 2026-10-05's 8.8 s prefill and 12.9 s, 25-token decode
+/// came out at 1.1 tok/s rather than ~1.9.
 fn done_value(model: &str, r: &engine::ChatResult, started: Instant) -> serde_json::Value {
-    let total_ns = crate::nanos(started.elapsed());
-    let eval_ns = r.elapsed_ms.saturating_mul(1_000_000);
+    let t = &r.timings;
+    let ns = |ms: u64| ms.saturating_mul(1_000_000);
     json!({
         "model": model,
         "created_at": now_rfc3339(),
         "done": true,
         "done_reason": done_reason(r.finish),
-        "total_duration": total_ns,
-        "load_duration": 0,
-        "prompt_eval_count": 0,
-        "prompt_eval_duration": 0,
+        "total_duration": crate::nanos(started.elapsed()),
+        "load_duration": ns(t.plan_ms + t.queue_ms + t.load_ms),
+        "prompt_eval_count": t.prompt_tokens,
+        "prompt_eval_duration": ns(t.vision_ms + t.prefill_ms),
         "eval_count": r.tokens,
-        "eval_duration": eval_ns,
+        // Never zero, though a one-token answer decodes in 0 ms: clients
+        // divide by it, and ollama never sends one — llama.cpp clamps a
+        // generation's time to 1 µs for exactly this.
+        "eval_duration": ns(t.decode_ms).max(1_000),
     })
 }
 
@@ -2202,6 +2225,59 @@ mod tests {
         ] {
             assert_eq!(done_reason(finish), reason, "{finish:?}");
         }
+    }
+
+    /// Ollama's timing fields come from the phases the engine measured, so
+    /// the rate a client computes as `eval_count / eval_duration` is the
+    /// decode rate rather than tokens over the whole request. Every final
+    /// line — streamed or buffered, /api/chat or /api/generate — is built
+    /// by `done_value`.
+    #[test]
+    fn the_done_line_splits_the_request_into_ollamas_phases() {
+        let result = |tokens: usize, decode_ms: u64| engine::ChatResult {
+            tokens,
+            // What `eval_duration` used to be: prefill and decode together.
+            elapsed_ms: 8_800 + decode_ms,
+            timings: crate::trace::Timings {
+                plan_ms: 40,
+                queue_ms: 60,
+                load_ms: 200,
+                vision_ms: 500,
+                prefill_ms: 8_300,
+                decode_ms,
+                prompt_tokens: 412,
+                image_tokens: 256,
+                completion_tokens: tokens,
+            },
+            ..answered("The Danube", Vec::new())
+        };
+        let started = Instant::now();
+        let said = Said {
+            content: "The Danube",
+            thinking: "",
+        };
+
+        // 2026-10-05's shape: an 8.8 s prompt, then 25 tokens in 12.9 s,
+        // which the whole-request sum read as 1.1 tok/s.
+        let r = result(25, 12_900);
+        for v in [
+            done_value("m", &r, started),
+            chat_done("m", said, &r, started),
+            generate_done("m", said, &r, started),
+        ] {
+            assert_eq!(v["load_duration"], json!(300_000_000_u64), "{v}");
+            assert_eq!(v["prompt_eval_count"], json!(412), "{v}");
+            assert_eq!(v["prompt_eval_duration"], json!(8_800_000_000_u64), "{v}");
+            assert_eq!(v["eval_count"], json!(25), "{v}");
+            assert_eq!(v["eval_duration"], json!(12_900_000_000_u64), "{v}");
+            let count = v["eval_count"].as_f64().expect("a count");
+            let secs = v["eval_duration"].as_f64().expect("a duration") / 1e9;
+            assert!((count / secs - 1.94).abs() < 0.01, "{v}");
+        }
+
+        // A one-token answer decodes in 0 ms, and a client divides by it.
+        let v = done_value("m", &result(1, 0), started);
+        assert_eq!(v["eval_duration"], json!(1_000), "{v}");
     }
 
     /// The 2026-10-02 production case: `think: false`, hidden reasoning that
