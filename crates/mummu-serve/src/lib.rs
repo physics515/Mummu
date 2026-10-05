@@ -99,7 +99,7 @@ use axum::routing::{get, post};
 use mummu::chat::{Role, Turn};
 use mummu::decode::SamplerOptions;
 use mummu::manage::ModelManager;
-use mummu_num::{f64_from_u64, f64_from_usize, trunc_i64};
+use mummu_num::{f64_from_u64, trunc_i64};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::net::TcpListener;
@@ -1480,20 +1480,7 @@ where
             publish_profile();
         }
         let frame = match result {
-            Ok(r) => {
-                let secs = (f64_from_u64(r.elapsed_ms) / 1000.0).max(1e-3);
-                json!({
-                    "type": "done",
-                    "text": r.text,
-                    "tokens": r.tokens,
-                    "device": r.device,
-                    "elapsed_ms": r.elapsed_ms,
-                    "tokens_per_second": (f64_from_usize(r.tokens) / secs * 10.0).round() / 10.0,
-                    // Why decoding stopped: `length` is a reply the token
-                    // budget cut off (see `trace::finish_name`).
-                    "finish": trace::finish_name(r.finish),
-                })
-            }
+            Ok(r) => done_frame(&r),
             Err(e) => {
                 eprintln!(
                     "[mummu-serve] chat {model}: {e} (after {} ms)",
@@ -1505,6 +1492,34 @@ where
         last.send(frame);
     });
     ChatStream { rx, inflight }
+}
+
+/// A finished native chat as its `done` frame.
+///
+/// `tokens_per_second` is the DECODE rate, the one the request's trace line
+/// reports ([`trace::Timings::tokens_per_second`]). It used to be `tokens`
+/// over `elapsed_ms`, which spans the prefill too, so a long prompt read as
+/// a slow model — the ollama shim's copy of that sum turned an 8.8 s prefill
+/// and a 12.9 s, 25-token decode into 1.1 tok/s rather than ~1.9. Below two
+/// tokens there is no rate, and it is `null` rather than a number that means
+/// something else. The prefill and decode times go out beside it, so where
+/// `elapsed_ms` went can still be read.
+fn done_frame(r: &engine::ChatResult) -> serde_json::Value {
+    let t = &r.timings;
+    json!({
+        "type": "done",
+        "text": r.text,
+        "tokens": r.tokens,
+        "device": r.device,
+        "elapsed_ms": r.elapsed_ms,
+        "prompt_tokens": t.prompt_tokens,
+        "prefill_ms": t.prefill_ms,
+        "decode_ms": t.decode_ms,
+        "tokens_per_second": t.tokens_per_second().map(|tps| (tps * 10.0).round() / 10.0),
+        // Why decoding stopped: `length` is a reply the token budget cut off
+        // (see `trace::finish_name`).
+        "finish": trace::finish_name(r.finish),
+    })
 }
 
 #[cfg(test)]
@@ -1707,6 +1722,44 @@ mod tests {
             assert_eq!(last["type"], json!("done"), "{last}");
             assert_eq!(last["finish"], json!(name), "{last}");
         }
+    }
+
+    /// The `done` frame's rate is the decode rate, not tokens over the whole
+    /// request, so a long prefill does not read as a slow model. Below two
+    /// tokens there is no rate, and the frame says `null` rather than a
+    /// number.
+    #[test]
+    fn the_done_frame_reports_the_decode_rate_not_the_whole_request() {
+        let result = |tokens: usize, prefill_ms: u64, decode_ms: u64| engine::ChatResult {
+            text: "The Danube".into(),
+            tokens,
+            device: "test",
+            elapsed_ms: prefill_ms + decode_ms,
+            timings: trace::Timings {
+                prefill_ms,
+                decode_ms,
+                prompt_tokens: 412,
+                completion_tokens: tokens,
+                ..trace::Timings::default()
+            },
+            tool_calls: Vec::new(),
+            finish: mummu::decode::Finish::Eos,
+        };
+
+        // 2026-10-05's shape: 24 token intervals in 12.9 s is 1.86 tok/s,
+        // where 25 tokens over the whole 21.7 s said 1.2.
+        let frame = done_frame(&result(25, 8_800, 12_900));
+        assert_eq!(frame["tokens_per_second"], json!(1.9), "{frame}");
+        assert_eq!(frame["prefill_ms"], json!(8_800), "{frame}");
+        assert_eq!(frame["decode_ms"], json!(12_900), "{frame}");
+        assert_eq!(frame["prompt_tokens"], json!(412), "{frame}");
+        // The existing fields keep their meaning.
+        assert_eq!(frame["elapsed_ms"], json!(21_700), "{frame}");
+        assert_eq!(frame["tokens"], json!(25), "{frame}");
+
+        let frame = done_frame(&result(1, 8_800, 0));
+        assert_eq!(frame["tokens_per_second"], json!(null), "{frame}");
+        assert_eq!(frame["prefill_ms"], json!(8_800), "{frame}");
     }
 
     /// The belt under the braces: whatever becomes of the worker, the stream
