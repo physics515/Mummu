@@ -44,7 +44,7 @@ use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use mummu::chat::ToolCall;
-use mummu::decode::Finish;
+use mummu::decode::{Cancel, Finish};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -53,7 +53,7 @@ use crate::engine::{CallSyntax, ChatResult};
 use crate::recovery::{self, ChatError, InFlight};
 use crate::shim::{OllamaOptions, RunPlan, ToolDef, offer_tools, plan, tags_body, tool_specs};
 use crate::think::Filter;
-use crate::{ChatMessage, OutputFormat, engine, json_response, parse_json};
+use crate::{ChatMessage, Listening, OutputFormat, engine, json_response, parse_json};
 
 /// Both spellings of every route. See the module comment.
 pub fn router() -> Router {
@@ -537,6 +537,7 @@ async fn chat_completions(body: Bytes) -> Response {
                 think: p.think,
                 images: p.images,
                 tools: p.tools,
+                cancel: &sink.cancel,
             };
             engine::run_chat(&req, |delta| sink.delta(delta)).await
         },
@@ -571,6 +572,8 @@ where
 
     let (tx, rx) = mpsc::unbounded_channel::<String>();
     let inflight = InFlight::enter();
+    let cancel = Cancel::default();
+    let listening = Listening::new(&cancel);
     tokio::spawn(async move {
         let last = FinalText::new(
             tx.clone(),
@@ -600,6 +603,7 @@ where
             model: model.clone(),
             created,
             held: held.clone(),
+            cancel,
         };
         let tail = match recovery::contain(&model, run(sink)).await {
             Ok(r) => {
@@ -622,7 +626,7 @@ where
         };
         last.send(tail);
     });
-    sse_response(rx, inflight)
+    sse_response(rx, inflight, listening)
 }
 
 /// The buffered half of [`respond`]: one JSON document once the generation
@@ -639,9 +643,10 @@ where
     F: FnOnce(Deltas) -> Fut + Send + 'static,
     Fut: Future<Output = Result<ChatResult, ChatError>> + Send,
 {
-    crate::keepalive_json(async move {
+    let cancel = Cancel::default();
+    crate::keepalive_json(Listening::new(&cancel), async move {
         let _inflight = InFlight::enter();
-        let outcome = recovery::contain(&model, run(Deltas::nowhere())).await;
+        let outcome = recovery::contain(&model, run(Deltas::nowhere(cancel))).await;
         // Padded exactly when the answer outlived the keep-alive grace:
         // that is the condition `keepalive_json` pads on.
         let padded = begin.started.elapsed() >= crate::KEEPALIVE_GRACE;
@@ -713,16 +718,20 @@ struct Deltas {
     /// back from `delta.content`, as the ollama shim does. The calls go out
     /// structured, and whole, once the answer is — see [`stream_tail`].
     held: Option<Arc<Mutex<Filter>>>,
+    /// Raised when the client hangs up (see [`Listening`]): the generation's
+    /// request carries it (`engine::GenerationRequest::cancel`).
+    cancel: Cancel,
 }
 
 impl Deltas {
-    const fn nowhere() -> Self {
+    const fn nowhere(cancel: Cancel) -> Self {
         Self {
             tx: None,
             id: String::new(),
             model: String::new(),
             created: 0,
             held: None,
+            cancel,
         }
     }
 
@@ -865,10 +874,17 @@ fn sse(value: &serde_json::Value) -> String {
 
 /// The SSE body: frames as the worker produces them, and nothing else. The
 /// worker always writes a terminator (`data: [DONE]`), including on the
-/// paths where it dies — see [`FinalFrame`].
-fn sse_response(mut rx: mpsc::UnboundedReceiver<String>, inflight: InFlight) -> Response {
+/// paths where it dies — see [`FinalFrame`]. The body holds the chat's claim
+/// to be in flight and its client (see [`Listening`]): a client that hangs
+/// up drops it, and that cancels the generation.
+fn sse_response(
+    mut rx: mpsc::UnboundedReceiver<String>,
+    inflight: InFlight,
+    listening: Listening,
+) -> Response {
     let stream = async_stream::stream! {
         let _inflight = inflight;
+        let _listening = listening;
         while let Some(frame) = rx.recv().await {
             yield Ok::<String, std::convert::Infallible>(frame);
         }
@@ -1205,5 +1221,63 @@ mod tests {
             serde_json::from_str(&body_text(response).await).expect("JSON");
         assert_eq!(body["choices"][0]["finish_reason"], json!("length"));
         assert_eq!(body["usage"]["completion_tokens"], json!(48));
+    }
+
+    /// A client that hangs up — dropping the SSE body, or the buffered
+    /// handler's future inside its keep-alive grace — reaches the generation
+    /// at once, and its trace says how it ended: `cancelled`, not an `ok`
+    /// forty minutes after the client left.
+    #[tokio::test]
+    async fn a_chat_whose_client_hangs_up_is_told_and_traced_cancelled() {
+        let _serial = crate::progress_serial().await;
+        for stream in [true, false] {
+            let (told, heard) = tokio::sync::oneshot::channel();
+            let handler = respond(
+                "m".into(),
+                stream,
+                None,
+                begin(stream),
+                move |sink| async move {
+                    sink.cancel.cancelled().await;
+                    let _ = told.send(());
+                    Ok(ChatResult {
+                        tokens: 0,
+                        finish: Finish::Cancelled,
+                        ..answered("", Vec::new())
+                    })
+                },
+            );
+            if stream {
+                drop(handler.await); // the client takes the stream, then hangs up
+            } else {
+                let waited =
+                    tokio::time::timeout(std::time::Duration::from_millis(50), handler).await;
+                assert!(waited.is_err(), "the buffered answer finished on its own");
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(10), heard)
+                .await
+                .unwrap_or_else(|_| panic!("stream = {stream}: never told its client hung up"))
+                .expect("told");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let recent = crate::trace::recent_json(16);
+                let traced = recent["requests"].as_array().is_some_and(|r| {
+                    r.iter().any(|t| {
+                        t["surface"] == json!("openai")
+                            && t["stream"] == json!(stream)
+                            && t["finish"] == json!("cancelled")
+                            && t["outcome"] == json!("ok")
+                    })
+                });
+                if traced {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "stream = {stream}: no cancelled trace: {recent}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
     }
 }

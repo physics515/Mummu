@@ -2318,6 +2318,26 @@ pub(super) fn after_request(ctx: usize, prompt: usize, tokens: usize, in_use_bef
     remember_residual();
 }
 
+/// After a generation its client abandoned before a token (see
+/// `GenerationRequest::cancel`): no working-set sample, because the
+/// prefill's high-water it would measure may never have come — and ε̂ is the
+/// max of the last [`ENVELOPE`] samples, which a burst of abandoned retries
+/// (seventeen on 2026-10-05) would flush of every real one. The pages it did
+/// fill go back all the same, as [`after_request`]'s do.
+pub(super) fn after_abandoned(in_use_before: Option<u64>) {
+    if in_use_before.is_none() {
+        return;
+    }
+    let backend = LIVE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .map(|live| live.backend);
+    if let Some(backend) = backend {
+        return_pages(backend);
+    }
+}
+
 /// Hand our pool's empty pages back to the driver without them reading as
 /// somebody else's: a reading first, so the next one sees our pool fall and
 /// credits the bytes the driver has not reclaimed yet ([`ambient`]'s window).

@@ -2,9 +2,11 @@
 //!
 //! On-device argmax, a top-k probe, temperature/top-p sampling with a
 //! deterministic in-house RNG, and the streaming `generate_loop` driver with
-//! cooperative cancellation.
+//! cooperative cancellation ([`OnToken`], [`Cancel`]).
 
 use std::ops::ControlFlow;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use burn::tensor::Tensor;
 use mummu_num::f32_from_u32;
@@ -310,13 +312,102 @@ pub fn prefill_chunk_len() -> usize {
     })
 }
 
+/// A caller's standing request to stop a generation it no longer wants.
+///
+/// Raised once — its client hung up — from anywhere ([`Self::cancel`]: any
+/// thread, a `Drop`), and read wherever a generation can stop: before every
+/// forward of [`generate_loop`] (through [`Cancellable`]) and between the
+/// prefill chunks of a batch admission
+/// ([`crate::batch::Admission::cancel`]). A caller waiting on something else
+/// in the meantime awaits [`Self::cancelled`] beside it.
+///
+/// A flag, not a dropped future, because the stretches it has to interrupt
+/// do not await: a chunked prefill is minutes of blocking compute on a split
+/// 27B, and a batch admits on a thread of its own.
+#[derive(Clone, Debug, Default)]
+pub struct Cancel(Arc<Raised>);
+
+#[derive(Debug, Default)]
+struct Raised {
+    flag: AtomicBool,
+    waiters: tokio::sync::Notify,
+}
+
+impl Cancel {
+    /// Raise it. Raising it again does nothing.
+    pub fn cancel(&self) {
+        if !self.0.flag.swap(true, Ordering::SeqCst) {
+            self.0.waiters.notify_waiters();
+        }
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.0.flag.load(Ordering::SeqCst)
+    }
+
+    /// Resolves once it is raised — at once, if it already was.
+    pub async fn cancelled(&self) {
+        let mut notified = std::pin::pin!(self.0.waiters.notified());
+        // Registered before the flag is read, so a raise in between still
+        // wakes this waiter: `notify_waiters` reaches registered ones only.
+        notified.as_mut().enable();
+        if self.is_cancelled() {
+            return;
+        }
+        notified.await;
+    }
+}
+
+/// A generation's caller, as [`generate_loop`] sees it.
+///
+/// Told each token it accepts ([`Self::token`]), and asked before every
+/// forward — each prefill chunk and each decode step — whether the answer
+/// is still wanted ([`Self::abandoned`]). Any `FnMut(u32) -> ControlFlow<()>`
+/// is one that always wants it; [`Cancellable`] adds a [`Cancel`] to one.
+pub trait OnToken {
+    /// One accepted token; `Break` stops the generation before its next
+    /// forward ([`Finish::Cancelled`]).
+    fn token(&mut self, id: u32) -> ControlFlow<()>;
+
+    /// The answer is no longer wanted: the generation stops before its next
+    /// forward ([`Finish::Cancelled`]). Asked mid-prompt too, which is the
+    /// point — a long prompt's prefill is the longest stretch of a
+    /// generation with no token to answer `Break` to.
+    fn abandoned(&self) -> bool {
+        false
+    }
+}
+
+impl<F: FnMut(u32) -> ControlFlow<()>> OnToken for F {
+    fn token(&mut self, id: u32) -> ControlFlow<()> {
+        self(id)
+    }
+}
+
+/// `on_token`, abandoned once `cancel` is raised.
+pub struct Cancellable<'a, F> {
+    pub on_token: F,
+    pub cancel: &'a Cancel,
+}
+
+impl<F: FnMut(u32) -> ControlFlow<()>> OnToken for Cancellable<'_, F> {
+    fn token(&mut self, id: u32) -> ControlFlow<()> {
+        (self.on_token)(id)
+    }
+
+    fn abandoned(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+}
+
 /// Why a generation stopped — what a client is told as ollama's
 /// `done_reason` or `OpenAI`'s `finish_reason`.
 ///
 /// One enum for both decode drivers. [`generate_loop`] never reports
 /// [`Self::Context`] (it has no ceiling of its own), and a batch
-/// ([`crate::batch`]) never reports [`Self::Cancelled`] (a cancelled
-/// sequence just leaves).
+/// ([`crate::batch`]) reports [`Self::Cancelled`] only for an admission
+/// abandoned during its prefill (a sequence cancelled later just leaves).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Finish {
     /// It picked an end-of-sequence id (not emitted).
@@ -327,7 +418,9 @@ pub enum Finish {
     Complete,
     /// It reached the model's context.
     Context,
-    /// Its caller stopped it: `on_token` returned `Break`.
+    /// Its caller stopped it: `on_token` returned `Break` or was abandoned
+    /// ([`OnToken::abandoned`]), or its batch admission was
+    /// ([`crate::batch::Admission::cancel`]).
     Cancelled,
 }
 
@@ -343,8 +436,11 @@ pub struct Generated {
 ///
 /// Emits each accepted token through `on_token`; a `Break` return cancels
 /// cooperatively *before* the next forward, and so does the `max_tokens`-th
-/// token (its logits would never be read). EOS is never emitted. The result
-/// says which of these stopped it (see [`Finish`]).
+/// token (its logits would never be read). An `on_token` that is abandoned
+/// ([`OnToken::abandoned`]) cancels before the next forward too, a prefill
+/// chunk included — with no ids, when the prompt never finished. EOS is
+/// never emitted. The result says which of these stopped it (see
+/// [`Finish`]).
 ///
 /// `step(new_ids, past, need_logits)` advances the cache; it must return
 /// `Some([1, vocab] logits)` for the last position whenever `need_logits`
@@ -377,7 +473,7 @@ pub async fn generate_loop(
     max_tokens: usize,
     opts: &SamplerOptions,
     is_eos: impl Fn(u32) -> bool,
-    mut on_token: impl FnMut(u32) -> ControlFlow<()>,
+    mut on_token: impl OnToken,
     mut constraint: Option<&mut dyn Constraint>,
 ) -> Result<Generated, String> {
     opts.validate();
@@ -401,6 +497,14 @@ pub async fn generate_loop(
         let mut done = 0usize;
         let mut last = None;
         while done < prompt_ids.len() {
+            // Each chunk of a long prompt is minutes of blocking compute on a
+            // split model, with no token for `on_token` to break on.
+            if on_token.abandoned() {
+                return Ok(Generated {
+                    ids: Vec::new(),
+                    finish: Finish::Cancelled,
+                });
+            }
             let end = done.saturating_add(chunk).min(prompt_ids.len());
             let is_final = end == prompt_ids.len();
             let out = step(&prompt_ids[done..end], done, is_final);
@@ -442,7 +546,7 @@ pub async fn generate_loop(
         if let Some(c) = constraint.as_deref_mut() {
             c.accept(next);
         }
-        if on_token(next).is_break() {
+        if on_token.token(next).is_break() || on_token.abandoned() {
             break Finish::Cancelled;
         }
         // The constrained value closed. Nothing after it can belong to the
@@ -781,6 +885,102 @@ mod tests {
         assert_eq!(out.ids.len(), 2, "break after the 2nd token stops the loop");
         assert_eq!(streamed, out.ids, "every emitted token was streamed");
         assert_eq!(out.finish, Finish::Cancelled);
+    }
+
+    /// A caller that goes away while the prompt is still being read stops the
+    /// prefill before its next chunk: a 4,800-token prompt was ten minutes of
+    /// prefill on a split 27B in production (2026-10-05), all of it for a
+    /// client that had hung up after two.
+    #[tokio::test]
+    async fn an_abandoned_generation_stops_between_prefill_chunks() {
+        let device = crate::backend::cpu_device();
+        let chunk = prefill_chunk_len();
+        // Three chunks — one, if this environment turned chunking off.
+        let len = chunk.saturating_mul(2).saturating_add(1).min(8192);
+        let prompt = vec![1u32; len];
+        let cancel = Cancel::default();
+        let mut forwards = 0usize;
+        let mut model = toy_step(&device);
+        let step = |ids: &[u32], past: usize, need_logits: bool| {
+            forwards += 1;
+            cancel.cancel(); // the client hangs up during the first chunk
+            model(ids, past, need_logits)
+        };
+        let out = generate_loop(
+            step,
+            &prompt,
+            100,
+            &SamplerOptions::greedy(),
+            |_| false,
+            Cancellable {
+                on_token: |_: u32| ControlFlow::Continue(()),
+                cancel: &cancel,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(forwards, 1, "a forward ran after the caller abandoned it");
+        assert_eq!(out.finish, Finish::Cancelled);
+        assert_eq!(
+            out.ids.is_empty(),
+            len > chunk,
+            "an unfinished prompt picks no token"
+        );
+    }
+
+    /// Abandoned before it began — the client left while the request waited
+    /// for the model — it runs no forward at all.
+    #[tokio::test]
+    async fn a_generation_abandoned_before_it_starts_runs_no_forward() {
+        let cancel = Cancel::default();
+        cancel.cancel();
+        let mut forwards = 0usize;
+        let out = generate_loop(
+            |_, _, _| {
+                forwards += 1;
+                None
+            },
+            &[1, 2, 3],
+            4,
+            &SamplerOptions::greedy(),
+            |_| false,
+            Cancellable {
+                on_token: |_: u32| ControlFlow::Continue(()),
+                cancel: &cancel,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(forwards, 0);
+        assert_eq!(
+            out,
+            Generated {
+                ids: Vec::new(),
+                finish: Finish::Cancelled
+            }
+        );
+    }
+
+    /// Raised on another thread — the decode thread, a dropped response body —
+    /// it wakes a task waiting on it; raised already, the wait is over at once.
+    #[tokio::test]
+    async fn a_raised_cancel_wakes_whoever_waits_on_it() {
+        let cancel = Cancel::default();
+        let raiser = cancel.clone();
+        let thread = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            raiser.cancel();
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), cancel.cancelled())
+            .await
+            .expect("the raise woke the waiter");
+        thread.join().expect("raiser");
+        assert!(cancel.is_cancelled());
+        tokio::time::timeout(std::time::Duration::from_millis(100), cancel.cancelled())
+            .await
+            .expect("an already raised cancel does not wait");
     }
 
     /// Running out of budget is told apart from the model ending the answer:

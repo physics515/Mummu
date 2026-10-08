@@ -38,7 +38,7 @@ use mummu::batch::{Admission, Batcher, Event, SeqId};
 use mummu::cache::SlotGuard;
 use mummu::capture::{StaticDecode, StepMode};
 use mummu::constrain::Constraint;
-use mummu::decode::{Finish, SamplerOptions};
+use mummu::decode::{Cancel, Finish, SamplerOptions};
 use mummu::models::{qwen3, qwen35};
 use tokenizers::Tokenizer;
 
@@ -75,6 +75,10 @@ pub(super) struct Job {
     /// context was planned for when it took the slot (`before_request`); a
     /// joiner's is charged at admission (see `Thread::admit`).
     pub joined: bool,
+    /// Raised when the request's client hangs up: a job still waiting for a
+    /// slot is dropped unadmitted, and one being admitted stops its prefill
+    /// before the next chunk (see `Thread::admit`).
+    pub cancel: Cancel,
 }
 
 /// What the thread tells a request about its generation.
@@ -430,7 +434,16 @@ impl Thread {
     /// Admit `job`, or hand it back to wait: the batch is full, or the
     /// graph a joiner would need is not priced yet (the next step's capture
     /// prices it).
+    ///
+    /// A job whose client hung up is dropped here, unadmitted — its prefill
+    /// would run on this thread, and every live sequence in the batch would
+    /// wait through it for nobody (on 2026-10-05, ten minutes per abandoned
+    /// 4,800-token prompt). One that hangs up DURING its prefill stops it
+    /// before the next chunk.
     fn admit(&mut self, job: Job) -> Option<Job> {
+        if abandoned(&job) {
+            return None;
+        }
         let (Some(held), Some(cached)) = (&mut self.held, &mut self.cached) else {
             let _ = job.updates.send(Update::Done(Err(ChatError::request(
                 "this model cannot take the batched decode path",
@@ -489,6 +502,7 @@ impl Thread {
             opts,
             constraint,
             updates,
+            cancel,
             ..
         } = job;
         let adm = Admission {
@@ -496,6 +510,7 @@ impl Thread {
             max_tokens,
             opts: &opts,
             constraint,
+            cancel: Some(&cancel),
         };
         let model = &held.guard.lm;
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -507,6 +522,9 @@ impl Thread {
         }));
         match outcome {
             Ok(Ok((id, events))) => {
+                if events.contains(&Event::Done(Finish::Cancelled)) {
+                    note_stopped_prefill(prompt_ids.len());
+                }
                 let finished = events.iter().any(|e| matches!(e, Event::Done(_)));
                 // A request gone after one event needs no more of them.
                 let open = events.into_iter().all(|e| deliver(&updates, e));
@@ -814,6 +832,28 @@ fn gib(bytes: u64) -> f64 {
     mummu_num::f64_from_u64(bytes) / f64::from(1u32 << 30)
 }
 
+/// Whether `job`'s client hung up before it was admitted; if so, its request
+/// is told so, and the job is the caller's to drop.
+fn abandoned(job: &Job) -> bool {
+    let gone = job.cancel.is_cancelled() || job.updates.is_closed();
+    if gone {
+        eprintln!(
+            "[mummu-serve] decode thread: a request's client went away before it was admitted \
+             — dropped without a prefill"
+        );
+        let _ = job.updates.send(Update::Done(Ok(Finish::Cancelled)));
+    }
+    gone
+}
+
+/// Said when an admission's prefill stopped because its client hung up.
+fn note_stopped_prefill(prompt_tokens: usize) {
+    eprintln!(
+        "[mummu-serve] decode thread: a request's client went away during its prefill \
+         ({prompt_tokens} prompt tokens) — stopped it"
+    );
+}
+
 /// Send one batch event to its request; `false` when the request is gone.
 fn deliver(tx: &tokio::sync::mpsc::UnboundedSender<Update>, e: Event) -> bool {
     let update = match e {
@@ -821,4 +861,37 @@ fn deliver(tx: &tokio::sync::mpsc::UnboundedSender<Update>, e: Event) -> bool {
         Event::Done(why) => Update::Done(Ok(why)),
     };
     tx.send(update).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A request whose client hung up while it waited to join a batch is
+    /// dropped before anything is admitted — no prefill on the thread every
+    /// live sequence waits on — and its generation is told it was
+    /// cancelled, not that it failed.
+    #[test]
+    fn a_job_whose_client_hung_up_is_dropped_before_its_prefill() {
+        let (updates, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = Cancel::default();
+        cancel.cancel();
+        let job = Job {
+            prompt_ids: vec![1, 2, 3],
+            max_tokens: 4,
+            opts: SamplerOptions::greedy(),
+            constraint: None,
+            updates,
+            joined: true,
+            cancel,
+        };
+        assert!(
+            Thread::default().admit(job).is_none(),
+            "an abandoned job was handed back to wait for a slot"
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(Update::Done(Ok(Finish::Cancelled)))),
+            "the request was not told its generation was cancelled"
+        );
+    }
 }

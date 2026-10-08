@@ -38,7 +38,7 @@ use crate::capture::{
 };
 use crate::constrain::Constraint;
 pub use crate::decode::Finish;
-use crate::decode::{Picker, SamplerOptions, prefill_chunk_len};
+use crate::decode::{Cancel, Picker, SamplerOptions, prefill_chunk_len};
 use crate::nn::MAX_CONTEXT_TOKENS;
 use crate::nn::static_kv::bucket;
 
@@ -109,6 +109,12 @@ pub struct Admission<'a> {
     /// Decides which ids may be emitted, and when the value is complete
     /// (see [`crate::constrain`]).
     pub constraint: Option<Box<dyn Constraint>>,
+    /// The request that brought it went away: the prefill stops before its
+    /// next chunk, and the admission ends [`Finish::Cancelled`] (see
+    /// [`Batcher::admit`]). The prefill runs on the thread that steps the
+    /// batch, so every chunk spent on a prompt nobody waits for is a chunk
+    /// every live sequence waits through.
+    pub cancel: Option<&'a Cancel>,
 }
 
 struct Seq {
@@ -260,7 +266,9 @@ impl<M: StaticDecode + Sync + 'static> Batcher<M> {
 
     /// Admit a sequence: prefill its prompt on the ordinary path, seed it
     /// into the next slot and pick its first token. The events are that
-    /// token and/or why it stopped at once (it is then not in the batch).
+    /// token and/or why it stopped at once (it is then not in the batch) —
+    /// [`Finish::Cancelled`] alone when its [`Admission::cancel`] was raised
+    /// before the prefill finished, which then stops before its next chunk.
     ///
     /// # Errors
     ///
@@ -277,6 +285,7 @@ impl<M: StaticDecode + Sync + 'static> Batcher<M> {
             max_tokens,
             opts,
             mut constraint,
+            cancel,
         } = adm;
         assert!(!prompt_ids.is_empty(), "admit: empty prompt");
         assert!(max_tokens >= 1, "admit: max_tokens must be >= 1");
@@ -285,6 +294,10 @@ impl<M: StaticDecode + Sync + 'static> Batcher<M> {
         }
         if !self.fits(prompt_ids.len(), max_tokens) {
             return Err("the request is longer than the model's context".to_owned());
+        }
+        let abandoned = || cancel.is_some_and(Cancel::is_cancelled);
+        if abandoned() {
+            return Ok(self.cancelled());
         }
         let cell = Arc::clone(&self.cell);
         let _attached = Attached::new(&cell, model);
@@ -298,6 +311,9 @@ impl<M: StaticDecode + Sync + 'static> Batcher<M> {
         let mut done = 0usize;
         let mut logits = None;
         while done < prompt_len {
+            if abandoned() {
+                return Ok(self.cancelled());
+            }
             let end = done.saturating_add(chunk).min(prompt_len);
             if end == prompt_len {
                 logits =
@@ -351,6 +367,14 @@ impl<M: StaticDecode + Sync + 'static> Batcher<M> {
             });
         }
         Ok((seq_id, events))
+    }
+
+    /// An admission abandoned before its prefill finished: an id that never
+    /// entered the batch, and why.
+    fn cancelled(&mut self) -> (SeqId, Vec<Event>) {
+        let id = SeqId(self.next_id);
+        self.next_id += 1;
+        (id, vec![Event::Done(Finish::Cancelled)])
     }
 
     /// One step for every live sequence: each one's events (a token, a
@@ -760,6 +784,7 @@ pub(crate) fn run<M: StaticDecode + Sync + 'static>(
                             max_tokens: p.max_tokens,
                             opts: &p.opts,
                             constraint: None,
+                            cancel: None,
                         },
                     )
                     .expect("admits");
