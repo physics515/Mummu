@@ -31,6 +31,7 @@ use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete as delete_route, get, post};
 use mummu::chat::{ToolCall, ToolSpec};
+use mummu::decode::Cancel;
 use mummu::manage::ModelManager;
 use mummu::registry::{ModelSpec, WeightFormat};
 use mummu_num::{f64_from_u64, trunc_i64};
@@ -42,8 +43,8 @@ use crate::engine::CallSyntax;
 use crate::recovery::{self, ChatError, InFlight};
 use crate::think::{Filter, Split};
 use crate::{
-    ChatMessage, DEFAULT_MAX_TOKENS, FinalFrame, MAX_BODY_BYTES, MAX_MAX_TOKENS, OutputFormat,
-    blocking, engine, json_response, models_root, parse_json, to_turns,
+    ChatMessage, DEFAULT_MAX_TOKENS, FinalFrame, Listening, MAX_BODY_BYTES, MAX_MAX_TOKENS,
+    OutputFormat, blocking, engine, json_response, models_root, parse_json, to_turns,
 };
 
 /// The shim's routes. Binding and serving them (and draining them on
@@ -405,8 +406,9 @@ fn not_found(model: &str) -> Response {
 // ---------------------------------------------------------------------------
 // NDJSON plumbing (ollama streams one JSON object per line). Same shape as
 // the native API's SSE: a worker task feeds an mpsc channel, and the
-// response body drains it — a dropped client closes the receiver, the next
-// send fails, and the worker breaks off cooperatively.
+// response body drains it. A dropped client drops the body, and with it the
+// chat's `Listening`, which cancels the generation wherever it is — waiting
+// for the slot, prefilling, or decoding deltas it holds back.
 // ---------------------------------------------------------------------------
 
 fn ndjson_frame(value: &serde_json::Value) -> String {
@@ -414,12 +416,13 @@ fn ndjson_frame(value: &serde_json::Value) -> String {
 }
 
 /// `chat` is `Some` for a chat stream, which must end on a final line — the
-/// `done: true` object or an `{"error": …}` — and holds the response open for
-/// a restarting process (see [`InFlight`]). A pull ends on its own `status`
-/// line and passes `None`.
+/// `done: true` object or an `{"error": …}` — holds the response open for a
+/// restarting process (see [`InFlight`]), and is the generation's client
+/// (see [`Listening`]). A pull ends on its own `status` line and passes
+/// `None`.
 fn ndjson_response(
     mut rx: mpsc::UnboundedReceiver<serde_json::Value>,
-    chat: Option<InFlight>,
+    chat: Option<(InFlight, Listening)>,
 ) -> Response {
     let stream = async_stream::stream! {
         let must_end = chat.is_some();
@@ -951,6 +954,7 @@ async fn run(p: RunPlan, stream: bool, wrap: Wrap, finish: Finish) -> Response {
                 think: p.think,
                 images: p.images,
                 tools: p.tools,
+                cancel: &sink.cancel,
             };
             let r = engine::run_chat(&req, |delta| sink.delta(delta)).await;
             // Padded exactly when a buffered answer outlived the keep-alive
@@ -1101,6 +1105,10 @@ struct ShimSink {
     /// What the answer holds back between deltas; `None` when the request
     /// neither asked to see the thinking nor offered tools.
     held: Option<Arc<Mutex<Held>>>,
+    /// Raised when the client hangs up (see [`Listening`]): the generation's
+    /// request carries it (`engine::GenerationRequest::cancel`). A held
+    /// delta is never sent, so its send cannot be what notices.
+    cancel: Cancel,
 }
 
 impl ShimSink {
@@ -1196,9 +1204,11 @@ where
     Fut: std::future::Future<Output = Result<engine::ChatResult, ChatError>> + Send,
 {
     let started = Instant::now();
+    let cancel = Cancel::default();
     if stream {
         let (tx, rx) = mpsc::unbounded_channel::<serde_json::Value>();
         let inflight = InFlight::enter();
+        let listening = Listening::new(&cancel);
         tokio::spawn(async move {
             let last = FinalFrame::new(tx.clone(), ended_without_result());
             let held = (think || calls.is_some()).then(|| {
@@ -1212,6 +1222,7 @@ where
                 model: model.clone(),
                 wrap,
                 held: held.clone(),
+                cancel,
             };
             let line = match recovery::contain(&model, run(sink)).await {
                 Ok(mut r) => {
@@ -1232,18 +1243,19 @@ where
             };
             last.send(line);
         });
-        return ndjson_response(rx, Some(inflight));
+        return ndjson_response(rx, Some((inflight, listening)));
     }
     // Non-stream: run to completion, answer with one object — under the
     // keep-alive, because a buffered answer that sends nothing for minutes
     // is what a proxy reports as a dead origin (see `crate::keepalive_json`).
-    crate::keepalive_json(async move {
+    crate::keepalive_json(Listening::new(&cancel), async move {
         let _inflight = InFlight::enter();
         let sink = ShimSink {
             tx: None,
             model: model.clone(),
             wrap,
             held: None,
+            cancel,
         };
         match recovery::contain(&model, run(sink)).await {
             Ok(r) => {
@@ -2516,9 +2528,157 @@ mod tests {
         };
         tx.send(wrap("m", half)).expect("open");
         drop(tx);
-        let text = body_text(ndjson_response(rx, Some(InFlight::enter()))).await;
+        let chat = (InFlight::enter(), Listening::new(&Cancel::default()));
+        let text = body_text(ndjson_response(rx, Some(chat))).await;
         let last: serde_json::Value =
             serde_json::from_str(text.lines().last().expect("lines")).expect("JSON");
         assert!(last["error"].is_string(), "{text}");
+    }
+
+    /// What `engine::run_chat` answers a request whose client hung up.
+    fn cancelled() -> engine::ChatResult {
+        engine::ChatResult {
+            tokens: 0,
+            finish: mummu::decode::Finish::Cancelled,
+            ..answered("", Vec::new())
+        }
+    }
+
+    /// How long a test waits for a generation to hear its client left —
+    /// against the hour a generation that is never told runs on.
+    const TOLD_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Production, 2026-10-05: a streamed tool request whose client hung up
+    /// learned nothing until it finished, 35-43 minutes later — its deltas
+    /// were all held back, so not one was a send that could fail. Its client
+    /// hanging up (the body dropped, as hyper drops it) now reaches the
+    /// generation at once.
+    #[tokio::test]
+    async fn a_streamed_tool_chat_is_told_when_its_client_hangs_up() {
+        let _serial = crate::progress_serial().await;
+        let (told, heard) = tokio::sync::oneshot::channel();
+        let response = respond(
+            "m".into(),
+            true,
+            false,
+            engine::tool_calls(Architecture::Qwen3),
+            chat_delta,
+            chat_done,
+            |sink| async move {
+                // A call being drafted for as long as anyone listens: every
+                // delta is held back, so none is sent, and none can fail.
+                while !sink.cancel.is_cancelled() {
+                    let flow = sink.delta("<tool_call>{\"name\": \"get_");
+                    assert!(flow.is_continue(), "a held delta reported the hang-up");
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                let _ = told.send(());
+                Ok(cancelled())
+            },
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(response); // the client's 120 s timeout
+        tokio::time::timeout(TOLD_WITHIN, heard)
+            .await
+            .expect("the generation was never told its client hung up")
+            .expect("told");
+    }
+
+    /// Buffered, an answer sends nothing until it is done, so no send could
+    /// ever notice the client go. A client that hangs up while the handler
+    /// still waits — hyper drops its future — reaches the generation instead.
+    #[tokio::test]
+    async fn a_buffered_chat_is_told_when_its_client_hangs_up() {
+        let _serial = crate::progress_serial().await;
+        let (told, heard) = tokio::sync::oneshot::channel();
+        let handler = respond(
+            "m".into(),
+            false,
+            false,
+            None,
+            chat_delta,
+            chat_done,
+            |sink| async move {
+                // Queued for the slot, then prefilling: nothing to say yet.
+                sink.cancel.cancelled().await;
+                let _ = told.send(());
+                Ok(cancelled())
+            },
+        );
+        let hung_up = tokio::time::timeout(std::time::Duration::from_millis(50), handler).await;
+        assert!(hung_up.is_err(), "the buffered answer finished on its own");
+        tokio::time::timeout(TOLD_WITHIN, heard)
+            .await
+            .expect("the generation was never told its client hung up")
+            .expect("told");
+    }
+
+    /// The chain on a real socket: hyper notices a client that hangs up
+    /// while the response is pending — a streamed body with nothing in it
+    /// yet, a buffered answer before its headers — and drops what it held,
+    /// which tells the generation. The tests above take that on trust.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_client_that_hangs_up_on_a_real_socket_is_heard() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _serial = crate::progress_serial().await;
+        for stream in [true, false] {
+            let (told, heard) = tokio::sync::oneshot::channel::<()>();
+            let told = Arc::new(Mutex::new(Some(told)));
+            let app = Router::new().route(
+                "/api/chat",
+                post(move |_body: Bytes| {
+                    let told = Arc::clone(&told);
+                    respond(
+                        "m".into(),
+                        stream,
+                        false,
+                        None,
+                        chat_delta,
+                        chat_done,
+                        move |sink| async move {
+                            sink.cancel.cancelled().await;
+                            let taken = told
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .take();
+                            if let Some(told) = taken {
+                                let _ = told.send(());
+                            }
+                            Ok(cancelled())
+                        },
+                    )
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let server = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            client
+                .write_all(b"POST /api/chat HTTP/1.1\r\nhost: mummu\r\ncontent-length: 2\r\n\r\n{}")
+                .await
+                .expect("request");
+            if stream {
+                // The headers go out at once; the body has nothing in it yet.
+                let mut status = [0u8; 12];
+                client.read_exact(&mut status).await.expect("status line");
+                assert_eq!(&status, b"HTTP/1.1 200");
+            } else {
+                // Inside the keep-alive grace: not a byte comes back.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            drop(client);
+            tokio::time::timeout(TOLD_WITHIN, heard)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("stream = {stream}: the generation never heard its client hang up")
+                })
+                .expect("told");
+            server.abort();
+        }
     }
 }

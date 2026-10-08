@@ -97,7 +97,7 @@ use axum::response::sse::Event;
 use axum::response::{IntoResponse, Response, Sse};
 use axum::routing::{get, post};
 use mummu::chat::{Role, Turn};
-use mummu::decode::SamplerOptions;
+use mummu::decode::{Cancel, SamplerOptions};
 use mummu::manage::ModelManager;
 use mummu_num::{f64_from_u64, trunc_i64};
 use serde::Deserialize;
@@ -520,7 +520,13 @@ const KEEPALIVE_TICK: std::time::Duration = std::time::Duration::from_secs(10);
 /// a 5xx. Racing the grace period first is what keeps that narrow — every
 /// fast failure still gets its proper status, and only a request already
 /// past 20 seconds of real work can land in it.
-pub(crate) async fn keepalive_json<F>(work: F) -> Response
+///
+/// `listening` is the work's client (see [`Listening`]): held by this
+/// future until the grace runs out, then by the padded body — whichever the
+/// connection holds — so a client that hangs up at any point cancels the
+/// work. Nothing else would tell it: a buffered answer sends nothing that
+/// could fail before it is done.
+pub(crate) async fn keepalive_json<F>(listening: Listening, work: F) -> Response
 where
     // `'static` because the padded path hands the result channel to a
     // response body, which outlives this call.
@@ -548,6 +554,7 @@ where
         }
         () = tokio::time::sleep(KEEPALIVE_GRACE) => {
             let stream = async_stream::stream! {
+                let _listening = listening;
                 loop {
                     tokio::select! {
                         res = &mut rx => {
@@ -771,14 +778,18 @@ async fn unload() -> Response {
 // by `MAX_MAX_TOKENS` short strings.
 // ---------------------------------------------------------------------------
 
+/// `chat` is `Some` for a chat stream: its claim to be in flight, and its
+/// client (see [`Listening`]), both held for as long as the body is.
 fn sse_response(
     mut rx: mpsc::UnboundedReceiver<serde_json::Value>,
-    inflight: Option<recovery::InFlight>,
+    chat: Option<(recovery::InFlight, Listening)>,
 ) -> Response {
     let stream = async_stream::stream! {
         // Held until the last frame has been handed to the connection, so a
-        // process exiting to restart the GPU backend waits for it.
-        let _inflight = inflight;
+        // process exiting to restart the GPU backend waits for it — and
+        // dropped with the body when the client hangs up, which cancels the
+        // generation.
+        let _chat = chat;
         let mut ended = false;
         while let Some(frame) = rx.recv().await {
             ended |= is_final_frame(&frame);
@@ -846,6 +857,36 @@ impl Drop for FinalFrame {
         if let Some(tx) = self.tx.take() {
             let _ = tx.send(std::mem::take(&mut self.fallback));
         }
+    }
+}
+
+/// A generation's client, held by whatever the connection holds for its
+/// response — the body, or the handler's future while there is no body yet
+/// ([`keepalive_json`]). Dropped, it raises the generation's [`Cancel`]:
+/// when the client hangs up, hyper drops both, and the generation learns it
+/// there and then (see `engine::GenerationRequest::cancel`).
+///
+/// Before this, a generation learned its client was gone only when a delta
+/// failed to send: never while it queued for the slot or prefilled, never
+/// for a buffered answer, and never at all for one that held its deltas back
+/// — a tool call's markup, hidden thinking. On 2026-10-05 a client with a
+/// 120 s timeout retried a 4,800-token tool request every two minutes;
+/// seventeen sat in production at once, and the ones that finished did so
+/// 35–43 minutes after their client had left.
+///
+/// A response written out to the end drops it too. By then the generation
+/// is over, and the raise changes nothing.
+pub(crate) struct Listening(Cancel);
+
+impl Listening {
+    pub(crate) fn new(cancel: &Cancel) -> Self {
+        Self(cancel.clone())
+    }
+}
+
+impl Drop for Listening {
+    fn drop(&mut self) {
+        self.0.cancel();
     }
 }
 
@@ -1008,8 +1049,16 @@ async fn drive_chat_ws(
                     return Ok(());
                 }
             }
-            // A client that closes mid-generation lands here through `recv`
-            // returning an error on the next send, which is handled above.
+            // The client's side, read so that one that hangs up — a Close, or
+            // the connection dropping — is heard now, not at the next send:
+            // mid-prefill that is a heartbeat up to 15 s off. Returning drops
+            // `chat`, whose `Listening` cancels the generation.
+            message = socket.recv() => match message {
+                Some(Ok(Message::Close(_)) | Err(_)) | None => return Ok(()),
+                // Pings are answered by the socket; nothing else is asked
+                // of a chat in flight.
+                Some(Ok(_)) => {}
+            },
         }
     }
 }
@@ -1277,18 +1326,20 @@ async fn chat(body: Bytes) -> Response {
         Err(response) => return *response,
     };
     match start_chat(&parsed) {
-        Ok(chat) => sse_response(chat.rx, Some(chat.inflight)),
+        Ok(chat) => sse_response(chat.rx, Some((chat.inflight, chat.listening))),
         Err(rejection) => rejection.response(),
     }
 }
 
-/// A chat that has started: its frames, and the claim that its response is
-/// still open (see [`recovery::InFlight`]) — carried together so that
-/// whichever transport drains the frames also holds the claim until it is
-/// done writing them.
+/// A chat that has started: its frames, the claim that its response is
+/// still open (see [`recovery::InFlight`]), and its client (see
+/// [`Listening`]) — carried together so that whichever transport drains the
+/// frames also holds the claim until it is done writing them, and lets go
+/// of the client when the connection does.
 struct ChatStream {
     rx: mpsc::UnboundedReceiver<serde_json::Value>,
     inflight: recovery::InFlight,
+    listening: Listening,
 }
 
 /// A chat refused before it started. A POST client gets the status; a
@@ -1413,17 +1464,26 @@ fn start_chat(parsed: &ChatRequest) -> Result<ChatStream, Rejection> {
             think: false,
             images: Vec::new(),
             tools: Vec::new(),
+            cancel: &sink.cancel,
         };
         engine::run_chat(&req, |delta| sink.delta(delta)).await
     }))
 }
 
-/// Where a generation's text goes: one `delta` frame per piece.
-struct DeltaSink(mpsc::UnboundedSender<serde_json::Value>);
+/// Where a generation's text goes: one `delta` frame per piece. `cancel` is
+/// raised when the client hangs up (see [`Listening`]).
+struct DeltaSink {
+    tx: mpsc::UnboundedSender<serde_json::Value>,
+    cancel: Cancel,
+}
 
 impl DeltaSink {
     fn delta(&self, text: &str) -> ControlFlow<()> {
-        if self.0.send(json!({"type": "delta", "text": text})).is_err() {
+        if self
+            .tx
+            .send(json!({"type": "delta", "text": text}))
+            .is_err()
+        {
             return ControlFlow::Break(()); // client gone: stop decoding
         }
         ControlFlow::Continue(())
@@ -1453,6 +1513,8 @@ where
 {
     let (tx, rx) = mpsc::unbounded_channel::<serde_json::Value>();
     let inflight = recovery::InFlight::enter();
+    let cancel = Cancel::default();
+    let listening = Listening::new(&cancel);
     // A normal async task: the generation is mostly awaits. The one part
     // that genuinely blocks — the model load — declares itself as blocking
     // where it happens, in `mummu::cache`, rather than this pushing the whole
@@ -1474,7 +1536,7 @@ where
             DisableProfilerOnDrop
         });
         let started = std::time::Instant::now();
-        let result = recovery::contain(&model, run(DeltaSink(tx))).await;
+        let result = recovery::contain(&model, run(DeltaSink { tx, cancel })).await;
         if let Some(session) = profile_session {
             drop(session); // stop collecting before folding the report
             publish_profile();
@@ -1491,7 +1553,11 @@ where
         };
         last.send(frame);
     });
-    ChatStream { rx, inflight }
+    ChatStream {
+        rx,
+        inflight,
+        listening,
+    }
 }
 
 /// A finished native chat as its `done` frame.
@@ -1660,7 +1726,7 @@ mod tests {
         let chat = spawn_chat("qwen3.8-27b-ud-q4ks".into(), false, |_| async {
             fails_like_production()
         });
-        let frames = sse_frames(sse_response(chat.rx, Some(chat.inflight))).await;
+        let frames = sse_frames(sse_response(chat.rx, Some((chat.inflight, chat.listening)))).await;
         assert!(!frames.is_empty(), "the incident's empty 200");
         assert_eq!(
             frames.iter().filter(|f| is_final_frame(f)).count(),
@@ -1689,7 +1755,7 @@ mod tests {
         let chat = spawn_chat("m".into(), false, |_| async {
             fails_with_an_ordinary_bug()
         });
-        let frames = sse_frames(sse_response(chat.rx, Some(chat.inflight))).await;
+        let frames = sse_frames(sse_response(chat.rx, Some((chat.inflight, chat.listening)))).await;
         let last = frames.last().expect("a frame");
         assert_eq!(last["type"], json!("error"), "{last}");
         assert!(last.get("recovery").is_none(), "{last}");
@@ -1717,11 +1783,40 @@ mod tests {
                     finish,
                 })
             });
-            let frames = sse_frames(sse_response(chat.rx, Some(chat.inflight))).await;
+            let frames =
+                sse_frames(sse_response(chat.rx, Some((chat.inflight, chat.listening)))).await;
             let last = frames.last().expect("a frame");
             assert_eq!(last["type"], json!("done"), "{last}");
             assert_eq!(last["finish"], json!(name), "{last}");
         }
+    }
+
+    /// A native chat's client is whatever holds its `ChatStream` — the SSE
+    /// body, the WebSocket handler — and letting go of it tells the
+    /// generation, which used to learn it only at its next delta: never,
+    /// while it queued or prefilled.
+    #[tokio::test]
+    async fn a_native_chat_is_told_when_its_client_lets_go() {
+        let _serial = progress_serial().await;
+        let (told, heard) = tokio::sync::oneshot::channel();
+        let chat = spawn_chat("m".into(), false, move |sink| async move {
+            sink.cancel.cancelled().await;
+            let _ = told.send(());
+            Ok(engine::ChatResult {
+                text: String::new(),
+                tokens: 0,
+                device: "test",
+                elapsed_ms: 0,
+                timings: trace::Timings::default(),
+                tool_calls: Vec::new(),
+                finish: mummu::decode::Finish::Cancelled,
+            })
+        });
+        drop(chat);
+        tokio::time::timeout(std::time::Duration::from_secs(10), heard)
+            .await
+            .expect("the generation was never told its client let go")
+            .expect("told");
     }
 
     /// The `done` frame's rate is the decode rate, not tokens over the whole
@@ -1831,6 +1926,59 @@ mod tests {
             }
         }
         frames
+    }
+
+    /// A WebSocket client that closes mid-generation — before a frame, when
+    /// the only send due is a heartbeat up to 15 s off — is heard at once,
+    /// and its generation told.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_websocket_client_that_hangs_up_is_heard_at_once() {
+        use futures::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+        static TOLD: tokio::sync::Notify = tokio::sync::Notify::const_new();
+        let waits_for_its_client: fn(&ChatRequest) -> Result<ChatStream, Rejection> = |_| {
+            Ok(spawn_chat("m".into(), false, |sink| async move {
+                sink.cancel.cancelled().await;
+                TOLD.notify_one();
+                Ok(engine::ChatResult {
+                    text: String::new(),
+                    tokens: 0,
+                    device: "test",
+                    elapsed_ms: 0,
+                    timings: trace::Timings::default(),
+                    tool_calls: Vec::new(),
+                    finish: mummu::decode::Finish::Cancelled,
+                })
+            }))
+        };
+        let _serial = progress_serial().await;
+        let app = Router::new().route(
+            "/ws",
+            get(move |up: axum::extract::ws::WebSocketUpgrade| async move {
+                up.on_upgrade(move |socket| async move {
+                    let _ = drive_chat_ws(socket, waits_for_its_client).await;
+                })
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .expect("connect");
+        ws.send(Message::Text(
+            r#"{"model": "m", "messages": [{"role": "user", "content": "hi"}]}"#.into(),
+        ))
+        .await
+        .expect("send");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let _ = ws.close(None).await; // the tab closes
+        tokio::time::timeout(std::time::Duration::from_secs(5), TOLD.notified())
+            .await
+            .expect("the generation was not told inside the heartbeat");
+        server.abort();
     }
 
     /// The UI's transport. A GPU failure arrives as an error frame on the

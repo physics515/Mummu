@@ -14,7 +14,7 @@ use burn::tensor::Device;
 use futures::FutureExt;
 use mummu::cache::ModelSlot;
 use mummu::chat::{ChatMl, Role, ToolCall, Turn};
-use mummu::decode::{Finish, Generated, SamplerOptions};
+use mummu::decode::{Cancel, Cancellable, Finish, Generated, OnToken, SamplerOptions};
 use mummu::gguf::GgufFile;
 use mummu::models::{lfm2, olmoe, qwen2, qwen3, qwen35};
 use mummu::registry::{Architecture, ModelSpec, WeightFormat};
@@ -78,7 +78,7 @@ impl AnyLm {
         max_tokens: usize,
         opts: &SamplerOptions,
         device: &Device,
-        on_token: impl FnMut(u32) -> ControlFlow<()>,
+        on_token: impl OnToken,
         constraint: Option<&mut dyn mummu::constrain::Constraint>,
     ) -> Result<Generated, String> {
         match self {
@@ -139,7 +139,7 @@ async fn decode_captured<M: mummu::capture::StaticDecode + Sync>(
     max_tokens: usize,
     opts: &SamplerOptions,
     device: &Device,
-    on_token: impl FnMut(u32) -> ControlFlow<()>,
+    on_token: impl OnToken,
     constraint: Option<&mut dyn mummu::constrain::Constraint>,
 ) -> Result<Generated, String> {
     let req = mummu::capture::DecodeRequest {
@@ -1089,11 +1089,21 @@ pub struct GenerationRequest<'a> {
     pub think: bool,
     pub images: Vec<mummu::vision::Patches>,
     pub tools: Vec<mummu::chat::ToolSpec>,
+    /// Raised when the request's client hangs up (see `crate::Listening`).
+    /// Every wait on the way to the first token watches it — the slot, a
+    /// running batch's admission, the prefill's chunks — and so does every
+    /// decoded token, so a generation nobody waits for stops there, ending
+    /// [`Finish::Cancelled`].
+    pub cancel: &'a Cancel,
 }
 
 /// Run one chat completion, streaming decoded-text deltas through `on_delta`
 /// (return `Break` to cancel cooperatively). Loads the model into the
 /// backend's slot on first use; generations are serialized by the slot mutex.
+///
+/// A request whose client hung up ([`GenerationRequest::cancel`]) comes back
+/// `Ok` with [`Finish::Cancelled`] and the timings it got to, wherever it
+/// was stopped — a trace then says where its time went before it was.
 ///
 /// Callers run this under [`crate::recovery::contain`], which is what turns a
 /// panic in here — a GPU failure surfacing as a failed read, say — into an
@@ -1168,19 +1178,53 @@ pub async fn run_chat(
         "[mummu-serve] fit plan for {}: {:?} @ {:?}",
         spec.name, plan.backend, plan.policy
     );
-    // Our GPU use from here on is not a co-tenant's (see `sysmon`): the
-    // queue, the load and the generation all count as ours.
-    let _work = crate::sysmon::DeviceWork::enter();
-    // One slot, one device value: the plan picks *where*, not *which type*.
-    drive(&SLOT, req, &prompt, plan, on_delta)
-        .await
-        .map(|mut r| {
-            r.timings.plan_ms = plan_ms;
-            if offered_tools {
-                lift_tool_calls(spec.architecture, &mut r);
-            }
-            r
-        })
+    let result = if req.cancel.is_cancelled() {
+        Ok(abandoned(crate::trace::Timings::default()))
+    } else {
+        // Our GPU use from here on is not a co-tenant's (see `sysmon`): the
+        // queue, the load and the generation all count as ours.
+        let _work = crate::sysmon::DeviceWork::enter();
+        // One slot, one device value: the plan picks *where*, not *which type*.
+        drive(&SLOT, req, &prompt, plan, on_delta).await
+    };
+    result.map(|mut r| {
+        r.timings.plan_ms = plan_ms;
+        if offered_tools {
+            lift_tool_calls(spec.architecture, &mut r);
+        }
+        if r.finish == Finish::Cancelled {
+            let t = &r.timings;
+            eprintln!(
+                "[mummu-serve] chat request for {}: the client went away — stopped after {} \
+                 token(s) (queue {} ms, load {} ms, prefill {} ms, decode {} ms)",
+                spec.name, r.tokens, t.queue_ms, t.load_ms, t.prefill_ms, t.decode_ms
+            );
+        }
+        r
+    })
+}
+
+/// The answer to a request whose client hung up before its generation began
+/// (see [`GenerationRequest::cancel`]): nothing, [`Finish::Cancelled`], and
+/// the time it spent getting there.
+const fn abandoned(timings: crate::trace::Timings) -> ChatResult {
+    ChatResult {
+        text: String::new(),
+        tokens: 0,
+        device: "",
+        elapsed_ms: 0,
+        timings,
+        tool_calls: Vec::new(),
+        finish: Finish::Cancelled,
+    }
+}
+
+/// [`abandoned`] while it waited for the slot, from `waiting`: its queue time.
+fn left_the_queue(waiting: Instant) -> ChatResult {
+    abandoned(crate::trace::Timings {
+        queue_ms: crate::millis(waiting.elapsed()),
+        ..crate::trace::Timings::default()
+    })
 }
 
 /// The device a backend choice denotes (burn 0.22 selects at runtime).
@@ -3782,6 +3826,9 @@ async fn drive(
 ) -> Result<ChatResult, ChatError> {
     let (spec, models_root) = (req.spec, req.models_root);
     let key = spec.dir(models_root);
+    // A client that hangs up while this request waits for the slot below
+    // ends the wait (see `left_the_queue`).
+    let waiting = Instant::now();
     // A batch already decoding this model takes the request between steps;
     // so does one that starts while this request waits for the slot below.
     let mut sessions = decoder::subscribe();
@@ -3806,6 +3853,7 @@ async fn drive(
         loop {
             tokio::select! {
                 biased;
+                () = req.cancel.cancelled() => return Ok(left_the_queue(waiting)),
                 k = &mut look => break k,
                 changed = sessions.changed() => {
                     if changed.is_err() {
@@ -3898,12 +3946,14 @@ async fn drive(
         );
         tokio::pin!(acquire);
         // Waiting for the slot and watching for a session to join, whichever
-        // comes first. Abandoning the wait is safe only while it IS a wait: once
-        // `acquire_valid` holds the lock it runs its load to the end without an
-        // await, so it never stops halfway through one.
+        // comes first — or for the client to hang up. Abandoning the wait is
+        // safe only while it IS a wait: once `acquire_valid` holds the lock it
+        // runs its load to the end without an await, so it never stops
+        // halfway through one.
         loop {
             tokio::select! {
                 biased;
+                () = req.cancel.cancelled() => return Ok(left_the_queue(waiting)),
                 m = &mut acquire => break m?,
                 changed = sessions.changed() => {
                     if changed.is_err() {
@@ -3976,6 +4026,11 @@ async fn serve_held(
     // the state to `idle` / `model: null` while a 27B sat in RAM serving the
     // next request warm. From here a drop settles on `ready` instead.
     progress.resident();
+    // A client that hung up while this request queued or loaded is owed
+    // nothing more: no layers moved for it, no prefill.
+    if req.cancel.is_cancelled() {
+        return Ok(abandoned(crate::trace::Timings::default()));
+    }
     // The weights are resident. What is left before the first token is kernel
     // compilation and autotune — one pass whose duration is the unknown, so
     // it renders indeterminate rather than as a fake percentage.
@@ -4032,12 +4087,7 @@ async fn serve_held(
     .await;
     let failure = match outcome {
         Ok((Ok(GenerationOutcome::Done(result)), before)) => {
-            placement::after_request(
-                ctx,
-                ctx.saturating_sub(req.max_tokens),
-                result.tokens,
-                before,
-            );
+            after_request(ctx, req, &result, before);
             return Ok(result);
         }
         Ok((Ok(GenerationOutcome::Batched(prepared)), before)) => {
@@ -4055,6 +4105,7 @@ async fn serve_held(
                 constraint,
                 updates: tx,
                 joined: false,
+                cancel: req.cancel.clone(),
             };
             let started = Instant::now();
             let info = decoder::start(m, key, &spec.name, job);
@@ -4071,12 +4122,7 @@ async fn serve_held(
             )
             .await;
             if let Ok(result) = &r {
-                placement::after_request(
-                    ctx,
-                    ctx.saturating_sub(req.max_tokens),
-                    result.tokens,
-                    before,
-                );
+                after_request(ctx, req, result, before);
             }
             return r;
         }
@@ -4096,6 +4142,28 @@ async fn serve_held(
     drop(progress);
     evict_held(m, key, &spec.name);
     decided
+}
+
+/// What placement learns from a generation that held the model for `ctx`
+/// tokens: its working set, measured — unless its client went away before
+/// a token, when the prefill that set the high-water may not have run
+/// (see `placement::after_abandoned`).
+fn after_request(
+    ctx: usize,
+    req: &GenerationRequest<'_>,
+    result: &ChatResult,
+    before: Option<u64>,
+) {
+    if result.finish == Finish::Cancelled && result.tokens == 0 {
+        placement::after_abandoned(before);
+    } else {
+        placement::after_request(
+            ctx,
+            ctx.saturating_sub(req.max_tokens),
+            result.tokens,
+            before,
+        );
+    }
 }
 
 /// The text of a panic the generation raised, when it is the device's
@@ -4244,7 +4312,9 @@ fn prepare_batched(
 /// through `updates`; the rest — the think filter, the stream, the answer
 /// and its timings — is this request's own, as in [`generate_on`].
 /// Dropping `updates` (the client went away, or `on_delta` broke) is what
-/// cancels the sequence in the batch.
+/// cancels the sequence in the batch. The client going away is watched
+/// beside `updates`, not learned from the next token: a sequence still
+/// waiting for its admission, or prefilling, has none coming for minutes.
 #[expect(
     clippy::too_many_arguments,
     reason = "one generation's pieces, all distinct"
@@ -4267,12 +4337,20 @@ async fn generate_batched(
     let mut finish = None;
     let mut pending = first;
     loop {
-        let update = match pending.take() {
-            Some(u) => u,
-            None => match updates.recv().await {
-                Some(u) => u,
-                None => break,
-            },
+        let update = if let Some(u) = pending.take() {
+            u
+        } else {
+            tokio::select! {
+                biased;
+                () = req.cancel.cancelled() => {
+                    finish = Some(Finish::Cancelled);
+                    break;
+                }
+                u = updates.recv() => {
+                    let Some(u) = u else { break };
+                    u
+                }
+            }
         };
         match update {
             // Only ever an admission's first answer, which `join_session`
@@ -4370,15 +4448,30 @@ async fn join_session(
         constraint,
         updates: tx,
         joined: true,
+        cancel: req.cancel.clone(),
     };
     let started = Instant::now();
     decoder::join(key, job).ok()?;
     let mut rx = rx;
     // The thread answers the admission first: a bounce sends the request
-    // back to the slot queue, anything else is its generation.
-    let first = match rx.recv().await {
-        Some(decoder::Update::Bounced) | None => return None,
-        first => first,
+    // back to the slot queue, anything else is its generation. That answer
+    // can be a long way off — behind the sequences waiting for a slot, and
+    // this prompt's own prefill — so a client that hangs up meanwhile ends
+    // the wait, and the dropped `rx` tells the thread to skip the job (or
+    // stop its prefill; see `decoder::Thread::admit`).
+    let first = tokio::select! {
+        biased;
+        () = req.cancel.cancelled() => {
+            return Some(Ok(abandoned(crate::trace::Timings {
+                prefill_ms: crate::millis(started.elapsed()),
+                prompt_tokens,
+                ..crate::trace::Timings::default()
+            })));
+        }
+        first = rx.recv() => match first {
+            Some(decoder::Update::Bounced) | None => return None,
+            first => first,
+        },
     };
     eprintln!(
         "[mummu-serve] chat request for {} joined the running decode batch",
@@ -4488,6 +4581,12 @@ async fn generate_on(
     let constraint = constraint
         .as_mut()
         .map(|c| c as &mut dyn mummu::constrain::Constraint);
+    // Stopped before its next forward once the client hangs up — between the
+    // prompt's chunks too, where there is no token to break on.
+    let on_token = Cancellable {
+        on_token: &mut on_token,
+        cancel: req.cancel,
+    };
     let out = if let (AnyLm::Qwen35(vlm), false) = (&m.lm, placed.is_empty()) {
         mummu::models::generate_multimodal(
             vlm,
@@ -4498,20 +4597,13 @@ async fn generate_on(
                 opts,
                 device,
             },
-            &mut on_token,
+            on_token,
             constraint,
         )
         .await?
     } else {
-        m.lm.generate(
-            &prompt_ids,
-            max_tokens,
-            opts,
-            device,
-            &mut on_token,
-            constraint,
-        )
-        .await?
+        m.lm.generate(&prompt_ids, max_tokens, opts, device, on_token, constraint)
+            .await?
     };
 
     let Generated { ids: out, finish } = out;
@@ -4665,7 +4757,9 @@ fn conclude(
     // tokens with nothing but whitespace after it, and came back as a 200
     // with an empty answer, because only an open block was caught here.
     let spent = f.truncated() || (f.opened() && finish == Finish::Length);
-    if visible.trim().is_empty() && spent {
+    // A generation cancelled mid-thought did not spend its budget: its
+    // client left, and nothing reads what it is told.
+    if visible.trim().is_empty() && spent && finish != Finish::Cancelled {
         return Err(format!(
             "the model spent all {max_tokens} tokens thinking and never reached an answer — \
              raise the token limit, or set \"think\": true to see the reasoning"
@@ -5858,6 +5952,16 @@ mod conclude_tests {
         assert!(err.contains("all 64 tokens"), "{err}");
 
         let (streamed, buffered) = answer(&deltas, false, Finish::Eos);
+        assert_eq!(streamed, "");
+        assert_eq!(buffered.as_deref(), Ok(""));
+    }
+
+    /// A generation whose client hung up mid-thought spent nothing: it was
+    /// stopped. Read as the budget's error, its trace would say the request
+    /// failed rather than `"finish":"cancelled"`.
+    #[test]
+    fn a_generation_cancelled_mid_thought_is_not_the_spent_budget_error() {
+        let (streamed, buffered) = answer(&["<think>", "still going"], false, Finish::Cancelled);
         assert_eq!(streamed, "");
         assert_eq!(buffered.as_deref(), Ok(""));
     }
