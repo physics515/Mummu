@@ -3826,14 +3826,18 @@ async fn drive(
 ) -> Result<ChatResult, ChatError> {
     let (spec, models_root) = (req.spec, req.models_root);
     let key = spec.dir(models_root);
-    // A client that hangs up while this request waits for the slot below
-    // ends the wait (see `left_the_queue`).
+    // The queue clock. Everything from here until this request holds the
+    // slot or joins a batch is waiting, less only the load it may run: the
+    // warm/cold look below takes the slot's lock and so waits out whoever
+    // holds it, which is most of a queued request's wait — a clock started
+    // at the acquire found the slot already free and read ~0. A client that
+    // hangs up meanwhile ends the wait (see `left_the_queue`).
     let waiting = Instant::now();
     // A batch already decoding this model takes the request between steps;
     // so does one that starts while this request waits for the slot below.
     let mut sessions = decoder::subscribe();
     sessions.mark_unchanged();
-    if let Some(r) = join_session(&key, req, prompt, &mut on_delta).await {
+    if let Some(r) = join_session(&key, req, prompt, waiting, &mut on_delta).await {
         return r;
     }
     // Is this request likely to pay for a load? `loaded_key_async` waits for
@@ -3859,7 +3863,7 @@ async fn drive(
                     if changed.is_err() {
                         break (&mut look).await;
                     }
-                    if let Some(r) = join_session(&key, req, prompt, &mut on_delta).await {
+                    if let Some(r) = join_session(&key, req, prompt, waiting, &mut on_delta).await {
                         return r;
                     }
                 }
@@ -3919,7 +3923,6 @@ async fn drive(
     // outside and have entirely different fixes.
     let load_ms = std::sync::atomic::AtomicU64::new(0);
     let load_ms_ref = &load_ms;
-    let acquire_started = Instant::now();
     let m = {
         let acquire = slot.acquire_valid(
             &key,
@@ -3959,16 +3962,15 @@ async fn drive(
                     if changed.is_err() {
                         break (&mut acquire).await?;
                     }
-                    if let Some(r) = join_session(&key, req, prompt, &mut on_delta).await {
+                    if let Some(r) = join_session(&key, req, prompt, waiting, &mut on_delta).await {
                         return r;
                     }
                 }
             }
         }
     };
-    let acquire_ms = crate::millis(acquire_started.elapsed());
     let load_ms = load_ms.load(SeqCst);
-    let queue_ms = acquire_ms.saturating_sub(load_ms);
+    let queue_ms = crate::millis(waiting.elapsed()).saturating_sub(load_ms);
     resident_note.loaded = true;
     // DECLARATION ORDER IS DROP ORDER HERE, reversed: the last binding
     // declared is the first one dropped. The progress guard must be declared
@@ -4417,10 +4419,14 @@ async fn generate_batched(
 /// Join the decode session running on model `key`, when there is one and
 /// this request can take it: decoded in its batch, never queueing for the
 /// slot. `None` when the request should take the ordinary path.
+///
+/// `waiting` is `drive`'s queue clock: a request that joins after waiting
+/// for the slot was queued until it joined, and its trace says so.
 async fn join_session(
     key: &Path,
     req: &GenerationRequest<'_>,
     prompt: &str,
+    waiting: Instant,
     on_delta: &mut impl FnMut(&str) -> ControlFlow<()>,
 ) -> Option<Result<ChatResult, ChatError>> {
     if !req.images.is_empty() {
@@ -4451,6 +4457,9 @@ async fn join_session(
         cancel: req.cancel.clone(),
     };
     let started = Instant::now();
+    // The queue ends where the prefill begins (`generate_batched` times the
+    // admission from `started`).
+    let queue_ms = crate::millis(started.duration_since(waiting));
     decoder::join(key, job).ok()?;
     let mut rx = rx;
     // The thread answers the admission first: a bounce sends the request
@@ -4463,6 +4472,7 @@ async fn join_session(
         biased;
         () = req.cancel.cancelled() => {
             return Some(Ok(abandoned(crate::trace::Timings {
+                queue_ms,
                 prefill_ms: crate::millis(started.elapsed()),
                 prompt_tokens,
                 ..crate::trace::Timings::default()
@@ -4489,7 +4499,11 @@ async fn join_session(
             started,
             on_delta,
         )
-        .await,
+        .await
+        .map(|mut result| {
+            result.timings.queue_ms = queue_ms;
+            result
+        }),
     )
 }
 

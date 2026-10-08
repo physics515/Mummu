@@ -439,6 +439,42 @@ async fn a_request_queued_behind_an_error_path_failure_gets_a_fresh_model() {
     );
 }
 
+/// A request queued behind another generation reports that wait as
+/// `queue_ms`, not just as `total_ms` with no phase to account for it. The
+/// wait is mostly spent in `drive`'s warm/cold look (`loaded_key_async`),
+/// which takes the slot's lock BEFORE the acquire does: a queue clock
+/// started at the acquire found the slot free and read ~0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_queued_behind_another_generation_reports_the_wait_as_queue_time() {
+    let _fx = Fixture::new("queue-clock").await;
+    assert_answered(&chat().await);
+    let loaded = loads();
+    arm(Arm {
+        stall_ms: 1000,
+        ..Arm::default()
+    });
+    let ahead = tokio::spawn(chat());
+    // `ahead` holds the slot, stalled before its first read.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let seq = newest_trace();
+    let queued = Box::pin(crate::shim::chat(shim_request(true))).await;
+    assert_eq!(queued.status(), 200);
+    axum::body::to_bytes(queued.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    assert_answered(&ahead.await.expect("ahead"));
+    assert_eq!(loads(), loaded, "both requests found the model resident");
+    let trace = shim_trace_after(seq).await;
+    let timings = &trace["timings"];
+    assert_eq!(timings["load_ms"], json!(0), "{trace}");
+    let queue_ms = timings["queue_ms"].as_u64().expect("queue_ms");
+    assert!(
+        queue_ms >= 500,
+        "the request waited ~900 ms behind the stalled generation and its trace \
+         put {queue_ms} ms of that in the queue: {trace}"
+    );
+}
+
 static COUNT_EXITS: AtomicU32 = AtomicU32::new(0);
 fn count_exit(_: i32) {
     COUNT_EXITS.fetch_add(1, SeqCst);
