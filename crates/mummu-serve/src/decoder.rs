@@ -26,7 +26,9 @@
 //!
 //! A failure while the thread holds the slot is decided there, exactly as
 //! `serve_held` decides one: recorded, the model evicted through the guard,
-//! and every sequence in the batch told.
+//! and every sequence in the batch told. That includes the failure cubecl
+//! swallows on its device thread, which only the fault epoch shows: every
+//! call into the batcher is judged against it ([`guarded`]).
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -502,15 +504,15 @@ impl Thread {
             cancel: Some(&cancel),
         };
         let model = &held.guard.lm;
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let outcome = guarded(held.guard.fault_epoch, &held.guard.devices, || {
             match (&mut cached.batcher, model) {
                 (AnyBatcher::Qwen3(b), AnyLm::Qwen3(m)) => b.admit(m, adm),
                 (AnyBatcher::Qwen35(b), AnyLm::Qwen35(m)) => b.admit(m, adm),
                 _ => Err("the cached batcher is for another model".to_owned()),
             }
-        }));
+        });
         match outcome {
-            Ok(Ok((id, events))) => {
+            Ok((id, events)) => {
                 if events.contains(&Event::Done(Finish::Cancelled)) {
                     note_stopped_prefill(prompt_ids.len());
                 }
@@ -525,8 +527,7 @@ impl Thread {
                     }
                 }
             }
-            Ok(Err(message)) => self.fail(&[updates], message, None),
-            Err(payload) => self.fail(&[updates], recovery::payload_text(&*payload), Some(payload)),
+            Err(failure) => self.fail(&[updates], failure),
         }
         None
     }
@@ -589,23 +590,18 @@ impl Thread {
             return;
         }
         let model = &held.guard.lm;
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let outcome = guarded(held.guard.fault_epoch, &held.guard.devices, || {
             match (&mut cached.batcher, model) {
                 (AnyBatcher::Qwen3(b), AnyLm::Qwen3(m)) => b.step(m),
                 (AnyBatcher::Qwen35(b), AnyLm::Qwen35(m)) => b.step(m),
                 _ => Err("the cached batcher is for another model".to_owned()),
             }
-        }));
+        });
         let events = match outcome {
-            Ok(Ok(events)) => events,
-            Ok(Err(message)) => {
+            Ok(events) => events,
+            Err(failure) => {
                 let all: Vec<_> = held.jobs.drain().map(|(_, tx)| tx).collect();
-                self.fail(&all, message, None);
-                return;
-            }
-            Err(payload) => {
-                let all: Vec<_> = held.jobs.drain().map(|(_, tx)| tx).collect();
-                self.fail(&all, recovery::payload_text(&*payload), Some(payload));
+                self.fail(&all, failure);
                 return;
             }
         };
@@ -655,72 +651,35 @@ impl Thread {
         }
     }
 
-    /// A failure on the thread: told to every sequence in `to`; a device
-    /// failure decided like `serve_held` decides one — recorded, and the
-    /// model evicted through the guard — and the batch dropped.
-    fn fail(
-        &mut self,
-        to: &[tokio::sync::mpsc::UnboundedSender<Update>],
-        message: String,
-        payload: Option<Box<dyn std::any::Any + Send>>,
-    ) {
-        let device = recovery::is_device_failure(&message);
-        if !device {
-            if let Some(payload) = payload {
-                // An ordinary bug: the sequences are told, the slot is
-                // released with the model still in it, and the panic is
-                // logged rather than taking the thread down.
-                eprintln!(
-                    "[mummu-serve] decode thread: a generation panicked: {}",
-                    recovery::payload_text(&*payload)
-                );
+    /// A failure on the thread, told to every sequence in `to`. A device
+    /// failure is decided like `serve_held` decides one — recorded against
+    /// the devices [`guarded`] charged, placement's ε̂ told, the model
+    /// evicted through the guard — and told to every sequence the session
+    /// holds, live or waiting; an ordinary one drops the batch and admits
+    /// what waits into a fresh one.
+    fn fail(&mut self, to: &[tokio::sync::mpsc::UnboundedSender<Update>], failure: Failure) {
+        let (cause, devices) = match failure {
+            Failure::Device { cause, devices } => (cause, devices),
+            Failure::Ordinary { message, payload } => {
+                self.fail_ordinary(to, message, payload);
+                return;
             }
-            let error = ChatError::request(message);
-            for tx in to {
-                let _ = tx.send(Update::Done(Err(error.clone())));
-            }
-            // The batch's state is unknown after a panic mid-step.
-            if let Some(held) = &mut self.held {
-                for (_, tx) in held.jobs.drain() {
-                    let _ = tx.send(Update::Done(Err(error.clone())));
-                }
-            }
-            self.drop_cache("a failed step");
-            // What waited is admitted into a fresh batch, if one can be made.
-            if let Some(held) = &self.held {
-                let device = device_of(held.guard.backend);
-                let mode = mummu::capture::step_mode();
-                let batcher = match &held.guard.lm {
-                    AnyLm::Qwen3(q) => {
-                        Batcher::new(q, &device, max_slots(), mode).map(AnyBatcher::Qwen3)
-                    }
-                    AnyLm::Qwen35(q) => {
-                        Batcher::new(q, &device, max_slots(), mode).map(AnyBatcher::Qwen35)
-                    }
-                    _ => None,
-                };
-                self.cached = batcher.map(|batcher| Cached {
-                    key: held.key.clone(),
-                    load_id: held.guard.load_id,
-                    batcher,
-                    idle_since: None,
-                });
-            }
-            self.admit_waiting();
-            return;
-        }
+        };
         let Some(held) = self.held.take() else { return };
         {
             let mut r = registry();
             r.info = None;
             r.accepting = false;
         }
-        let decided = recovery::record_failure(
-            &held.model,
-            &held.guard.devices,
-            &recovery::summarize(&message),
+        eprintln!(
+            "[mummu-serve] decode thread: the device failed under the batch ({}) — its {} \
+             generation(s) end, and {} is evicted",
+            recovery::summarize(&cause),
+            to.len() + held.jobs.len() + held.waiting.len(),
+            held.model
         );
-        super::placement::note_device_failure(&message);
+        let decided = recovery::record_failure(&held.model, &devices, &recovery::summarize(&cause));
+        super::placement::note_device_failure(&cause);
         for tx in to
             .iter()
             .chain(held.jobs.values())
@@ -732,6 +691,55 @@ impl Thread {
         evict_held(held.guard, &held.key, &held.model);
     }
 
+    /// [`fail`](Self::fail) for an ordinary failure: the sequences are told,
+    /// the slot stays held with the model still in it, and a panic is
+    /// logged rather than taking the thread down.
+    fn fail_ordinary(
+        &mut self,
+        to: &[tokio::sync::mpsc::UnboundedSender<Update>],
+        message: String,
+        payload: Option<Box<dyn std::any::Any + Send>>,
+    ) {
+        if let Some(payload) = payload {
+            eprintln!(
+                "[mummu-serve] decode thread: a generation panicked: {}",
+                recovery::payload_text(&*payload)
+            );
+        }
+        let error = ChatError::request(message);
+        for tx in to {
+            let _ = tx.send(Update::Done(Err(error.clone())));
+        }
+        // The batch's state is unknown after a panic mid-step.
+        if let Some(held) = &mut self.held {
+            for (_, tx) in held.jobs.drain() {
+                let _ = tx.send(Update::Done(Err(error.clone())));
+            }
+        }
+        self.drop_cache("a failed step");
+        // What waited is admitted into a fresh batch, if one can be made.
+        if let Some(held) = &self.held {
+            let device = device_of(held.guard.backend);
+            let mode = mummu::capture::step_mode();
+            let batcher = match &held.guard.lm {
+                AnyLm::Qwen3(q) => {
+                    Batcher::new(q, &device, max_slots(), mode).map(AnyBatcher::Qwen3)
+                }
+                AnyLm::Qwen35(q) => {
+                    Batcher::new(q, &device, max_slots(), mode).map(AnyBatcher::Qwen35)
+                }
+                _ => None,
+            };
+            self.cached = batcher.map(|batcher| Cached {
+                key: held.key.clone(),
+                load_id: held.guard.load_id,
+                batcher,
+                idle_since: None,
+            });
+        }
+        self.admit_waiting();
+    }
+
     fn drop_cache(&mut self, why: &str) {
         if let Some(mut c) = self.cached.take() {
             match &mut c.batcher {
@@ -740,6 +748,105 @@ impl Thread {
             }
             eprintln!("[mummu-serve] decode thread: dropped the cached graphs and state ({why})");
         }
+    }
+}
+
+/// A call into the batcher that failed, as [`guarded`] judged it.
+enum Failure {
+    /// A device failed: decided, and the model evicted ([`Thread::fail`]).
+    Device {
+        /// cubecl's text, as the client reads it — and as placement reads
+        /// it for an out-of-memory (`placement::note_device_failure`).
+        cause: String,
+        /// What `recovery::attribute` charged it to.
+        devices: Vec<DeviceKey>,
+    },
+    /// An ordinary error, or a bug's panic: the model stays.
+    Ordinary {
+        message: String,
+        payload: Option<Box<dyn std::any::Any + Send>>,
+    },
+}
+
+impl Failure {
+    /// The device failure only the recovery hook saw: charged where
+    /// `recovery::attribute` says since `mark`, with the text the hook
+    /// recorded for it (as `recovery::load_fault` takes it).
+    fn recorded(mark: &recovery::EpochMark, used: &[DeviceKey]) -> Self {
+        let devices = recovery::attribute(mark, used);
+        let cause = recovery::last_cause(&devices)
+            .unwrap_or_else(|| "a device failure the recovery hook kept no text for".to_owned());
+        Self::Device { cause, devices }
+    }
+
+    /// An error or a panic out of the call: the device's when its text
+    /// carries cubecl's signature (`serve_held`'s rule) or a device failed
+    /// under the call — the error is then the symptom, and the hook's text
+    /// the cause — and ordinary otherwise.
+    fn of(
+        message: String,
+        payload: Option<Box<dyn std::any::Any + Send>>,
+        mark: &recovery::EpochMark,
+        used: &[DeviceKey],
+    ) -> Self {
+        if recovery::is_device_failure(&message) {
+            Self::Device {
+                cause: message,
+                devices: recovery::attribute(mark, used),
+            }
+        } else if mark.moved() {
+            Self::recorded(mark, used)
+        } else {
+            Self::Ordinary { message, payload }
+        }
+    }
+}
+
+/// Make one call into the batcher — an admission or a step — for the model
+/// loaded at fault epoch `stamp` on `used`, and judge what came of it.
+///
+/// The call returning `Ok` does not mean the device did its work. An
+/// allocation that fails on cubecl's device thread (`DSD-0-0`) panics THERE
+/// and is caught there; the call returns, with tokens computed on a device
+/// that has just refused it memory. On 2026-10-08 a joiner's prefill did
+/// exactly that, its admission returned `Ok` (its client had gone), the
+/// thread stepped the two live sequences into a second fault four seconds
+/// later, and delivered their tokens as an ordinary `eos`. Only the recovery
+/// hook saw either fault, and moved the fault epoch. So the epoch is marked
+/// before the call and read after it, as a load's is (`recovery::load_fault`),
+/// and any movement is a device failure whatever the call returned.
+///
+/// Any movement, even for a device the batch does not use: the epoch is
+/// global, every acquire refuses a model stamped before it, so the model
+/// this thread holds is condemned whichever device failed — and this thread,
+/// holding the slot, is the one place it could still be served. Nothing
+/// tells a call that raced another device's failure from one that caused
+/// it, either; as for a load, a false failure costs the batch where a false
+/// success is the incident. It is charged to the device whose thread failed,
+/// not to this model's.
+///
+/// For the same reason a model whose stamp is already behind the epoch when
+/// the call would begin — a device failed between two calls, under a fresh
+/// batcher's allocations, say — is not called at all.
+fn guarded<T>(
+    stamp: u64,
+    used: &[DeviceKey],
+    call: impl FnOnce() -> Result<T, String>,
+) -> Result<T, Failure> {
+    let mark = recovery::mark();
+    if mark.global() != stamp {
+        return Err(Failure::recorded(&mark, used));
+    }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)) {
+        Ok(Ok(value)) if !mark.moved() => Ok(value),
+        Ok(Ok(_)) => Err(Failure::recorded(&mark, used)),
+        Ok(Err(message)) => Err(Failure::of(message, None, &mark, used)),
+        Err(payload) => Err(Failure::of(
+            recovery::payload_text(&*payload),
+            Some(payload),
+            &mark,
+            used,
+        )),
     }
 }
 
@@ -913,6 +1020,115 @@ fn deliver(tx: &tokio::sync::mpsc::UnboundedSender<Update>, e: Event) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_seams::device_thread_panic;
+
+    const CUDA0: DeviceKey = DeviceKey::Cubecl {
+        type_id: 0,
+        index: 0,
+    };
+    const IGPU: DeviceKey = DeviceKey::Cubecl {
+        type_id: 1,
+        index: 0,
+    };
+
+    /// DSD-0-0's panic under the joiner's prefill, 2026-10-08 14:44:51Z.
+    const JOINER_OOM: &str = "failed to reserve 71303168 bytes of device memory: out of device \
+                              memory allocating 1045278720 bytes";
+
+    /// An eager readback's report of a failed device (`mummu::decode::argmax_id`).
+    const READBACK_ERR: &str = "argmax readback: ServerUnhealthy { errors: [\"The server is in \
+                                an invalid state\"] }";
+
+    /// The batch of 2026-10-08, replayed on the CPU: cubecl's out-of-memory
+    /// on `DSD-0-0`, raised and swallowed there, under a call that returns
+    /// `Ok` — the joiner's admission. The batch fails as a device failure,
+    /// charged to the card whose thread failed and not the host its model
+    /// also runs on, with the hook's text (which placement doubles ε̂ on);
+    /// and the step that followed is never made. A failure on a device the
+    /// batch does not use fails it too, charged there. An error that says
+    /// the device failed is the device's on its own; one that does not is
+    /// ordinary, and moves nothing.
+    #[test]
+    fn a_device_failure_cubecl_swallowed_under_a_call_fails_the_batch() {
+        let _serial = crate::progress_serial_blocking();
+        recovery::reset_for_tests();
+        recovery::install_panic_hook();
+        let used = [CUDA0, DeviceKey::Host];
+
+        let stamp = recovery::fault_epoch();
+        assert!(
+            matches!(guarded(stamp, &used, || Ok::<_, String>(7)), Ok(7)),
+            "a clean call is clean"
+        );
+
+        let admitted = guarded(stamp, &used, || {
+            device_thread_panic("DSD-0-0", JOINER_OOM);
+            Ok::<_, String>(Event::Done(Finish::Cancelled))
+        });
+        let Err(Failure::Device { cause, devices }) = admitted else {
+            panic!("a call the device failed under was served as a clean one");
+        };
+        assert_eq!(devices, [CUDA0], "charged to the card, not the host");
+        assert!(recovery::is_device_failure(&cause), "{cause}");
+        assert!(cause.contains("out of device memory"), "{cause}");
+
+        let mut stepped = false;
+        let step = guarded(stamp, &used, || {
+            stepped = true;
+            Ok::<_, String>(Event::Done(Finish::Eos))
+        });
+        assert!(
+            !stepped,
+            "a model stamped before the fault was stepped again"
+        );
+        let Err(Failure::Device { cause, devices }) = step else {
+            panic!("a model stamped before the fault was served");
+        };
+        assert_eq!(devices, [CUDA0]);
+        assert!(cause.contains("out of device memory"), "{cause}");
+
+        let stamp = recovery::fault_epoch();
+        let raced = guarded(stamp, &[CUDA0], || {
+            device_thread_panic("DSD-1-0", JOINER_OOM);
+            Ok::<_, String>(())
+        });
+        let Err(Failure::Device { devices, .. }) = raced else {
+            panic!("a fault on another device left a condemned model serving");
+        };
+        assert_eq!(devices, [IGPU], "charged to the device that failed");
+
+        let stamp = recovery::fault_epoch();
+        let read = guarded(stamp, &used, || Err::<(), _>(READBACK_ERR.to_owned()));
+        let Err(Failure::Device { cause, devices }) = read else {
+            panic!("an eager readback's device failure was taken for an ordinary error");
+        };
+        assert_eq!(devices, [CUDA0]);
+        assert!(cause.contains("invalid state"), "{cause}");
+
+        let wrong = guarded(stamp, &used, || {
+            Err::<(), _>("the cached batcher is for another model".to_owned())
+        });
+        assert!(matches!(
+            wrong,
+            Err(Failure::Ordinary { payload: None, .. })
+        ));
+        let bug = guarded(stamp, &used, || -> Result<(), String> {
+            panic!("index out of bounds: the len is 3 but the index is 7")
+        });
+        assert!(matches!(
+            bug,
+            Err(Failure::Ordinary {
+                payload: Some(_),
+                ..
+            })
+        ));
+        assert_eq!(
+            recovery::fault_epoch(),
+            stamp,
+            "an ordinary failure is no device's"
+        );
+        recovery::reset_for_tests();
+    }
 
     /// A request whose client hung up while it waited to join a batch is
     /// dropped before anything is admitted — no prefill on the thread every
