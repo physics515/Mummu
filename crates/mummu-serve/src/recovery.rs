@@ -1025,6 +1025,25 @@ pub fn attribute(mark: &EpochMark, used: &[DeviceKey]) -> Vec<DeviceKey> {
     }
 }
 
+/// Why a device failed, when all its catcher saw was a moved epoch.
+///
+/// The text the hook last recorded for one of `devices` (the first whose
+/// book holds one), or else the last it recorded anywhere. Already
+/// [`summarize`]d: the text the hook took for a device failure.
+#[must_use]
+pub fn last_cause(devices: &[DeviceKey]) -> Option<String> {
+    let st = state();
+    devices
+        .iter()
+        .find_map(|d| {
+            st.books
+                .iter()
+                .find(|b| b.key == *d)
+                .and_then(|b| b.last_cause.clone())
+        })
+        .or_else(|| st.last_cause.clone())
+}
+
 /// What a load check found wrong: which devices, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadFault {
@@ -1057,15 +1076,8 @@ pub fn load_fault(
     let synced = sync();
     if mark.moved() {
         let devices = attribute(mark, touched);
-        let cause = {
-            let st = state();
-            devices
-                .iter()
-                .find_map(|d| st.books.iter().find(|b| b.key == *d))
-                .and_then(|b| b.last_cause.clone())
-                .or_else(|| st.last_cause.clone())
-                .unwrap_or_else(|| "a device-thread panic during the load".to_owned())
-        };
+        let cause = last_cause(&devices)
+            .unwrap_or_else(|| "a device-thread panic during the load".to_owned());
         return Some(LoadFault { devices, cause });
     }
     synced.err().map(|(device, e)| LoadFault {
@@ -2254,21 +2266,8 @@ pub(crate) fn supervise_for_tests(
 mod tests {
     use super::*;
     use crate::logs::LogLine;
-    use crate::test_seams::Scratch;
+    use crate::test_seams::{Scratch, device_thread_panic};
     use std::sync::atomic::{AtomicI32, AtomicU32};
-
-    /// A panic exactly as cubecl raises and swallows it: on a thread named
-    /// like its device runner, caught right there, never seen by the caller.
-    fn device_thread_panic(name: &str, message: &'static str) {
-        std::thread::Builder::new()
-            .name(name.to_owned())
-            .spawn(move || {
-                let _ = std::panic::catch_unwind(|| panic!("{message}"));
-            })
-            .expect("spawn")
-            .join()
-            .expect("the device thread survives its own panic, as cubecl's does");
-    }
 
     const LOAD_OOM: &str = "failed to reserve 22020096 bytes of device memory: out of device \
                             memory allocating 261319680 bytes";

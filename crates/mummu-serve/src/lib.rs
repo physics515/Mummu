@@ -177,6 +177,21 @@ pub(crate) mod test_seams {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = backend;
     }
 
+    /// A panic exactly as cubecl raises and swallows it: on a thread named
+    /// like its device runner (`DSD-0-0` is CUDA device 0), caught right
+    /// there, never seen by the caller — only by the recovery hook, when it
+    /// is installed.
+    pub fn device_thread_panic(name: &str, message: &'static str) {
+        std::thread::Builder::new()
+            .name(name.to_owned())
+            .spawn(move || {
+                let _ = std::panic::catch_unwind(|| panic!("{message}"));
+            })
+            .expect("spawn")
+            .join()
+            .expect("the device thread survives its own panic, as cubecl's does");
+    }
+
     /// A scratch directory that removes itself when dropped — on a failed
     /// assertion too, which unwinds through it. An earlier run of these tests
     /// cleaned up only on success and left seventeen directories in `/tmp`.
