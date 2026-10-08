@@ -59,6 +59,16 @@ pub struct Loaded {
     devices: Vec<DeviceKey>,
 }
 
+impl Loaded {
+    /// Has a device failed since this model's load began? Then it is never
+    /// served again ([`Self::fault_epoch`]), and nothing more runs on it:
+    /// whatever it computes from here was computed on a device that has
+    /// failed, and is nobody's answer.
+    fn condemned(&self) -> bool {
+        self.fault_epoch != recovery::fault_epoch()
+    }
+}
+
 /// Architecture-erased causal LM. `CausalLm` itself can't be a trait object
 /// (associated `Cache` type, generic `on_token`), so erase by enum instead —
 /// the zoo is closed and small.
@@ -4046,12 +4056,13 @@ async fn serve_held(
     // Every way the device can fail this generation is caught HERE, while
     // this request still holds the slot: a panic on its own thread (the
     // incident's read), a device-thread failure the hook counted while it
-    // ran, or an error carrying cubecl's text (an eager readback). Each is
-    // decided (`recovery::record_failure`: epoch, poison, count, and a
-    // restart latched if it comes to that) and the model evicted through the
-    // guard BEFORE the slot is released — so the request queued behind this
-    // one finds an empty slot or a refusal, never the poisoned model, and
-    // never a process that has decided to exit but not yet said so.
+    // ran — whatever the generation returned — or an error carrying cubecl's
+    // text (an eager readback). Each is decided (`recovery::record_failure`:
+    // epoch, poison, count, and a restart latched if it comes to that) and
+    // the model evicted through the guard BEFORE the slot is released — so
+    // the request queued behind this one finds an empty slot or a refusal,
+    // never the poisoned model, and never a process that has decided to exit
+    // but not yet said so.
     let mark = recovery::mark();
     // The context this request will actually hold: its prompt, its images'
     // tokens and its budget. Exact now that the tokenizer is at hand.
@@ -4071,6 +4082,11 @@ async fn serve_held(
     // like one that fails under a token.
     let outcome = AssertUnwindSafe(async {
         let before = placement::before_request(&mut m, key, ctx, needs_tower);
+        // A device that failed under the move, or since the model's load,
+        // condemned it: nothing is run on it, nor handed to the decode thread.
+        if m.condemned() {
+            return (Ok(GenerationOutcome::Condemned), before);
+        }
         // A model on the card — split with the host too — decodes on the
         // decode thread, in a batch with whatever else arrives for it: the
         // slot goes there with this request's generation, and failures from
@@ -4088,11 +4104,11 @@ async fn serve_held(
     .catch_unwind()
     .await;
     let failure = match outcome {
-        Ok((Ok(GenerationOutcome::Done(result)), before)) => {
+        Ok((Ok(GenerationOutcome::Done(result)), before)) if !m.condemned() => {
             after_request(ctx, req, &result, before);
             return Ok(result);
         }
-        Ok((Ok(GenerationOutcome::Batched(prepared)), before)) => {
+        Ok((Ok(GenerationOutcome::Batched(prepared)), before)) if !m.condemned() => {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             let Prepared {
                 prompt_ids,
@@ -4128,7 +4144,25 @@ async fn serve_held(
             }
             return r;
         }
+        // It returned, and a device failed under it all the same: cubecl
+        // caught the failure on its device thread — 2026-10-08's `DSD-0-0`
+        // out-of-memory under a prefill — and only the recovery hook saw it,
+        // by moving the epoch. Delivered as a clean result, its tokens were
+        // computed on a device that had refused them memory, the first one
+        // reset the count that escalates to a restart, and placement never
+        // heard of the out-of-memory; the model went only when the next
+        // request found its stamp stale. Decided here instead, like any other
+        // device failure. (The generation stopped at its first token after
+        // the failure — see `generate_on` — so nothing it computed since
+        // reached the client.)
+        Ok((Ok(_), _)) => swallowed(&mark, &m.devices, &spec.name),
         Ok((Err(e), _)) if e.needs_decision() => e.message,
+        // An error out of a generation a device failed under is the
+        // failure's symptom, and the hook's text its cause (as
+        // `decoder::Failure::of` judges one).
+        Ok((Err(e), _)) if m.condemned() && !e.is_device() => {
+            swallowed(&mark, &m.devices, &spec.name)
+        }
         Ok((Err(e), _)) => return Err(e),
         Err(payload) => device_failure_or_resume(payload, &mark),
     };
@@ -4166,6 +4200,21 @@ fn after_request(
             before,
         );
     }
+}
+
+/// A device failure under a generation of `model` that only the recovery
+/// hook saw, said in the log — and its cause: the text the hook recorded for
+/// it, charged where `recovery::attribute` says since `mark` (the decode
+/// thread's `Failure::recorded`, and `recovery::load_fault`, take it the
+/// same way).
+fn swallowed(mark: &recovery::EpochMark, used: &[DeviceKey], model: &str) -> String {
+    let cause = recovery::last_cause(&recovery::attribute(mark, used))
+        .unwrap_or_else(|| "a device failure the recovery hook kept no text for".to_owned());
+    eprintln!(
+        "[mummu-serve] chat {model}: a device failed under the generation and only the recovery \
+         hook saw it ({cause}) — what the generation returned is not delivered"
+    );
+    cause
 }
 
 /// The text of a panic the generation raised, when it is the device's
@@ -4261,11 +4310,14 @@ fn encode_with(tok: &Tokenizer, spec: &ModelSpec, prompt: &str) -> Result<Vec<u3
     Ok(ids)
 }
 
-/// How a held request's generation went: decoded here, or to be handed to
-/// the decode thread with the slot.
+/// How a held request's generation went: decoded here, to be handed to the
+/// decode thread with the slot, or never begun.
 enum GenerationOutcome {
     Done(ChatResult),
     Batched(Prepared),
+    /// Not run: a device failed before it could begin — under the move that
+    /// made room for it, say — and condemned the model.
+    Condemned,
 }
 
 /// What a generation needs before its first forward, from the tokenizer.
@@ -4508,8 +4560,9 @@ async fn join_session(
 }
 
 /// The generation itself, on a model the slot handed out. Everything that
-/// can fail here is decided by `drive`, which runs this under
-/// `catch_unwind` while it holds the slot.
+/// can fail here is decided by `serve_held`, which runs this under
+/// `catch_unwind` while it holds the slot — a device failure that only the
+/// recovery hook saw too, after this returns `Ok`.
 async fn generate_on(
     m: &Loaded,
     req: &GenerationRequest<'_>,
@@ -4567,16 +4620,26 @@ async fn generate_on(
     // One callback for both decode paths: the text one and the multimodal
     // one see exactly the same tokens.
     let mut on_token = |id: u32| {
+        // A device failed since the model's load — under this prefill, say,
+        // where cubecl caught an out-of-memory on its device thread and the
+        // forward went on. This token was computed on a device that had
+        // just refused it memory: it is not the client's, and it vouches for
+        // nothing. The generation stops here, and `serve_held` decides the
+        // failure when it returns. Checked per token, as the decode thread
+        // judges every step (`decoder::guarded`); one atomic load.
+        if m.condemned() {
+            return ControlFlow::Break(());
+        }
         // The first token is where warming ends and the wait the bar
         // exists for is over. Said here rather than after `generate`
         // returns, because the rest of a 512-token decode is not a
         // load and must not keep a progress bar on screen.
         if ids.is_empty() {
             progress.ready();
-            // The model's devices computed and read back: whatever
-            // failed on THEM before is behind us (see
-            // `recovery::decide`). Only on them — a token on the host
-            // vouches for nothing on the card.
+            // The model's devices computed and read back, with no device
+            // failure since its load (just above): whatever failed on THEM
+            // before is behind us (see `recovery::decide`). Only on them —
+            // a token on the host vouches for nothing on the card.
             recovery::generation_succeeded(&m.devices);
         }
         if first_token_at.is_none() {
@@ -4624,7 +4687,11 @@ async fn generate_on(
     let text = decode_answer(&m.tokenizer, &out, &keep).map_err(|e| format!("decode: {e}"))?;
     let text = conclude(thinking, text, max_tokens, finish, on_delta)?;
     let elapsed_ms = crate::millis(start.elapsed());
-    after_generation(m, out.len(), elapsed_ms);
+    // Not a sample of anything, nor a re-tier, on a model a device failed
+    // under: `serve_held` evicts it.
+    if !m.condemned() {
+        after_generation(m, out.len(), elapsed_ms);
+    }
     let generation_done = Instant::now();
     let first = first_token_at.unwrap_or(generation_done);
     let timings = crate::trace::Timings {
@@ -5440,6 +5507,13 @@ pub mod test_support {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
+        ALLOC_FAILED.store(false, SeqCst);
+    }
+
+    /// Was placement told a device ran out of memory
+    /// (`placement::note_device_failure`, which doubles ε̂ for the reload)?
+    pub fn alloc_failed() -> bool {
+        ALLOC_FAILED.load(SeqCst)
     }
 
     /// Note `dir` resident on `backend`, exactly as `plan_fit`'s GGUF ladder
