@@ -26,6 +26,16 @@
 //! * **`kernel_gap_oom`** — the same window, but what the device thread
 //!   raised is an out-of-memory. Caught and retried just the same — and it
 //!   must still poison the device.
+//! * **`swallowed_oom`** — at the next forward, cubecl's out-of-memory on
+//!   `DSD-0-0`, raised and swallowed there as a prefill's allocation was on
+//!   2026-10-08 — and the generation goes on, and returns `Ok`. Only the
+//!   recovery hook sees it, by moving the fault epoch. Charged to the device
+//!   the thread names.
+//! * **`caught_oom`** — the same failure raised and caught on the request's
+//!   own thread, as `mummu::nn::moe::native_qmatmul_ok` catches any panic
+//!   ("any panic means no"), the generation again going on. No device thread
+//!   names it, so it is charged to the model's own devices — the ones its
+//!   tokens vouch for; the host, in a test.
 //! * **`stall_ms`** — the next generation sleeps this long before its first
 //!   read, holding the slot: how a test queues a request behind another.
 //! * **`device_oom_now`** — raise cubecl's OOM on `DSD-0-0` right now, while
@@ -84,11 +94,17 @@ pub const INVALID_READ_ERR: &str = "argmax readback: ServerUnhealthy { errors: [
 pub const KERNEL_GAP_MESSAGE: &str =
     "quantized view float vector size 4 must be a positive multiple of num_quants 8";
 
+/// `DSD-0-0`'s panic under the joiner's prefill, 2026-10-08 14:44:51Z.
+pub const PREFILL_OOM_MESSAGE: &str = "failed to reserve 71303168 bytes of device memory: out \
+                                       of device memory allocating 1045278720 bytes";
+
 static LOAD_OOM: AtomicU32 = AtomicU32::new(0);
 static READ_INVALID: AtomicU32 = AtomicU32::new(0);
 static READ_INVALID_ERR: AtomicU32 = AtomicU32::new(0);
 static KERNEL_GAP: AtomicU32 = AtomicU32::new(0);
 static KERNEL_GAP_OOM: AtomicU32 = AtomicU32::new(0);
+static SWALLOWED_OOM: AtomicU32 = AtomicU32::new(0);
+static CAUGHT_OOM: AtomicU32 = AtomicU32::new(0);
 static STALL_MS: AtomicU64 = AtomicU64::new(0);
 static EXIT_STALL: AtomicBool = AtomicBool::new(false);
 
@@ -124,6 +140,10 @@ pub struct Arm {
     #[serde(default)]
     pub kernel_gap_oom: u32,
     #[serde(default)]
+    pub swallowed_oom: u32,
+    #[serde(default)]
+    pub caught_oom: u32,
+    #[serde(default)]
     pub stall_ms: u64,
     #[serde(default)]
     pub exit_stall: bool,
@@ -151,6 +171,8 @@ pub fn arm(a: Arm) {
     READ_INVALID_ERR.store(a.read_invalid_err, SeqCst);
     KERNEL_GAP.store(a.kernel_gap, SeqCst);
     KERNEL_GAP_OOM.store(a.kernel_gap_oom, SeqCst);
+    SWALLOWED_OOM.store(a.swallowed_oom, SeqCst);
+    CAUGHT_OOM.store(a.caught_oom, SeqCst);
     STALL_MS.store(a.stall_ms, SeqCst);
     EXIT_STALL.store(a.exit_stall, SeqCst);
     if a.device_oom_now {
@@ -171,6 +193,8 @@ pub fn armed() -> Arm {
         read_invalid_err: READ_INVALID_ERR.load(SeqCst),
         kernel_gap: KERNEL_GAP.load(SeqCst),
         kernel_gap_oom: KERNEL_GAP_OOM.load(SeqCst),
+        swallowed_oom: SWALLOWED_OOM.load(SeqCst),
+        caught_oom: CAUGHT_OOM.load(SeqCst),
         stall_ms: STALL_MS.load(SeqCst),
         exit_stall: EXIT_STALL.load(SeqCst),
         device_oom_now: false,
@@ -264,6 +288,21 @@ pub async fn before_first_read() -> Result<(), String> {
     if take(&KERNEL_GAP_OOM) {
         catch_and_retry_window(LOAD_OOM_MESSAGE);
     }
+    if take(&SWALLOWED_OOM) {
+        eprintln!(
+            "[mummu-serve] fault injection: raising cubecl's OOM on DSD-0-0 under the generation, \
+             as under the 2026-10-08 prefill; the generation goes on"
+        );
+        raise_on_device_thread(PREFILL_OOM_MESSAGE);
+    }
+    if take(&CAUGHT_OOM) {
+        eprintln!(
+            "[mummu-serve] fault injection: an OOM raised and caught on the request's thread; the \
+             generation goes on"
+        );
+        let caught = std::panic::catch_unwind(|| panic!("{PREFILL_OOM_MESSAGE}"));
+        debug_assert!(caught.is_err());
+    }
     Ok(())
 }
 
@@ -291,6 +330,8 @@ pub fn report() -> Value {
             "read_invalid_err": a.read_invalid_err,
             "kernel_gap": a.kernel_gap,
             "kernel_gap_oom": a.kernel_gap_oom,
+            "swallowed_oom": a.swallowed_oom,
+            "caught_oom": a.caught_oom,
             "stall_ms": a.stall_ms,
             "exit_stall": a.exit_stall,
         },

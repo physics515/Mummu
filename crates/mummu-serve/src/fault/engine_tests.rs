@@ -267,6 +267,16 @@ fn poisoned_on(key: DeviceKey) -> bool {
         .any(|d| d.key == key && d.poisoned)
 }
 
+/// The failures on `key` that cost a request since a token there — what
+/// escalates to a restart. The hook alone never counts one: only a decision
+/// does (`recovery::record_failure`).
+fn consecutive_on(key: DeviceKey) -> u32 {
+    recovery::snapshot()
+        .iter()
+        .find(|d| d.key == key)
+        .map_or(0, |d| d.consecutive)
+}
+
 // ---------------------------------------------------------------------------
 // The tests
 // ---------------------------------------------------------------------------
@@ -689,7 +699,8 @@ async fn the_exit_waits_for_open_responses_before_it_goes() {
 /// gap `run_readback_with_fallback` retries around — and one of those must
 /// not poison a healthy server: the chat completes, nothing is reloaded,
 /// health stays 200. An OOM in the very same window still poisons the
-/// device and makes the model stale.
+/// device, and fails the chat it happened under, whose generation went on
+/// and returned `Ok`: the model goes with it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_handled_kernel_gap_does_not_poison_but_an_oom_in_the_same_window_does() {
     let _fx = Fixture::new("kernel-gap").await;
@@ -717,11 +728,16 @@ async fn a_handled_kernel_gap_does_not_poison_but_an_oom_in_the_same_window_does
         kernel_gap_oom: 1,
         ..Arm::default()
     });
-    assert_answered(&chat().await);
+    let message = assert_failed(&chat().await, Recovery::Reload);
+    assert!(message.contains("out of device memory"), "{message}");
     assert!(recovery::fault_epoch() > epoch);
     assert!(
         poisoned_on(CUDA0),
         "an OOM inside a retry window went unseen"
+    );
+    assert!(
+        engine::resident_dirs().is_empty(),
+        "the model the OOM happened under was left in the slot"
     );
     assert_eq!(health().await, 503);
     assert_answered(&chat().await);
@@ -730,6 +746,95 @@ async fn a_handled_kernel_gap_does_not_poison_but_an_oom_in_the_same_window_does
         loaded + 1,
         "the model the OOM happened under was served again"
     );
+}
+
+/// 2026-10-08, on the path that does not batch (a CPU model, a dynamic step
+/// mode, an image, a model the decode thread does not run): cubecl's
+/// out-of-memory, raised and swallowed on `DSD-0-0` under a generation that
+/// goes on and returns `Ok`. It must not be served as an answer. Nothing
+/// computed after it reaches the client; the failure is decided while the
+/// request holds the slot — counted against the card whose thread failed,
+/// not the host the model runs on, and placement told of the out-of-memory
+/// so the reload plans smaller — and the model is evicted then, not left
+/// for the next request to find stale.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_failure_cubecl_swallowed_under_a_generation_fails_it() {
+    let fx = Fixture::new("swallowed").await;
+    assert_answered(&chat().await);
+    let loaded = loads();
+    arm(Arm {
+        swallowed_oom: 1,
+        ..Arm::default()
+    });
+    let failed = chat().await;
+    let message = assert_failed(&failed, Recovery::Reload);
+    assert!(
+        message.contains("71303168 bytes of device memory"),
+        "not the text the hook recorded for this failure: {message}"
+    );
+    assert!(
+        !failed.iter().any(|f| f["type"] == json!("delta")),
+        "tokens computed after the device failed reached the client: {failed:?}"
+    );
+    assert!(
+        engine::resident_dirs().is_empty(),
+        "the model the device failed under was left in the slot"
+    );
+    assert_eq!(
+        (consecutive_on(CUDA0), consecutive_on(DeviceKey::Host)),
+        (1, 0),
+        "decided against the card whose thread failed, and only there"
+    );
+    assert!(
+        engine::test_support::alloc_failed(),
+        "placement never heard of the out-of-memory"
+    );
+    assert_eq!(health().await, 503);
+
+    assert_answered(&chat().await);
+    assert_eq!(loads(), loaded + 1, "the next request loads it fresh");
+    // The fixture holds `progress_serial` for the whole test: released
+    // here, at the end, and not at its last mention above.
+    drop(fx);
+}
+
+static SWALLOWED_EXITS: AtomicU32 = AtomicU32::new(0);
+fn swallowed_exit(_: i32) {
+    SWALLOWED_EXITS.fetch_add(1, SeqCst);
+}
+
+/// A token computed after a device failed under its generation vouches for
+/// nothing, so it does not reset the count that escalates to a restart.
+/// Here the failure is one no device thread names (an out-of-memory caught
+/// on the request's own thread), so it is charged to the model's own device
+/// — the one its tokens would vouch for; the host, for this fixture, as the
+/// card for a model on the card. Two in a row, each after a fresh load, is
+/// the reload that did not hold: the second restarts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_token_after_a_swallowed_device_failure_does_not_reset_the_count() {
+    let fx = Fixture::new("swallowed-count").await;
+    fx.supervise(swallowed_exit);
+    let exits = SWALLOWED_EXITS.load(SeqCst);
+    let loaded = loads();
+    arm(Arm {
+        caught_oom: 1,
+        ..Arm::default()
+    });
+    assert_failed(&chat().await, Recovery::Reload);
+    assert_eq!(consecutive_on(DeviceKey::Host), 1);
+    arm(Arm {
+        caught_oom: 1,
+        ..Arm::default()
+    });
+    assert_failed(&chat().await, Recovery::Restart);
+    assert_eq!(loads(), loaded + 2, "each failure was after a fresh load");
+    assert!(
+        wait_for(&SWALLOWED_EXITS, exits + 1, Duration::from_secs(5)),
+        "the restart was decided and never taken"
+    );
+    // The fixture holds `progress_serial` for the whole test: released
+    // here, at the end, and not at its last mention above.
+    drop(fx);
 }
 
 /// MINOR 10: a request planned by `plan_fit`'s "already resident" shortcut
