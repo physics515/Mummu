@@ -1145,6 +1145,63 @@ pub(super) fn transient_bytes(cfg: &qwen35::Qwen35Config, ctx: usize) -> u64 {
     scores + dequant
 }
 
+/// What a prompt of `prompt` tokens takes on the card while a running batch
+/// admits it, beyond the state the batch keeps for it: the working set
+/// placement holds back for one request (`W`), at this prompt — its pool
+/// pages ([`prefill_reserve`]) and ε̂ (`residual`) — and the cache its
+/// prefill fills for the layers on the card (`on_card`) before the batch
+/// takes it over, `s_l` at the prompt's length.
+///
+/// A batch's room is what placement leaves free, and that includes the `W`
+/// it held back for the request the batch started with. A joiner charged
+/// for its state alone spends that room on state, then prefills into pages
+/// the card no longer has: on 2026-10-08 a 1040-token prompt joined a batch
+/// planned for 184 tokens, charged 1.87 GiB against 2.48 free, and its
+/// first chunk ran the card out of memory reserving a fresh 1 GiB page.
+pub(super) fn prefill_working_set(
+    cfg: &qwen35::Qwen35Config,
+    on_card: impl IntoIterator<Item = usize>,
+    prompt: usize,
+    card_total: u64,
+    residual: u64,
+) -> u64 {
+    let cache: u64 = on_card
+        .into_iter()
+        .map(|l| state_bytes(cfg, l, prompt))
+        .sum();
+    prefill_reserve(cfg, prompt.max(1), card_total) + residual + cache
+}
+
+/// [`prefill_working_set`] under the live placement of the model at `key`
+/// on `backend`'s card. `None` when no live placement describes that model
+/// there: a model placement does not lay out has no working set to price.
+pub(super) fn joiner_prefill_bytes(
+    backend: BackendChoice,
+    key: &Path,
+    prompt: usize,
+) -> Option<u64> {
+    let total = card(backend).map(|c| c.total).or_else(inventory_vram)?;
+    let residual = residual_for(Some(total));
+    let live = LIVE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let priced = live
+        .as_ref()
+        .filter(|l| l.backend == backend && l.pack_dir.starts_with(key))
+        .map(|l| {
+            let on_card = l
+                .assignment
+                .layers
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.device == 1)
+                .map(|(i, _)| i);
+            prefill_working_set(&l.cfg, on_card, prompt, total, residual)
+        });
+    drop(live);
+    priced
+}
+
 /// A device's measured behaviour.
 #[derive(Debug, Clone, Default)]
 struct DeviceModel {
@@ -2831,6 +2888,29 @@ mod tests {
         assert!(short < 64 << 20);
         assert!(prefill_reserve(&cfg, 16_384, card) > prefill_reserve(&cfg, 4818, card));
         assert!(idle_context() >= IDLE_CONTEXT_FLOOR);
+    }
+
+    /// A joiner's prefill is priced as placement prices a request: its pool
+    /// pages and ε̂, plus the cache it fills for the card's layers — which
+    /// grows with the prompt on an attention layer and not on a `DeltaNet`
+    /// one, and is nothing for layers on the host.
+    #[test]
+    fn a_joiners_prefill_is_priced_as_a_requests_working_set() {
+        let cfg = cfg_27b();
+        let card = 16u64 << 30;
+        let residual = 650 << 20;
+        let attn = (0..cfg.num_layers).find(|&l| cfg.is_attention(l)).unwrap();
+        let delta = (0..cfg.num_layers).find(|&l| !cfg.is_attention(l)).unwrap();
+        let w = |on_card: &[usize], prompt| {
+            prefill_working_set(&cfg, on_card.iter().copied(), prompt, card, residual)
+        };
+        assert_eq!(w(&[], 1040), prefill_reserve(&cfg, 1040, card) + residual);
+        assert_eq!(
+            w(&[attn, delta], 1040) - w(&[], 1040),
+            state_bytes(&cfg, attn, 1040) + state_bytes(&cfg, delta, 1040)
+        );
+        let grows = |l| w(&[l], 2048) - w(&[], 2048) > w(&[l], 1024) - w(&[], 1024);
+        assert!(grows(attn) && !grows(delta));
     }
 
     /// ε̂ is recalled from its own key only: the old key's 5.65 GiB held the
