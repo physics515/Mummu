@@ -236,6 +236,49 @@ async fn chat() -> Vec<Value> {
     frames(crate::chat(request()).await).await
 }
 
+/// One shim `/api/chat`, the surface the LAN client of 2026-10-05 used.
+fn shim_request(stream: bool) -> Bytes {
+    Bytes::from(
+        json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "hello there"}],
+            "stream": stream,
+            "options": {"temperature": 0, "num_predict": 3},
+        })
+        .to_string(),
+    )
+}
+
+/// The newest trace's sequence number, to tell the next one from it.
+fn newest_trace() -> Option<u64> {
+    crate::trace::recent_json(1)["requests"][0]["seq"].as_u64()
+}
+
+/// The first shim trace recorded after `seq`, waited for: a trace is written
+/// when its generation returns.
+async fn shim_trace_after(seq: Option<u64>) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let recent = crate::trace::recent_json(16);
+        let found = recent["requests"].as_array().and_then(|r| {
+            r.iter()
+                .find(|t| {
+                    t["surface"] == json!("ollama")
+                        && seq.is_none_or(|s| t["seq"].as_u64().is_some_and(|n| n > s))
+                })
+                .cloned()
+        });
+        if let Some(trace) = found {
+            return trace;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no trace for the shim chat: {recent}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 fn last(frames: &[Value]) -> &Value {
     frames
         .last()
@@ -436,6 +479,42 @@ async fn a_request_queued_behind_an_error_path_failure_gets_a_fresh_model() {
         loads(),
         loaded + 1,
         "the queued request was handed the model the device had just failed under"
+    );
+}
+
+/// A request queued behind another generation reports that wait as
+/// `queue_ms`, not just as `total_ms` with no phase to account for it. The
+/// wait is mostly spent in `drive`'s warm/cold look (`loaded_key_async`),
+/// which takes the slot's lock BEFORE the acquire does: a queue clock
+/// started at the acquire found the slot free and read ~0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_queued_behind_another_generation_reports_the_wait_as_queue_time() {
+    let _fx = Fixture::new("queue-clock").await;
+    assert_answered(&chat().await);
+    let loaded = loads();
+    arm(Arm {
+        stall_ms: 1000,
+        ..Arm::default()
+    });
+    let ahead = tokio::spawn(chat());
+    // `ahead` holds the slot, stalled before its first read.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let seq = newest_trace();
+    let queued = Box::pin(crate::shim::chat(shim_request(true))).await;
+    assert_eq!(queued.status(), 200);
+    axum::body::to_bytes(queued.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    assert_answered(&ahead.await.expect("ahead"));
+    assert_eq!(loads(), loaded, "both requests found the model resident");
+    let trace = shim_trace_after(seq).await;
+    let timings = &trace["timings"];
+    assert_eq!(timings["load_ms"], json!(0), "{trace}");
+    let queue_ms = timings["queue_ms"].as_u64().expect("queue_ms");
+    assert!(
+        queue_ms >= 500,
+        "the request waited ~900 ms behind the stalled generation and its trace \
+         put {queue_ms} ms of that in the queue: {trace}"
     );
 }
 
