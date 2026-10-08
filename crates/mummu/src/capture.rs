@@ -34,13 +34,12 @@
 //! `.await` breaks it.
 
 use std::collections::HashMap;
-use std::ops::ControlFlow;
 use std::sync::Mutex;
 
 use burn::tensor::{Device, Int, Tensor, TensorData};
 
 use crate::constrain::Constraint;
-use crate::decode::{Generated, SamplerOptions, generate_loop};
+use crate::decode::{Generated, OnToken, SamplerOptions, generate_loop};
 use crate::models::CausalLm;
 use crate::nn::MAX_CONTEXT_TOKENS;
 use crate::nn::static_kv::{BUCKET, StaticKv, bucket};
@@ -385,7 +384,7 @@ pub fn applies<M: StaticDecode>(model: &M, req: &DecodeRequest<'_>) -> bool {
 pub async fn generate<M: StaticDecode + Sync>(
     model: &M,
     req: DecodeRequest<'_>,
-    on_token: impl FnMut(u32) -> ControlFlow<()>,
+    on_token: impl OnToken,
     constraint: Option<&mut dyn Constraint>,
 ) -> Result<Generated, String> {
     let DecodeRequest {
@@ -535,6 +534,7 @@ pub fn generate_batch_greedy<M: StaticDecode + Sync + 'static>(
                 max_tokens,
                 opts: &greedy,
                 constraint: None,
+                cancel: None,
             },
         )?;
         ids.push(id);
@@ -568,9 +568,14 @@ pub(crate) fn greedy_decode<M: StaticDecode + Sync>(
         device,
         mode,
     };
-    pollster::block_on(generate(model, req, |_| ControlFlow::Continue(()), None))
-        .expect("decodes")
-        .ids
+    pollster::block_on(generate(
+        model,
+        req,
+        |_| std::ops::ControlFlow::Continue(()),
+        None,
+    ))
+    .expect("decodes")
+    .ids
 }
 
 #[cfg(test)]

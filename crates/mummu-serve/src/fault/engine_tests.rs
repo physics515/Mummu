@@ -236,49 +236,6 @@ async fn chat() -> Vec<Value> {
     frames(crate::chat(request()).await).await
 }
 
-/// One shim `/api/chat`, the surface the LAN client of 2026-10-05 used.
-fn shim_request(stream: bool) -> Bytes {
-    Bytes::from(
-        json!({
-            "model": MODEL,
-            "messages": [{"role": "user", "content": "hello there"}],
-            "stream": stream,
-            "options": {"temperature": 0, "num_predict": 3},
-        })
-        .to_string(),
-    )
-}
-
-/// The newest trace's sequence number, to tell the next one from it.
-fn newest_trace() -> Option<u64> {
-    crate::trace::recent_json(1)["requests"][0]["seq"].as_u64()
-}
-
-/// The first shim trace recorded after `seq`, waited for: a trace is written
-/// when its generation returns.
-async fn shim_trace_after(seq: Option<u64>) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let recent = crate::trace::recent_json(16);
-        let found = recent["requests"].as_array().and_then(|r| {
-            r.iter()
-                .find(|t| {
-                    t["surface"] == json!("ollama")
-                        && seq.is_none_or(|s| t["seq"].as_u64().is_some_and(|n| n > s))
-                })
-                .cloned()
-        });
-        if let Some(trace) = found {
-            return trace;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "no trace for the shim chat: {recent}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
 fn last(frames: &[Value]) -> &Value {
     frames
         .last()
@@ -852,10 +809,141 @@ async fn a_device_failure_decided_outside_the_engine_still_evicts_the_resident_m
     let stream = crate::spawn_chat(MODEL.into(), false, |_| async {
         Err::<engine::ChatResult, _>(ChatError::request(super::INVALID_READ_ERR))
     });
-    let f = frames(crate::sse_response(stream.rx, Some(stream.inflight))).await;
+    let f = frames(crate::sse_response(
+        stream.rx,
+        Some((stream.inflight, stream.listening)),
+    ))
+    .await;
     assert_failed(&f, Recovery::Reload);
     assert!(
         engine::resident_dirs().is_empty(),
         "the resident model outlived a device failure"
     );
+}
+
+// ---------------------------------------------------------------------------
+// A client that hangs up
+// ---------------------------------------------------------------------------
+
+/// One shim `/api/chat`, the surface the LAN client of 2026-10-05 used.
+fn shim_request(stream: bool) -> Bytes {
+    Bytes::from(
+        json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "hello there"}],
+            "stream": stream,
+            "options": {"temperature": 0, "num_predict": 3},
+        })
+        .to_string(),
+    )
+}
+
+/// The newest trace's sequence number, to tell the next one from it.
+fn newest_trace() -> Option<u64> {
+    crate::trace::recent_json(1)["requests"][0]["seq"].as_u64()
+}
+
+/// The first shim trace recorded after `seq`, waited for: a trace is written
+/// when its generation returns.
+async fn shim_trace_after(seq: Option<u64>) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let recent = crate::trace::recent_json(16);
+        let found = recent["requests"].as_array().and_then(|r| {
+            r.iter()
+                .find(|t| {
+                    t["surface"] == json!("ollama")
+                        && seq.is_none_or(|s| t["seq"].as_u64().is_some_and(|n| n > s))
+                })
+                .cloned()
+        });
+        if let Some(trace) = found {
+            return trace;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no trace for the shim chat: {recent}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[track_caller]
+fn assert_cancelled_before_a_token(trace: &Value) {
+    assert_eq!(trace["finish"], json!("cancelled"), "{trace}");
+    assert_eq!(trace["outcome"], json!("ok"), "{trace}");
+    assert_eq!(trace["timings"]["completion_tokens"], json!(0), "{trace}");
+}
+
+/// Production, 2026-10-05: requests whose client had hung up queued for the
+/// slot behind a generation and then ran in full — seventeen in flight at
+/// once, the last of them finishing 35-43 minutes after their clients left.
+/// A request queued behind a stalled generation whose client hangs up now
+/// leaves the queue then and there: it never takes the slot, and its trace
+/// says it was cancelled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_queued_chat_whose_client_hangs_up_leaves_the_queue() {
+    let _fx = Fixture::new("hangup-queued").await;
+    assert_answered(&chat().await);
+    arm(Arm {
+        stall_ms: 4000,
+        ..Arm::default()
+    });
+    let ahead = tokio::spawn(chat());
+    // `ahead` holds the slot, stalled before its first read.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let seq = newest_trace();
+    let queued = crate::shim::chat(shim_request(true)).await;
+    // It plans, then waits for the slot.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let hung_up = Instant::now();
+    drop(queued);
+    let trace = shim_trace_after(seq).await;
+    assert!(
+        hung_up.elapsed() < Duration::from_secs(2),
+        "it stayed in the queue after its client left ({:?})",
+        hung_up.elapsed()
+    );
+    assert_cancelled_before_a_token(&trace);
+    assert_answered(&ahead.await.expect("ahead"));
+}
+
+/// A chat whose client hangs up after it took the slot — the model resident,
+/// the prompt not yet read — stops before the prefill's first forward: no
+/// token, the slot released, and the model left resident for the next
+/// request. Streamed, and buffered, where nothing is ever sent that could
+/// fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_chat_whose_client_hangs_up_before_its_prefill_runs_no_forward() {
+    let fx = Fixture::new("hangup-prefill").await;
+    assert_answered(&chat().await);
+    let loaded = loads();
+    for stream in [true, false] {
+        arm(Arm {
+            stall_ms: 600,
+            ..Arm::default()
+        });
+        let seq = newest_trace();
+        if stream {
+            let response = crate::shim::chat(shim_request(true)).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            drop(response);
+        } else {
+            // The client hangs up while the handler still waits.
+            let waited = tokio::time::timeout(
+                Duration::from_millis(200),
+                crate::shim::chat(shim_request(false)),
+            )
+            .await;
+            assert!(waited.is_err(), "the buffered answer came back mid-stall");
+        }
+        assert_cancelled_before_a_token(&shim_trace_after(seq).await);
+    }
+    assert_eq!(loads(), loaded, "a hang-up reloaded the model");
+    assert_eq!(
+        engine::resident_dirs(),
+        vec![fx.dir()],
+        "the model went with the request that was cancelled"
+    );
+    assert_answered(&chat().await);
 }

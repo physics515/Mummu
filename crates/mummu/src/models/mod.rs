@@ -4,7 +4,7 @@
 
 use burn::tensor::{Device, Tensor};
 
-use crate::decode::{Generated, SamplerOptions, argmax_id, generate_loop, top_k_ids};
+use crate::decode::{Generated, OnToken, SamplerOptions, argmax_id, generate_loop, top_k_ids};
 
 pub mod lfm2;
 pub mod minilm;
@@ -238,7 +238,8 @@ pub trait CausalLm {
 /// future must stay `Send` for mummu-serve to spawn it, and a trait method
 /// returning `impl Future` does not reliably leak that. `constraint` vetoes
 /// any token that would break the grammar and decides when the value is
-/// complete (see [`crate::constrain`]).
+/// complete (see [`crate::constrain`]). `on_token` may also be abandoned
+/// mid-prompt (see [`OnToken`]).
 ///
 /// # Errors
 ///
@@ -251,7 +252,7 @@ pub async fn generate_constrained<M>(
     max_tokens: usize,
     opts: &SamplerOptions,
     device: &Device,
-    on_token: impl FnMut(u32) -> std::ops::ControlFlow<()>,
+    on_token: impl OnToken,
     constraint: Option<&mut dyn crate::constrain::Constraint>,
 ) -> Result<Generated, String>
 where
@@ -322,7 +323,7 @@ pub struct MultimodalPrompt<'a> {
 pub async fn generate_multimodal(
     model: &qwen35::LoadedQwen35,
     prompt: &MultimodalPrompt<'_>,
-    on_token: impl FnMut(u32) -> std::ops::ControlFlow<()>,
+    on_token: impl OnToken,
     constraint: Option<&mut dyn crate::constrain::Constraint>,
 ) -> Result<Generated, String> {
     let mut cache = model.new_cache();

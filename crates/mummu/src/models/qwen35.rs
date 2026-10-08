@@ -5373,6 +5373,7 @@ mod tests {
             max_tokens,
             opts: &greedy,
             constraint: None,
+            cancel: None,
         };
         batch
             .admit(&m, adm(&[3, 14, 15, 9, 26], 1000))
@@ -5391,6 +5392,43 @@ mod tests {
             m.static_bytes(2, 1536, &device),
             most,
             "two slots, the context doubled once"
+        );
+    }
+
+    /// A request that left before its prefill finished never enters the
+    /// batch: its admission ends `Cancelled` with no token, and the live
+    /// sequences step on without it.
+    #[test]
+    fn an_abandoned_admission_never_enters_the_batch() {
+        use crate::batch::{Admission, Batcher, Event};
+        use crate::capture::StepMode;
+        use crate::decode::{Cancel, Finish, SamplerOptions};
+        let mut m = toy_model();
+        m.config.eos_token_id = EosIds::One(u32::MAX);
+        let device = crate::backend::cpu_device();
+        let greedy = SamplerOptions::greedy();
+        let mut batch = Batcher::new(&m, &device, 4, StepMode::Static).expect("static path");
+        let adm = |prompt: &'static [u32], cancel| Admission {
+            prompt_ids: prompt,
+            max_tokens: 8,
+            opts: &greedy,
+            constraint: None,
+            cancel,
+        };
+        let (live, events) = batch.admit(&m, adm(&[3, 14, 15], None)).expect("admits");
+        assert!(matches!(events.as_slice(), [Event::Token(_)]), "{events:?}");
+        let cancel = Cancel::default();
+        cancel.cancel();
+        let (gone, events) = batch
+            .admit(&m, adm(&[9, 26, 5, 3], Some(&cancel)))
+            .expect("an abandoned admission is not an error");
+        assert_eq!(events, vec![Event::Done(Finish::Cancelled)]);
+        assert_ne!(gone, live);
+        assert_eq!(batch.active(), 1, "only the live sequence is in the batch");
+        let stepped = batch.step(&m).expect("steps");
+        assert!(
+            !stepped.is_empty() && stepped.iter().all(|(id, _)| *id == live),
+            "{stepped:?}"
         );
     }
 }

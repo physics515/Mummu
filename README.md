@@ -216,7 +216,9 @@ async fn search(dir: &std::path::Path, rr: &std::path::Path) -> Result<(), Box<d
   byte-identical, max |Δlogprob| 2.5e-1 / 3.9e-1, *below* the f32 legs' own 2.7e-1 / 4.0e-1. So half
   precision is a verified path, not merely a live one.
 - **Sampling, streaming, cancellation** — temperature / top-k / top-p sampling (deterministic per seed),
-  per-token streaming through a `ControlFlow` callback, and cooperative between-token cancellation;
+  per-token streaming through a `ControlFlow` callback, and cooperative cancellation — between tokens,
+  and between a long prompt's prefill chunks through a `decode::Cancel` (mummu-serve raises one the
+  moment a client hangs up, wherever its request is: queued, joining a batch, prefilling, decoding);
   greedy decoding keeps the argmax on-device.
 - **Function calling (both zoo conventions)** — advertise `ToolSpec`s through `render_with_tools` in
   the convention the model was trained on: **Hermes** for Qwen2.5/Qwen3 (the exact
