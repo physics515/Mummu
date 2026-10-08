@@ -459,21 +459,15 @@ impl Thread {
         }
         if job.joined {
             let live = !held.jobs.is_empty();
-            match charge(&cached.batcher, &held.guard, &job) {
+            match charge(&cached.batcher, held, &job) {
                 Charge::Unknown if live => return Some(job),
                 Charge::Unknown => {
                     // Nothing in the batch to learn the price from.
                     let _ = job.updates.send(Update::Bounced);
                     return None;
                 }
-                Charge::Over { need, free } => {
-                    eprintln!(
-                        "[mummu-serve] decode thread: a request stays out of the batch — its \
-                         context needs {:.2} GiB more of the card, placement leaves {:.2} GiB; it \
-                         queues for the slot instead",
-                        gib(need),
-                        gib(free)
-                    );
+                Charge::Over(c) => {
+                    c.say_stays_out();
                     let _ = job.updates.send(Update::Bounced);
                     return None;
                 }
@@ -488,12 +482,7 @@ impl Thread {
                     let _ = job.updates.send(Update::Bounced);
                     return None;
                 }
-                Charge::Fits { need, free } => eprintln!(
-                    "[mummu-serve] decode thread: a request joins the batch — charged {:.2} GiB \
-                     of the card at its longest, {:.2} GiB free",
-                    gib(need),
-                    gib(free)
-                ),
+                Charge::Fits(c) => c.say_joins(),
             }
         }
         let Job {
@@ -755,13 +744,22 @@ impl Thread {
 }
 
 /// What the card must find room for beside the placement before a batch
-/// may admit `job` from a request that joined it: the batch's state grown
-/// to every live sequence's last position and the job's, less what it holds
-/// already, plus the graph of a wider slot tier when it would need one
-/// (`Batcher::charge`), plus [`BATCH_MARGIN`] — and placement's free bytes for the card
-/// (`free_for_new`: capacity under the guard, less everything in use,
-/// nothing at all while the GPU is yielded). It joins only when the first
-/// fits in the second.
+/// may admit `job` from a request that joined it — and placement's free
+/// bytes for the card (`free_for_new`: capacity under the guard, less
+/// everything in use, nothing at all while the GPU is yielded). It joins
+/// only when the first fits in the second. Two things need the room, plus
+/// [`BATCH_MARGIN`] for the steps after:
+///
+/// * its state: the batch's state grown to every live sequence's last
+///   position and the job's, less what it holds already, plus the graph of
+///   a wider slot tier when it would need one (`Batcher::charge`);
+/// * its prefill, which runs on admission: the pool pages, ε̂ and card-layer
+///   cache placement holds back for one request's prompt
+///   (`placement::joiner_prefill_bytes`). What placement left free includes
+///   the working set it held back for the request the batch started with,
+///   so a joiner charged for its state alone spends that room on state and
+///   then prefills into pages the card no longer has — the out-of-device-
+///   memory of 2026-10-08.
 ///
 /// A model split across the card and the host keeps its host layers' state
 /// in host memory, so a joiner is charged there too (`Batcher::charge_host`)
@@ -770,10 +768,12 @@ impl Thread {
 ///
 /// A batch never asks placement to MOVE layers for a joiner: a move under a
 /// live batch would break its state — kept beside each layer — for every
-/// sequence in it.
-fn charge(batcher: &AnyBatcher, guard: &Loaded, job: &Job) -> Charge {
+/// sequence in it. A joiner that does not fit queues for the slot instead,
+/// where its own context is planned for before its prefill.
+fn charge(batcher: &AnyBatcher, held: &Held, job: &Job) -> Charge {
+    let guard = &held.guard;
     let (prompt, max) = (job.prompt_ids.len(), job.max_tokens);
-    let (need, host_need) = match (batcher, &guard.lm) {
+    let (state, host_need) = match (batcher, &guard.lm) {
         (AnyBatcher::Qwen3(b), AnyLm::Qwen3(m)) => {
             (b.charge(m, prompt, max), b.charge_host(m, prompt, max))
         }
@@ -782,7 +782,7 @@ fn charge(batcher: &AnyBatcher, guard: &Loaded, job: &Job) -> Charge {
         }
         _ => (Some(0), 0),
     };
-    let Some(need) = need else {
+    let Some(state) = state else {
         return Charge::Unknown;
     };
     if host_need > 0
@@ -796,25 +796,30 @@ fn charge(batcher: &AnyBatcher, guard: &Loaded, job: &Job) -> Charge {
             };
         }
     }
-    let need = need + BATCH_MARGIN;
-    let free = super::placement::free_for_new(guard.backend);
-    if need > free {
-        Charge::Over { need, free }
+    // A model placement does not lay out has no working set to price; its
+    // joiners are charged their state, as before.
+    let prefill =
+        super::placement::joiner_prefill_bytes(guard.backend, &held.key, prompt).unwrap_or(0);
+    judge(CardCharge {
+        state,
+        prefill,
+        free: super::placement::free_for_new(guard.backend),
+    })
+}
+
+/// Whether a joiner's charge on the card fits what placement leaves free.
+const fn judge(c: CardCharge) -> Charge {
+    if c.need() > c.free {
+        Charge::Over(c)
     } else {
-        Charge::Fits { need, free }
+        Charge::Fits(c)
     }
 }
 
 /// A joiner's charge against the card (see [`charge`]).
 enum Charge {
-    Fits {
-        need: u64,
-        free: u64,
-    },
-    Over {
-        need: u64,
-        free: u64,
-    },
+    Fits(CardCharge),
+    Over(CardCharge),
     /// The host layers' state does not fit above the host's floor.
     HostOver {
         need: u64,
@@ -824,8 +829,50 @@ enum Charge {
     Unknown,
 }
 
-/// Headroom a joiner's admission keeps beyond the state it charges: the
-/// wider tier's activations, its logits row and its graph's working set.
+/// What a joiner needs of the card, and what placement leaves free there.
+#[derive(Debug, Clone, Copy)]
+struct CardCharge {
+    /// The batch's state grown for it, at its longest.
+    state: u64,
+    /// Its prefill's working set (see [`charge`]).
+    prefill: u64,
+    free: u64,
+}
+
+impl CardCharge {
+    const fn need(&self) -> u64 {
+        self.state
+            .saturating_add(self.prefill)
+            .saturating_add(BATCH_MARGIN)
+    }
+
+    fn say_joins(&self) {
+        eprintln!(
+            "[mummu-serve] decode thread: a request joins the batch — charged {:.2} GiB of the \
+             card ({:.2} for its state at its longest, {:.2} for its prefill), {:.2} GiB free",
+            gib(self.need()),
+            gib(self.state),
+            gib(self.prefill),
+            gib(self.free)
+        );
+    }
+
+    fn say_stays_out(&self) {
+        eprintln!(
+            "[mummu-serve] decode thread: a request stays out of the batch — its state at its \
+             longest ({:.2} GiB) and its prefill ({:.2}) need {:.2} GiB more of the card, \
+             placement leaves {:.2} GiB; it queues for the slot instead",
+            gib(self.state),
+            gib(self.prefill),
+            gib(self.need()),
+            gib(self.free)
+        );
+    }
+}
+
+/// Headroom a joiner's admission keeps beyond the state and the prefill it
+/// charges: the wider tier's activations, its logits row and its graph's
+/// working set — what the steps after its prefill take.
 const BATCH_MARGIN: u64 = 128 << 20;
 
 fn gib(bytes: u64) -> f64 {
@@ -892,6 +939,74 @@ mod tests {
         assert!(
             matches!(rx.try_recv(), Ok(Update::Done(Ok(Finish::Cancelled)))),
             "the request was not told its generation was cancelled"
+        );
+    }
+
+    /// The joiner of 2026-10-08, replayed from production's log: the Bonsai
+    /// 27B fresh after a restart, planned for a 184-token probe with 36 of
+    /// its 64 layers on a 16 GiB card (the solver's suffix, 28..64), took a
+    /// 1040-token tool request into the probes' batch — charged 1.87 GiB of
+    /// state against 2.48 GiB free — and the first prefill chunk's card
+    /// half ran the card out of memory reserving a fresh 1 GiB page. Its
+    /// prefill needs the two pages and ε̂ placement held back for the probe,
+    /// which the state had already taken. Charged for both, it queues for
+    /// the slot, where its own context is planned for. A probe still joins
+    /// that placement, and the same prompt still joins the 28-layer
+    /// placement the reload chose, with 4.35 GiB free.
+    #[test]
+    fn a_joiner_is_charged_for_the_prefill_it_runs_on_admission() {
+        if mummu::decode::prefill_chunk_len() != 1024 {
+            return; // the replay is of production's 1024-token chunks
+        }
+        let gib = |x: f64| mummu_num::trunc_u64(x * f64::from(1u32 << 30));
+        // The Bonsai's linear-attention widths, from the projections its
+        // load logged: [5120 x 10240] in, [6144 x 5120] out.
+        let cfg = mummu::models::qwen35::Qwen35Config {
+            d_inner: 6144,
+            n_v_heads: 48,
+            ..super::super::cfg_27b_for_tests()
+        };
+        let card = 16_376u64 << 20;
+        let prefill = |on_card: std::ops::Range<usize>, prompt, residual| {
+            super::super::placement::prefill_working_set(&cfg, on_card, prompt, card, residual)
+        };
+
+        let incident = CardCharge {
+            state: gib(1.87) - BATCH_MARGIN,
+            prefill: prefill(28..64, 1040, gib(0.65)),
+            free: gib(2.48),
+        };
+        assert!(
+            incident.state + BATCH_MARGIN <= incident.free,
+            "the state alone fit, which is how it was admitted"
+        );
+        assert!(
+            incident.prefill >= 2 * (card / 16),
+            "a 1024-row chunk takes two whole pool pages"
+        );
+        assert!(
+            matches!(judge(incident), Charge::Over(_)),
+            "admitted again: {incident:?}"
+        );
+
+        let probe = CardCharge {
+            state: gib(0.26) - BATCH_MARGIN,
+            prefill: prefill(28..64, 26, gib(0.65)),
+            free: gib(2.61),
+        };
+        assert!(
+            matches!(judge(probe), Charge::Fits(_)),
+            "a short prompt no longer joins: {probe:?}"
+        );
+
+        let after_reload = CardCharge {
+            state: gib(0.77) - BATCH_MARGIN,
+            prefill: prefill(36..64, 1040, gib(1.03)),
+            free: gib(4.35),
+        };
+        assert!(
+            matches!(judge(after_reload), Charge::Fits(_)),
+            "the long prompt no longer joins a placement with room for it: {after_reload:?}"
         );
     }
 }

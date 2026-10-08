@@ -3814,6 +3814,15 @@ The subsystem that turns "a model on HuggingFace or on disk" into a loaded, pari
       use, and a shrinking batch keeps its wider tier instead of recapturing at every halving.
       Same burst: 5.8 GB held against 8.4. Verified: Qwen3-0.6B (f32 KV, 2.8 GiB per widening at
       4096 tokens) turned joiners back at 2.23 GiB free and served all six requests in turn.
+      *(2026-10-08) …and for the prefill it runs on admission.* Placement's free bytes include the
+      working set it held back for the request the batch started with (`W`: page-rounded prefill
+      transients + ε̂), so a joiner charged for its state alone spent that room on state and then
+      prefilled past the card: production's freshly restarted Bonsai 27B (36/64 layers, planned for
+      a 184-token probe) admitted a 1040-token tool request at 1.87 GiB charged / 2.48 free, and
+      its first chunk's card half failed to reserve a fresh 1 GiB pool page. A joiner is now
+      charged its state plus its own prompt's `W` and card-layer cache
+      (`placement::joiner_prefill_bytes`); that one comes to 4.7 GiB and queues for the slot,
+      where `before_request` plans its context.
 - [x] **Batch memory goes back to the driver** *(2026-10-01)* — after each batch shape the 2B's
       process held 4.3-6.6 GB on the card against 4.0 GB after one, although the allocator had
       returned everything: wgpu frees a dropped buffer only at its next sync. A model load in that
