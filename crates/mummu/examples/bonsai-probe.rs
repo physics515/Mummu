@@ -41,6 +41,32 @@ fn load(dir: &std::path::Path, host: &burn::tensor::Device) -> qwen35::LoadedQwe
     qwen35::load_from_pack(dir, host, &choose).expect("loads")
 }
 
+/// `PROBE_REPEAT=n`: the prompt n times over — a long prefill for the
+/// chunked memory probe.
+fn repeated(prompt: String) -> String {
+    match std::env::var("PROBE_REPEAT")
+        .ok()
+        .and_then(|n| n.parse::<usize>().ok())
+    {
+        Some(n) => vec![prompt.as_str(); n].join(" "),
+        None => prompt,
+    }
+}
+
+/// `PROBE_ADD_Q2=<gguf>`: add the native ternary level first. True when
+/// `PROBE_ONLY_ADD` asks to stop there.
+fn add_level(dir: &std::path::Path) -> bool {
+    let Ok(gguf) = std::env::var("PROBE_ADD_Q2") else {
+        return false;
+    };
+    let added = mummu::pack::add_ternary_level(dir, std::path::Path::new(&gguf), |i, n, name| {
+        eprintln!("q2 level {i}/{n} {name}");
+    })
+    .expect("adds the native ternary level");
+    eprintln!("native ternary level added to {added} tensors");
+    std::env::var("PROBE_ONLY_ADD").is_ok()
+}
+
 #[tokio::main]
 async fn main() {
     let mut args = std::env::args().skip(1);
@@ -48,19 +74,12 @@ async fn main() {
         args.next()
             .expect("usage: bonsai-probe <pack dir> [prompt]"),
     );
-    let prompt = args
-        .next()
-        .unwrap_or_else(|| "List the first five prime numbers.".into());
-    if let Ok(gguf) = std::env::var("PROBE_ADD_Q2") {
-        let added =
-            mummu::pack::add_ternary_level(&dir, std::path::Path::new(&gguf), |i, n, name| {
-                eprintln!("q2 level {i}/{n} {name}");
-            })
-            .expect("adds the native ternary level");
-        eprintln!("native ternary level added to {added} tensors");
-        if std::env::var("PROBE_ONLY_ADD").is_ok() {
-            return;
-        }
+    let prompt = repeated(
+        args.next()
+            .unwrap_or_else(|| "List the first five prime numbers.".into()),
+    );
+    if add_level(&dir) {
+        return;
     }
     let pack = mummu::pack::Pack::open(&dir).expect("pack opens");
     let header = pack.header().expect("header");
@@ -120,6 +139,10 @@ async fn main() {
         .unwrap();
     stats("inp_embd (all tokens)", &emb);
     stats(&format!("inp_embd row0 (token {})", ids[0]), &emb[..hidden]);
+    if let Ok(chunk) = std::env::var("PROBE_CHUNK") {
+        prefill_in_chunks(&loaded, &ids, chunk.parse().expect("chunk length"), &device);
+        return;
+    }
     let mut cache = loaded.new_cache();
     let logits = loaded
         .forward(&ids, 0, &mut cache, &device)
@@ -139,6 +162,43 @@ async fn main() {
             logits[i] - lse,
             tok.decode(&[u32::try_from(i).expect("vocab index fits u32")], false)
                 .unwrap_or_default()
+        );
+    }
+}
+
+/// `PROBE_CHUNK=n`: prefill `ids` in spans of `n`, as the server does, and
+/// report the card's pool after each (with `MUMMU_POOL_TRACE=1` the model
+/// also reports per-layer peaks inside each span).
+fn prefill_in_chunks(
+    loaded: &qwen35::LoadedQwen35,
+    ids: &[u32],
+    chunk: usize,
+    device: &burn::tensor::Device,
+) {
+    #[cfg(feature = "cuda")]
+    let card = Some(mummu::backend::cuda_device());
+    #[cfg(not(feature = "cuda"))]
+    let card: Option<burn::tensor::Device> = None;
+    let pool = || {
+        card.as_ref()
+            .and_then(burn::tensor::Device::memory_pool_usage)
+            .map_or((0, 0), |u| (u.bytes_reserved >> 20, u.bytes_in_use >> 20))
+    };
+    eprintln!(
+        "prefill {} ids in spans of {chunk}; pool before (MiB reserved, in use): {:?}",
+        ids.len(),
+        pool()
+    );
+    let mut cache = loaded.new_cache();
+    for (i, span) in ids.chunks(chunk).enumerate() {
+        let started = std::time::Instant::now();
+        let logits = loaded.forward(span, i * chunk, &mut cache, device);
+        let _ = logits.into_data();
+        eprintln!(
+            "span {i} ({} ids) in {:.1}s; pool after: {:?}",
+            span.len(),
+            started.elapsed().as_secs_f64(),
+            pool()
         );
     }
 }
