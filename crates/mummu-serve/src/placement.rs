@@ -1002,11 +1002,13 @@ fn layer_maps(pack: &Pack, layers: usize, ceiling: QuantPolicy) -> Vec<LayerMap>
                     params: 0,
                     kind: Kind::Attention,
                     levels: Vec::new(),
+                    exact: None,
                 },
                 joint::Part {
                     params: 0,
                     kind: Kind::Ffn,
                     levels: Vec::new(),
+                    exact: None,
                 },
             ],
             fixed_bytes: 0,
@@ -2645,6 +2647,7 @@ mod tests {
             params: 30_000_000,
             kind,
             levels: vec![(QuantPolicy::Q4, 19 << 20), (QuantPolicy::Q8, 34 << 20)],
+            exact: None,
         };
         let layer = joint::Layer {
             parts: vec![part(Kind::Attention), part(Kind::Ffn)],

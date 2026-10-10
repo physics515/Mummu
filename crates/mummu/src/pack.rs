@@ -13,8 +13,9 @@
 //! - `header.gguf` — the source GGUF's header bytes (metadata + tensor table,
 //!   no payload): `GgufFile::open` parses it, so every config / tokenizer
 //!   reader the GGUF path already has works on a pack unchanged.
-//! - `q4.bin`, `q8.bin`, `f16.bin`, `f32.bin` — one blob per stored
-//!   precision; each tensor's bytes are contiguous within it.
+//! - `q2.bin`, `q4.bin`, `q8.bin`, `f16.bin`, `f32.bin` — one blob per
+//!   stored precision; each tensor's bytes are contiguous within it.
+//!   `q2.bin` exists only for ternary sources (see [`Precision::Q2`]).
 //!
 //! Stored precisions stop at f32: weights born bf16/Q4 carry no more
 //! information, so f64 is a *compute* option derived from f32 where a
@@ -53,19 +54,32 @@ pub const BLOCK: usize = 32;
 )]
 #[serde(rename_all = "lowercase")]
 pub enum Precision {
+    /// A ternary source's own values, stored natively: 2-bit codes with
+    /// one f32 scale per [`KBLOCK`] INPUT rows of each output column
+    /// (burn `Q2S`, `[KBLOCK, 1]` blocks — `nn::packed_gemv::is_kblock`).
+    /// Exact, not a re-quantization: written only when every weight of a
+    /// projection is its group's scale times −2..1, which a ternary
+    /// checkpoint (Bonsai's `PQ2_0`/`PTQ1_0`) always is. Unlike the other
+    /// integer levels its blocks run along the INPUT axis — the source's
+    /// own groups — so it cannot be column-sliced at [`BLOCK`] granularity.
+    Q2,
     Q4,
     Q8,
     F16,
     F32,
 }
 
+/// Input rows per scale of the [`Precision::Q2`] level.
+pub use crate::nn::packed_gemv::KBLOCK;
+
 impl Precision {
-    pub const ALL: [Self; 4] = [Self::Q4, Self::Q8, Self::F16, Self::F32];
+    pub const ALL: [Self; 5] = [Self::Q2, Self::Q4, Self::Q8, Self::F16, Self::F32];
 
     /// Blob file name inside the pack.
     #[must_use]
     pub const fn blob_name(self) -> &'static str {
         match self {
+            Self::Q2 => "q2.bin",
             Self::Q4 => "q4.bin",
             Self::Q8 => "q8.bin",
             Self::F16 => "f16.bin",
@@ -77,23 +91,26 @@ impl Precision {
     #[must_use]
     pub const fn policy(self) -> QuantPolicy {
         match self {
+            Self::Q2 => QuantPolicy::Q2,
             Self::Q4 => QuantPolicy::Q4,
             Self::Q8 => QuantPolicy::Q8,
             Self::F16 | Self::F32 => QuantPolicy::Off,
         }
     }
 
-    /// Parse `q4,q8,f16,f32` lists (the `MUMMU_PACK_PRECISIONS` convention).
+    /// Parse `q2,q4,q8,f16,f32` lists (the `MUMMU_PACK_PRECISIONS`
+    /// convention).
     ///
     /// # Errors
     ///
-    /// When an item is not one of `q4`/`int4`, `q8`/`int8`, `f16`/`half`,
+    /// When an item is not one of `q2`/`ternary`, `q4`/`int4`, `q8`/`int8`, `f16`/`half`,
     /// `f32`/`float` (case-insensitive), or when the list holds no items
     /// once blanks are trimmed.
     pub fn parse_list(s: &str) -> Result<Vec<Self>, String> {
         let mut out = Vec::new();
         for item in s.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             out.push(match item.to_ascii_lowercase().as_str() {
+                "q2" | "ternary" => Self::Q2,
                 "q4" | "int4" => Self::Q4,
                 "q8" | "int8" => Self::Q8,
                 "f16" | "half" => Self::F16,
@@ -300,6 +317,97 @@ fn unpack_nibbles(bytes: &[u8], n: usize) -> Vec<i8> {
         }
     }
     out
+}
+
+/// The exact [`Precision::Q2`] encoding of a `[rows, cols]` row-major
+/// (`[in, out]`) weight: per column and per group of [`KBLOCK`] rows, the
+/// scale is the smallest nonzero magnitude and every value must be that
+/// scale times a code in `−2..=1` — bit for bit, no rounding. `None` when
+/// any group is not (the tensor is not ternary at this grouping), so a
+/// caller can never store a lossy Q2.
+///
+/// A ternary source's values are `code · d` with `d` an f16 widened to f32
+/// and `code ∈ {−1, 0, 1}` (`PQ2_0` reserves a `+2` slot that this layout
+/// cannot hold; a group using it is refused, not clamped). Exactness is
+/// checked with `==` on purpose — the codec's output is exactly
+/// representable, and anything else is a different tensor.
+#[must_use]
+pub fn ternary_codes(values: &[f32], rows: usize, cols: usize) -> Option<(Vec<i8>, Vec<f32>)> {
+    if rows == 0 || !rows.is_multiple_of(KBLOCK) || values.len() != rows * cols {
+        return None;
+    }
+    let groups = rows / KBLOCK;
+    let mut scales = vec![0.0f32; groups * cols];
+    for g in 0..groups {
+        let srow = &mut scales[g * cols..(g + 1) * cols];
+        for r in g * KBLOCK..(g + 1) * KBLOCK {
+            for (s, &v) in srow.iter_mut().zip(&values[r * cols..(r + 1) * cols]) {
+                let a = v.abs();
+                if a > 0.0 && (*s == 0.0 || a < *s) {
+                    *s = a;
+                }
+            }
+        }
+        for s in srow.iter_mut().filter(|s| **s == 0.0) {
+            *s = 1.0; // an all-zero group: any scale reproduces it
+        }
+    }
+    let mut codes = Vec::with_capacity(values.len());
+    for (i, &v) in values.iter().enumerate() {
+        let d = scales[(i / cols) / KBLOCK * cols + i % cols];
+        let code = (v / d).round();
+        if !(-2.0..=1.0).contains(&code) || code * d != v {
+            return None;
+        }
+        codes.push(trunc_i8(code));
+    }
+    Some((codes, scales))
+}
+
+/// Pack i8 values holding 2-bit range four per byte, element `j` at bits
+/// `2·(j % 4)` — byte-for-byte burn's `Q2S` u32 words (16 per word, little
+/// endian), so loading is a copy.
+fn pack_crumbs(values: &[i8]) -> Vec<u8> {
+    values
+        .chunks(4)
+        .map(|c| {
+            c.iter().enumerate().fold(0u8, |b, (j, &v)| {
+                b | ((u8::from_ne_bytes(v.to_ne_bytes()) & 0x3) << (2 * j))
+            })
+        })
+        .collect()
+}
+
+/// Inverse of [`pack_crumbs`]: sign-extend each 2-bit field back to i8.
+fn unpack_crumbs(bytes: &[u8], n: usize) -> Vec<i8> {
+    let mut out = Vec::with_capacity(n);
+    for &b in bytes {
+        for j in 0..4 {
+            if out.len() == n {
+                break;
+            }
+            let c = (b >> (2 * j)) & 0x3;
+            out.push(if c & 0x2 != 0 {
+                i8::from_ne_bytes([c | 0xFC])
+            } else {
+                i8::from_ne_bytes([c])
+            });
+        }
+    }
+    out
+}
+
+/// The [`Precision::Q2`] bytes of a `[rows, cols]` weight: packed codes and
+/// their f32 scales, or an error naming why the tensor is not exactly
+/// ternary.
+fn q2_level_bytes(data: &[f32], rows: usize, cols: usize) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let (codes, scales) = ternary_codes(data, rows, cols).ok_or_else(|| {
+        format!("[{rows}, {cols}] is not exactly ternary at {KBLOCK}-row groups")
+    })?;
+    Ok((
+        pack_crumbs(&codes),
+        scales.iter().flat_map(|s| s.to_le_bytes()).collect(),
+    ))
 }
 
 /// Each i8 as its raw byte (two's complement) — the Q8 blob encoding.
@@ -518,6 +626,17 @@ fn write_level(
                 scales_len: 0,
             }
         }
+        Precision::Q2 => {
+            let (vbytes, sbytes) = q2_level_bytes(data, data.len() / last_dim, last_dim)?;
+            let (vo, vl) = w.append(&vbytes).map_err(|e| e.to_string())?;
+            let (so, sl) = w.append(&sbytes).map_err(|e| e.to_string())?;
+            Blob {
+                values_offset: vo,
+                values_len: vl,
+                scales_offset: so,
+                scales_len: sl,
+            }
+        }
         Precision::Q8 | Precision::Q4 => {
             let (q, scales) = quantize_blocks(data, last_dim, p);
             let vbytes = quant_bytes(&q, p);
@@ -576,7 +695,7 @@ pub fn import_gguf(
     let mut writers = open_writers(out_dir, &all_levels)?;
     let integer_requested = precisions
         .iter()
-        .any(|p| matches!(p, Precision::Q4 | Precision::Q8));
+        .any(|p| matches!(p, Precision::Q2 | Precision::Q4 | Precision::Q8));
     let narrowest_float = float_levels
         .iter()
         .copied()
@@ -626,6 +745,16 @@ pub fn import_gguf(
                         float_levels.contains(&p) || !quantizable && p == Precision::F32
                     }
                     Precision::Q4 | Precision::Q8 => quantizable && precisions.contains(&p),
+                    // The native ternary level: only for a ternary source,
+                    // and only where the input axis splits into whole
+                    // source groups and the output into whole 2-bit words.
+                    Precision::Q2 => {
+                        ternary
+                            && quantizable
+                            && precisions.contains(&p)
+                            && shape[0].is_multiple_of(KBLOCK)
+                            && shape[1].is_multiple_of(16)
+                    }
                 };
                 if !stored {
                     continue;
@@ -681,17 +810,17 @@ fn transpose(values: &[f32], out: usize, inp: usize) -> Vec<f32> {
 
 /// An opened pack: manifest + lazily-read blobs.
 ///
-/// Burn's canonical quantized `TensorData` bytes for block-quantized i8/i4
-/// values: the values packed little-endian into u32 words (8 nibbles or 4
-/// bytes per word, element `j` at bits `j·bits`), then the f32 block scales
-/// appended — exactly what `Tensor::quantize(..).into_data()` yields and
+/// Burn's canonical quantized `TensorData` bytes for block-quantized i8/i4/i2
+/// values: the values packed little-endian into u32 words (16 2-bit codes,
+/// 8 nibbles or 4 bytes per word, element `j` at bits `j·bits`), then the
+/// f32 block scales appended — exactly what `Tensor::quantize(..).into_data()` yields and
 /// what every backend's `q_from_data` consumes. (`TensorData::quantized`
 /// itself only handles 8-bit values under the default `PackedU32` store:
 /// its Q4 reader unpacks nibbles the constructor never packed.)
 ///
 /// # Panics
 ///
-/// If `scheme.value` is not one of `Q8S`/`Q8F`/`Q4S`/`Q4F` — the only
+/// If `scheme.value` is not one of `Q8S`/`Q8F`/`Q4S`/`Q4F`/`Q2S`/`Q2F` — the only
 /// value types this packing is defined for.
 pub fn quantized_tensor_data(
     values: &[i8],
@@ -704,6 +833,7 @@ pub fn quantized_tensor_data(
     let bits = match scheme.value {
         QuantValue::Q8S | QuantValue::Q8F => 8,
         QuantValue::Q4S | QuantValue::Q4F => 4,
+        QuantValue::Q2S | QuantValue::Q2F => 2,
         other => panic!("quantized_tensor_data: unsupported value type {other:?}"),
     };
     let per_word = 32 / bits;
@@ -882,6 +1012,8 @@ impl Pack {
                         scales.iter().flat_map(|s| s.to_le_bytes()).collect(),
                     )
                 }
+                Precision::Q2 => q2_level_bytes(values, numel / last, last)
+                    .map_err(|e| format!("rewrite '{}': {e}", entry.name))?,
             };
             if vbytes.len() as u64 != blob.values_len || sbytes.len() as u64 != blob.scales_len {
                 return Err(format!(
@@ -939,6 +1071,10 @@ impl Pack {
         };
         let width: usize = ranges.iter().map(|r| r.1).sum();
         match precision {
+            Precision::Q2 => Err(format!(
+                "'{}': the ternary level's blocks run along the input axis and are not column-sliced",
+                entry.name
+            )),
             Precision::Q4 | Precision::Q8 => {
                 if ranges
                     .iter()
@@ -1007,6 +1143,10 @@ impl Pack {
         };
         let height: usize = ranges.iter().map(|r| r.1).sum();
         match precision {
+            Precision::Q2 => Err(format!(
+                "'{}': the ternary level is not row-sliced",
+                entry.name
+            )),
             Precision::Q4 | Precision::Q8 => {
                 let (values, scales) = self.read_quant(entry, precision)?;
                 let bpr = cols / BLOCK;
@@ -1174,6 +1314,15 @@ impl Pack {
                 .map(|c| half::f16::from_le_bytes(*c).to_f32())
                 .collect());
         }
+        if entry.precisions.contains_key(&Precision::Q2) {
+            let (q, scales) = self.read_quant(entry, Precision::Q2)?;
+            let cols = *entry.shape.last().unwrap_or(&1);
+            return Ok(q
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| f32::from(v) * scales[(i / cols) / KBLOCK * cols + i % cols])
+                .collect());
+        }
         for p in [Precision::Q8, Precision::Q4] {
             if entry.precisions.contains_key(&p) {
                 let (q, scales) = self.read_quant(entry, p)?;
@@ -1227,6 +1376,7 @@ impl Pack {
             )
         };
         let values: Vec<i8> = match precision {
+            Precision::Q2 => unpack_crumbs(&vbytes, n),
             Precision::Q4 => unpack_nibbles(&vbytes, n),
             Precision::Q8 => vbytes.iter().map(|&b| i8::from_ne_bytes([b])).collect(),
             _ => return Err(format!("{precision:?} is not a quantized level")),
@@ -1237,7 +1387,12 @@ impl Pack {
             .iter()
             .map(|c| f32::from_le_bytes(*c))
             .collect();
-        if values.len() != n || scales.len() != n / BLOCK {
+        let per_scale = if precision == Precision::Q2 {
+            KBLOCK
+        } else {
+            BLOCK
+        };
+        if values.len() != n || scales.len() != n / per_scale {
             return Err(format!("'{}' {precision:?} blob size mismatch", entry.name));
         }
         Ok((values, scales))
@@ -1269,6 +1424,16 @@ impl Pack {
             )
         })?;
         match precision {
+            Precision::Q2 => {
+                let (values, scales) = self.read_quant(entry, precision)?;
+                let data = quantized_tensor_data(
+                    &values,
+                    &scales,
+                    shape,
+                    crate::nn::packed_gemv::kblock_scheme(),
+                );
+                Ok(Tensor::from_data(data, device))
+            }
             Precision::Q4 | Precision::Q8 => {
                 let (values, scales) = self.read_quant(entry, precision)?;
                 let scheme: QuantScheme = precision
@@ -1360,10 +1525,14 @@ mod tests {
         };
         assert_eq!(
             levels("blk.0.ffn_up.weight"),
-            vec![Precision::Q4, Precision::Q8]
+            vec![Precision::Q2, Precision::Q4, Precision::Q8]
         );
         assert_eq!(levels("token_embd.weight"), vec![Precision::F16]);
-        assert_eq!(levels("blk.0.ffn_down.weight"), Precision::ALL.to_vec());
+        // A float source never gets the native ternary level.
+        assert_eq!(
+            levels("blk.0.ffn_down.weight"),
+            Precision::ALL[1..].to_vec()
+        );
         // With one scale for every block, the integer copy is exact: every
         // stored value is ±d or 0 (real checkpoints mix scales across a
         // block's 32 output rows and lose ~5% at Q4 — see the doc).
@@ -1390,7 +1559,54 @@ mod tests {
             let _ = r;
             assert!((q.abs() - 0.5).abs() < 1e-6 || q.abs() < 1e-6, "{q}");
         }
+        // The native level IS the source, element for element, in the
+        // stored [in, out] layout: transpose the codec's [out, in] values.
+        let q2 = pack
+            .tensor::<2>(entry, Precision::Q2, &device)
+            .expect("q2 tensor")
+            .dequantize()
+            .into_data()
+            .try_to_vec::<f32>()
+            .expect("f32");
+        assert_eq!(q2, transpose(&want, 256, 256), "Q2 is the source, bit for bit");
+        assert_eq!(pack.read_f32(entry).expect("read_f32 decodes Q2 too").len(), q2.len());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The exact ternary encoder refuses anything it cannot reproduce bit
+    /// for bit — a lossy Q2 must be impossible to store — and its codes
+    /// survive the 2-bit packing, sign included.
+    #[test]
+    fn ternary_codes_are_exact_or_refused() {
+        let (rows, cols) = (2 * KBLOCK, 16);
+        // Per-column, per-group scales — the axis the pack's Q4 gets wrong.
+        let scale = |r: usize, c: usize| 0.25 * f32_from_usize(1 + c + 3 * (r / KBLOCK));
+        let vals: Vec<f32> = (0..rows * cols)
+            .map(|i| {
+                let (r, c) = (i / cols, i % cols);
+                f32_from_u32(u32::try_from((r * 7 + c * 3) % 3).expect("small")) - 1.0
+            })
+            .enumerate()
+            .map(|(i, code)| code * scale(i / cols, i % cols))
+            .collect();
+        let (codes, scales) = ternary_codes(&vals, rows, cols).expect("ternary");
+        assert_eq!(scales.len(), rows / KBLOCK * cols);
+        let back: Vec<f32> = codes
+            .iter()
+            .enumerate()
+            .map(|(i, &q)| f32::from(q) * scales[(i / cols) / KBLOCK * cols + i % cols])
+            .collect();
+        assert_eq!(back, vals);
+        assert_eq!(unpack_crumbs(&pack_crumbs(&codes), codes.len()), codes);
+
+        let mut off = vals.clone();
+        off[5] *= 1.001;
+        assert!(ternary_codes(&off, rows, cols).is_none(), "not a multiple of the scale");
+        let mut plus_two = vals;
+        plus_two[0] = 2.0 * scale(0, 0); // the reserved +2 slot
+        plus_two[cols] = scale(0, 0);
+        assert!(ternary_codes(&plus_two, rows, cols).is_none(), "+2 does not fit Q2S");
+        assert!(ternary_codes(&[0.0; 64], 4, 16).is_none(), "rows must be whole groups");
     }
 
     /// A pack read must return the SAME bytes whether they came off the
