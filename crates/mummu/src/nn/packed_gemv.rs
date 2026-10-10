@@ -302,7 +302,8 @@ mod cube_impl {
     /// at 4, `0x8080_8080` at 8.
     fn sign_pattern(per_word: usize) -> u32 {
         let bits = value_bits(per_word);
-        (0..per_word as u32).fold(0, |p, j| p | (1u32 << (j * bits + bits - 1)))
+        let n = u32::try_from(per_word).expect("at most 32 values per word");
+        (0..n).fold(0, |p, j| p | (1u32 << (j * bits + bits - 1)))
     }
 
     /// The offset [`sign_pattern`] adds to every value, as f32.
@@ -485,15 +486,17 @@ mod cube_impl {
                 xsum += xk;
                 #[unroll]
                 for j in 0..per_word {
-                    let biased = (word >> (u32::cast_from(j) * bits)) & mask;
-                    group[j] += f32::cast_from(biased) * xk;
+                    let field = (word >> (u32::cast_from(j) * bits)) & mask;
+                    let prod = f32::cast_from(field) * xk;
+                    group[j] += prod;
                 }
                 if k % kblock == kblock - 1 || kk + 1 == k_per {
                     let srow = (k / kblock) * stride_s + col0;
-                    let bias = offset * xsum;
+                    let shift = offset * xsum;
                     #[unroll]
                     for j in 0..per_word {
-                        acc[j] += (group[j] - bias) * scales[srow + j];
+                        let term = (group[j] - shift) * scales[srow + j];
+                        acc[j] += term;
                         group[j] = 0.0f32;
                     }
                     xsum = 0.0f32;
@@ -722,6 +725,95 @@ mod cube_impl {
         best.0
     }
 
+    /// A packed weight as the GEMV launches read it.
+    struct PackedView<'a, R: CubeRuntime> {
+        values: &'a CubeTensor<R>,
+        scales: &'a CubeTensor<R>,
+        /// Logical output width.
+        width: usize,
+        per_word: usize,
+        /// Workgroups along the packed words (32 words each).
+        cubes: u32,
+    }
+
+    /// One block-32 launch at split `split` ([`packed_gemv_kernel`]).
+    fn launch_nblocks<R: CubeRuntime>(
+        client: &ComputeClient<R>,
+        x: &CubeTensor<R>,
+        view: &PackedView<'_, R>,
+        split: usize,
+    ) -> CubeTensor<R> {
+        let out = empty_device::<R, f32>(
+            client.clone(),
+            x.device.clone(),
+            Shape::new([1, view.width]),
+        );
+        packed_gemv_kernel::launch::<R>(
+            client,
+            CubeCount::Static(view.cubes, 1, 1),
+            CubeDim::new_2d(32, u32::try_from(split).expect("split is at most 32")),
+            view.values.clone().into_tensor_arg(),
+            view.scales.clone().into_tensor_arg(),
+            x.clone().into_tensor_arg(),
+            out.clone().into_tensor_arg(),
+            view.per_word,
+            split,
+        );
+        out
+    }
+
+    /// One K-axis ternary launch at `config` ([`kblock_config`]): the
+    /// split-K kernel over the grid's slices, then their sum when the grid
+    /// split them.
+    fn launch_kblocks<R: CubeRuntime>(
+        client: &ComputeClient<R>,
+        x: &CubeTensor<R>,
+        view: &PackedView<'_, R>,
+        config: usize,
+    ) -> CubeTensor<R> {
+        let (split, grid) = (config & 0xff, (config >> 8).max(1));
+        let out = empty_device::<R, f32>(
+            client.clone(),
+            x.device.clone(),
+            Shape::new([1, view.width]),
+        );
+        let parts = if grid == 1 {
+            out.clone()
+        } else {
+            empty_device::<R, f32>(
+                client.clone(),
+                x.device.clone(),
+                Shape::new([grid, view.width]),
+            )
+        };
+        kblock_gemv_kernel::launch::<R>(
+            client,
+            CubeCount::Static(view.cubes, u32::try_from(grid).expect("grid is small"), 1),
+            CubeDim::new_2d(32, u32::try_from(split).expect("split is at most 16")),
+            view.values.clone().into_tensor_arg(),
+            view.scales.clone().into_tensor_arg(),
+            x.clone().into_tensor_arg(),
+            parts.clone().into_tensor_arg(),
+            view.per_word,
+            super::KBLOCK,
+            split,
+        );
+        if grid > 1 {
+            sum_rows_kernel::launch::<R>(
+                client,
+                CubeCount::Static(
+                    u32::try_from(view.width.div_ceil(256)).expect("width fits u32"),
+                    1,
+                    1,
+                ),
+                CubeDim::new_1d(256),
+                parts.into_tensor_arg(),
+                out.clone().into_tensor_arg(),
+            );
+        }
+        out
+    }
+
     pub(super) fn q4s_gemv_cube<R: CubeRuntime>(
         x: CubeTensor<R>,
         w: &CubeTensor<R>,
@@ -744,71 +836,30 @@ mod cube_impl {
         let (w_vals, w_scales) = w
             .quantized_handles()
             .expect("q4s_gemv: weight must be a quantized CubeTensor");
-        let n = w.meta.shape()[1];
+        let width = w.meta.shape()[1];
         let n_words = w_vals.meta.shape()[1];
         let client = x.client.clone();
         let k_len = x.meta.shape()[1];
         debug_assert_eq!(
             n_words * per_word,
-            n,
+            width,
             "packed values view must cover exactly the logical width"
         );
         let cubes = u32::try_from(n_words)
             .expect("packed width fits u32")
             .div_ceil(32);
         let launch = |config: usize| {
-            let out = empty_device::<R, f32>(client.clone(), x.device.clone(), Shape::new([1, n]));
+            let view = PackedView {
+                values: &w_vals,
+                scales: &w_scales,
+                width,
+                per_word,
+                cubes,
+            };
             match layout {
-                Layout::NBlocks => packed_gemv_kernel::launch::<R>(
-                    &client,
-                    CubeCount::Static(cubes, 1, 1),
-                    CubeDim::new_2d(32, u32::try_from(config).expect("split is at most 32")),
-                    w_vals.clone().into_tensor_arg(),
-                    w_scales.clone().into_tensor_arg(),
-                    x.clone().into_tensor_arg(),
-                    out.clone().into_tensor_arg(),
-                    per_word,
-                    config,
-                ),
-                Layout::KBlocks => {
-                    let (split, grid) = (config & 0xff, (config >> 8).max(1));
-                    let parts = if grid == 1 {
-                        out.clone()
-                    } else {
-                        empty_device::<R, f32>(
-                            client.clone(),
-                            x.device.clone(),
-                            Shape::new([grid, n]),
-                        )
-                    };
-                    kblock_gemv_kernel::launch::<R>(
-                        &client,
-                        CubeCount::Static(cubes, u32::try_from(grid).expect("grid is small"), 1),
-                        CubeDim::new_2d(32, u32::try_from(split).expect("split is at most 16")),
-                        w_vals.clone().into_tensor_arg(),
-                        w_scales.clone().into_tensor_arg(),
-                        x.clone().into_tensor_arg(),
-                        parts.clone().into_tensor_arg(),
-                        per_word,
-                        super::KBLOCK,
-                        split,
-                    );
-                    if grid > 1 {
-                        sum_rows_kernel::launch::<R>(
-                            &client,
-                            CubeCount::Static(
-                                u32::try_from(n.div_ceil(256)).expect("width fits u32"),
-                                1,
-                                1,
-                            ),
-                            CubeDim::new_1d(256),
-                            parts.into_tensor_arg(),
-                            out.clone().into_tensor_arg(),
-                        );
-                    }
-                }
+                Layout::NBlocks => launch_nblocks(&client, &x, &view, config),
+                Layout::KBlocks => launch_kblocks(&client, &x, &view, config),
             }
-            out
         };
         // Split-K factor: autotuned per shape (or `MUMMU_GEMV_SPLIT`).
         // Forced to 1 when it does not divide k, so odd shapes keep the
@@ -818,7 +869,7 @@ mod cube_impl {
             &x.device,
             &w_scales,
             GemvShape {
-                n,
+                n: width,
                 n_words,
                 k_len,
                 per_word,
@@ -868,8 +919,8 @@ mod cube_impl {
             let orow = k * out.shape(1) + wc * per_word;
             #[unroll]
             for j in 0..per_word {
-                let biased = (word >> (u32::cast_from(j) * bits)) & mask;
-                out[orow + j] = (f32::cast_from(biased) - offset) * scales[srow + j];
+                let field = (word >> (u32::cast_from(j) * bits)) & mask;
+                out[orow + j] = (f32::cast_from(field) - offset) * scales[srow + j];
             }
         }
     }
@@ -885,7 +936,7 @@ mod cube_impl {
                 .expect("kblock_dequant: weight must be a quantized CubeTensor");
             let [k, n] = [w.meta.shape()[0], w.meta.shape()[1]];
             let client = w.client.clone();
-            let out = empty_device::<R, f32>(client.clone(), w.device.clone(), Shape::new([k, n]));
+            let out = empty_device::<R, f32>(client.clone(), w.device, Shape::new([k, n]));
             let words = k * w_vals.meta.shape()[1];
             kblock_dequant_kernel::launch::<R>(
                 &client,
@@ -1096,9 +1147,7 @@ mod flex_impl {
             let out: Vec<f32> = wq
                 .iter()
                 .enumerate()
-                .map(|(i, &q)| {
-                    f32::from(q) * scales[(i / n) / super::KBLOCK * n + i % n]
-                })
+                .map(|(i, &q)| f32::from(q) * scales[(i / n) / super::KBLOCK * n + i % n])
                 .collect();
             FlexTensor::from_data(TensorData::new(out, [k_len, n]))
         }
@@ -1191,7 +1240,10 @@ mod flex_impl {
             }
             // Non-Q4S (or twin disabled): the i8 loop per row. Correct, and
             // still one op instead of m dispatches.
-            let kblock = matches!(w.dtype(), burn::tensor::DType::QFloat(s) if super::is_kblock(&s));
+            let kblock = matches!(
+                w.dtype(),
+                burn::tensor::DType::QFloat(scheme) if super::is_kblock(&scheme)
+            );
             let mut out = vec![0f32; m * n];
             for r in 0..m {
                 let (xr, orow) = (
@@ -1485,12 +1537,7 @@ mod tests {
                 let sum: f64 = (0..k)
                     .map(|r| f64::from(x[r]) * f64::from(w[r * n + c]))
                     .sum();
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "test reference narrowed back to the f32 the kernels return"
-                )]
-                let v = sum as f32;
-                v
+                mummu_num::narrow(sum)
             })
             .collect()
     }
@@ -1503,50 +1550,58 @@ mod tests {
     #[test]
     fn kblock_ternary_gemv_is_exact_on_flex() {
         let device = crate::backend::cpu_device();
-        let (k, n) = (384, 96);
+        let (k_len, width) = (384, 96);
         let mut rng = Rng(7);
-        let (w, exact) = ternary_weight(&mut rng, k, n, &device);
-        let deq = w.clone().dequantize().into_data().try_to_vec::<f32>().unwrap();
-        assert_eq!(deq, exact, "burn's dequantize must read the K-axis scale grid");
-
-        let xv = rng.uniform_vec(k);
-        let x = Tensor::<2>::from_data(TensorData::new(xv.clone(), [1, k]), &device);
-        let want = reference_gemv(&xv, &exact, k, n);
-        let got = try_q4s_gemv(&x, &w)
-            .expect("packed path must engage for the ternary layout")
+        let (weight, exact) = ternary_weight(&mut rng, k_len, width, &device);
+        let deq = weight
+            .clone()
+            .dequantize()
             .into_data()
             .try_to_vec::<f32>()
             .unwrap();
-        let peak = want.iter().fold(0f32, |a, v| a.max(v.abs()));
-        let err = got
-            .iter()
-            .zip(&want)
-            .fold(0f32, |a, (g, w)| a.max((g - w).abs()));
-        assert!(err / peak < 1e-5, "ternary gemv rel err {}", err / peak);
-
+        assert_eq!(
+            deq, exact,
+            "burn's dequantize must read the K-axis scale grid"
+        );
         let wf = Tensor::<2>::from_dispatch(
-            <burn::backend::Dispatch as KblockDequantOps>::kblock_dequant(w.clone().into_dispatch()),
+            <burn::backend::Dispatch as KblockDequantOps>::kblock_dequant(
+                weight.clone().into_dispatch(),
+            ),
         )
         .into_data()
         .try_to_vec::<f32>()
         .unwrap();
         assert_eq!(wf, exact, "the ternary dequant op is exact on the host");
 
-        let m = 3;
-        let xm = rng.uniform_vec(m * k);
-        let x3 = Tensor::<2>::from_data(TensorData::new(xm.clone(), [m, k]), &device);
-        let got3 = try_q4s_gemv(&x3, &w)
+        let max_err = |got: &[f32], want: &[f32]| {
+            got.iter()
+                .zip(want)
+                .fold(0f32, |acc, (g, r)| acc.max((g - r).abs()))
+        };
+        let row = rng.uniform_vec(k_len);
+        let input = Tensor::<2>::from_data(TensorData::new(row.clone(), [1, k_len]), &device);
+        let want = reference_gemv(&row, &exact, k_len, width);
+        let got = try_q4s_gemv(&input, &weight)
+            .expect("packed path must engage for the ternary layout")
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap();
+        let peak = want.iter().fold(0f32, |acc, v| acc.max(v.abs())).max(1e-6);
+        let err = max_err(&got, &want);
+        assert!(err / peak < 1e-5, "ternary gemv rel err {}", err / peak);
+
+        let rows = 3;
+        let batch = rng.uniform_vec(rows * k_len);
+        let input = Tensor::<2>::from_data(TensorData::new(batch.clone(), [rows, k_len]), &device);
+        let got = try_q4s_gemv(&input, &weight)
             .expect("host gemm must engage for the ternary layout")
             .into_data()
             .try_to_vec::<f32>()
             .unwrap();
-        for r in 0..m {
-            let want = reference_gemv(&xm[r * k..(r + 1) * k], &exact, k, n);
-            let err = got3[r * n..(r + 1) * n]
-                .iter()
-                .zip(&want)
-                .fold(0f32, |a, (g, w)| a.max((g - w).abs()));
-            assert!(err / peak.max(1e-6) < 1e-4, "row {r} rel err {}", err / peak);
+        for r in 0..rows {
+            let want = reference_gemv(&batch[r * k_len..(r + 1) * k_len], &exact, k_len, width);
+            let err = max_err(&got[r * width..(r + 1) * width], &want);
+            assert!(err / peak < 1e-4, "row {r} rel err {}", err / peak);
         }
     }
 

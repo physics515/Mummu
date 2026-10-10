@@ -943,7 +943,10 @@ mod tests {
         assert_eq!(card.len(), 8, "Q2 at ~0.65x the bytes");
         assert!(card.iter().all(|c| c.levels == vec![Q2, Q2]));
         assert!(exact.used[1] <= cap);
-        assert!(error_of(&pb, &exact.assignment).abs() < 1e-12, "exact costs nothing");
+        assert!(
+            error_of(&pb, &exact.assignment).abs() < 1e-12,
+            "exact costs nothing"
+        );
     }
 
     /// When every layer fits, leftover card bytes go to precision — the

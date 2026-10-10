@@ -6,12 +6,39 @@
 //! ```text
 //! MUMMU_LAYER_TRACE=1 cargo run --release -p mummu --example bonsai-probe -- <pack dir> [prompt]
 //! ```
+//!
+//! `PROBE_LEVEL` = `q2` (the native ternary level), `q8`, or `q4` (default).
+//! `PROBE_ADD_Q2=<source gguf>` first adds the native level to the pack in
+//! place (`pack::add_ternary_level`). With the `cuda` feature,
+//! `PROBE_CUDA=1` puts every layer and the head on the card (the embedding
+//! stays on the host) — the production path for a fully resident model.
 
 #![warn(clippy::pedantic, clippy::nursery, clippy::all)]
 
 use mummu::models::CausalLm;
 use mummu::models::qwen35;
 use mummu::pack::Precision;
+
+/// The pack at the `PROBE_LEVEL` level, on the host — or, with
+/// `PROBE_CUDA` (cuda builds), every layer and the head on the card with the
+/// embedding on the host.
+fn load(dir: &std::path::Path, host: &burn::tensor::Device) -> qwen35::LoadedQwen35 {
+    let level = match std::env::var("PROBE_LEVEL").as_deref() {
+        Ok("q8") => Precision::Q8,
+        Ok("q2") => Precision::Q2,
+        _ => Precision::Q4,
+    };
+    eprintln!("level: {level:?}");
+    let choose = move |_: &mummu::pack::TensorEntry| level;
+    #[cfg(feature = "cuda")]
+    if std::env::var("PROBE_CUDA").is_ok() {
+        let card = mummu::backend::cuda_device();
+        eprintln!("layers + head on {card:?}, embedding on the host");
+        return qwen35::load_from_pack_layered(dir, &|_| card.clone(), host, &card, &choose)
+            .expect("loads");
+    }
+    qwen35::load_from_pack(dir, host, &choose).expect("loads")
+}
 
 #[tokio::main]
 async fn main() {
@@ -23,6 +50,14 @@ async fn main() {
     let prompt = args
         .next()
         .unwrap_or_else(|| "List the first five prime numbers.".into());
+    if let Ok(gguf) = std::env::var("PROBE_ADD_Q2") {
+        let added =
+            mummu::pack::add_ternary_level(&dir, std::path::Path::new(&gguf), |i, n, name| {
+                eprintln!("q2 level {i}/{n} {name}");
+            })
+            .expect("adds the native ternary level");
+        eprintln!("native ternary level added to {added} tensors");
+    }
     let pack = mummu::pack::Pack::open(&dir).expect("pack opens");
     let header = pack.header().expect("header");
     let tok = mummu::tokenizer::tokenizer_from_gguf(&header).expect("tokenizer");
@@ -42,13 +77,7 @@ async fn main() {
     );
     eprintln!("prompt ids ({}): {ids:?}", ids.len());
     let device = mummu::backend::cpu_device();
-    let loaded = qwen35::load_from_pack(&dir, &device, &|_| match std::env::var("PROBE_LEVEL")
-        .as_deref()
-    {
-        Ok("q8") => Precision::Q8,
-        _ => Precision::Q4,
-    })
-    .expect("loads");
+    let loaded = load(&dir, &device);
     eprintln!(
         "hadamard: {:?}",
         loaded.config.hadamard.as_ref().map(|h| (

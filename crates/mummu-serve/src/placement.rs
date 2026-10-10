@@ -593,7 +593,8 @@ fn update_evidence(path: &Path, change: impl FnOnce(&mut serde_json::Value)) {
 // ---------------------------------------------------------------------------
 
 /// The levels a rate can be remembered for, by name.
-const RATE_LEVELS: [QuantPolicy; 4] = [
+const RATE_LEVELS: [QuantPolicy; 5] = [
+    QuantPolicy::Q2,
     QuantPolicy::Q4,
     QuantPolicy::Q8,
     QuantPolicy::F16,
@@ -912,6 +913,7 @@ pub(super) fn note_tower_use() {
 
 const fn policy_of(p: Precision) -> QuantPolicy {
     match p {
+        Precision::Q2 => QuantPolicy::Q2,
         Precision::Q4 => QuantPolicy::Q4,
         Precision::Q8 => QuantPolicy::Q8,
         Precision::F16 => QuantPolicy::F16,
@@ -921,7 +923,10 @@ const fn policy_of(p: Precision) -> QuantPolicy {
 
 const fn precision_of(q: QuantPolicy) -> Precision {
     match q {
-        QuantPolicy::Q4 | QuantPolicy::Q2 => Precision::Q4,
+        // Q2 is only ever stored (and so only ever chosen) as a ternary
+        // source's exact level — `pack::Precision::Q2`.
+        QuantPolicy::Q2 => Precision::Q2,
+        QuantPolicy::Q4 => Precision::Q4,
         QuantPolicy::Q8 => Precision::Q8,
         QuantPolicy::F16 => Precision::F16,
         QuantPolicy::Off => Precision::F32,
@@ -969,8 +974,15 @@ fn fixed_precision(e: &TensorEntry) -> Precision {
 /// quantization-born source (1-16 bits/param) it is read at f16 — half the
 /// bytes off the disk, holding the source's values well under its own quant
 /// error — and at f32 otherwise.
-fn trunk_precision(e: &TensorEntry, source_bits: f64) -> Precision {
+fn trunk_precision(e: &TensorEntry, source_bits: f64, card: bool) -> Precision {
     match e.role {
+        // A ternary head stored natively runs exact at a quarter of Q4's
+        // value bytes on the card (0.36 GB for the 27B's against 0.79). On
+        // the host the native level has no packed kernel (an i8 slab, 1 B
+        // a weight) and the Q4 twin's bounded head is the faster read.
+        Role::Linear | Role::Expert { .. } if card && e.precisions.contains_key(&Precision::Q2) => {
+            Precision::Q2
+        }
         Role::Embedding
             if (1.0..16.0).contains(&source_bits) && e.precisions.contains_key(&Precision::F16) =>
         {
@@ -1045,11 +1057,14 @@ fn layer_maps(pack: &Pack, layers: usize, ceiling: QuantPolicy) -> Vec<LayerMap>
     }
     for (l, s) in sums.into_iter().enumerate() {
         for (pi, levels) in s.into_iter().enumerate() {
-            maps[l].parts[pi].levels = levels
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(p, b)| (policy_of(p), b))
-                .collect();
+            let levels = levels.unwrap_or_default();
+            // Every tensor of the part stores the native ternary level (the
+            // sums intersect), and the pack writes that level only when it
+            // reproduces the source bit for bit: the part's exact level.
+            maps[l].parts[pi].exact = levels
+                .contains_key(&Precision::Q2)
+                .then_some(QuantPolicy::Q2);
+            maps[l].parts[pi].levels = levels.into_iter().map(|(p, b)| (policy_of(p), b)).collect();
         }
         // A layer with no choosable tensor of a kind has an empty part; it
         // costs nothing and stores nothing, so drop it.
@@ -1445,6 +1460,9 @@ fn measure_device(
                 numel * (1.0 + 0.125 + twin)
             }
             (true, Precision::Q8) => numel * 1.125,
+            // The native ternary level unpacks to an i8 slab plus its f32
+            // scales per 128 — four times its pack bytes.
+            (true, Precision::Q2) => numel * (1.0 + 4.0 / 128.0),
             // Floats are widened to f32 on load (host, wgpu; assumed on CUDA).
             (_, Precision::F16 | Precision::F32) => numel * 4.0,
             // The card's pool pads what it holds: 11.28 GiB resident for a
@@ -1467,7 +1485,7 @@ fn probe_host(pack: &Pack) -> DeviceModel {
         pack,
         &mummu::backend::cpu_device(),
         true,
-        &[Precision::Q4, Precision::Q8, Precision::F16],
+        &[Precision::Q2, Precision::Q4, Precision::Q8, Precision::F16],
     );
     host.rate = uncontended(&host.rate, probed_under.cpu_free, Scaling::MemoryBound);
     host
@@ -1484,8 +1502,8 @@ fn probe_card(pack: &Pack, backend: BackendChoice) -> DeviceModel {
     // are the card's.
     let levels: &[Precision] = match backend {
         #[cfg(feature = "cuda")]
-        BackendChoice::Cuda => &[Precision::Q4, Precision::Q8, Precision::F16],
-        _ => &[Precision::Q4, Precision::Q8],
+        BackendChoice::Cuda => &[Precision::Q2, Precision::Q4, Precision::Q8, Precision::F16],
+        _ => &[Precision::Q2, Precision::Q4, Precision::Q8],
     };
     let mut accel = measure_device(pack, &device_of(backend), false, levels);
     accel.rate = uncontended(&accel.rate, probed_under.gpu_free, Scaling::TimeSliced);
@@ -1576,7 +1594,11 @@ impl Live {
             "output.weight"
         });
         let head_card_bytes = head_entry.map_or(0, |e| {
-            let bytes = blob_bytes(e, trunk_precision(e, source_bits)).unwrap_or(0);
+            let bytes = blob_bytes(
+                e,
+                trunk_precision(e, source_bits, backend != BackendChoice::Cpu),
+            )
+            .unwrap_or(0);
             // The card's pool padding, as for the layers.
             trunc_u64(f64_from_u64(bytes) * 1.05)
         });
@@ -1857,7 +1879,7 @@ impl Live {
                     self.precision_for(l, c, e)
                 }
             }
-            _ => trunk_precision(e, self.source_bits),
+            _ => trunk_precision(e, self.source_bits, self.backend != BackendChoice::Cpu),
         }
     }
 

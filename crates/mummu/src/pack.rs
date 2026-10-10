@@ -319,12 +319,14 @@ fn unpack_nibbles(bytes: &[u8], n: usize) -> Vec<i8> {
     out
 }
 
-/// The exact [`Precision::Q2`] encoding of a `[rows, cols]` row-major
-/// (`[in, out]`) weight: per column and per group of [`KBLOCK`] rows, the
-/// scale is the smallest nonzero magnitude and every value must be that
-/// scale times a code in `−2..=1` — bit for bit, no rounding. `None` when
-/// any group is not (the tensor is not ternary at this grouping), so a
-/// caller can never store a lossy Q2.
+/// The exact [`Precision::Q2`] encoding of a `[rows, cols]` (`[in, out]`)
+/// weight, or `None` when it has none.
+///
+/// Per column and per group of [`KBLOCK`] rows, the scale is the smallest
+/// nonzero magnitude and every value must be that scale times a code in
+/// `−2..=1` — bit for bit, no rounding. Any group that is not makes the
+/// whole tensor `None` (not ternary at this grouping), so a caller can
+/// never store a lossy Q2.
 ///
 /// A ternary source's values are `code · d` with `d` an f16 widened to f32
 /// and `code ∈ {−1, 0, 1}` (`PQ2_0` reserves a `+2` slot that this layout
@@ -356,7 +358,10 @@ pub fn ternary_codes(values: &[f32], rows: usize, cols: usize) -> Option<(Vec<i8
     for (i, &v) in values.iter().enumerate() {
         let d = scales[(i / cols) / KBLOCK * cols + i % cols];
         let code = (v / d).round();
-        if !(-2.0..=1.0).contains(&code) || code * d != v {
+        // A zero difference, not `==`: a negative source scale times a zero
+        // code is −0.0, the same weight as our +0.0.
+        let back = code * d;
+        if !v.is_finite() || !(-2.0..=1.0).contains(&code) || (back - v).abs() > 0.0 {
             return None;
         }
         codes.push(trunc_i8(code));
@@ -401,9 +406,8 @@ fn unpack_crumbs(bytes: &[u8], n: usize) -> Vec<i8> {
 /// their f32 scales, or an error naming why the tensor is not exactly
 /// ternary.
 fn q2_level_bytes(data: &[f32], rows: usize, cols: usize) -> Result<(Vec<u8>, Vec<u8>), String> {
-    let (codes, scales) = ternary_codes(data, rows, cols).ok_or_else(|| {
-        format!("[{rows}, {cols}] is not exactly ternary at {KBLOCK}-row groups")
-    })?;
+    let (codes, scales) = ternary_codes(data, rows, cols)
+        .ok_or_else(|| format!("[{rows}, {cols}] is not exactly ternary at {KBLOCK}-row groups"))?;
     Ok((
         pack_crumbs(&codes),
         scales.iter().flat_map(|s| s.to_le_bytes()).collect(),
@@ -787,9 +791,134 @@ pub fn import_gguf(
         tensors: entries,
         ffn_partition: None,
     };
-    let json = serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?;
-    std::fs::write(out_dir.join("manifest.json"), json).map_err(|e| e.to_string())?;
+    write_manifest(out_dir, &manifest)?;
     Ok(manifest)
+}
+
+/// Add the native ternary level ([`Precision::Q2`]) to a pack imported
+/// before it existed, in place.
+///
+/// Every linear whose SOURCE tensor is ternary-family is re-read from
+/// `gguf_path`, encoded exactly, and appended to `q2.bin`; the level's
+/// index is written last (temp file + rename), so a crash leaves the pack
+/// as it was.
+///
+/// Why not re-import: the 27B's pack is 44 GB on a contended HDD array; the
+/// new level is ~6.5 GB and needs only the 7.2 GB GGUF read once. Returns
+/// how many tensors gained the level (0 when the pack already has it, or
+/// the source has nothing ternary).
+///
+/// # Errors
+///
+/// When the pack or GGUF cannot be opened, a source tensor cannot be read,
+/// a ternary-family tensor is not exactly ternary at [`KBLOCK`]-row groups
+/// (a codec bug — refused rather than stored lossy), or a write fails.
+pub fn add_ternary_level(
+    pack_dir: &Path,
+    gguf_path: &Path,
+    mut on_progress: impl FnMut(usize, usize, &str),
+) -> Result<usize, String> {
+    let pack = Pack::open(pack_dir)?;
+    if pack.manifest.precisions.contains(&Precision::Q2) {
+        return Ok(0);
+    }
+    // The pack's own header copy answers "anything ternary?" without
+    // touching the source file, which may sit on a contended disk.
+    if !pack
+        .header()?
+        .tensors
+        .iter()
+        .any(|t| t.dtype.is_ternary_family())
+    {
+        return Ok(0);
+    }
+    let f = GgufFile::open(gguf_path).map_err(|e| e.to_string())?;
+    let ternary: BTreeMap<&str, &GgufTensorInfo> = f
+        .tensors
+        .iter()
+        .filter(|t| t.dtype.is_ternary_family())
+        .map(|t| (t.name.as_str(), t))
+        .collect();
+    let todo: Vec<usize> = pack
+        .manifest
+        .tensors
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| {
+            e.role == Role::Linear
+                && ternary.contains_key(e.name.as_str())
+                && e.shape.len() == 2
+                && e.shape[0].is_multiple_of(KBLOCK)
+                && e.shape[1].is_multiple_of(16)
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if todo.is_empty() {
+        return Ok(0);
+    }
+    let mut manifest = pack.manifest.clone();
+    drop(pack);
+    let blob = pack_dir.join(Precision::Q2.blob_name());
+    let file =
+        std::fs::File::create(&blob).map_err(|e| format!("create {}: {e}", blob.display()))?;
+    let mut w = BlobWriter {
+        file: std::io::BufWriter::with_capacity(8 << 20, file),
+        len: 0,
+        unsynced: 0,
+    };
+    for (n, &i) in todo.iter().enumerate() {
+        let entry = &mut manifest.tensors[i];
+        on_progress(n, todo.len(), &entry.name);
+        let (inp, out) = (entry.shape[0], entry.shape[1]);
+        let values = f.read_tensor_f32(&entry.name).map_err(|e| e.to_string())?;
+        let data = transpose(&values, out, inp);
+        let level = write_level(&mut w, Precision::Q2, &data, out)
+            .map_err(|e| format!("'{}': {e}", entry.name))?;
+        entry.precisions.insert(Precision::Q2, level);
+    }
+    w.file.flush().map_err(|e| e.to_string())?;
+    w.file.get_ref().sync_all().map_err(|e| e.to_string())?;
+    manifest.precisions.push(Precision::Q2);
+    manifest.precisions.sort();
+    write_manifest(pack_dir, &manifest)?;
+    Ok(todo.len())
+}
+
+/// The sidecar index of the [`Precision::Q2`] level: tensor name → blob.
+const Q2_INDEX: &str = "q2.json";
+
+/// Write `manifest` to `dir` as `manifest.json` WITHOUT the native ternary
+/// level, plus that level's blobs in [`Q2_INDEX`] — so a binary that
+/// predates the level (the deploy rollback image) still parses the
+/// manifest and opens the pack, never seeing a variant it cannot name.
+/// Both files go through a temp file and a rename; the sidecar first, so a
+/// crash between them leaves at worst an index the manifest does not
+/// mention, which [`Pack::open`] only merges for entries it finds.
+fn write_manifest(dir: &Path, manifest: &Manifest) -> Result<(), String> {
+    let q2: BTreeMap<&str, Blob> = manifest
+        .tensors
+        .iter()
+        .filter_map(|e| {
+            e.precisions
+                .get(&Precision::Q2)
+                .map(|b| (e.name.as_str(), *b))
+        })
+        .collect();
+    if !q2.is_empty() {
+        let tmp = dir.join("q2.json.tmp");
+        let json = serde_json::to_string(&q2).map_err(|e| e.to_string())?;
+        std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, dir.join(Q2_INDEX)).map_err(|e| e.to_string())?;
+    }
+    let mut legacy = manifest.clone();
+    legacy.precisions.retain(|&p| p != Precision::Q2);
+    for e in &mut legacy.tensors {
+        e.precisions.remove(&Precision::Q2);
+    }
+    let json = serde_json::to_string_pretty(&legacy).map_err(|e| e.to_string())?;
+    let tmp = dir.join("manifest.json.tmp");
+    std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, dir.join("manifest.json")).map_err(|e| e.to_string())
 }
 
 /// Row-major `[out, in]` → `[in, out]`.
@@ -941,6 +1070,21 @@ impl Pack {
                 manifest.version
             ));
         }
+        let mut manifest = manifest;
+        if let Ok(json) = std::fs::read_to_string(dir.join(Q2_INDEX)) {
+            let q2: BTreeMap<String, Blob> =
+                serde_json::from_str(&json).map_err(|e| format!("parse {Q2_INDEX}: {e}"))?;
+            let mut any = false;
+            for e in &mut manifest.tensors {
+                if let Some(b) = q2.get(&e.name) {
+                    e.precisions.insert(Precision::Q2, *b);
+                    any = true;
+                }
+            }
+            if any && !manifest.precisions.contains(&Precision::Q2) {
+                manifest.precisions.insert(0, Precision::Q2);
+            }
+        }
         Ok(Self::new(dir.to_path_buf(), manifest))
     }
 
@@ -959,10 +1103,7 @@ impl Pack {
     /// When the manifest does not serialize, the temporary file cannot be
     /// written, or the rename over `manifest.json` fails.
     pub fn save_manifest(&self) -> Result<(), String> {
-        let json = serde_json::to_string_pretty(&self.manifest).map_err(|e| e.to_string())?;
-        let tmp = self.dir.join("manifest.json.tmp");
-        std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
-        std::fs::rename(&tmp, self.dir.join("manifest.json")).map_err(|e| e.to_string())
+        write_manifest(&self.dir, &self.manifest)
     }
 
     /// Overwrite every stored level of `entry` from new f32 values of the
@@ -1460,25 +1601,22 @@ mod tests {
     use super::*;
     use mummu_num::{f32_from_u32, f32_from_usize, trunc_i32};
 
-    /// A ternary source stores only what carries information: the integer
-    /// levels for a projection, the narrowest float level for the embedding
-    /// — while an ordinary float source keeps every level requested.
-    #[test]
-    fn ternary_sources_skip_the_float_levels_they_cannot_use() {
+    /// A tiny ternary checkpoint: one `PQ2_0` linear `blk.0.ffn_up.weight`
+    /// [256, 256] (512 blocks of 34 B), one `PQ2_0` embedding [16, 128], one
+    /// `F32` linear `blk.0.ffn_down.weight` [256, 256]; every offset lands
+    /// 32-aligned. Returns the scratch root, the GGUF path, and the `PQ2_0`
+    /// payload of the first linear.
+    fn ternary_fixture(tag: &str) -> (PathBuf, PathBuf, Vec<u8>) {
         use crate::gguf::tests::TestGguf;
-        let _serial = crate::progress::test_serial();
-        // One PQ2_0 linear [256, 256] (65536 elements = 512 blocks of 34 B),
-        // one PQ2_0 embedding [16, 128] (16 blocks), one F32 linear [256, 256];
-        // every offset lands 32-aligned.
-        let d = half::f16::from_f32(0.5).to_bits().to_le_bytes();
+        let scale_bits = half::f16::from_f32(0.5).to_bits().to_le_bytes();
         let mut payload = Vec::new();
         for _ in 0..512 {
-            payload.extend_from_slice(&d);
+            payload.extend_from_slice(&scale_bits);
             payload.extend(std::iter::repeat_n(0b1001_0110u8, 32));
         }
         let emb_off = payload.len() as u64; // 17408, 32-aligned
         for _ in 0..16 {
-            payload.extend_from_slice(&d);
+            payload.extend_from_slice(&scale_bits);
             payload.extend(std::iter::repeat_n(0b0110_1001u8, 32));
         }
         let f32_off = payload.len() as u64; // 17952, 32-aligned
@@ -1492,23 +1630,47 @@ mod tests {
             .tensor("token_embd.weight", &[128, 16], 142, emb_off)
             .tensor("blk.0.ffn_down.weight", &[256, 256], 0, f32_off)
             .build_with_payload(&payload);
-        let root = std::env::temp_dir().join(format!("mummu-pack-ternary-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("mummu-pack-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("root");
         let gguf = root.join("t.gguf");
         std::fs::write(&gguf, &bytes).expect("gguf");
-        let map = |info: &GgufTensorInfo| {
-            Some(if info.name == "token_embd.weight" {
-                ImportAction::Embedding
-            } else {
-                ImportAction::Linear
-            })
-        };
+        payload.truncate(512 * 34);
+        (root, gguf, payload)
+    }
+
+    fn fixture_action(info: &GgufTensorInfo) -> ImportAction {
+        if info.name == "token_embd.weight" {
+            ImportAction::Embedding
+        } else {
+            ImportAction::Linear
+        }
+    }
+
+    /// The fixture's ternary linear at `level`, dequantized on the host.
+    fn level_values(pack: &Pack, level: Precision) -> Vec<f32> {
+        let entry = pack.entry("blk.0.ffn_up.weight").expect("entry");
+        pack.tensor::<2>(entry, level, &crate::backend::cpu_device())
+            .expect("tensor")
+            .dequantize()
+            .into_data()
+            .try_to_vec::<f32>()
+            .expect("f32")
+    }
+
+    /// A ternary source stores only what carries information: the integer
+    /// levels — the native one included — for a projection, the narrowest
+    /// float level for the embedding; an ordinary float source keeps every
+    /// level requested except the native ternary one.
+    #[test]
+    fn ternary_sources_skip_the_float_levels_they_cannot_use() {
+        let _serial = crate::progress::test_serial();
+        let (root, gguf, payload) = ternary_fixture("ternary");
         let manifest = import_gguf(
             &gguf,
             &root.join("pack"),
             &Precision::ALL,
-            &map,
+            &|i| Some(fixture_action(i)),
             |_, _, _| {},
         )
         .expect("imports");
@@ -1528,7 +1690,6 @@ mod tests {
             vec![Precision::Q2, Precision::Q4, Precision::Q8]
         );
         assert_eq!(levels("token_embd.weight"), vec![Precision::F16]);
-        // A float source never gets the native ternary level.
         assert_eq!(
             levels("blk.0.ffn_down.weight"),
             Precision::ALL[1..].to_vec()
@@ -1537,39 +1698,81 @@ mod tests {
         // stored value is ±d or 0 (real checkpoints mix scales across a
         // block's 32 output rows and lose ~5% at Q4 — see the doc).
         let pack = Pack::open(&root.join("pack")).expect("pack opens");
-        let entry = pack.entry("blk.0.ffn_up.weight").expect("entry");
-        let device = crate::backend::cpu_device();
-        let q4 = pack
-            .tensor::<2>(entry, Precision::Q4, &device)
-            .expect("q4 tensor")
-            .dequantize()
-            .into_data()
-            .try_to_vec::<f32>()
-            .expect("f32");
-        let want = crate::gguf::dequantize(crate::gguf::GgmlType::Pq20, &payload[..512 * 34])
-            .expect("dequant");
+        let q4 = level_values(&pack, Precision::Q4);
+        let want = crate::gguf::dequantize(crate::gguf::GgmlType::Pq20, &payload).expect("dequant");
         // Stored [in, out] = transposed; compare as a multiset per value class.
         assert_eq!(q4.len(), want.len());
-        let mut a: Vec<i32> = q4.iter().map(|v| trunc_i32((v / 0.5).round())).collect();
-        let mut b: Vec<i32> = want.iter().map(|v| trunc_i32((v / 0.5).round())).collect();
-        a.sort_unstable();
-        b.sort_unstable();
-        assert_eq!(a, b, "the Q4 level reproduces the ternary values exactly");
-        for (q, r) in q4.iter().zip(&a) {
-            let _ = r;
+        let mut got_codes: Vec<i32> = q4.iter().map(|v| trunc_i32((v / 0.5).round())).collect();
+        let mut want_codes: Vec<i32> = want.iter().map(|v| trunc_i32((v / 0.5).round())).collect();
+        got_codes.sort_unstable();
+        want_codes.sort_unstable();
+        assert_eq!(
+            got_codes, want_codes,
+            "the Q4 level reproduces the ternary values exactly"
+        );
+        for q in &q4 {
             assert!((q.abs() - 0.5).abs() < 1e-6 || q.abs() < 1e-6, "{q}");
         }
         // The native level IS the source, element for element, in the
         // stored [in, out] layout: transpose the codec's [out, in] values.
-        let q2 = pack
-            .tensor::<2>(entry, Precision::Q2, &device)
-            .expect("q2 tensor")
-            .dequantize()
-            .into_data()
-            .try_to_vec::<f32>()
-            .expect("f32");
-        assert_eq!(q2, transpose(&want, 256, 256), "Q2 is the source, bit for bit");
-        assert_eq!(pack.read_f32(entry).expect("read_f32 decodes Q2 too").len(), q2.len());
+        let q2 = level_values(&pack, Precision::Q2);
+        assert_eq!(
+            q2,
+            transpose(&want, 256, 256),
+            "Q2 is the source, bit for bit"
+        );
+        let entry = pack.entry("blk.0.ffn_up.weight").expect("entry");
+        assert_eq!(pack.read_f32(entry).expect("read_f32 decodes Q2 too"), q2);
+        // A binary that predates the level still parses the manifest: the
+        // level lives in the sidecar index only.
+        let raw = std::fs::read_to_string(root.join("pack/manifest.json")).expect("manifest");
+        assert!(
+            !raw.to_ascii_lowercase().contains("\"q2\""),
+            "manifest.json must not name q2"
+        );
+        assert!(root.join("pack").join(Q2_INDEX).is_file());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A pack imported before the native level existed gains it in place —
+    /// identical to an import's, only for the ternary-sourced linear, and
+    /// only once.
+    #[test]
+    fn an_older_pack_gains_the_native_level_in_place() {
+        let _serial = crate::progress::test_serial();
+        let (root, gguf, payload) = ternary_fixture("upgrade");
+        let old = root.join("old");
+        let m = import_gguf(
+            &gguf,
+            &old,
+            &[Precision::Q4, Precision::Q8],
+            &|i| Some(fixture_action(i)),
+            |_, _, _| {},
+        )
+        .expect("imports without q2");
+        assert!(!m.precisions.contains(&Precision::Q2));
+        assert_eq!(
+            add_ternary_level(&old, &gguf, |_, _, _| {}).expect("adds"),
+            1
+        );
+        assert_eq!(
+            add_ternary_level(&old, &gguf, |_, _, _| {}).expect("idempotent"),
+            0
+        );
+        let upgraded = Pack::open(&old).expect("opens");
+        assert!(upgraded.manifest.precisions.contains(&Precision::Q2));
+        let want = crate::gguf::dequantize(crate::gguf::GgmlType::Pq20, &payload).expect("dequant");
+        assert_eq!(
+            level_values(&upgraded, Precision::Q2),
+            transpose(&want, 256, 256)
+        );
+        assert!(
+            !upgraded
+                .entry("blk.0.ffn_down.weight")
+                .expect("float source")
+                .precisions
+                .contains_key(&Precision::Q2)
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1601,12 +1804,21 @@ mod tests {
 
         let mut off = vals.clone();
         off[5] *= 1.001;
-        assert!(ternary_codes(&off, rows, cols).is_none(), "not a multiple of the scale");
+        assert!(
+            ternary_codes(&off, rows, cols).is_none(),
+            "not a multiple of the scale"
+        );
         let mut plus_two = vals;
         plus_two[0] = 2.0 * scale(0, 0); // the reserved +2 slot
         plus_two[cols] = scale(0, 0);
-        assert!(ternary_codes(&plus_two, rows, cols).is_none(), "+2 does not fit Q2S");
-        assert!(ternary_codes(&[0.0; 64], 4, 16).is_none(), "rows must be whole groups");
+        assert!(
+            ternary_codes(&plus_two, rows, cols).is_none(),
+            "+2 does not fit Q2S"
+        );
+        assert!(
+            ternary_codes(&[0.0; 64], 4, 16).is_none(),
+            "rows must be whole groups"
+        );
     }
 
     /// A pack read must return the SAME bytes whether they came off the
