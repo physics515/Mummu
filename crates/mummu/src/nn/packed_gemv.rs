@@ -184,10 +184,44 @@ fn kblock_matmul(x: &Tensor<2>, w: &Tensor<2>, m: usize) -> Tensor<2> {
             .collect();
         return Tensor::cat(rows, 0);
     }
-    let wf = Tensor::<2>::from_dispatch(
-        <burn::backend::Dispatch as KblockDequantOps>::kblock_dequant(w.clone().into_dispatch()),
-    );
-    x.clone().matmul(wf)
+    // Column slabs of at most `KBLOCK_SLAB_BYTES` of f32 each. One whole
+    // projection at a time ran the 27B out of device memory with every layer
+    // on the card (2026-10-10, a 1505-token prompt): the FFN's three f32
+    // copies (356 MB each) were live together and the pool reserved 9.0 GiB
+    // for 5.7 in use. Slabs bound the transient to a few pool slices.
+    let [k_len, width] = w.dims();
+    let slab = kblock_slab(k_len, width);
+    let parts: Vec<Tensor<2>> = (0..width)
+        .step_by(slab)
+        .map(|col0| {
+            let cols = slab.min(width - col0);
+            let wf = Tensor::<2>::from_dispatch(
+                <burn::backend::Dispatch as KblockDequantOps>::kblock_dequant(
+                    w.clone().into_dispatch(),
+                    col0,
+                    cols,
+                ),
+            );
+            x.clone().matmul(wf)
+        })
+        .collect();
+    if parts.len() == 1 {
+        parts.into_iter().next().expect("one slab")
+    } else {
+        Tensor::cat(parts, 1)
+    }
+}
+
+/// The f32 bytes one dequantized prefill slab may hold.
+pub const KBLOCK_SLAB_BYTES: usize = 64 << 20;
+
+/// Columns per prefill slab for a `[k_len, width]` ternary weight: as many
+/// as fit [`KBLOCK_SLAB_BYTES`] of f32, in whole 256-column steps (never
+/// fewer than 256, never more than the weight).
+#[must_use]
+pub fn kblock_slab(k_len: usize, width: usize) -> usize {
+    let fit = KBLOCK_SLAB_BYTES / (k_len.max(1) * 4);
+    (fit / 256 * 256).max(256).min(width)
 }
 
 #[backend_extension(
@@ -196,12 +230,14 @@ fn kblock_matmul(x: &Tensor<2>, w: &Tensor<2>, m: usize) -> Tensor<2> {
     Vulkan: cfg(feature = "vulkan-spirv"),
     Cuda: cfg(feature = "cuda"),
 )]
-/// Dequantize a weight in the K-axis ternary layout ([`is_kblock`]) to f32
-/// `[K, N]` — what burn's own `dequantize` gets wrong for these blocks on
-/// the GPU backends.
+/// Dequantize columns of a weight in the K-axis ternary layout
+/// ([`is_kblock`]) to f32 — what burn's own `dequantize` gets wrong for
+/// these blocks on the GPU backends.
 pub trait KblockDequantOps: Backend {
-    /// `w[k, n] = q(k, n) · scale(k / KBLOCK, n)` in f32.
-    fn kblock_dequant(w: QuantizedTensor<Self>) -> FloatTensor<Self>;
+    /// `out[k, j] = q(k, col0 + j) · scale(k / KBLOCK, col0 + j)` in f32,
+    /// `[K, cols]`. `col0` and `cols` are multiples of the codes per word
+    /// (16).
+    fn kblock_dequant(w: QuantizedTensor<Self>, col0: usize, cols: usize) -> FloatTensor<Self>;
 }
 
 /// The widest host batch the packed GEMM accepts — the prefill chunk's
@@ -902,21 +938,23 @@ mod cube_impl {
         w_packed: &Tensor<u32>,
         scales: &Tensor<f32>,
         out: &mut Tensor<f32>,
+        word0: u32,
         #[comptime] per_word: usize,
         #[comptime] kblock: usize,
     ) {
-        let n_words = w_packed.shape(1);
+        let out_words = out.shape(1) / per_word;
         let pos = ABSOLUTE_POS;
-        if pos < w_packed.shape(0) * n_words {
-            let k = pos / n_words;
-            let wc = pos % n_words;
+        if pos < w_packed.shape(0) * out_words {
+            let k = pos / out_words;
+            let local = pos % out_words;
+            let wc = usize::cast_from(word0) + local;
             let bits = comptime!(value_bits(per_word));
             let mask = comptime!((1u32 << value_bits(per_word)) - 1);
             let flip = comptime!(sign_pattern(per_word));
             let offset = comptime!(f32_offset(per_word));
             let word = w_packed[k * w_packed.stride(0) + wc] ^ flip;
             let srow = (k / kblock) * scales.stride(0) + wc * per_word;
-            let orow = k * out.shape(1) + wc * per_word;
+            let orow = k * out.shape(1) + local * per_word;
             #[unroll]
             for j in 0..per_word {
                 let field = (word >> (u32::cast_from(j) * bits)) & mask;
@@ -926,7 +964,7 @@ mod cube_impl {
     }
 
     impl<R: CubeRuntime> super::KblockDequantOps for CubeBackend<R> {
-        fn kblock_dequant(w: QuantizedTensor<Self>) -> FloatTensor<Self> {
+        fn kblock_dequant(w: QuantizedTensor<Self>, col0: usize, cols: usize) -> FloatTensor<Self> {
             let per_word = match w.dtype {
                 burn::tensor::DType::QFloat(scheme) => 32 / scheme.value.size_bits(),
                 other => unreachable!("kblock dequant on a non-quantized weight: {other:?}"),
@@ -934,10 +972,15 @@ mod cube_impl {
             let (w_vals, w_scales) = w
                 .quantized_handles()
                 .expect("kblock_dequant: weight must be a quantized CubeTensor");
-            let [k, n] = [w.meta.shape()[0], w.meta.shape()[1]];
+            let k = w.meta.shape()[0];
+            debug_assert!(
+                col0.is_multiple_of(per_word) && cols.is_multiple_of(per_word),
+                "slab must cover whole words"
+            );
+            debug_assert!(col0 + cols <= w.meta.shape()[1], "slab inside the weight");
             let client = w.client.clone();
-            let out = empty_device::<R, f32>(client.clone(), w.device, Shape::new([k, n]));
-            let words = k * w_vals.meta.shape()[1];
+            let out = empty_device::<R, f32>(client.clone(), w.device, Shape::new([k, cols]));
+            let words = k * (cols / per_word);
             kblock_dequant_kernel::launch::<R>(
                 &client,
                 CubeCount::Static(
@@ -949,6 +992,7 @@ mod cube_impl {
                 w_vals.into_tensor_arg(),
                 w_scales.into_tensor_arg(),
                 out.clone().into_tensor_arg(),
+                u32::try_from(col0 / per_word).expect("word index fits u32"),
                 per_word,
                 super::KBLOCK,
             );
@@ -1136,20 +1180,22 @@ mod flex_impl {
     }
 
     impl super::KblockDequantOps for Flex {
-        fn kblock_dequant(w: QuantizedTensor<Self>) -> FloatTensor<Self> {
+        fn kblock_dequant(w: QuantizedTensor<Self>, col0: usize, cols: usize) -> FloatTensor<Self> {
             let shape = w.shape();
-            let [k_len, n] = shape.dims::<2>();
+            let [k_len, width] = shape.dims::<2>();
             let wq: &[i8] = w
                 .tensor()
                 .as_slice::<i8>()
                 .expect("flex quantized weight is contiguous i8");
             let scales: &[f32] = w.scales();
-            let out: Vec<f32> = wq
-                .iter()
-                .enumerate()
-                .map(|(i, &q)| f32::from(q) * scales[(i / n) / super::KBLOCK * n + i % n])
-                .collect();
-            FlexTensor::from_data(TensorData::new(out, [k_len, n]))
+            let mut out = Vec::with_capacity(k_len * cols);
+            for k in 0..k_len {
+                let srow = (k / super::KBLOCK) * width;
+                for c in col0..col0 + cols {
+                    out.push(f32::from(wq[k * width + c]) * scales[srow + c]);
+                }
+            }
+            FlexTensor::from_data(TensorData::new(out, [k_len, cols]))
         }
     }
 
@@ -1316,6 +1362,8 @@ mod fusion_impl {
     #[derive(Clone, Debug)]
     struct Dequant<B> {
         desc: CustomOpIr,
+        col0: usize,
+        cols: usize,
         _b: core::marker::PhantomData<B>,
     }
     impl<B1: FusionBackend + KblockDequantOps> Operation<B1::FusionRuntime> for Dequant<B1> {
@@ -1325,15 +1373,15 @@ mod fusion_impl {
         ) {
             let ([w_ir], [out_ir]) = self.desc.as_fixed();
             let wt = handles.get_quantized_tensor::<B1>(w_ir);
-            let y = B1::kblock_dequant(wt);
+            let y = B1::kblock_dequant(wt, self.col0, self.cols);
             handles.register_float_tensor::<B1>(&out_ir.id, y);
         }
     }
 
     impl<B: FusionBackend + KblockDequantOps> KblockDequantOps for Fusion<B> {
-        fn kblock_dequant(w: QuantizedTensor<Self>) -> FloatTensor<Self> {
+        fn kblock_dequant(w: QuantizedTensor<Self>, col0: usize, cols: usize) -> FloatTensor<Self> {
             let client = w.client.clone();
-            let shape_out = Shape::new([w.shape[0], w.shape[1]]);
+            let shape_out = Shape::new([w.shape[0], cols]);
             let stream = StreamId::current();
             let out = TensorIr::uninit(client.create_empty_handle(), shape_out, DType::F32);
             let desc = CustomOpIr::new("mummu_kblock_dequant", &[w.into_ir()], &[out]);
@@ -1343,6 +1391,8 @@ mod fusion_impl {
                     OperationIr::Custom(desc.clone()),
                     Dequant::<B> {
                         desc,
+                        col0,
+                        cols,
                         _b: core::marker::PhantomData,
                     },
                 )
@@ -1566,12 +1616,28 @@ mod tests {
         let wf = Tensor::<2>::from_dispatch(
             <burn::backend::Dispatch as KblockDequantOps>::kblock_dequant(
                 weight.clone().into_dispatch(),
+                0,
+                width,
             ),
         )
         .into_data()
         .try_to_vec::<f32>()
         .unwrap();
         assert_eq!(wf, exact, "the ternary dequant op is exact on the host");
+        let slab = Tensor::<2>::from_dispatch(
+            <burn::backend::Dispatch as KblockDequantOps>::kblock_dequant(
+                weight.clone().into_dispatch(),
+                32,
+                48,
+            ),
+        )
+        .into_data()
+        .try_to_vec::<f32>()
+        .unwrap();
+        let want_slab: Vec<f32> = (0..k_len)
+            .flat_map(|k| exact[k * width + 32..k * width + 80].to_vec())
+            .collect();
+        assert_eq!(slab, want_slab, "a column slab is the same columns");
 
         let max_err = |got: &[f32], want: &[f32]| {
             got.iter()

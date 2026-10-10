@@ -9,7 +9,8 @@
 //!
 //! `PROBE_LEVEL` = `q2` (the native ternary level), `q8`, or `q4` (default).
 //! `PROBE_ADD_Q2=<source gguf>` first adds the native level to the pack in
-//! place (`pack::add_ternary_level`). With the `cuda` feature,
+//! place (`pack::add_ternary_level`; `PROBE_ONLY_ADD=1` stops there). With
+//! the `cuda` feature,
 //! `PROBE_CUDA=1` puts every layer and the head on the card (the embedding
 //! stays on the host) — the production path for a fully resident model.
 
@@ -57,6 +58,9 @@ async fn main() {
             })
             .expect("adds the native ternary level");
         eprintln!("native ternary level added to {added} tensors");
+        if std::env::var("PROBE_ONLY_ADD").is_ok() {
+            return;
+        }
     }
     let pack = mummu::pack::Pack::open(&dir).expect("pack opens");
     let header = pack.header().expect("header");
