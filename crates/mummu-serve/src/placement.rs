@@ -35,7 +35,7 @@
 //!
 //! `act` is the widest live prefill buffer (three `[chunk, intermediate]`
 //! f32 tensors through `SwiGLU`); `T` the card's other prefill transients,
-//! which grow with the context ([`transient_bytes`]: a chunk's attention
+//! which grow with the context ([`transient_bytes_at`]: a chunk's attention
 //! scores over the whole context, and one projection dequantized for the
 //! chunk's matmul); `P` rounds them to the pool's pages ([`prefill_reserve`]);
 //! `ε̂` is the allocator residual the analytic terms do not explain — measured
@@ -419,7 +419,7 @@ static RESIDUAL: Mutex<Envelope> = Mutex::new(Envelope(VecDeque::new()));
 /// The evidence-file key ε̂ is remembered under.
 ///
 /// Renamed when ε̂ stopped absorbing the context-dependent transients
-/// ([`transient_bytes`]): the old `residual_bytes` held them too — 5.65 GiB
+/// ([`transient_bytes_at`]): the old `residual_bytes` held them too — 5.65 GiB
 /// on the production Bonsai, where a 4786-token prompt needed 3.4 — and read
 /// as the new quantity it would hold that back from layers for good.
 const RESIDUAL_KEY: &str = "residual_base_bytes";
@@ -482,7 +482,7 @@ fn inventory_vram() -> Option<u64> {
 
 /// Non-weight bytes a planner without a model config should hold back: the
 /// measured residual, but never less than its prior. ε̂ no longer covers the
-/// prefill transients ([`transient_bytes`]), and such a planner cannot add
+/// prefill transients ([`transient_bytes_at`]), and such a planner cannot add
 /// them — it has no context and no shapes to add them from.
 pub(super) fn nonweight_estimate() -> u64 {
     let card = inventory_vram();
@@ -1099,7 +1099,12 @@ pub(super) fn state_bytes(cfg: &qwen35::Qwen35Config, layer: usize, ctx: usize) 
 /// through `SwiGLU`. Prefill is chunked, so this is bounded by the chunk, not
 /// the context.
 pub(super) fn act_bytes(cfg: &qwen35::Qwen35Config, ctx: usize) -> u64 {
-    3 * ctx.min(mummu::decode::prefill_chunk_len()).max(1) as u64 * cfg.intermediate_size as u64 * 4
+    act_bytes_at(cfg, ctx, mummu::decode::prefill_chunk_len())
+}
+
+/// [`act_bytes`] at an explicit prefill `chunk`.
+fn act_bytes_at(cfg: &qwen35::Qwen35Config, ctx: usize, chunk: usize) -> u64 {
+    3 * ctx.min(chunk).max(1) as u64 * cfg.intermediate_size as u64 * 4
 }
 
 /// Prefill spans up to this many rows run the packed GEMV row by row on the
@@ -1125,7 +1130,7 @@ fn pool_page(card_total: u64) -> u64 {
     (card_total / 16).max(1 << 20)
 }
 
-/// [`act_bytes`] and [`transient_bytes`] as the card's pool reserves them.
+/// [`act_bytes`] and [`transient_bytes_at`] as the card's pool reserves them.
 ///
 /// A span wider than [`GEMV_ROWS`] takes its buffers as slices of the
 /// largest pages ([`pool_page`]), so what it costs the card is whole pages —
@@ -1134,16 +1139,28 @@ fn pool_page(card_total: u64) -> u64 {
 /// out of device memory (2026-10-04): 1.85 GiB modelled, and the pool asked
 /// the driver for another whole page beyond it.
 pub(super) fn prefill_reserve(cfg: &qwen35::Qwen35Config, ctx: usize, card_total: u64) -> u64 {
-    let live = act_bytes(cfg, ctx) + transient_bytes(cfg, ctx);
-    if ctx.min(mummu::decode::prefill_chunk_len()) <= GEMV_ROWS {
+    prefill_reserve_at(cfg, ctx, card_total, mummu::decode::prefill_chunk_len())
+}
+
+/// [`prefill_reserve`] at an explicit prefill `chunk`.
+fn prefill_reserve_at(
+    cfg: &qwen35::Qwen35Config,
+    ctx: usize,
+    card_total: u64,
+    chunk: usize,
+) -> u64 {
+    let live = act_bytes_at(cfg, ctx, chunk) + transient_bytes_at(cfg, ctx, chunk);
+    if ctx.min(chunk) <= GEMV_ROWS {
         return live;
     }
     let page = pool_page(card_total);
     (live.div_ceil(page) + 1) * page
 }
 
-pub(super) fn transient_bytes(cfg: &qwen35::Qwen35Config, ctx: usize) -> u64 {
-    let rows = ctx.min(mummu::decode::prefill_chunk_len()).max(1) as u64;
+/// The card's prefill transients beyond [`act_bytes`] at `ctx` tokens and
+/// a prefill `chunk` (see the doc above [`pool_page`]).
+fn transient_bytes_at(cfg: &qwen35::Qwen35Config, ctx: usize, chunk: usize) -> u64 {
+    let rows = ctx.min(chunk).max(1) as u64;
     let scores = 3 * cfg.num_attention_heads as u64 * rows * ctx.max(1) as u64 * 4;
     let hidden = cfg.hidden_size as u64;
     let widest = [
@@ -1160,6 +1177,32 @@ pub(super) fn transient_bytes(cfg: &qwen35::Qwen35Config, ctx: usize) -> u64 {
         0
     };
     scores + dequant
+}
+
+/// The prefill chunks a request may narrow to, widest first
+/// ([`Live::fit_prefill_chunk`]). 128 is the floor: below it the dequantized
+/// projections and per-pass launches outweigh what the scores save.
+const CHUNK_LADDER: [usize; 4] = [1024, 512, 256, 128];
+
+/// The widest chunk, at most `default` and never wider than the prompt needs
+/// (`ctx`), at which `fits` holds; the narrowest rung when none does.
+fn widest_fitting(default: usize, ctx: usize, mut fits: impl FnMut(usize) -> bool) -> usize {
+    let cap = default.min(ctx.max(1));
+    let mut ladder: Vec<usize> = std::iter::once(cap)
+        .chain(CHUNK_LADDER.into_iter().filter(|&c| c < cap))
+        .collect();
+    ladder.dedup();
+    let narrowest = *ladder.last().expect("the cap is always a rung");
+    ladder.into_iter().find(|&c| fits(c)).unwrap_or(narrowest)
+}
+
+/// Clears a request's narrower prefill chunk when dropped.
+struct ChunkReset;
+
+impl Drop for ChunkReset {
+    fn drop(&mut self) {
+        mummu::decode::set_prefill_chunk_override(None);
+    }
 }
 
 /// What a prompt of `prompt` tokens takes on the card while a running batch
@@ -1842,6 +1885,56 @@ impl Live {
         }
     }
 
+    /// Choose this request's prefill chunk: the widest of
+    /// [`CHUNK_LADDER`] at which the current placement still fits the card
+    /// beside the request's working set (the solver's own accounting, on the
+    /// live reading), set as the request's override. When none fits, the
+    /// narrowest is set and the repair that follows moves layers off — priced
+    /// at that chunk, so it moves as few as the context allows.
+    ///
+    /// Why the chunk first: a long prompt's prefill is dominated by
+    /// attention scores, `3 · heads · chunk · context` f32, which a narrower
+    /// chunk shrinks in proportion. Moving layers instead re-reads them from
+    /// the pack (16 Bonsai layers took 54 s off the array, 2026-10-10) and
+    /// leaves every later token slower until idle moves them back. Chunking
+    /// is exact, so the only cost is more, smaller prefill passes.
+    fn fit_prefill_chunk(&self, ctx: usize, needs_tower: bool) {
+        mummu::decode::set_prefill_chunk_override(None);
+        if self.backend == BackendChoice::Cpu || self.layers_on_card() == 0 {
+            return;
+        }
+        let Some(reading) = card(self.backend) else {
+            return;
+        };
+        let default = mummu::decode::default_prefill_chunk_len();
+        let fits = |chunk: usize| {
+            mummu::decode::set_prefill_chunk_override(Some(chunk));
+            let pb = self.problem(ctx, needs_tower, Some(&reading), View::Now);
+            let used = joint::used_of(&pb, &self.assignment);
+            pb.devices
+                .get(1)
+                .zip(used.get(1))
+                .is_none_or(|(d, &u)| u <= d.capacity)
+        };
+        let mut fits = fits;
+        let chosen = widest_fitting(default, ctx, &mut fits);
+        let enough = fits(chosen);
+        let narrowed = chosen < default.min(ctx);
+        // `fits` leaves its last probe as the override: set the choice.
+        mummu::decode::set_prefill_chunk_override(narrowed.then_some(chosen));
+        if narrowed {
+            eprintln!(
+                "[mummu-serve] placement: a {ctx}-token context prefills in {chosen}-token chunks to fit beside the {} layer(s) on the card{}",
+                self.layers_on_card(),
+                if enough {
+                    ""
+                } else {
+                    " — still short, so the repair moves layers"
+                },
+            );
+        }
+    }
+
     /// The pack precision `entry` loads at under `choice`.
     fn precision_for(
         &self,
@@ -2350,6 +2443,11 @@ pub(super) fn before_request(
         .as_mut()
         .filter(|l| l.pack_dir.starts_with(key))
         .and_then(|live| {
+            // Narrow this request's prefill chunk until its working set fits
+            // beside the layers already on the card; only a context that does
+            // not fit even at the narrowest chunk makes the repair below move
+            // layers to the host.
+            live.fit_prefill_chunk(ctx, needs_tower);
             if let Err(e) = replan_and_apply(live, lm, ctx, needs_tower, false) {
                 eprintln!("[mummu-serve] placement: could not re-place before the request: {e}");
             }
@@ -2365,6 +2463,9 @@ pub(super) fn after_request(ctx: usize, prompt: usize, tokens: usize, in_use_bef
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .push_back((Instant::now(), tokens));
+    // The request's narrower chunk ends with it — after the measurement
+    // below, which prices the prefill at the chunk it actually ran.
+    let _chunk = ChunkReset;
     let Some(before) = in_use_before else { return };
     let residual = LIVE
         .lock()
@@ -2406,6 +2507,7 @@ pub(super) fn after_request(ctx: usize, prompt: usize, tokens: usize, in_use_bef
 /// (seventeen on 2026-10-05) would flush of every real one. The pages it did
 /// fill go back all the same, as [`after_request`]'s do.
 pub(super) fn after_abandoned(in_use_before: Option<u64>) {
+    let _chunk = ChunkReset;
     if in_use_before.is_none() {
         return;
     }
@@ -2881,11 +2983,12 @@ mod tests {
         let cfg = cfg_27b();
         let gib = |b: u64| f64_from_u64(b) / f64::from(1u32 << 30);
         if mummu::decode::prefill_chunk_len() == 1024 {
-            let long = gib(act_bytes(&cfg, 4786) + transient_bytes(&cfg, 4786));
+            let long = gib(act_bytes(&cfg, 4786)
+                + transient_bytes_at(&cfg, 4786, mummu::decode::prefill_chunk_len()));
             assert!(long >= 1.73 - 0.08, "{long:.2} GiB");
             assert!(long <= 2.2, "and not wildly over: {long:.2} GiB");
         }
-        let at = |ctx| transient_bytes(&cfg, ctx);
+        let at = |ctx| transient_bytes_at(&cfg, ctx, mummu::decode::prefill_chunk_len());
         assert!(at(16_384) > at(4096) && at(4096) > at(1024));
         let hidden = cfg.hidden_size as u64;
         let dequant = hidden * cfg.intermediate_size as u64 * 4;
@@ -2909,7 +3012,10 @@ mod tests {
             assert_eq!(prefill_reserve(&cfg, 4818, card), 3 << 30);
         }
         let short = prefill_reserve(&cfg, 54, card);
-        assert_eq!(short, act_bytes(&cfg, 54) + transient_bytes(&cfg, 54));
+        assert_eq!(
+            short,
+            act_bytes(&cfg, 54) + transient_bytes_at(&cfg, 54, mummu::decode::prefill_chunk_len())
+        );
         assert!(short < 64 << 20);
         assert!(prefill_reserve(&cfg, 16_384, card) > prefill_reserve(&cfg, 4818, card));
         assert!(idle_context() >= IDLE_CONTEXT_FLOOR);
@@ -2951,6 +3057,31 @@ mod tests {
     }
 
     /// Prefill is chunked, so the activation term stops growing at the chunk.
+    #[test]
+    fn the_widest_fitting_chunk_is_chosen() {
+        // Everything fits: the configured chunk, capped by the prompt.
+        assert_eq!(widest_fitting(1024, 5000, |_| true), 1024);
+        assert_eq!(widest_fitting(1024, 300, |_| true), 300);
+        // Room for 256-token chunks only.
+        assert_eq!(widest_fitting(1024, 5000, |c| c <= 256), 256);
+        // Nothing fits: the narrowest rung, and the repair takes it from there.
+        assert_eq!(widest_fitting(1024, 5000, |_| false), 128);
+        // A configured chunk narrower than the ladder's top is never widened.
+        assert_eq!(widest_fitting(400, 5000, |c| c <= 400), 400);
+        assert_eq!(widest_fitting(400, 5000, |c| c < 400), 256);
+    }
+
+    /// The reason the chunk is the first lever: at a Chompass-sized context
+    /// a 256-token chunk reserves far less than the default on the 27B.
+    #[test]
+    fn a_narrower_chunk_shrinks_a_long_prompts_reserve() {
+        let cfg = cfg_27b();
+        let card = 16u64 << 30;
+        let wide = prefill_reserve_at(&cfg, 4400, card, 1024);
+        let narrow = prefill_reserve_at(&cfg, 4400, card, 256);
+        assert!(narrow + (1 << 30) <= wide, "{narrow} vs {wide}");
+    }
+
     #[test]
     fn activations_are_bounded_by_the_prefill_chunk() {
         let cfg = cfg_27b();

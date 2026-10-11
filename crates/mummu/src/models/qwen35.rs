@@ -1033,7 +1033,24 @@ impl GatedDeltaNet {
             };
             let len = combined.dims()[2];
             if len >= kk - 1 {
-                combined.narrow(2, len - (kk - 1), kk - 1)
+                let tail = combined.narrow(2, len - (kk - 1), kk - 1);
+                // Copied into a buffer of its own (×1.0 is bit-exact for
+                // every value). A narrow is a view: kept as the cache, it
+                // pinned the whole span's `[b, conv_dim, t]` input — 42 MB
+                // per DeltaNet layer at a 1024-token chunk, ~2 GiB across the
+                // 27B's 48 when every layer is on the card, from the first
+                // prefill chunk until decode replaced it (measured
+                // 2026-10-10: in-use rose 7.6 -> 9.9 GiB during one span, and
+                // the long prompts ran the card out of memory). The clone is
+                // held across the multiply on purpose: a sole owner lets the
+                // backend compute in place, into the very buffer to drop.
+                if t > 1 {
+                    let copy = tail.clone().mul_scalar(1.0);
+                    drop(tail);
+                    copy
+                } else {
+                    tail
+                }
             } else {
                 let pad = Tensor::<3>::zeros([b, conv_dim, (kk - 1) - len], device);
                 Tensor::cat(vec![pad, combined], 2)
