@@ -1572,7 +1572,7 @@ pub fn pack_expert_costs(pack: &crate::pack::Pack) -> Result<Vec<crate::tier::Ex
         })?;
         for (&p, blob) in &entry.precisions {
             let bytes = match p {
-                Precision::Q4 | Precision::Q8 => blob.values_len + blob.scales_len,
+                Precision::Q2 | Precision::Q4 | Precision::Q8 => blob.values_len + blob.scales_len,
                 Precision::F16 | Precision::F32 => numel * 4,
             };
             *cost.bytes.entry(p).or_insert(0) += bytes;
@@ -1624,7 +1624,7 @@ pub fn load_expert_from_pack(
         let precision = stored_level(entry, tier.precision);
         let blob = entry.precisions[&precision];
         bytes += match precision {
-            Precision::Q4 | Precision::Q8 => blob.values_len + blob.scales_len,
+            Precision::Q2 | Precision::Q4 | Precision::Q8 => blob.values_len + blob.scales_len,
             Precision::F16 | Precision::F32 => entry.shape.iter().product::<usize>() as u64 * 4,
         };
         let t = Param::from_tensor(pack.tensor::<2>(entry, precision, device)?);

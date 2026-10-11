@@ -302,14 +302,44 @@ pub fn best_allowed(logits: &[f32], allowed: impl Fn(u32) -> bool) -> Option<u32
 /// the accelerator reserve in mummu-serve is derived from, so the two must
 /// move together. `mummu_schedule::prefill::best_chunk` solves for the
 /// optimum from measured constants; this is its memory-feasible default.
+///
+/// A server may narrow it for one request ([`set_prefill_chunk_override`]):
+/// a long prompt's attention scores grow with `chunk · context`, so a
+/// narrower chunk is how its working set fits beside the layers already on
+/// the card, instead of moving layers off it.
 #[must_use]
 pub fn prefill_chunk_len() -> usize {
+    match CHUNK_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => default_prefill_chunk_len(),
+        c => c.min(default_prefill_chunk_len()),
+    }
+}
+
+/// [`prefill_chunk_len`] without a request's override: the configured
+/// chunk (`MUMMU_PREFILL_CHUNK`, default 1024).
+#[must_use]
+pub fn default_prefill_chunk_len() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| match std::env::var("MUMMU_PREFILL_CHUNK") {
         Ok(v) if v == "0" || v.eq_ignore_ascii_case("off") => usize::MAX,
         Ok(v) => v.parse::<usize>().ok().filter(|&c| c >= 1).unwrap_or(1024),
         Err(_) => 1024,
     })
+}
+
+/// The current request's narrower prefill chunk; 0 = none.
+static CHUNK_OVERRIDE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Narrow [`prefill_chunk_len`] to `chunk` until cleared with `None`.
+///
+/// Never wider than the configured chunk. Process-wide: the server holds one
+/// request's model slot at a time, and a joiner admitted meanwhile only ever
+/// sees a narrower chunk, which is safe — chunking is exact.
+pub fn set_prefill_chunk_override(chunk: Option<usize>) {
+    CHUNK_OVERRIDE.store(
+        chunk.filter(|&c| c >= 1).unwrap_or(0),
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// A caller's standing request to stop a generation it no longer wants.

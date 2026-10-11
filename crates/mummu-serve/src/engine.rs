@@ -2709,6 +2709,7 @@ fn cap_ladders_at_source(
         Precision::F16 => 16,
         Precision::Q8 => 8,
         Precision::Q4 => 4,
+        Precision::Q2 => 2,
     };
     let mut trimmed = Vec::new();
     for (_, dev) in devices.iter_mut() {
@@ -2937,6 +2938,8 @@ fn host_probe_floor_ms(pack: &mummu::pack::Pack, precision: mummu::pack::Precisi
         // Packed nibbles + f16 scales per 32-group (the VNNI twin's stream).
         mummu::pack::Precision::Q4 => numel * (0.5 + 2.0 / 32.0),
         mummu::pack::Precision::Q8 => numel * (1.0 + 4.0 / 32.0),
+        // The native ternary level runs from its i8 slab on the host.
+        mummu::pack::Precision::Q2 => numel * (1.0 + 4.0 / 128.0),
         // flex widens a half blob to f32 on load.
         mummu::pack::Precision::F16 | mummu::pack::Precision::F32 => numel * 4.0,
     };
@@ -2962,6 +2965,8 @@ fn card_probe_floor_ms(pack: &mummu::pack::Pack, precision: mummu::pack::Precisi
         // Packed nibbles / bytes plus f32 scales per 32-block.
         mummu::pack::Precision::Q4 => numel * (0.5 + 4.0 / 32.0),
         mummu::pack::Precision::Q8 => numel * (1.0 + 4.0 / 32.0),
+        // 2-bit codes plus f32 scales per 128 inputs.
+        mummu::pack::Precision::Q2 => numel * (0.25 + 4.0 / 128.0),
         mummu::pack::Precision::F16 => numel * 2.0,
         mummu::pack::Precision::F32 => numel * 4.0,
     };
@@ -3124,7 +3129,8 @@ const fn precision_for(policy: mummu::quant::QuantPolicy) -> mummu::pack::Precis
 /// The `.mummu` pack beside a GGUF (`<model dir>/pack`), importing it on
 /// first use when packing is on (`MUMMU_PACK` unset or `on`; `off` keeps
 /// the GGUF streaming path). Stored precisions come from
-/// `MUMMU_PACK_PRECISIONS` (default every level: q4,q8,f16,f32). Returns
+/// `MUMMU_PACK_PRECISIONS` (default every level: q2,q4,q8,f16,f32 — q2 is
+/// stored only for a ternary source). Returns
 /// `None` when packing is off; errors if the import fails.
 fn ensure_pack(
     model_dir: &Path,
@@ -3137,14 +3143,34 @@ fn ensure_pack(
         return Ok(None);
     }
     let pack_dir = model_dir.join("pack");
-    if Pack::is_pack(&pack_dir) {
-        ensure_partition(&pack_dir, spec)?;
-        return Ok(Some(pack_dir));
-    }
     let precisions = match std::env::var("MUMMU_PACK_PRECISIONS") {
         Ok(v) => Precision::parse_list(&v)?,
         Err(_) => Precision::ALL.to_vec(),
     };
+    if Pack::is_pack(&pack_dir) {
+        // A ternary model's pack imported before the native level existed
+        // gains it in place, once (~6.5 GB appended for the 27B, instead of
+        // a 44 GB re-import). `add_ternary_level` decides from the pack's
+        // header copy, so other models never touch their GGUF here.
+        if precisions.contains(&Precision::Q2) {
+            let started = Instant::now();
+            let added = mummu::pack::add_ternary_level(&pack_dir, gguf_path, |i, n, name| {
+                if i % 32 == 0 {
+                    eprintln!("[mummu-serve] native ternary level {i}/{n} ({name})");
+                }
+            })?;
+            if added > 0 {
+                eprintln!(
+                    "[mummu-serve] native ternary level added to {} tensors of {} in {:.0}s",
+                    added,
+                    spec.name,
+                    started.elapsed().as_secs_f32()
+                );
+            }
+        }
+        ensure_partition(&pack_dir, spec)?;
+        return Ok(Some(pack_dir));
+    }
     eprintln!(
         "[mummu-serve] importing {} to a .mummu pack ({precisions:?}) at {} — one-time",
         spec.name,

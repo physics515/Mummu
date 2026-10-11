@@ -2693,13 +2693,30 @@ a benchmark holds/improves its budget; README perf claims link an artifact.
       (`PrismML-Eng/llama.cpp` branch `prism`, commit bdc23b5), CPU build — note `GGML_CPU_REPACK`
       must be OFF on this host (the repacked PQ2_0 path segfaults at load on the 7950X3D, NULL call in
       `libggml-cpu`); the plain vec_dot build loads and decodes at ~370 ms/token on 8 threads.
-      **Left open, in order of value:** (a) the real win is a **native ternary rung** — burn's `Q2S`
-      value (`QuantPolicy::Q2` exists in the ladder, `Precision` in the pack does not) represents
-      −1/0/+1 exactly ONLY with scales along the input axis (per-128 source groups), so it needs a
-      block layout the pack does not have today; done right, the 24.35B backbone is ~7.6 GB and fits
-      the 16 GB card entire instead of streaming half its layers from the host at Q4 (~14 GB), and it
-      also removes the 5% Q4 error above. Needs a `Q2` pack level, the planner floor lifted for
-      exact-at-Q2 sources, and the Q2S matmul kernels measured on CUDA/wgpu/flex; (b) `PTQ1_0` in the catalog is one entry (the decoder is in); (c)
+      **Left open, in order of value:** (a) ~~native ternary rung~~ **LANDED 2026-10-10** (branch
+      `claude/native-ternary-rung`): `pack::Precision::Q2` stores a ternary source's own values —
+      burn `Q2S` with `[128, 1]` blocks (scales along the INPUT axis, the source's groups), written
+      only when `ternary_codes` reproduces every weight bit for bit (all 401 Bonsai projections do);
+      its index lives in a `q2.json` sidecar so pre-Q2 binaries still open the pack, and
+      `add_ternary_level` upgrades an existing pack in place (7.2 GB appended, no 44 GB re-import —
+      `ensure_pack` does it once). `nn::packed_gemv` reads the layout directly (split-K over the
+      grid + offset-binary decode: **2.2x Q4's per-GEMV time** in a dependent FFN chain on CUDA,
+      exact to ~3e-6), and prefill dequantizes with its own kernel in ≤64 MB column slabs — burn's
+      `dequantize` is WRONG for `[128, 1]` blocks on CUDA (83% error), so the ternary route never
+      falls back to it. `joint::Part::exact` makes Q2 a zero-error level exempt from the Q4 floor.
+      Measured on the real 27B through `mummu-serve` (CUDA, production paused for the test): all 64
+      layers + head fit the card at **6.8 GiB**; greedy output **byte-identical** to production's Q4;
+      warm decode **4.07 tok/s at 47-51/64 layers vs production's 1.32** (64/64 measured 2.46 under
+      `MUMMU_POOL_TRACE`, not comparable); a 1505-token tool prompt prefilled in ~30 s on 64/64
+      (63 s at 49/64, 81-311 s for 1040-2304 tokens in production). **Still open — the prefill
+      working set, not the rung:** with every layer on the card a 1505-token prompt peaks at 11.4 GiB
+      of pool (in use 7.6 -> 9.9 during the first 1024-token span) beside 3.7-3.8 GiB of desktop, so it
+      passes or OOMs on a few hundred MB; a ~4k-token prompt OOMs mid-prefill even at 48/64 (prefill
+      attention materializes `[24, chunk, ctx]` f32 scores three times, in 1 GiB pool pages). The
+      planner's OOM back-off (working-set estimate doubles, the next load places fewer layers) recovers,
+      at the cost of the failed request. Next: memory-bounded prefill attention (key-chunked or
+      flash-style) and a `transient_bytes` model calibrated on these traces; a packed-ternary prefill
+      GEMM would drop the slabs. (b) `PTQ1_0` in the catalog is one entry (the decoder is in); (c)
       Ternary-Bonsai-8B (`prism-ml/Ternary-Bonsai-8B-gguf`, plain Qwen3 + PQ2_0, no Hadamard) is
       blocked only by YaRN rope scaling (factor 4, original 16384), which `attn_config` still refuses;
       (d) the host-side transform on flex layers goes through the 1024×1024 matmul like every device —

@@ -483,7 +483,7 @@ pub fn cluster_costs(pack: &Pack, layer: usize) -> Result<Vec<crate::tier::Exper
         let numel = e.shape.iter().product::<usize>() as u64;
         for (&p, blob) in &e.precisions {
             let bytes = match p {
-                Precision::Q4 | Precision::Q8 => blob.values_len + blob.scales_len,
+                Precision::Q2 | Precision::Q4 | Precision::Q8 => blob.values_len + blob.scales_len,
                 Precision::F32 => numel * 4,
                 // f16 is TWO bytes. Costing it as four made it look exactly
                 // as expensive as f32 to the tier planner, so it could never

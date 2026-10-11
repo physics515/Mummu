@@ -107,11 +107,35 @@ pub struct Part {
     /// device's measured rate is per. What it OCCUPIES once loaded is a
     /// property of the device ([`Device::resident`]).
     pub levels: Vec<(QuantPolicy, u64)>,
+    /// The level at which this part reproduces its SOURCE exactly, if any:
+    /// a ternary checkpoint (Bonsai's `PQ2_0`, every weight a per-128 scale
+    /// times −1/0/+1) stored natively at [`QuantPolicy::Q2`] with its scales
+    /// along the input axis. That level costs no error at all — so it is
+    /// exempt from [`Problem::floor`], which guards against the generic Q2
+    /// quality cliff, and its error term is zero rather than
+    /// [`rel_error`]'s measured re-quantization loss.
+    pub exact: Option<QuantPolicy>,
 }
 
 impl Part {
     fn bytes(&self, p: QuantPolicy) -> Option<u64> {
         self.levels.iter().find(|(q, _)| *q == p).map(|&(_, b)| b)
+    }
+
+    /// The relative error this part carries at `p`: zero at its exact
+    /// level, the ladder's measured cost everywhere else.
+    #[must_use]
+    pub fn error(&self, p: QuantPolicy) -> f64 {
+        if self.exact == Some(p) {
+            0.0
+        } else {
+            rel_error(p)
+        }
+    }
+
+    /// May this part take `p` under `floor`? Its exact level always may.
+    fn allows(&self, p: QuantPolicy, floor: QuantPolicy) -> bool {
+        self.exact == Some(p) || level_ok(p, floor)
     }
 
     fn stores(&self, p: QuantPolicy) -> bool {
@@ -233,7 +257,7 @@ fn fastest(part: &Part, dev: &Device, floor: QuantPolicy) -> Option<QuantPolicy>
     part.levels
         .iter()
         .map(|&(p, _)| p)
-        .filter(|&p| level_ok(p, floor))
+        .filter(|&p| part.allows(p, floor))
         .filter_map(|p| part_time(part, dev, p).map(|t| (p, t)))
         .min_by(|a, b| {
             a.1.partial_cmp(&b.1)
@@ -270,7 +294,7 @@ fn choices(layer: &Layer, device: usize, dev: &Device, floor: QuantPolicy) -> Ve
             p.levels
                 .iter()
                 .map(|&(q, _)| q)
-                .filter(|&q| level_ok(q, floor) && dev.rate_of(q).is_some())
+                .filter(|&q| p.allows(q, floor) && dev.rate_of(q).is_some())
                 .collect()
         })
         .collect();
@@ -379,7 +403,7 @@ pub fn error_of(pb: &Problem, a: &Assignment) -> f64 {
     for (l, c) in pb.layers.iter().zip(&a.layers) {
         for (p, &q) in l.parts.iter().zip(&c.levels) {
             let w = sensitivity(p.kind) * f64_from_usize(p.params);
-            num = w.mul_add(rel_error(q), num);
+            num = w.mul_add(p.error(q), num);
             den += w;
         }
     }
@@ -516,7 +540,7 @@ fn spend(pb: &Problem, a: &mut Assignment) {
                     continue;
                 }
                 let gain = sensitivity(part.kind)
-                    * (rel_error(q) - rel_error(up))
+                    * (part.error(q) - part.error(up))
                     * f64_from_usize(part.params);
                 if gain <= 0.0 {
                     continue;
@@ -726,7 +750,7 @@ fn repair(pb: &Problem, mut a: Assignment) -> Outcome {
             for (pi, &q) in c.levels.iter().enumerate() {
                 let Some(down) = q.demote() else { continue };
                 let part = &pb.layers[li].parts[pi];
-                if !level_ok(down, pb.floor)
+                if !part.allows(down, pb.floor)
                     || !part.stores(down)
                     || pb.devices[d].rate_of(down).is_none()
                 {
@@ -739,7 +763,7 @@ fn repair(pb: &Problem, mut a: Assignment) -> Outcome {
                 // then only the quality is lost, and it is charged as a tiny
                 // time so the cheapest precision goes first.
                 let lost = (1e-12 * sensitivity(part.kind)).mul_add(
-                    rel_error(down) - rel_error(q),
+                    part.error(down) - part.error(q),
                     (time_of(pb, &trial) - base).max(0.0),
                 );
                 if freed > 0 {
@@ -777,11 +801,13 @@ mod tests {
                     params: attn,
                     kind: Kind::Attention,
                     levels: stored(attn, &[Off, F16, Q8, Q4]),
+                    exact: None,
                 },
                 Part {
                     params: ffn,
                     kind: Kind::Ffn,
                     levels: stored(ffn, &[Off, F16, Q8, Q4]),
+                    exact: None,
                 },
             ],
             fixed_bytes: 4096,
@@ -866,6 +892,61 @@ mod tests {
         assert!(o.assignment.layers[..5].iter().all(|c| c.device == 1));
         assert_eq!(crossings(&o.assignment), 1);
         assert!(o.used[1] <= cap);
+    }
+
+    /// A ternary source stored natively at Q2 (its exact level): the Q4
+    /// floor does not apply to it, Q2 costs no error, so the card holds it
+    /// at Q2 and fits more layers (8 against 5 here: `bytes_at` charges Q2
+    /// block-32 scales, so a layer is ~0.65x its Q4 bytes with the state).
+    /// A part WITHOUT an exact level keeps the floor: Q2 stored is never
+    /// chosen.
+    #[test]
+    fn an_exact_q2_level_bypasses_the_floor_and_fills_the_card() {
+        let mut pb = problem(12, 0);
+        for l in &mut pb.layers {
+            for p in &mut l.parts {
+                p.levels = stored(p.params, &[Q8, Q4, Q2]);
+            }
+        }
+        for d in &mut pb.devices {
+            d.rate.push((Q2, d.rate[0].1));
+        }
+        let per = bytes_at(8 * M, Q4) + bytes_at(2 * M, Q4) + 4096 + (1 << 20);
+        let cap = (64 << 20) + 5 * per + per / 2;
+        pb.devices[1].capacity = cap;
+
+        let generic = solve(&pb);
+        assert!(generic.feasible);
+        assert!(
+            generic
+                .assignment
+                .layers
+                .iter()
+                .all(|c| !c.levels.contains(&Q2)),
+            "the floor keeps a re-quantized Q2 out"
+        );
+        assert_eq!(on_card(&generic.assignment), 5);
+
+        for l in &mut pb.layers {
+            for p in &mut l.parts {
+                p.exact = Some(Q2);
+            }
+        }
+        let exact = solve(&pb);
+        assert!(exact.feasible);
+        let card: Vec<&Choice> = exact
+            .assignment
+            .layers
+            .iter()
+            .filter(|c| c.device == 1)
+            .collect();
+        assert_eq!(card.len(), 8, "Q2 at ~0.65x the bytes");
+        assert!(card.iter().all(|c| c.levels == vec![Q2, Q2]));
+        assert!(exact.used[1] <= cap);
+        assert!(
+            error_of(&pb, &exact.assignment).abs() < 1e-12,
+            "exact costs nothing"
+        );
     }
 
     /// When every layer fits, leftover card bytes go to precision — the
@@ -1165,11 +1246,13 @@ mod timing {
                     params: 73 << 20,
                     kind: Kind::Attention,
                     levels: lv(73 << 20),
+                    exact: None,
                 },
                 Part {
                     params: 267 << 20,
                     kind: Kind::Ffn,
                     levels: lv(267 << 20),
+                    exact: None,
                 },
             ],
             fixed_bytes: 1 << 20,
