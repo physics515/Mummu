@@ -315,6 +315,23 @@ pub fn prefill_chunk_len() -> usize {
     }
 }
 
+/// The chunk placement plans a card's prefill reserve at.
+///
+/// The request's override, else the configured chunk capped at
+/// [`IDLE_PLAN_CHUNK`]. A request that finds more room runs wider (it sets
+/// its own override), so the idle reserve need not hold a 1024-token chunk's
+/// pages and layers stay on the card.
+#[must_use]
+pub fn planned_prefill_chunk_len() -> usize {
+    match CHUNK_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => default_prefill_chunk_len().min(IDLE_PLAN_CHUNK),
+        c => c.min(default_prefill_chunk_len()),
+    }
+}
+
+/// See [`planned_prefill_chunk_len`].
+pub const IDLE_PLAN_CHUNK: usize = 256;
+
 /// [`prefill_chunk_len`] without a request's override: the configured
 /// chunk (`MUMMU_PREFILL_CHUNK`, default 1024).
 #[must_use]

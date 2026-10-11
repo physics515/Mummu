@@ -41,6 +41,24 @@ use std::time::{Duration, Instant};
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
+/// Waits for queued device work; see [`set_sync`].
+static SYNC: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Make every scope boundary wait for the device (once per process).
+///
+/// GPU ops queue lazily, so without this a scope times the enqueue, not the
+/// work; with it the bars are real wall time, at the cost of the overlap
+/// the queue gives — a profiling mode, not a serving one.
+pub fn set_sync(wait: fn()) {
+    let _ = SYNC.set(wait);
+}
+
+fn wait_for_device() {
+    if let Some(wait) = SYNC.get() {
+        wait();
+    }
+}
+
 /// Path → (inclusive nanoseconds, times entered). `BTreeMap` for a
 /// deterministic report; `const`-constructible, unlike `HashMap`.
 static TOTALS: Mutex<BTreeMap<String, (u64, u64)>> = Mutex::new(BTreeMap::new());
@@ -76,6 +94,7 @@ pub fn scope(name: impl Into<String>) -> ScopeGuard {
     if !enabled() {
         return ScopeGuard { start: None };
     }
+    wait_for_device();
     STACK.with(|s| s.borrow_mut().push(name.into()));
     ScopeGuard {
         start: Some(Instant::now()),
@@ -122,6 +141,7 @@ pub struct ScopeGuard {
 impl Drop for ScopeGuard {
     fn drop(&mut self) {
         let Some(start) = self.start else { return };
+        wait_for_device();
         let elapsed = nanos(start.elapsed());
         let path = STACK.with(|s| {
             let mut stack = s.borrow_mut();
