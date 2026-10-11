@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/physics515/Mummu"
@@ -96,9 +96,9 @@ burn-flex = "0.22.0-pre.3"
 # `mummu-num` is the exact, `as`-free numeric conversions (see its crate
 # docs): the one thing every crate shares, the dependency-free schedulers
 # included.
-mummu-num = { version = "0.6.0", path = "crates/mummu-num" }
-mummu-mix = { version = "0.6.0", path = "crates/mummu-mix" }
-mummu-schedule = { version = "0.6.0", path = "crates/mummu-schedule" }
+mummu-num = { version = "0.6.1", path = "crates/mummu-num" }
+mummu-mix = { version = "0.6.1", path = "crates/mummu-mix" }
+mummu-schedule = { version = "0.6.1", path = "crates/mummu-schedule" }
 # Direct handle on burn-store (the same crate burn's `store` feature pulls) to
 # turn on its `pytorch` feature: .pth / pytorch_model.bin state-dict loading
 # for models never re-shipped as safetensors (feature-unified, no duplicate).
