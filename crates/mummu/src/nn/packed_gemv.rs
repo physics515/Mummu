@@ -177,12 +177,8 @@ fn kblock_matmul(x: &Tensor<2>, w: &Tensor<2>, m: usize) -> Tensor<2> {
             w.clone().into_dispatch(),
         ));
     }
-    if m <= 64 {
-        let k = x.dims()[1];
-        let rows: Vec<Tensor<2>> = (0..m)
-            .map(|r| gemv(x.clone().slice([r..r + 1, 0..k])))
-            .collect();
-        return Tensor::cat(rows, 0);
+    if m <= KBLOCK_ROWS_MAX {
+        return gemv(x.clone());
     }
     // Column slabs of at most `KBLOCK_SLAB_BYTES` of f32 each. One whole
     // projection at a time ran the 27B out of device memory with every layer
@@ -211,6 +207,10 @@ fn kblock_matmul(x: &Tensor<2>, w: &Tensor<2>, m: usize) -> Tensor<2> {
         Tensor::cat(parts, 1)
     }
 }
+
+/// The widest batch the multi-row packed kernel takes; wider spans
+/// dequantize and use the tensor cores.
+pub const KBLOCK_ROWS_MAX: usize = 1024;
 
 /// The f32 bytes one dequantized prefill slab may hold.
 pub const KBLOCK_SLAB_BYTES: usize = 64 << 20;
@@ -450,6 +450,59 @@ mod cube_impl {
         }
     }
 
+    /// Writes a tile's accumulators to `out` rows at `out_row0` (`live` rows
+    /// of `rows`, this thread's columns from `col`), folding the in-workgroup
+    /// k-slices through shared partials one row at a time.
+    #[cube]
+    fn kblock_store(
+        acc: Array<f32>,
+        out: &mut Tensor<f32>,
+        out_row0: usize,
+        col: usize,
+        live: usize,
+        #[comptime] per_word: usize,
+        #[comptime] split: usize,
+        #[comptime] rows: usize,
+    ) -> usize {
+        let width = out.shape(1);
+        let lane = usize::cast_from(UNIT_POS_X);
+        let slice = usize::cast_from(UNIT_POS_Y);
+        if comptime!(split == 1) {
+            #[unroll]
+            for r in 0..rows {
+                if r < live {
+                    #[unroll]
+                    for j in 0..per_word {
+                        out[out_row0 + r * width + col + j] = acc[r * per_word + j];
+                    }
+                }
+            }
+        } else {
+            let mut partials = Shared::<[f32]>::new_slice(comptime!(32 * split * per_word));
+            let slot = (lane * split + slice) * per_word;
+            #[unroll]
+            for r in 0..rows {
+                #[unroll]
+                for j in 0..per_word {
+                    partials[slot + j] = acc[r * per_word + j];
+                }
+                sync_cube();
+                if slice == 0 && r < live {
+                    #[unroll]
+                    for j in 0..per_word {
+                        let mut total = 0.0f32;
+                        for ss in 0..split {
+                            total += partials[(lane * split + ss) * per_word + j];
+                        }
+                        out[out_row0 + r * width + col + j] = total;
+                    }
+                }
+                sync_cube();
+            }
+        }
+        live
+    }
+
     /// Split-K packed GEMV over the K-axis ternary layout
     /// ([`super::is_kblock`]): the same workgroup shape as
     /// [`packed_gemv_kernel`] (32 coalesced word-columns by `split`
@@ -480,6 +533,7 @@ mod cube_impl {
         #[comptime] per_word: usize,
         #[comptime] kblock: usize,
         #[comptime] split: usize,
+        #[comptime] rows: usize,
     ) {
         let lane = usize::cast_from(UNIT_POS_X);
         let slice = usize::cast_from(UNIT_POS_Y);
@@ -487,9 +541,12 @@ mod cube_impl {
         let n_words = w_packed.shape(1);
         let valid = wc < n_words;
 
+        let m = x.shape(0);
+        let width = scales.shape(1);
         let k_chunk = x.shape(1) / usize::cast_from(CUBE_COUNT_Y);
         let k_base = usize::cast_from(CUBE_POS_Y) * k_chunk;
-        let out_row = usize::cast_from(CUBE_POS_Y) * out.shape(1);
+        let tile = usize::cast_from(CUBE_POS_Z) * rows;
+        let part_base = usize::cast_from(CUBE_POS_Y) * m * width;
         let bits = comptime!(value_bits(per_word));
         let mask = comptime!((1u32 << value_bits(per_word)) - 1);
         // Two's complement as offset binary: flipping each field's sign bit
@@ -501,10 +558,25 @@ mod cube_impl {
         let flip = comptime!(sign_pattern(per_word));
         let offset = comptime!(f32_offset(per_word));
 
-        let mut acc = Array::<f32>::new(per_word);
-        let mut group = Array::<f32>::new(per_word);
+        // `rows` rows of x share every decoded word: the weight is read
+        // once per row tile, not once per row. Rows past `m` repeat the
+        // last row and are not stored.
+        let mut xbase = Array::<usize>::new(rows);
+        let mut xsum = Array::<f32>::new(rows);
+        let mut xs = Array::<f32>::new(rows);
         #[unroll]
-        for j in 0..per_word {
+        for r in 0..rows {
+            let mut row = tile + r;
+            if row >= m {
+                row = m - 1;
+            }
+            xbase[r] = row * x.stride(0);
+            xsum[r] = 0.0f32;
+        }
+        let mut acc = Array::<f32>::new(rows * per_word);
+        let mut group = Array::<f32>::new(rows * per_word);
+        #[unroll]
+        for j in 0..rows * per_word {
             acc[j] = 0.0f32;
             group[j] = 0.0f32;
         }
@@ -514,59 +586,62 @@ mod cube_impl {
             let col0 = wc * per_word;
             let k_per = k_chunk / split;
             let k0 = k_base + slice * k_per;
-            let mut xsum = 0.0f32;
             for kk in 0..k_per {
                 let k = k0 + kk;
                 let word = w_packed[k * stride_w + wc] ^ flip;
-                let xk = x[k];
-                xsum += xk;
+                #[unroll]
+                for r in 0..rows {
+                    let xk = x[xbase[r] + k];
+                    xs[r] = xk;
+                    xsum[r] += xk;
+                }
                 #[unroll]
                 for j in 0..per_word {
                     let field = (word >> (u32::cast_from(j) * bits)) & mask;
-                    let prod = f32::cast_from(field) * xk;
-                    group[j] += prod;
+                    let code = f32::cast_from(field);
+                    #[unroll]
+                    for r in 0..rows {
+                        let prod = code * xs[r];
+                        group[r * per_word + j] += prod;
+                    }
                 }
                 if k % kblock == kblock - 1 || kk + 1 == k_per {
                     let srow = (k / kblock) * stride_s + col0;
-                    let shift = offset * xsum;
                     #[unroll]
                     for j in 0..per_word {
-                        let term = (group[j] - shift) * scales[srow + j];
-                        acc[j] += term;
-                        group[j] = 0.0f32;
+                        let scale = scales[srow + j];
+                        #[unroll]
+                        for r in 0..rows {
+                            let shift = offset * xsum[r];
+                            let term = (group[r * per_word + j] - shift) * scale;
+                            acc[r * per_word + j] += term;
+                            group[r * per_word + j] = 0.0f32;
+                        }
                     }
-                    xsum = 0.0f32;
+                    #[unroll]
+                    for r in 0..rows {
+                        xsum[r] = 0.0f32;
+                    }
                 }
             }
         }
-        if comptime!(split == 1) {
-            if valid {
-                let base = wc * per_word;
-                #[unroll]
-                for j in 0..per_word {
-                    out[out_row + base + j] = acc[j];
-                }
-            }
-        } else {
-            let mut partials = Shared::<[f32]>::new_slice(comptime!(32 * split * per_word));
-            let slot = (lane * split + slice) * per_word;
-            #[unroll]
-            for j in 0..per_word {
-                partials[slot + j] = acc[j];
-            }
-            sync_cube();
-            if valid && slice == 0 {
-                let base = wc * per_word;
-                #[unroll]
-                for j in 0..per_word {
-                    let mut total = 0.0f32;
-                    for ss in 0..split {
-                        total += partials[(lane * split + ss) * per_word + j];
-                    }
-                    out[out_row + base + j] = total;
-                }
-            }
+        let mut live = m - tile;
+        if live > rows {
+            live = rows;
         }
+        if !valid {
+            live = 0;
+        }
+        let _stored = kblock_store(
+            acc,
+            out,
+            part_base + tile * width,
+            wc * per_word,
+            live,
+            per_word,
+            split,
+            rows,
+        );
     }
 
     /// `out[0, c] = Σ_y parts[y, c]` — folds [`kblock_gemv_kernel`]'s grid
@@ -574,7 +649,7 @@ mod cube_impl {
     #[cube(launch)]
     fn sum_rows_kernel(parts: &Tensor<f32>, out: &mut Tensor<f32>) {
         let c = ABSOLUTE_POS;
-        let n = out.shape(1);
+        let n = out.shape(0) * out.shape(1);
         if c < n {
             let mut total = 0.0f32;
             for y in 0..parts.shape(0) {
@@ -808,10 +883,12 @@ mod cube_impl {
         config: usize,
     ) -> CubeTensor<R> {
         let (split, grid) = (config & 0xff, (config >> 8).max(1));
+        let m = x.meta.shape()[0];
+        let rows = kblock_rows(m);
         let out = empty_device::<R, f32>(
             client.clone(),
             x.device.clone(),
-            Shape::new([1, view.width]),
+            Shape::new([m, view.width]),
         );
         let parts = if grid == 1 {
             out.clone()
@@ -819,12 +896,16 @@ mod cube_impl {
             empty_device::<R, f32>(
                 client.clone(),
                 x.device.clone(),
-                Shape::new([grid, view.width]),
+                Shape::new([grid, m, view.width]),
             )
         };
         kblock_gemv_kernel::launch::<R>(
             client,
-            CubeCount::Static(view.cubes, u32::try_from(grid).expect("grid is small"), 1),
+            CubeCount::Static(
+                view.cubes,
+                u32::try_from(grid).expect("grid is small"),
+                u32::try_from(m.div_ceil(rows)).expect("row tiles fit u32"),
+            ),
             CubeDim::new_2d(32, u32::try_from(split).expect("split is at most 16")),
             view.values.clone().into_tensor_arg(),
             view.scales.clone().into_tensor_arg(),
@@ -833,12 +914,13 @@ mod cube_impl {
             view.per_word,
             super::KBLOCK,
             split,
+            rows,
         );
         if grid > 1 {
             sum_rows_kernel::launch::<R>(
                 client,
                 CubeCount::Static(
-                    u32::try_from(view.width.div_ceil(256)).expect("width fits u32"),
+                    u32::try_from((m * view.width).div_ceil(256)).expect("width fits u32"),
                     1,
                     1,
                 ),
@@ -848,6 +930,22 @@ mod cube_impl {
             );
         }
         out
+    }
+
+    /// Rows of x one workgroup carries through the K-axis kernel: 1 for the
+    /// decode GEMV, `MUMMU_KROWS` (default 4) for a batch.
+    fn kblock_rows(m: usize) -> usize {
+        static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        if m == 1 {
+            return 1;
+        }
+        *ROWS.get_or_init(|| {
+            std::env::var("MUMMU_KROWS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&v| matches!(v, 1 | 2 | 4 | 8))
+                .unwrap_or(4)
+        })
     }
 
     pub(super) fn q4s_gemv_cube<R: CubeRuntime>(
@@ -897,6 +995,23 @@ mod cube_impl {
                 Layout::KBlocks => launch_kblocks(&client, &x, &view, config),
             }
         };
+        // A batch of rows has the parallelism the single-row GEMV had to
+        // split K for: one fixed shape, no tuning pass.
+        if layout == Layout::KBlocks && x.meta.shape()[0] > 1 {
+            let split = std::env::var("MUMMU_KSPLIT")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&v| matches!(v, 1 | 2 | 4 | 8))
+                .unwrap_or(4);
+            return launch(kblock_config(
+                if k_len.is_multiple_of(split) {
+                    split
+                } else {
+                    1
+                },
+                1,
+            ));
+        }
         // Split-K factor: autotuned per shape (or `MUMMU_GEMV_SPLIT`).
         // Forced to 1 when it does not divide k, so odd shapes keep the
         // exact split-1 path.

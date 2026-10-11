@@ -1660,8 +1660,8 @@ mod tests {
         assert_eq!(h["version"], json!(status::VERSION));
         assert_eq!(
             h["version"],
-            json!("0.5.0"),
-            "this branch ships as v0.5.0; the workspace version is what says so"
+            json!(env!("CARGO_PKG_VERSION")),
+            "the workspace version is what says which release this is"
         );
         let build = h["build"].as_str().expect("build is a string");
         assert!(

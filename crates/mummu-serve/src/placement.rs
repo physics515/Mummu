@@ -1099,7 +1099,7 @@ pub(super) fn state_bytes(cfg: &qwen35::Qwen35Config, layer: usize, ctx: usize) 
 /// through `SwiGLU`. Prefill is chunked, so this is bounded by the chunk, not
 /// the context.
 pub(super) fn act_bytes(cfg: &qwen35::Qwen35Config, ctx: usize) -> u64 {
-    act_bytes_at(cfg, ctx, mummu::decode::prefill_chunk_len())
+    act_bytes_at(cfg, ctx, mummu::decode::planned_prefill_chunk_len())
 }
 
 /// [`act_bytes`] at an explicit prefill `chunk`.
@@ -1139,7 +1139,12 @@ fn pool_page(card_total: u64) -> u64 {
 /// out of device memory (2026-10-04): 1.85 GiB modelled, and the pool asked
 /// the driver for another whole page beyond it.
 pub(super) fn prefill_reserve(cfg: &qwen35::Qwen35Config, ctx: usize, card_total: u64) -> u64 {
-    prefill_reserve_at(cfg, ctx, card_total, mummu::decode::prefill_chunk_len())
+    prefill_reserve_at(
+        cfg,
+        ctx,
+        card_total,
+        mummu::decode::planned_prefill_chunk_len(),
+    )
 }
 
 /// [`prefill_reserve`] at an explicit prefill `chunk`.
@@ -1921,7 +1926,7 @@ impl Live {
         let enough = fits(chosen);
         let narrowed = chosen < default.min(ctx);
         // `fits` leaves its last probe as the override: set the choice.
-        mummu::decode::set_prefill_chunk_override(narrowed.then_some(chosen));
+        mummu::decode::set_prefill_chunk_override(Some(chosen));
         if narrowed {
             eprintln!(
                 "[mummu-serve] placement: a {ctx}-token context prefills in {chosen}-token chunks to fit beside the {} layer(s) on the card{}",
@@ -3008,9 +3013,11 @@ mod tests {
         let cfg = cfg_27b();
         let card = 16u64 << 30;
         assert_eq!(pool_page(card), 1 << 30);
-        if mummu::decode::prefill_chunk_len() == 1024 {
-            assert_eq!(prefill_reserve(&cfg, 4818, card), 3 << 30);
-        }
+        assert_eq!(prefill_reserve_at(&cfg, 4818, card, 1024), 3 << 30);
+        assert!(
+            prefill_reserve(&cfg, 4818, card) <= 2 << 30,
+            "idle plan is narrow"
+        );
         let short = prefill_reserve(&cfg, 54, card);
         assert_eq!(
             short,
@@ -3085,7 +3092,7 @@ mod tests {
     #[test]
     fn activations_are_bounded_by_the_prefill_chunk() {
         let cfg = cfg_27b();
-        let chunk = mummu::decode::prefill_chunk_len();
+        let chunk = mummu::decode::planned_prefill_chunk_len();
         assert_eq!(act_bytes(&cfg, chunk), act_bytes(&cfg, chunk * 8));
         assert!(act_bytes(&cfg, 16) < act_bytes(&cfg, chunk));
     }

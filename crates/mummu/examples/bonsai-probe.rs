@@ -184,21 +184,41 @@ fn prefill_in_chunks(
             .and_then(burn::tensor::Device::memory_pool_usage)
             .map_or((0, 0), |u| (u.bytes_reserved >> 20, u.bytes_in_use >> 20))
     };
+    if std::env::var("PROBE_PROF").is_ok() {
+        #[cfg(feature = "cuda")]
+        mummu::prof::set_sync(|| {
+            let _ = burn::tensor::Device::sync(&mummu::backend::cuda_device());
+        });
+        mummu::prof::set_enabled(true);
+    }
     eprintln!(
         "prefill {} ids in spans of {chunk}; pool before (MiB reserved, in use): {:?}",
         ids.len(),
         pool()
     );
-    let mut cache = loaded.new_cache();
-    for (i, span) in ids.chunks(chunk).enumerate() {
-        let started = std::time::Instant::now();
-        let logits = loaded.forward(span, i * chunk, &mut cache, device);
-        let _ = logits.into_data();
-        eprintln!(
-            "span {i} ({} ids) in {:.1}s; pool after: {:?}",
-            span.len(),
-            started.elapsed().as_secs_f64(),
-            pool()
-        );
+    for pass in 0..std::env::var("PROBE_TWICE").map_or(1, |_| 2) {
+        let mut cache = loaded.new_cache();
+        if pass == 1 {
+            mummu::prof::reset();
+        }
+        let pass_started = std::time::Instant::now();
+        for (i, span) in ids.chunks(chunk).enumerate() {
+            let started = std::time::Instant::now();
+            let logits = loaded.forward(span, i * chunk, &mut cache, device);
+            let _ = logits.into_data();
+            eprintln!(
+                "span {i} ({} ids) in {:.1}s; pool after: {:?}",
+                span.len(),
+                started.elapsed().as_secs_f64(),
+                pool()
+            );
+            if i == 2 && std::env::var("PROBE_TWICE").is_err() {
+                mummu::prof::reset(); // the first spans pay the autotune
+            }
+        }
+        eprintln!("pass {pass}: {:.1}s", pass_started.elapsed().as_secs_f64());
+    }
+    if std::env::var("PROBE_PROF").is_ok() {
+        eprintln!("folded profile (self time, us):\n{}", mummu::prof::folded());
     }
 }
